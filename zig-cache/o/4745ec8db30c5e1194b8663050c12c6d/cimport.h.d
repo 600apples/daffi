@@ -1,0 +1,228 @@
+cimport.o: \
+  /home/fnn45/Documents/dafi/zig-cache/o/4745ec8db30c5e1194b8663050c12c6d/cimport.h \
+  /home/linuxbrew/.linuxbrew/opt/python@3.12/include/python3.12/Python.h \
+  /home/linuxbrew/.linuxbrew/opt/python@3.12/include/python3.12/patchlevel.h \
+  /home/linuxbrew/.linuxbrew/opt/python@3.12/include/python3.12/pyconfig.h \
+  /home/linuxbrew/.linuxbrew/opt/python@3.12/include/python3.12/pymacconfig.h \
+  /usr/include/stdlib.h \
+  /usr/include/x86_64-linux-gnu/bits/libc-header-start.h \
+  /usr/include/features.h /usr/include/features-time64.h \
+  /usr/include/x86_64-linux-gnu/bits/wordsize.h \
+  /usr/include/x86_64-linux-gnu/bits/timesize.h \
+  /usr/include/stdc-predef.h /usr/include/x86_64-linux-gnu/sys/cdefs.h \
+  /usr/include/x86_64-linux-gnu/bits/long-double.h \
+  /usr/include/x86_64-linux-gnu/gnu/stubs.h \
+  /usr/include/x86_64-linux-gnu/gnu/stubs-64.h \
+  /home/fnn45/zig11/lib/include/stddef.h \
+  /usr/include/x86_64-linux-gnu/bits/waitflags.h \
+  /usr/include/x86_64-linux-gnu/bits/waitstatus.h \
+  /usr/include/x86_64-linux-gnu/bits/floatn.h \
+  /usr/include/x86_64-linux-gnu/bits/floatn-common.h \
+  /usr/include/x86_64-linux-gnu/bits/types/locale_t.h \
+  /usr/include/x86_64-linux-gnu/bits/types/__locale_t.h \
+  /usr/include/x86_64-linux-gnu/sys/types.h \
+  /usr/include/x86_64-linux-gnu/bits/types.h \
+  /usr/include/x86_64-linux-gnu/bits/typesizes.h \
+  /usr/include/x86_64-linux-gnu/bits/time64.h \
+  /usr/include/x86_64-linux-gnu/bits/types/clock_t.h \
+  /usr/include/x86_64-linux-gnu/bits/types/clockid_t.h \
+  /usr/include/x86_64-linux-gnu/bits/types/time_t.h \
+  /usr/include/x86_64-linux-gnu/bits/types/timer_t.h \
+  /usr/include/x86_64-linux-gnu/bits/stdint-intn.h /usr/include/endian.h \
+  /usr/include/x86_64-linux-gnu/bits/endian.h \
+  /usr/include/x86_64-linux-gnu/bits/endianness.h \
+  /usr/include/x86_64-linux-gnu/bits/byteswap.h \
+  /usr/include/x86_64-linux-gnu/bits/uintn-identity.h \
+  /usr/include/x86_64-linux-gnu/sys/select.h \
+  /usr/include/x86_64-linux-gnu/bits/select.h \
+  /usr/include/x86_64-linux-gnu/bits/types/sigset_t.h \
+  /usr/include/x86_64-linux-gnu/bits/types/__sigset_t.h \
+  /usr/include/x86_64-linux-gnu/bits/types/struct_timeval.h \
+  /usr/include/x86_64-linux-gnu/bits/types/struct_timespec.h \
+  /usr/include/x86_64-linux-gnu/bits/pthreadtypes.h \
+  /usr/include/x86_64-linux-gnu/bits/thread-shared-types.h \
+  /usr/include/x86_64-linux-gnu/bits/pthreadtypes-arch.h \
+  /usr/include/x86_64-linux-gnu/bits/atomic_wide_counter.h \
+  /usr/include/x86_64-linux-gnu/bits/struct_mutex.h \
+  /usr/include/x86_64-linux-gnu/bits/struct_rwlock.h \
+  /usr/include/alloca.h \
+  /usr/include/x86_64-linux-gnu/bits/stdlib-bsearch.h \
+  /usr/include/x86_64-linux-gnu/bits/stdlib-float.h /usr/include/stdio.h \
+  /home/fnn45/zig11/lib/include/stdarg.h \
+  /usr/include/x86_64-linux-gnu/bits/types/__fpos_t.h \
+  /usr/include/x86_64-linux-gnu/bits/types/__mbstate_t.h \
+  /usr/include/x86_64-linux-gnu/bits/types/__fpos64_t.h \
+  /usr/include/x86_64-linux-gnu/bits/types/__FILE.h \
+  /usr/include/x86_64-linux-gnu/bits/types/FILE.h \
+  /usr/include/x86_64-linux-gnu/bits/types/struct_FILE.h \
+  /usr/include/x86_64-linux-gnu/bits/types/cookie_io_functions_t.h \
+  /usr/include/x86_64-linux-gnu/bits/stdio_lim.h \
+  /usr/include/x86_64-linux-gnu/bits/stdio.h /usr/include/errno.h \
+  /usr/include/x86_64-linux-gnu/bits/errno.h /usr/include/linux/errno.h \
+  /usr/include/x86_64-linux-gnu/asm/errno.h \
+  /usr/include/asm-generic/errno.h /usr/include/asm-generic/errno-base.h \
+  /usr/include/x86_64-linux-gnu/bits/types/error_t.h \
+  /usr/include/string.h /usr/include/strings.h /usr/include/unistd.h \
+  /usr/include/x86_64-linux-gnu/bits/posix_opt.h \
+  /usr/include/x86_64-linux-gnu/bits/environments.h \
+  /usr/include/x86_64-linux-gnu/bits/confname.h \
+  /usr/include/x86_64-linux-gnu/bits/getopt_posix.h \
+  /usr/include/x86_64-linux-gnu/bits/getopt_core.h \
+  /usr/include/x86_64-linux-gnu/bits/unistd_ext.h \
+  /usr/include/linux/close_range.h /usr/include/assert.h \
+  /usr/include/wchar.h /usr/include/x86_64-linux-gnu/bits/wchar.h \
+  /usr/include/x86_64-linux-gnu/bits/types/wint_t.h \
+  /usr/include/x86_64-linux-gnu/bits/types/mbstate_t.h \
+  /home/linuxbrew/.linuxbrew/opt/python@3.12/include/python3.12/pyport.h \
+  /home/fnn45/zig11/lib/include/inttypes.h /usr/include/inttypes.h \
+  /home/fnn45/zig11/lib/include/stdint.h /usr/include/stdint.h \
+  /usr/include/x86_64-linux-gnu/bits/stdint-uintn.h \
+  /usr/include/x86_64-linux-gnu/bits/stdint-least.h \
+  /home/fnn45/zig11/lib/include/limits.h /usr/include/limits.h \
+  /usr/include/x86_64-linux-gnu/bits/posix1_lim.h \
+  /usr/include/x86_64-linux-gnu/bits/local_lim.h \
+  /usr/include/linux/limits.h \
+  /usr/include/x86_64-linux-gnu/bits/pthread_stack_min-dynamic.h \
+  /usr/include/x86_64-linux-gnu/bits/posix2_lim.h \
+  /usr/include/x86_64-linux-gnu/bits/xopen_lim.h \
+  /usr/include/x86_64-linux-gnu/bits/uio_lim.h /usr/include/math.h \
+  /usr/include/x86_64-linux-gnu/bits/math-vector.h \
+  /usr/include/x86_64-linux-gnu/bits/libm-simd-decl-stubs.h \
+  /usr/include/x86_64-linux-gnu/bits/flt-eval-method.h \
+  /usr/include/x86_64-linux-gnu/bits/fp-logb.h \
+  /usr/include/x86_64-linux-gnu/bits/fp-fast.h \
+  /usr/include/x86_64-linux-gnu/bits/mathcalls-helper-functions.h \
+  /usr/include/x86_64-linux-gnu/bits/mathcalls.h \
+  /usr/include/x86_64-linux-gnu/bits/mathcalls-narrow.h \
+  /usr/include/x86_64-linux-gnu/bits/iscanonical.h \
+  /usr/include/x86_64-linux-gnu/sys/time.h /usr/include/time.h \
+  /usr/include/x86_64-linux-gnu/bits/time.h \
+  /usr/include/x86_64-linux-gnu/bits/timex.h \
+  /usr/include/x86_64-linux-gnu/bits/types/struct_tm.h \
+  /usr/include/x86_64-linux-gnu/bits/types/struct_itimerspec.h \
+  /usr/include/x86_64-linux-gnu/sys/stat.h \
+  /usr/include/x86_64-linux-gnu/bits/stat.h \
+  /usr/include/x86_64-linux-gnu/bits/struct_stat.h \
+  /usr/include/x86_64-linux-gnu/bits/statx.h /usr/include/linux/stat.h \
+  /usr/include/linux/types.h /usr/include/x86_64-linux-gnu/asm/types.h \
+  /usr/include/asm-generic/types.h /usr/include/asm-generic/int-ll64.h \
+  /usr/include/x86_64-linux-gnu/asm/bitsperlong.h \
+  /usr/include/asm-generic/bitsperlong.h \
+  /usr/include/linux/posix_types.h /usr/include/linux/stddef.h \
+  /usr/include/x86_64-linux-gnu/asm/posix_types.h \
+  /usr/include/x86_64-linux-gnu/asm/posix_types_64.h \
+  /usr/include/asm-generic/posix_types.h \
+  /usr/include/x86_64-linux-gnu/bits/statx-generic.h \
+  /usr/include/x86_64-linux-gnu/bits/types/struct_statx_timestamp.h \
+  /usr/include/x86_64-linux-gnu/bits/types/struct_statx.h \
+  /home/linuxbrew/.linuxbrew/opt/python@3.12/include/python3.12/exports.h \
+  /home/linuxbrew/.linuxbrew/opt/python@3.12/include/python3.12/pymacro.h \
+  /home/linuxbrew/.linuxbrew/opt/python@3.12/include/python3.12/pymath.h \
+  /home/linuxbrew/.linuxbrew/opt/python@3.12/include/python3.12/pymem.h \
+  /home/linuxbrew/.linuxbrew/opt/python@3.12/include/python3.12/cpython/pymem.h \
+  /home/linuxbrew/.linuxbrew/opt/python@3.12/include/python3.12/pytypedefs.h \
+  /home/linuxbrew/.linuxbrew/opt/python@3.12/include/python3.12/pybuffer.h \
+  /home/linuxbrew/.linuxbrew/opt/python@3.12/include/python3.12/object.h \
+  /home/linuxbrew/.linuxbrew/opt/python@3.12/include/python3.12/pystats.h \
+  /home/linuxbrew/.linuxbrew/opt/python@3.12/include/python3.12/cpython/object.h \
+  /home/linuxbrew/.linuxbrew/opt/python@3.12/include/python3.12/objimpl.h \
+  /home/linuxbrew/.linuxbrew/opt/python@3.12/include/python3.12/cpython/objimpl.h \
+  /home/linuxbrew/.linuxbrew/opt/python@3.12/include/python3.12/typeslots.h \
+  /home/linuxbrew/.linuxbrew/opt/python@3.12/include/python3.12/pyhash.h \
+  /home/linuxbrew/.linuxbrew/opt/python@3.12/include/python3.12/cpython/pydebug.h \
+  /home/linuxbrew/.linuxbrew/opt/python@3.12/include/python3.12/bytearrayobject.h \
+  /home/linuxbrew/.linuxbrew/opt/python@3.12/include/python3.12/cpython/bytearrayobject.h \
+  /home/linuxbrew/.linuxbrew/opt/python@3.12/include/python3.12/bytesobject.h \
+  /home/linuxbrew/.linuxbrew/opt/python@3.12/include/python3.12/cpython/bytesobject.h \
+  /home/linuxbrew/.linuxbrew/opt/python@3.12/include/python3.12/unicodeobject.h \
+  /usr/include/ctype.h \
+  /home/linuxbrew/.linuxbrew/opt/python@3.12/include/python3.12/cpython/unicodeobject.h \
+  /home/linuxbrew/.linuxbrew/opt/python@3.12/include/python3.12/cpython/initconfig.h \
+  /home/linuxbrew/.linuxbrew/opt/python@3.12/include/python3.12/pystate.h \
+  /home/linuxbrew/.linuxbrew/opt/python@3.12/include/python3.12/cpython/pystate.h \
+  /home/linuxbrew/.linuxbrew/opt/python@3.12/include/python3.12/pyerrors.h \
+  /home/linuxbrew/.linuxbrew/opt/python@3.12/include/python3.12/cpython/pyerrors.h \
+  /home/linuxbrew/.linuxbrew/opt/python@3.12/include/python3.12/longobject.h \
+  /home/linuxbrew/.linuxbrew/opt/python@3.12/include/python3.12/cpython/longobject.h \
+  /home/linuxbrew/.linuxbrew/opt/python@3.12/include/python3.12/cpython/longintrepr.h \
+  /home/linuxbrew/.linuxbrew/opt/python@3.12/include/python3.12/boolobject.h \
+  /home/linuxbrew/.linuxbrew/opt/python@3.12/include/python3.12/floatobject.h \
+  /home/linuxbrew/.linuxbrew/opt/python@3.12/include/python3.12/cpython/floatobject.h \
+  /home/linuxbrew/.linuxbrew/opt/python@3.12/include/python3.12/complexobject.h \
+  /home/linuxbrew/.linuxbrew/opt/python@3.12/include/python3.12/cpython/complexobject.h \
+  /home/linuxbrew/.linuxbrew/opt/python@3.12/include/python3.12/rangeobject.h \
+  /home/linuxbrew/.linuxbrew/opt/python@3.12/include/python3.12/memoryobject.h \
+  /home/linuxbrew/.linuxbrew/opt/python@3.12/include/python3.12/cpython/memoryobject.h \
+  /home/linuxbrew/.linuxbrew/opt/python@3.12/include/python3.12/tupleobject.h \
+  /home/linuxbrew/.linuxbrew/opt/python@3.12/include/python3.12/cpython/tupleobject.h \
+  /home/linuxbrew/.linuxbrew/opt/python@3.12/include/python3.12/listobject.h \
+  /home/linuxbrew/.linuxbrew/opt/python@3.12/include/python3.12/cpython/listobject.h \
+  /home/linuxbrew/.linuxbrew/opt/python@3.12/include/python3.12/dictobject.h \
+  /home/linuxbrew/.linuxbrew/opt/python@3.12/include/python3.12/cpython/dictobject.h \
+  /home/linuxbrew/.linuxbrew/opt/python@3.12/include/python3.12/cpython/odictobject.h \
+  /home/linuxbrew/.linuxbrew/opt/python@3.12/include/python3.12/enumobject.h \
+  /home/linuxbrew/.linuxbrew/opt/python@3.12/include/python3.12/setobject.h \
+  /home/linuxbrew/.linuxbrew/opt/python@3.12/include/python3.12/cpython/setobject.h \
+  /home/linuxbrew/.linuxbrew/opt/python@3.12/include/python3.12/methodobject.h \
+  /home/linuxbrew/.linuxbrew/opt/python@3.12/include/python3.12/cpython/methodobject.h \
+  /home/linuxbrew/.linuxbrew/opt/python@3.12/include/python3.12/moduleobject.h \
+  /home/linuxbrew/.linuxbrew/opt/python@3.12/include/python3.12/cpython/funcobject.h \
+  /home/linuxbrew/.linuxbrew/opt/python@3.12/include/python3.12/cpython/classobject.h \
+  /home/linuxbrew/.linuxbrew/opt/python@3.12/include/python3.12/fileobject.h \
+  /home/linuxbrew/.linuxbrew/opt/python@3.12/include/python3.12/cpython/fileobject.h \
+  /home/linuxbrew/.linuxbrew/opt/python@3.12/include/python3.12/pycapsule.h \
+  /home/linuxbrew/.linuxbrew/opt/python@3.12/include/python3.12/cpython/code.h \
+  /home/linuxbrew/.linuxbrew/opt/python@3.12/include/python3.12/pyframe.h \
+  /home/linuxbrew/.linuxbrew/opt/python@3.12/include/python3.12/cpython/pyframe.h \
+  /home/linuxbrew/.linuxbrew/opt/python@3.12/include/python3.12/traceback.h \
+  /home/linuxbrew/.linuxbrew/opt/python@3.12/include/python3.12/cpython/traceback.h \
+  /home/linuxbrew/.linuxbrew/opt/python@3.12/include/python3.12/sliceobject.h \
+  /home/linuxbrew/.linuxbrew/opt/python@3.12/include/python3.12/cpython/cellobject.h \
+  /home/linuxbrew/.linuxbrew/opt/python@3.12/include/python3.12/iterobject.h \
+  /home/linuxbrew/.linuxbrew/opt/python@3.12/include/python3.12/cpython/genobject.h \
+  /home/linuxbrew/.linuxbrew/opt/python@3.12/include/python3.12/descrobject.h \
+  /home/linuxbrew/.linuxbrew/opt/python@3.12/include/python3.12/cpython/descrobject.h \
+  /home/linuxbrew/.linuxbrew/opt/python@3.12/include/python3.12/genericaliasobject.h \
+  /home/linuxbrew/.linuxbrew/opt/python@3.12/include/python3.12/warnings.h \
+  /home/linuxbrew/.linuxbrew/opt/python@3.12/include/python3.12/cpython/warnings.h \
+  /home/linuxbrew/.linuxbrew/opt/python@3.12/include/python3.12/weakrefobject.h \
+  /home/linuxbrew/.linuxbrew/opt/python@3.12/include/python3.12/cpython/weakrefobject.h \
+  /home/linuxbrew/.linuxbrew/opt/python@3.12/include/python3.12/structseq.h \
+  /home/linuxbrew/.linuxbrew/opt/python@3.12/include/python3.12/cpython/picklebufobject.h \
+  /home/linuxbrew/.linuxbrew/opt/python@3.12/include/python3.12/cpython/pytime.h \
+  /home/linuxbrew/.linuxbrew/opt/python@3.12/include/python3.12/codecs.h \
+  /home/linuxbrew/.linuxbrew/opt/python@3.12/include/python3.12/pythread.h \
+  /home/linuxbrew/.linuxbrew/opt/python@3.12/include/python3.12/cpython/pythread.h \
+  /usr/include/pthread.h /usr/include/sched.h \
+  /usr/include/x86_64-linux-gnu/bits/sched.h \
+  /usr/include/x86_64-linux-gnu/bits/types/struct_sched_param.h \
+  /usr/include/x86_64-linux-gnu/bits/cpu-set.h \
+  /usr/include/x86_64-linux-gnu/bits/setjmp.h \
+  /usr/include/x86_64-linux-gnu/bits/types/struct___jmp_buf_tag.h \
+  /home/linuxbrew/.linuxbrew/opt/python@3.12/include/python3.12/cpython/context.h \
+  /home/linuxbrew/.linuxbrew/opt/python@3.12/include/python3.12/modsupport.h \
+  /home/linuxbrew/.linuxbrew/opt/python@3.12/include/python3.12/cpython/modsupport.h \
+  /home/linuxbrew/.linuxbrew/opt/python@3.12/include/python3.12/compile.h \
+  /home/linuxbrew/.linuxbrew/opt/python@3.12/include/python3.12/cpython/compile.h \
+  /home/linuxbrew/.linuxbrew/opt/python@3.12/include/python3.12/pythonrun.h \
+  /home/linuxbrew/.linuxbrew/opt/python@3.12/include/python3.12/cpython/pythonrun.h \
+  /home/linuxbrew/.linuxbrew/opt/python@3.12/include/python3.12/pylifecycle.h \
+  /home/linuxbrew/.linuxbrew/opt/python@3.12/include/python3.12/cpython/pylifecycle.h \
+  /home/linuxbrew/.linuxbrew/opt/python@3.12/include/python3.12/ceval.h \
+  /home/linuxbrew/.linuxbrew/opt/python@3.12/include/python3.12/cpython/ceval.h \
+  /home/linuxbrew/.linuxbrew/opt/python@3.12/include/python3.12/sysmodule.h \
+  /home/linuxbrew/.linuxbrew/opt/python@3.12/include/python3.12/cpython/sysmodule.h \
+  /home/linuxbrew/.linuxbrew/opt/python@3.12/include/python3.12/osmodule.h \
+  /home/linuxbrew/.linuxbrew/opt/python@3.12/include/python3.12/intrcheck.h \
+  /home/linuxbrew/.linuxbrew/opt/python@3.12/include/python3.12/import.h \
+  /home/linuxbrew/.linuxbrew/opt/python@3.12/include/python3.12/cpython/import.h \
+  /home/linuxbrew/.linuxbrew/opt/python@3.12/include/python3.12/abstract.h \
+  /home/linuxbrew/.linuxbrew/opt/python@3.12/include/python3.12/cpython/abstract.h \
+  /home/linuxbrew/.linuxbrew/opt/python@3.12/include/python3.12/bltinmodule.h \
+  /home/linuxbrew/.linuxbrew/opt/python@3.12/include/python3.12/cpython/pyctype.h \
+  /home/linuxbrew/.linuxbrew/opt/python@3.12/include/python3.12/pystrtod.h \
+  /home/linuxbrew/.linuxbrew/opt/python@3.12/include/python3.12/pystrcmp.h \
+  /home/linuxbrew/.linuxbrew/opt/python@3.12/include/python3.12/fileutils.h \
+  /home/linuxbrew/.linuxbrew/opt/python@3.12/include/python3.12/cpython/fileutils.h \
+  /home/linuxbrew/.linuxbrew/opt/python@3.12/include/python3.12/cpython/pyfpe.h \
+  /home/linuxbrew/.linuxbrew/opt/python@3.12/include/python3.12/tracemalloc.h
