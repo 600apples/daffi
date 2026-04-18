@@ -1,5 +1,6 @@
 const std = @import("std");
 const serde = @import("../serde.zig");
+const Mutex = @import("../misc.zig").Mutex;
 const Message = serde.Message;
 const Allocator = std.mem.Allocator;
 
@@ -7,22 +8,28 @@ const ClientMessageStore = @This();
 
 const buf_size: u16 = 2048;
 
-var buf: [buf_size]?*Message = [_]?*Message{null} ** buf_size;
+// Per-instance buffer (not global) so multiple connections don't share state.
+buf: [buf_size]?*Message = [_]?*Message{null} ** buf_size,
+mutex: Mutex = .{},
 allocator: Allocator,
 
-pub fn fetch(_: *ClientMessageStore, uuid: u16) ?*Message {
+pub fn fetch(self: *ClientMessageStore, uuid: u16) ?*Message {
+    self.mutex.lock();
+    defer self.mutex.unlock();
     const hash = @rem(uuid, buf_size);
-    if (buf[hash]) |msg| {
-        buf[hash] = null;
+    if (self.buf[hash]) |msg| {
+        self.buf[hash] = null;
         return msg;
     }
     return null;
 }
 
-pub fn insert(_: *ClientMessageStore, msg: *Message) !void {
+pub fn insert(self: *ClientMessageStore, msg: *Message) !void {
+    self.mutex.lock();
+    defer self.mutex.unlock();
     const uuid = msg.getUuid();
     const hash = @rem(uuid, buf_size);
-    buf[hash] = msg;
+    self.buf[hash] = msg;
 }
 
 pub fn setTimeoutError(self: *ClientMessageStore, uuid: u16) !void {

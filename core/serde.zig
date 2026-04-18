@@ -16,7 +16,7 @@ pub const concatenateSlicesBuf = @import("serde/slices.zig").concatenateSlicesBu
 pub const createHandshakeMessage = @import("serde/message.zig").createHandshakeMessage;
 pub const createEventMessage = @import("serde/message.zig").createEventMessage;
 
-pub const MAX_BYTES_MESSAGE: meta.FieldType(Header, .msg_len) = std.math.maxInt(meta.FieldType(Header, .msg_len));
+pub const MAX_BYTES_MESSAGE: @FieldType(Header, "msg_len") = std.math.maxInt(@FieldType(Header, "msg_len"));
 pub const HEADER_OFFSET_START: u32 = 0;
 pub const HEADER_OFFSET_END: u32 = HEADER_SIZE;
 pub const HEADER_SIZE: u32 = Header.size;

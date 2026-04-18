@@ -19,11 +19,13 @@ const MessageHandler = handlers.MessageHandler;
 const ClientMessageStore = repository.ClientMessageStore;
 const ChannelsMapper = repository.ChannelsMapper;
 const TasksQueue = repository.TasksQueue;
-const print = @import("../misc.zig").print;
+const misc = @import("../misc.zig");
+const print = misc.print;
+const Mutex = misc.Mutex;
 
 pub const HandlerMode = enum {
     Service,
-    Controller,
+    Router,
 };
 
 fn RoundRobinIterator(comptime T: type) type {
@@ -59,10 +61,10 @@ const CommonHandlers = struct {
 
 pub fn ServerHandler(comptime HandlerConnectionT: ConnectionType) type {
 
-    // Service/Controller handlers
+    // Service/Router handlers
     return union(HandlerMode) {
-        Service: Service,
-        Controller: Controller,
+        Service: ServiceHandler,
+        Router: RouterHandler,
 
         const HandlerUnion = @This();
         pub const ConnectionT = Connection(HandlerConnectionT);
@@ -75,8 +77,8 @@ pub fn ServerHandler(comptime HandlerConnectionT: ConnectionType) type {
                     self.* = .{ .Service = .{ .allocator = allocator, .chan_mapper = try ChannelsMapperT.init(allocator), .tasks_queue = try TasksQueue.init(allocator), .app_name = app_name } };
                     break :blk self;
                 },
-                .Controller => blk: {
-                    self.* = .{ .Controller = .{ .allocator = allocator, .chan_mapper = try ChannelsMapperT.init(allocator), .app_name = app_name } };
+                .Router => blk: {
+                    self.* = .{ .Router = .{ .allocator = allocator, .chan_mapper = try ChannelsMapperT.init(allocator), .app_name = app_name } };
                     break :blk self;
                 },
             };
@@ -88,19 +90,23 @@ pub fn ServerHandler(comptime HandlerConnectionT: ConnectionType) type {
             }
         }
 
-        const Service = struct {
+        const ServiceHandler = struct {
             chan_mapper: *ChannelsMapperT,
             tasks_queue: TasksQueue,
             allocator: Allocator,
             app_name: []const u8,
             methods: ?[]const u8 = null, // comma separated list of service methods
             task_cycle_position: usize = 0,
-            mutex: std.Thread.Mutex = .{},
+            mutex: Mutex = .{},
             chan_iterator: RoundRobinIterator(ChannelsMapperT.Channel) = .{},
 
             const Self = @This();
             pub const ParentConnT = ConnectionT;
             const MessageHandlerT = MessageHandler(Self);
+
+            fn wakeupFn(self: *Self) void {
+                self.tasks_queue.triggerWakeup();
+            }
 
             pub fn handler(self: *const Self) MessageHandlerT {
                 return .{
@@ -108,6 +114,7 @@ pub fn ServerHandler(comptime HandlerConnectionT: ConnectionType) type {
                     .handlers_mapping = MessageHandlerT.createMapping(.{ .HANDSHAKE = onHandshake, .REQUEST = onRequest }),
                     .error_handler = errorHandler,
                     .disconnection_handler = diconnectionHandler,
+                    .wakeup_fn = wakeupFn,
                 };
             }
 
@@ -188,7 +195,7 @@ pub fn ServerHandler(comptime HandlerConnectionT: ConnectionType) type {
             }
         };
 
-        const Controller = struct {
+        const RouterHandler = struct {
             chan_mapper: *ChannelsMapperT,
             app_name: []const u8,
             allocator: Allocator,
@@ -196,12 +203,15 @@ pub fn ServerHandler(comptime HandlerConnectionT: ConnectionType) type {
             const Self = @This();
             pub const ParentConnT = ConnectionT;
             const MessageHandlerT = MessageHandler(Self);
+            fn wakeupFn(_: *Self) void {}
+
             pub fn handler(self: *const Self) MessageHandlerT {
                 return .{
                     .ptr = @constCast(self),
                     .handlers_mapping = MessageHandlerT.createMapping(.{ .HANDSHAKE = onHandshake, .REQUEST = onRequest, .RESPONSE = onResponse, .ERROR = onResponse }),
                     .error_handler = errorHandler,
                     .disconnection_handler = diconnectionHandler,
+                    .wakeup_fn = wakeupFn,
                 };
             }
 
@@ -314,7 +324,7 @@ pub const ClientHandler = struct {
     app_name: []const u8,
     methods: ?[]const u8 = null, // comma separated list of service methods
     allocator: Allocator,
-    mutex: std.Thread.Mutex = .{},
+    mutex: Mutex = .{},
     chan_iterator: RoundRobinIterator(ChannelsMapperT.Channel) = .{},
 
     const Self = @This();
@@ -333,12 +343,17 @@ pub const ClientHandler = struct {
         self.allocator.destroy(self);
     }
 
+    fn wakeupFn(self: *Self) void {
+        self.tasks_queue.triggerWakeup();
+    }
+
     pub fn handler(self: *const Self) MessageHandlerT {
         return .{
             .ptr = @constCast(self),
             .handlers_mapping = MessageHandlerT.createMapping(.{ .HANDSHAKE = onHandshake, .REQUEST = onRequest, .EVENTS = onRequest, .RESPONSE = onResponse, .ERROR = onResponse }),
             .error_handler = errorHandler,
             .disconnection_handler = diconnectionHandler,
+            .wakeup_fn = wakeupFn,
         };
     }
 
@@ -351,7 +366,7 @@ pub const ClientHandler = struct {
             };
             if (chan.containsMethod(method)) return chan.connection_name;
         } else {
-            var found_channels = std.ArrayList(ChannelsMapperT.Channel).init(self.allocator);
+            var found_channels = std.array_list.Managed(ChannelsMapperT.Channel).init(self.allocator);
             self.mutex.lock();
             defer {
                 self.mutex.unlock();

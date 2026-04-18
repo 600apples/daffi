@@ -1,8 +1,6 @@
 const std = @import("std");
 const serde = @import("../serde.zig");
 
-const os = std.os;
-const net = std.net;
 const ascii = std.ascii;
 const Allocator = std.mem.Allocator;
 const expect = std.testing.expect;
@@ -19,19 +17,24 @@ pub const StreamReadError = error{
     EOF,
 };
 
+/// Read exactly buf.len bytes from reader, looping over partial reads.
+/// A single read() syscall on a TCP socket may return fewer bytes than
+/// requested even on localhost at high message rates.  The original
+/// single-read implementation would leave the tail of buf uninitialised,
+/// causing Header.fromBytes() to parse garbage and eventually leading to
+/// an enormous alloc() → OutOfMemory → ConnectionLost chain.
 fn mustRead(reader: anytype, buf: []u8) !void {
-    const n: usize = try reader.read(buf);
-    if (n == 0) {
-        return StreamReadError.EOF;
-    } else if (n > buf.len) {
-        return StreamReadError.IncompleteMessage;
+    var total: usize = 0;
+    while (total < buf.len) {
+        const n = try reader.read(buf[total..]);
+        if (n == 0) return StreamReadError.EOF;
+        total += n;
     }
 }
 
 pub const MessagePool = struct {
     allocator: Allocator,
     // web_connection: ?*WebConnection,
-    messages_delta: usize = 0,
 
     const Self = @This();
 
@@ -65,7 +68,6 @@ pub const MessagePool = struct {
         const raw_message = try RawMessage.create(self.allocator, data, uuid, flag, decoder, is_bytes, return_result, transmitter, receiver, func_name);
         defer self.allocator.free(raw_message.data);
         try raw_message.sendTo(writer);
-        if (return_result) self.messages_delta += 1;
     }
 
     pub fn createMessage(
@@ -104,7 +106,6 @@ pub const MessagePool = struct {
         errdefer self.allocator.free(data_buf);
         @memcpy(data_buf, &header_buf);
         try mustRead(reader, data_buf[header_buf.len..]);
-        self.messages_delta -= 1;
         return try Message.create(self.allocator, header, data_buf);
     }
 

@@ -1,7 +1,7 @@
 const std = @import("std");
-const net = std.net;
 const network = @import("../network.zig");
 const Allocator = std.mem.Allocator;
+const Mutex = @import("../misc.zig").Mutex;
 
 const expect = std.testing.expect;
 
@@ -9,11 +9,12 @@ pub fn ChannelsMapper(comptime ConnectionT: type) type {
     return struct {
         channels: Channels,
         allocator: Allocator,
-        mutex: std.Thread.Mutex = .{},
+        mutex: Mutex = .{},
 
         const Self = @This();
 
-        pub const Channels = std.StringArrayHashMap(Channel);
+        // std.StringArrayHashMap removed in 0.16; use the unmanaged equivalent.
+        pub const Channels = std.array_hash_map.String(Channel);
         const Uuid = []const u8;
 
         pub const Channel = struct {
@@ -45,7 +46,7 @@ pub fn ChannelsMapper(comptime ConnectionT: type) type {
             }
 
             pub fn joinedMethods(self: *Channel, allocator: Allocator, sep: u8) ![]const u8 {
-                var methods = std.ArrayList(u8).init(allocator);
+                var methods = std.array_list.Managed(u8).init(allocator);
                 var iterator = self.methods.iterator();
                 var count: usize = 0;
                 while (iterator.next()) |key| : (count += 1) {
@@ -59,7 +60,7 @@ pub fn ChannelsMapper(comptime ConnectionT: type) type {
         pub fn init(allocator: Allocator) !*Self {
             const self = try allocator.create(Self);
             self.* = .{
-                .channels = Channels.init(allocator),
+                .channels = .{},
                 .allocator = allocator,
             };
             return self;
@@ -83,7 +84,7 @@ pub fn ChannelsMapper(comptime ConnectionT: type) type {
             self.mutex.lock();
             defer self.mutex.unlock();
             const chan_uuid_dup = try self.allocator.dupe(u8, chan_uuid);
-            const result = try self.channels.getOrPut(chan_uuid_dup);
+            const result = try self.channels.getOrPut(self.allocator, chan_uuid_dup);
             const chan = result.value_ptr;
             if (!result.found_existing) {
                 chan.* = try Channel.init(self.allocator, conn, chan_uuid_dup);
@@ -97,7 +98,7 @@ pub fn ChannelsMapper(comptime ConnectionT: type) type {
 
         pub fn getChannelByConnection(self: *Self, conn: *ConnectionT) ?*Channel {
             for (self.channels.values()) |*chan| {
-                if (net.Address.eql(conn.getAddr().?, chan.conn.getAddr().?)) return chan;
+                if (chan.conn == conn) return chan;
             }
             return null;
         }
@@ -120,7 +121,7 @@ pub fn ChannelsMapper(comptime ConnectionT: type) type {
             for (self.channels.values()) |*chan| {
                 chan.clear();
             }
-            self.channels.clearAndFree();
+            self.channels.clearAndFree(self.allocator);
         }
     };
 }

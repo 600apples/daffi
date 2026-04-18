@@ -1,7 +1,10 @@
+"""
+Colored logger factory for daffi components.
+"""
+
 import sys
 import logging
 from typing import Callable
-from typing import Any
 
 from daffi.utils import colors
 
@@ -9,16 +12,20 @@ logging.basicConfig(level=logging.INFO)
 
 
 class DaffiLoggerAdapter(logging.LoggerAdapter):
-    def debug(self, msg: Any, *args, **kwargs) -> None:
-        if DEBUG:
-            return self.info(msg=msg, *args, **kwargs)
-        return super().debug(msg=msg, *args, **kwargs)
+    """``LoggerAdapter`` that injects a coloured *app* field into every record.
+
+    The ``extra={"app": ...}`` dict passed to the constructor is merged into
+    each ``LogRecord`` by the base-class ``process()`` so the ``%(app)s``
+    placeholder in the format string is always available.  No override is
+    needed — the default ``LoggerAdapter.process`` already handles this.
+    """
 
 
 class ColoredFormatter(logging.Formatter):
-    """A logging.Formatter which prints colored WARNING and ERROR messages"""
+    """``logging.Formatter`` that colorises WARNING and ERROR level prefixes."""
 
-    def get_level_message(self, record):
+    def get_level_message(self, record: logging.LogRecord) -> str:
+        """Return a fixed-width, coloured level label for *record*."""
         if record.levelno <= logging.INFO:
             levelname = f"{colors.green(record.levelname)}:"
         elif record.levelno <= logging.WARNING:
@@ -27,14 +34,25 @@ class ColoredFormatter(logging.Formatter):
             levelname = f"{colors.red(record.levelname)}:"
         return f"{levelname: <17}"
 
-    def format(self, record):
+    def format(self, record: logging.LogRecord) -> str:
+        """Format *record*, decoding bytes messages and prepending the level label."""
         if isinstance(record.msg, bytes):
             record.msg = record.msg.decode("utf-8")
         message = super().format(record)
         return f"{self.get_level_message(record)} {message}"
 
 
-def get_daffi_logger(name: str, color: Callable):
+def get_daffi_logger(name: str, color: Callable) -> DaffiLoggerAdapter:
+    """Create and return a configured :class:`DaffiLoggerAdapter` for *name*.
+
+    The adapter injects a ``%(app)s`` extra that wraps the logger name in
+    coloured pipe delimiters, e.g. ``| my-service |``.
+
+    Args:
+        name:  Identifier shown in every log line (e.g. ``"client[my-app]"``).
+        color: A callable from :mod:`daffi.utils.colors` used to colour the
+               pipe delimiters.
+    """
     logger = logging.getLogger(name=name)
     root_level = logging.getLogger().getEffectiveLevel()
 

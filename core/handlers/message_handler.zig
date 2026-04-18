@@ -12,6 +12,11 @@ pub fn MessageHandler(comptime T: type) type {
         handlers_mapping: HandlersMapping,
         error_handler: *const fn (ctx: *T, conn: *T.ParentConnT, err: anyerror) anyerror!void,
         disconnection_handler: *const fn (ctx: *T, conn: *T.ParentConnT) anyerror!void,
+        /// Called by serverLoop *after* it has finished examining (and possibly
+        /// freeing) the current message.  Implementations should call
+        /// TasksQueue.triggerWakeup() to notify the Python poller that one or
+        /// more new messages are waiting.  No-op for handlers without a queue.
+        wakeup_fn: *const fn (ctx: *T) void,
 
         const Self = @This();
 
@@ -39,6 +44,13 @@ pub fn MessageHandler(comptime T: type) type {
 
         pub fn handleDisconnect(self: Self, conn: *T.ParentConnT) !void {
             try self.disconnection_handler(self.ptr, conn);
+        }
+
+        /// Signal the Python poller that new messages may be available.
+        /// Must be called *after* the caller is fully done with the message
+        /// pointer so the Python poller cannot free it prematurely.
+        pub fn triggerWakeup(self: Self) void {
+            self.wakeup_fn(self.ptr);
         }
 
         fn notSupported(_: *T, _: *T.ParentConnT, message: *Message) !void {

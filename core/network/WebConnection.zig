@@ -1,9 +1,10 @@
 const std = @import("std");
-const net = std.net;
-const os = std.os;
+const net = @import("posix_net.zig");
 const ascii = std.ascii;
+const misc = @import("../misc.zig");
 const Allocator = std.mem.Allocator;
 const serde = @import("../serde.zig");
+const tls_impl = @import("tls.zig");
 pub const Handshake = @import("../network/web/handshake.zig").Handshake;
 pub const HandshakePool = @import("../network/web/handshake.zig").Pool;
 pub const framing = @import("../network/web/framing.zig");
@@ -13,6 +14,7 @@ pub const buffer = @import("../network/web/buffer.zig");
 pub const MessageType = @import("../network/web/reader.zig").MessageType;
 pub const OpCode = framing.OpCode;
 const OperationTable = @import("../network.zig").OperationTable;
+const WsMessage = @import("../network/web/reader.zig").Message;
 
 const WebConnection = @This();
 
@@ -22,11 +24,12 @@ pub const op_table = OperationTable{
     .write = write,
     .accept = accept,
     .close = close,
+    .destroy = destroy,
     .getAddr = getAddr,
 };
 
-pub const ReadError = os.ReadError;
-pub const WriteError = os.WriteError;
+pub const ReadError = anyerror;
+pub const WriteError = anyerror;
 
 const CLOSE_NORMAL = ([_]u8{ @intFromEnum(OpCode.close), 2, 3, 232 })[0..]; // code: 1000
 const CLOSE_PROTOCOL_ERROR = ([_]u8{ @intFromEnum(OpCode.close), 2, 3, 234 })[0..]; //code: 1002
@@ -37,6 +40,9 @@ reader: Reader,
 stream: net.Stream,
 addr: ?net.Address,
 allocator: Allocator,
+/// Non-null when the WebSocket connection runs over TLS (WSS).
+/// The ssl object is owned by this WebConnection and freed in close().
+ssl: ?*tls_impl.SslConn = null,
 
 pub const Config = struct {};
 
@@ -56,6 +62,25 @@ pub fn init(allocator: Allocator, stream: net.Stream, addr: net.Address, _: Conf
     return self;
 }
 
+/// Create a WSS (WebSocket Secure) connection from an already-completed TLS handshake.
+/// Takes ownership of `ssl`; it will be freed in close().
+pub fn initWithTls(allocator: Allocator, stream: net.Stream, addr: net.Address, _: Config, ssl: *tls_impl.SslConn) !*WebConnection {
+    const self = try allocator.create(WebConnection);
+    var buffer_pool = try buffer.Pool.init(allocator, 32, 32768);
+    var buffer_provider = buffer.Provider.init(allocator, &buffer_pool, 32768);
+    const reader = try Reader.init(5120, serde.MAX_BYTES_MESSAGE, &buffer_provider);
+    self.* = .{
+        .buffer_pool = buffer_pool,
+        .buffer_provider = buffer_provider,
+        .reader = reader,
+        .stream = stream,
+        .addr = addr,
+        .allocator = allocator,
+        .ssl = ssl,
+    };
+    return self;
+}
+
 pub fn read(_: *anyopaque, _: []u8) !usize {
     @panic("read with buffer not implemented");
 }
@@ -70,20 +95,40 @@ pub fn write(ctx: *anyopaque, data: []const u8) !void {
     try self.writeBin(data);
 }
 
-pub fn accept(_: *anyopaque) !net.Server.Connection {
+pub fn accept(_: *anyopaque) !@import("../network/connection.zig").AcceptedConnection {
     @panic("not implemented");
 }
 
-pub fn getAddr(ctx: *anyopaque) ?net.Address {
+pub fn getAddr(ctx: *anyopaque) ?@import("../network/connection.zig").NetAddress {
     const self: *WebConnection = @ptrCast(@alignCast(ctx));
-    return self.addr;
+    if (self.addr) |addr| {
+        var na = @import("../network/connection.zig").NetAddress{};
+        const len = @min(na.bytes.len, addr.bytes.len);
+        @memcpy(na.bytes[0..len], addr.bytes[0..len]);
+        return na;
+    }
+    return null;
+}
+
+/// Write data through TLS if this is a WSS connection, otherwise plain TCP.
+fn writeAllBuf(self: *WebConnection, data: []const u8) !void {
+    if (self.ssl) |ssl| return tls_impl.sslWrite(ssl, data);
+    return self.stream.writeAll(data);
+}
+
+/// Read the next WebSocket message, dispatching through TLS when ssl != null.
+fn readMessageFromStream(self: *WebConnection) !WsMessage {
+    if (self.ssl) |ssl| {
+        return self.reader.readMessage(tls_impl.TlsStream{ .ssl = ssl });
+    }
+    return self.reader.readMessage(self.stream);
 }
 
 fn readInternal(self: *WebConnection) !?[]const u8 {
-    const message = self.reader.readMessage(self.stream) catch |err| {
+    const message = self.readMessageFromStream() catch |err| {
         switch (err) {
-            error.LargeControl => try self.stream.writeAll(CLOSE_PROTOCOL_ERROR),
-            error.ReservedFlags => try self.stream.writeAll(CLOSE_PROTOCOL_ERROR),
+            error.LargeControl => try self.writeAllBuf(CLOSE_PROTOCOL_ERROR),
+            error.ReservedFlags => try self.writeAllBuf(CLOSE_PROTOCOL_ERROR),
             else => {},
         }
         return null;
@@ -104,7 +149,7 @@ fn readInternal(self: *WebConnection) !?[]const u8 {
             } else {
                 const data = message.data;
                 if (data.len == 0) {
-                    // try self.stream.writeAll(EMPTY_PONG);
+                    // try self.writeAllBuf(EMPTY_PONG);
                 } else {
                     try self.writeFrame(.pong, data);
                 }
@@ -118,28 +163,28 @@ fn readInternal(self: *WebConnection) !?[]const u8 {
             const data = message.data;
             const l = data.len;
             if (l == 0) {
-                self.writeClose();
+                _ = self.writeClose();
                 return null;
             }
             if (l == 1) {
                 // close with a payload always has to have at least a 2-byte payload,
                 // since a 2-byte code is required
-                _ = self.stream.writeAll(CLOSE_PROTOCOL_ERROR);
+                _ = self.writeAllBuf(CLOSE_PROTOCOL_ERROR);
                 return null;
             }
             const code = @as(u16, @intCast(data[1])) | (@as(u16, @intCast(data[0])) << 8);
             if (code < 1000 or code == 1004 or code == 1005 or code == 1006 or (code > 1013 and code < 3000)) {
-                _ = self.stream.writeAll(CLOSE_PROTOCOL_ERROR);
+                _ = self.writeAllBuf(CLOSE_PROTOCOL_ERROR);
                 return null;
             }
             if (l == 2) {
-                _ = try self.stream.writeAll(CLOSE_NORMAL);
+                try self.writeAllBuf(CLOSE_NORMAL);
                 return null;
             }
             const payload = data[2..];
             if (!std.unicode.utf8ValidateSlice(payload)) {
                 // if we have a payload, it must be UTF8 (why?!)
-                _ = try self.stream.writeAll(CLOSE_PROTOCOL_ERROR);
+                try self.writeAllBuf(CLOSE_PROTOCOL_ERROR);
                 return null;
             }
             _ = self.writeClose();
@@ -158,7 +203,7 @@ fn writeText(self: *WebConnection, data: []const u8) !void {
 }
 
 fn writeClose(self: *WebConnection) !void {
-    return self.stream.writeAll(CLOSE_NORMAL);
+    return self.writeAllBuf(CLOSE_NORMAL);
 }
 
 fn writeCloseWithCode(self: *WebConnection, code: u16) !void {
@@ -168,7 +213,6 @@ fn writeCloseWithCode(self: *WebConnection, code: u16) !void {
 }
 
 fn writeFrame(self: *WebConnection, op_code: WebConnection.OpCode, data: []const u8) !void {
-    const stream = self.stream;
     const l = data.len;
 
     // maximum possible prefix length. op_code + length_type + 8byte length
@@ -177,12 +221,12 @@ fn writeFrame(self: *WebConnection, op_code: WebConnection.OpCode, data: []const
 
     if (l <= 125) {
         buf[1] = @intCast(l);
-        try stream.writeAll(buf[0..2]);
+        try self.writeAllBuf(buf[0..2]);
     } else if (l < 65536) {
         buf[1] = 126;
         buf[2] = @intCast((l >> 8) & 0xFF);
         buf[3] = @intCast(l & 0xFF);
-        try stream.writeAll(buf[0..4]);
+        try self.writeAllBuf(buf[0..4]);
     } else {
         buf[1] = 127;
         buf[2] = @intCast((l >> 56) & 0xFF);
@@ -193,10 +237,10 @@ fn writeFrame(self: *WebConnection, op_code: WebConnection.OpCode, data: []const
         buf[7] = @intCast((l >> 16) & 0xFF);
         buf[8] = @intCast((l >> 8) & 0xFF);
         buf[9] = @intCast(l & 0xFF);
-        try stream.writeAll(buf[0..]);
+        try self.writeAllBuf(buf[0..]);
     }
     if (l > 0) {
-        try stream.writeAll(data);
+        try self.writeAllBuf(data);
     }
 }
 
@@ -209,7 +253,16 @@ pub fn deinit(self: *WebConnection) void {
 
 pub fn close(ctx: *anyopaque) void {
     const self: *WebConnection = @ptrCast(@alignCast(ctx));
+    if (self.ssl) |ssl| {
+        tls_impl.sslClose(ssl);
+        self.ssl = null;
+    }
     self.stream.close();
+}
+
+pub fn destroy(ctx: *anyopaque) void {
+    const self: *WebConnection = @ptrCast(@alignCast(ctx));
+    self.deinit();
 }
 
 pub const SynParser = struct {
@@ -226,17 +279,23 @@ pub const SynParser = struct {
         self.handshake_pool.deinit();
     }
 
-    fn readHandshakeRequest(_: *SynParser, stream: net.Stream, buf: []u8, initial_pos: usize, timeout: ?u32) ![]u8 {
+    /// Read the full HTTP upgrade request from `stream`, starting at `initial_pos` in `buf`.
+    ///
+    /// Works with any stream that provides `.read([]u8) !usize`.
+    /// Socket-level timeouts (SO_RCVTIMEO) are only set when the stream has a `.handle`
+    /// field (plain `net.Stream`); TLS streams rely on the underlying TCP timeout instead.
+    fn readHandshakeRequest(_: *SynParser, stream: anytype, buf: []u8, initial_pos: usize, timeout: ?u32) ![]u8 {
+        const StreamT = @TypeOf(stream);
         var deadline: ?i64 = null;
         var read_timeout: ?[@sizeOf(std.posix.timeval)]u8 = null;
         if (timeout) |ms| {
-            // our timeout for each individual read
-            read_timeout = std.mem.toBytes(std.posix.timeval{
-                .tv_sec = @intCast(@divTrunc(ms, 1000)),
-                .tv_usec = @intCast(@mod(ms, 1000) * 1000),
-            });
-            // our absolute deadline for reading the header
-            deadline = std.time.milliTimestamp() + ms;
+            if (comptime @hasField(StreamT, "handle")) {
+                read_timeout = std.mem.toBytes(std.posix.timeval{
+                    .sec = @intCast(@divTrunc(ms, 1000)),
+                    .usec = @intCast(@mod(ms, 1000) * 1000),
+                });
+            }
+            deadline = misc.milliTimestamp() + ms;
         }
 
         var total: usize = initial_pos;
@@ -245,8 +304,10 @@ pub const SynParser = struct {
                 return error.TooLarge;
             }
 
-            if (read_timeout) |to| {
-                try std.posix.setsockopt(stream.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, &to);
+            if (comptime @hasField(StreamT, "handle")) {
+                if (read_timeout) |to| {
+                    try std.posix.setsockopt(stream.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, &to);
+                }
             }
             const n = try stream.read(buf[total..]);
             if (n == 0) {
@@ -255,40 +316,47 @@ pub const SynParser = struct {
             total += n;
             const request = buf[0..total];
             if (std.mem.endsWith(u8, request, "\r\n\r\n")) {
-                if (read_timeout != null) {
-                    const read_no_timeout = std.mem.toBytes(std.posix.timeval{
-                        .tv_sec = 0,
-                        .tv_usec = 0,
-                    });
-                    try std.posix.setsockopt(stream.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, &read_no_timeout);
+                if (comptime @hasField(StreamT, "handle")) {
+                    if (read_timeout != null) {
+                        const read_no_timeout = std.mem.toBytes(std.posix.timeval{ .sec = 0, .usec = 0 });
+                        try std.posix.setsockopt(stream.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, &read_no_timeout);
+                    }
                 }
                 return request;
             }
 
             if (deadline) |dl| {
-                if (std.time.milliTimestamp() > dl) {
+                if (misc.milliTimestamp() > dl) {
                     return error.Timeout;
                 }
             }
         }
     }
 
-    pub fn tryWebSocket(self: *SynParser, stream: net.Stream) !bool {
+    /// Detect whether the incoming connection is a WebSocket upgrade request.
+    ///
+    /// Reads exactly `HEADER_SIZE` bytes from `stream`.  If they start with "GET",
+    /// the full HTTP upgrade handshake is completed in place and `true` is returned.
+    /// Otherwise those bytes were the daffi SYN probe and `false` is returned.
+    ///
+    /// `stream` can be a plain `net.Stream` *or* a `tls_impl.TlsStream` — anything
+    /// that provides `.read([]u8) !usize`, `.write([]const u8) !usize`, and
+    /// `.writeAll([]const u8) !void`.
+    pub fn tryWebSocket(self: *SynParser, stream: anytype) !bool {
         var buf: [serde.HEADER_SIZE]u8 = undefined;
 
         _ = try stream.read(&buf);
         if (ascii.startsWithIgnoreCase(&buf, "get")) {
-            // This block represents handshake_state's lifetime
             var handshake_state = try self.handshake_pool.acquire();
             defer self.handshake_pool.release(handshake_state);
 
             var handshake_buffer = handshake_state.buffer;
             @memcpy(handshake_buffer[0..buf.len], &buf);
             const request = self.readHandshakeRequest(stream, handshake_buffer, serde.HEADER_SIZE, 5000) catch |err| {
-                const s = switch (err) {
+                const s: []const u8 = switch (err) {
                     error.Invalid => "HTTP/1.1 400 Invalid\r\nerror: invalid\r\ncontent-length: 0\r\n\r\n",
                     error.TooLarge => "HTTP/1.1 400 Invalid\r\nerror: too large\r\ncontent-length: 0\r\n\r\n",
-                    error.Timeout, error.WouldBlock => "HTTP/1.1 400 Invalid\r\nerror: timeout\r\ncontent-length: 0\r\n\r\n",
+                    error.Timeout => "HTTP/1.1 400 Invalid\r\nerror: timeout\r\ncontent-length: 0\r\n\r\n",
                     else => "HTTP/1.1 400 Invalid\r\nerror: unknown\r\ncontent-length: 0\r\n\r\n",
                 };
                 _ = try stream.write(s);

@@ -21,26 +21,46 @@ const ClientMessageStore = repository.ClientMessageStore;
 const PLACEHOLDER = serde.PLACEHOLDER;
 const Allocator = std.mem.Allocator;
 const ArenaAllocator = std.heap.ArenaAllocator;
-const print = @import("misc.zig").print;
-const is_wasm = @import("misc.zig").is_wasm;
+const misc = @import("misc.zig");
+const print = misc.print;
+const is_wasm = misc.is_wasm;
 
 const Client = @This();
-var clientEntries: ?std.BoundedArray(?*ClientEntry, 256) = null;
+
+/// Replacement for std.BoundedArray (removed in 0.16) — fixed 256-slot array.
+const ClientEntryArray = struct {
+    buffer: [256]?*ClientEntry = [_]?*ClientEntry{null} ** 256,
+    len: usize = 256,
+
+    pub fn init() @This() {
+        return .{};
+    }
+
+    pub fn get(self: *const @This(), idx: usize) ?*ClientEntry {
+        return self.buffer[idx];
+    }
+
+    pub fn set(self: *@This(), idx: usize, val: ?*ClientEntry) void {
+        self.buffer[idx] = val;
+    }
+};
+
+var clientEntries: ?ClientEntryArray = null;
 
 fn setSignalHandler() !void {
     const internal_handler = struct {
-        fn internal_handler(_: c_int) callconv(.C) void {
+        fn internal_handler(_: posix.SIG) callconv(.c) void {
             std.debug.print("Exiting...\n", .{});
-            posix.exit(0);
+            std.process.exit(0);
         }
     }.internal_handler;
     const act = posix.Sigaction{
         .handler = .{ .handler = internal_handler },
-        .mask = posix.empty_sigset,
+        .mask = posix.sigemptyset(),
         .flags = 0,
     };
-    try posix.sigaction(posix.SIG.INT, &act, null);
-    try posix.sigaction(posix.SIG.TERM, &act, null);
+    posix.sigaction(posix.SIG.INT, &act, null);
+    posix.sigaction(posix.SIG.TERM, &act, null);
 }
 
 pub const MessageIdentifier = struct {
@@ -57,7 +77,6 @@ pub const MessageAndDataIndentifier = struct {
 const ClientEntry = struct {
     connection: *ClientConnection,
     msgpool: *MessagePool,
-    msg_store: ClientMessageStore,
     client_handler: *ClientHandler,
     uuid: u16 = 0,
 
@@ -79,26 +98,37 @@ const ClientEntry = struct {
     }
 
     pub fn desctroyClientEntry(self: *const ClientEntry) void {
+        // Only close the socket so the dispatcher thread can detect disconnect and exit.
+        // The Connection struct and msgpool are freed by messageDispatcherClientEntry
+        // after the thread finishes, avoiding use-after-free races.
         self.connection.close();
-        self.msgpool.deinit();
     }
 
     fn messageDispatcherClientEntry(self: *ClientEntry, conn_num: usize) !void {
-        // TODO: close connection?
         var msg_handler = self.client_handler.handler();
         while (self.msgpool.receiveMessage(self.connection)) |message| {
             try msg_handler.handle(self.connection, message);
+            // Notify the Python task dispatcher that a new task-queue message
+            // may be waiting.  This eliminates the 1 ms fallback poll delay for
+            // Client connections used as workers in a router topology.
+            // ClientHandler always marks inbound messages as durable (they go
+            // into msg_store or tasks_queue), so there is no double-free risk
+            // — unlike serverLoop, this loop has no defer message.deinit().
+            msg_handler.triggerWakeup();
         } else |err| {
             print("exit client connection with error: {}\n", .{err});
             try msg_handler.handleErr(self.connection, err);
         }
         try msg_handler.handleDisconnect(self.connection);
-        posix.nanosleep(0, 5000);
+        { const ts = std.os.linux.timespec{ .sec = 0, .nsec = 5000 }; _ = std.os.linux.nanosleep(&ts, null); }
         if (clientEntries) |*entries| entries.set(conn_num, null);
+        // Now safe to free: no Python thread or Zig code references this connection.
+        self.connection.destroy();
+        self.msgpool.deinit();
     }
 
     pub fn createMessageClientEntry(self: *ClientEntry, allocator: Allocator, data: []const u8, uuid: u16, flag: MessageFlag, decoder: MessageDecoder, is_bytes: bool, return_result: bool, receiver: []const u8, func_name: []const u8) !MessageAndDataIndentifier {
-        const ts = if (is_wasm) 0 else std.time.timestamp();
+        const ts = if (is_wasm) 0 else misc.timestamp();
         if (flag == .REQUEST) {
             // Find intersection between provided receiver and available receivers
             const actual_receiver = try self.client_handler.findReceiverForMethod(func_name, if (!std.mem.eql(u8, receiver, "")) receiver else null);
@@ -118,11 +148,11 @@ const ClientEntry = struct {
             const actual_receiver = try self.client_handler.findReceiverForMethod(func_name, if (!std.mem.eql(u8, receiver, "")) receiver else null);
             const actual_uuid = self.generateUUID();
             try self.msgpool.sendMessage(self.connection, data, actual_uuid, flag, decoder, is_bytes, return_result, self.client_handler.app_name, actual_receiver, func_name);
-            return .{ .receiver = actual_receiver, .uuid = actual_uuid, .timestamp = std.time.timestamp() };
+            return .{ .receiver = actual_receiver, .uuid = actual_uuid, .timestamp = misc.timestamp() };
         } else {
             std.debug.assert(uuid != 0);
             try self.msgpool.sendMessage(self.connection, data, uuid, flag, decoder, is_bytes, return_result, self.client_handler.app_name, receiver, func_name);
-            return .{ .receiver = receiver, .uuid = uuid, .timestamp = std.time.timestamp() };
+            return .{ .receiver = receiver, .uuid = uuid, .timestamp = misc.timestamp() };
         }
     }
 
@@ -132,7 +162,7 @@ const ClientEntry = struct {
         const data = try handshake.toJson(allocator);
         const uuid = self.generateUUID();
         const msg = try self.msgpool.createMessage(allocator, data, uuid, .HANDSHAKE, .JSON, false, true, self.client_handler.app_name, PLACEHOLDER, PLACEHOLDER);
-        const ts = if (is_wasm) 0 else std.time.timestamp();
+        const ts = if (is_wasm) 0 else misc.timestamp();
         return .{ .message = .{ .receiver = PLACEHOLDER, .uuid = uuid, .timestamp = ts }, .data = msg };
     }
 
@@ -148,26 +178,34 @@ const ClientEntry = struct {
         return .{
             .receiver = PLACEHOLDER,
             .uuid = uuid,
-            .timestamp = std.time.timestamp(),
+            .timestamp = misc.timestamp(),
         };
     }
 
     pub fn getMessageByUuidClientEntry(self: *ClientEntry, uuid: u16) ?*Message {
-        return self.msg_store.fetch(uuid);
+        return self.client_handler.msg_store.fetch(uuid);
     }
 
     pub fn setTimeoutErrorClientEntry(self: *ClientEntry, uuid: u16) !void {
-        try self.msg_store.setTimeoutError(uuid);
+        try self.client_handler.msg_store.setTimeoutError(uuid);
     }
 
     pub fn getMessageForClientWorkerClientEntry(self: *ClientEntry) ?*Message {
         return self.client_handler.tasks_queue.getMessageFromQueue();
     }
 
+    pub fn setWakeupFdClientEntry(self: *ClientEntry, fd: i32) void {
+        self.client_handler.tasks_queue.wakeup_fd = fd;
+    }
+
     pub fn getAvailableMembersClientEntry(self: *ClientEntry, allocator: Allocator) ![]const u8 {
         const chan_count = self.client_handler.chan_mapper.ChannelsCount();
-        if (chan_count == 0) return PLACEHOLDER;
-        var arena = ArenaAllocator.init(allocator); // page allocator to support webassembly
+        // Always return allocator-owned memory so the CFFI caller can safely
+        // call allocator.free() on the result.  The arena used for building the
+        // JSON is local to this function and is freed before we return, so we
+        // must copy the final JSON string into the caller's allocator first.
+        if (chan_count == 0) return allocator.dupe(u8, PLACEHOLDER);
+        var arena = ArenaAllocator.init(allocator);
         defer arena.deinit();
         const this_name = try std.fmt.allocPrint(arena.allocator(), "{s} (this app)", .{self.client_handler.app_name});
         var memberdata = try arena.allocator().alloc(Handshake.MemberData, chan_count);
@@ -176,7 +214,8 @@ const ClientEntry = struct {
             memberdata[idx] = .{ .name = name, .methods = try c.joinedMethods(arena.allocator(), serde.UNIT_SEPARATOR) };
         }
         var handshake = try Handshake.create(arena.allocator(), memberdata, null, null);
-        return try handshake.toJson(arena.allocator());
+        // Copy into the caller's allocator BEFORE defer arena.deinit() fires.
+        return try allocator.dupe(u8, try handshake.toJson(arena.allocator()));
     }
 };
 
@@ -189,15 +228,20 @@ pub fn init(allocator: std.mem.Allocator, app_name: []const u8, config: ClientCo
     const conn = try ClientConnection.init(allocator, config);
     var msgpool = try MessagePool.init(allocator);
     const client_handler = try ClientHandler.init(allocator, app_name);
-    const msg_store = client_handler.msg_store;
     if (!is_wasm) {
         try setSignalHandler();
+        // The SYN probe is sent by every daffi TCP client (plain and TLS alike).
+        // On the server side tryWebSocket() reads these bytes to distinguish a
+        // native daffi connection (SYN = 0x1F × HEADER_SIZE) from a browser
+        // WebSocket upgrade (starts with "GET").  Without SYN a TLS-TCP client
+        // would have its first real HANDSHAKE bytes consumed by tryWebSocket and
+        // the message framing would be corrupted.
         try msgpool.sendSynMessage(conn);
     }
     const cl_entry = try allocator.create(ClientEntry);
-    cl_entry.* = ClientEntry{ .connection = conn, .msgpool = msgpool, .client_handler = client_handler, .msg_store = msg_store };
+    cl_entry.* = ClientEntry{ .connection = conn, .msgpool = msgpool, .client_handler = client_handler };
     if (clientEntries == null) {
-        clientEntries = try std.BoundedArray(?*ClientEntry, 256).init(256);
+        clientEntries = ClientEntryArray.init();
     }
     const conn_num: usize = @rem(clientEntries.?.len, 256);
     clientEntries.?.set(conn_num, cl_entry);
@@ -248,6 +292,14 @@ pub fn getMessageForClientWorker(conn_num: usize) !?*Message {
 pub fn getAvailableMembers(allocator: Allocator, conn_num: usize) ![]const u8 {
     var entry = try ClientEntry.get(conn_num);
     return entry.getAvailableMembersClientEntry(allocator);
+}
+
+/// Register the eventfd (or pipe write-end) that the native layer signals
+/// whenever a new task-queue message is available for conn_num.
+/// Used by client connections acting as workers in a router topology.
+pub fn setWakeupFd(conn_num: usize, fd: i32) !void {
+    var entry = try ClientEntry.get(conn_num);
+    entry.setWakeupFdClientEntry(fd);
 }
 
 pub fn getClientEntry(conn_num: usize) !*ClientEntry {

@@ -17,9 +17,7 @@ pub const Event = struct {
     }
 
     pub fn toJson(self: *Event, allocator: Allocator) ![]const u8 {
-        var string = std.ArrayList(u8).init(allocator);
-        try std.json.stringify(self, .{}, string.writer());
-        return string.toOwnedSlice();
+        return try std.json.Stringify.valueAlloc(allocator, self, .{});
     }
 
     pub fn create(comptime conntype: []const u8, member: []const u8) Event {
@@ -51,9 +49,7 @@ pub const Handshake = struct {
     }
 
     pub fn toJson(self: *Handshake, allocator: Allocator) ![]const u8 {
-        var string = std.ArrayList(u8).init(allocator);
-        try std.json.stringify(self, .{}, string.writer());
-        return string.toOwnedSlice();
+        return try std.json.Stringify.valueAlloc(allocator, self, .{});
     }
 
     pub fn create(allocator: Allocator, memberdata: []const MemberData, password: ?[]const u8, connection_type: ?[]const u8) !Handshake {

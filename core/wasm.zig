@@ -96,7 +96,7 @@ export fn sendMessage(data: [*:0]const u8, receiver: [*:0]const u8, func_name: [
         const members = iterator.next() orelse throwError("failed to get members\n");
         // consoleLog("failed to create message: {any} for method '{s}'.\nAvailable receivers {s}\n", .{ err, actual_func_name, available_receivers });
         var buf: [1000]u8 = undefined;
-        _ = std.fmt.bufPrint(&buf, "failed to create message: {any} for method '{s}'.\nAvailable receivers {?s}\n", .{ err, actual_func_name, std.mem.trim(u8, members, ":}") }) catch
+        _ = std.fmt.bufPrint(&buf, "failed to create message: {any} for method '{s}'.\nAvailable receivers {s}\n", .{ err, actual_func_name, std.mem.trim(u8, members, ":}") }) catch
             @panic("failed to allocate memory for error message");
         throwError(&buf);
     };

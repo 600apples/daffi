@@ -1,8 +1,7 @@
 const std = @import("std");
 const mem = std.mem;
-const net = std.net;
 const ascii = std.ascii;
-const Mutex = std.Thread.Mutex;
+const Mutex = @import("../../misc.zig").Mutex;
 const Allocator = std.mem.Allocator;
 
 pub const KeyValue = struct {
@@ -97,7 +96,7 @@ pub const Handshake = struct {
                 required_headers |= 2;
             } else if (mem.eql(u8, "connection", name)) {
                 // find if connection header has upgrade in it, example header:
-                //		Connection: keep-alive, Upgrade
+                //  Connection: keep-alive, Upgrade
                 if (ascii.indexOfIgnoreCase(value, "upgrade") == null) {
                     return error.InvalidConnection;
                 }
