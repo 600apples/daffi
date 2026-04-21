@@ -9,28 +9,37 @@ Layouts
                 backend Worker server — the closest RPyC equivalent to daffi's
                 Client → Router → Worker topology.
 
-Run directly::
+Payload
+-------
+Same ``data.json`` used by perf_benchmark.py — a realistic nested order record
+(~2 KB).  The server echoes it back unchanged so the comparison is apples-to-apples.
 
-    python3 tests/rpyc_benchmark.py
+Run::
+
+    python3 tests/perf/rpyc_benchmark.py
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import multiprocessing as mp
 import os
 import socket
 import sys
 import time
+from pathlib import Path
 
 # ── constants ──────────────────────────────────────────────────────────────────
 
-N      = 1_000_00   # measured calls per layout (keep same as perf_benchmark.py)
-WARMUP = 20      # throwaway calls before measurement
-TIMEOUT = 30     # per-call timeout (seconds)
+_DATA_FILE = Path(__file__).parent / "data.json"
+
+N      = 100_000  # measured calls per layout — same as perf_benchmark.py
+WARMUP = 20
+TIMEOUT = 30
 HOST   = "127.0.0.1"
 
-# ── helpers (identical to perf_benchmark.py so output is comparable) ──────────
+# ── helpers ───────────────────────────────────────────────────────────────────
 
 def _free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -51,7 +60,6 @@ def _wait_for_port(port: int, timeout: float = 15.0) -> None:
 
 
 def _silence() -> None:
-    """Redirect stdout/stderr to /dev/null and kill Python logging."""
     devnull = os.open(os.devnull, os.O_WRONLY)
     os.dup2(devnull, 1)
     os.dup2(devnull, 2)
@@ -68,84 +76,67 @@ def _report(label: str, latencies_ms: list[float]) -> None:
 # ── subprocess entry points ────────────────────────────────────────────────────
 
 def _proc_rpyc_server(port: int) -> None:
-    """Background process: plain RPyC ThreadedServer exposing ping()."""
     _silence()
     import rpyc
     from rpyc.utils.server import ThreadedServer
 
-    class PingService(rpyc.Service):
-        def exposed_ping(self, x: int) -> int:
-            return x
+    class EchoService(rpyc.Service):
+        def exposed_echo(self, payload):
+            return payload
 
-    srv = ThreadedServer(
-        PingService,
+    ThreadedServer(
+        EchoService,
         hostname=HOST,
         port=port,
         protocol_config={"allow_public_attrs": True},
-    )
-    srv.start()
+    ).start()
 
 
 def _proc_rpyc_worker(port: int) -> None:
-    """Background process: backend worker server for the proxy layout."""
     _silence()
     import rpyc
     from rpyc.utils.server import ThreadedServer
 
-    class WorkerService(rpyc.Service):
-        def exposed_ping(self, x: int) -> int:
-            return x
+    class EchoService(rpyc.Service):
+        def exposed_echo(self, payload):
+            return payload
 
-    srv = ThreadedServer(
-        WorkerService,
+    ThreadedServer(
+        EchoService,
         hostname=HOST,
         port=port,
         protocol_config={"allow_public_attrs": True},
-    )
-    srv.start()
+    ).start()
 
 
 def _proc_rpyc_proxy(proxy_port: int, worker_port: int) -> None:
-    """Background process: proxy server that forwards every call to the worker.
-
-    This is the RPyC equivalent of daffi's Router.  Each incoming call on
-    ``exposed_ping`` is synchronously forwarded to the worker's
-    ``exposed_ping``, adding one extra TCP round-trip per call.
-    """
     _silence()
     import rpyc
     from rpyc.utils.server import ThreadedServer
 
-    # Connect once to the backend worker and reuse the connection.
-    _backend: list = []  # mutable container so the nested class can capture it
+    _backend: list = []
 
     class ProxyService(rpyc.Service):
         def on_connect(self, conn):
             if not _backend:
                 _backend.append(
-                    rpyc.connect(
-                        HOST,
-                        worker_port,
-                        config={"allow_public_attrs": True},
-                    )
+                    rpyc.connect(HOST, worker_port, config={"allow_public_attrs": True})
                 )
 
-        def exposed_ping(self, x: int) -> int:
-            return _backend[0].root.ping(x)
+        def exposed_echo(self, payload):
+            return _backend[0].root.echo(payload)
 
-    srv = ThreadedServer(
+    ThreadedServer(
         ProxyService,
         hostname=HOST,
         port=proxy_port,
         protocol_config={"allow_public_attrs": True},
-    )
-    srv.start()
+    ).start()
 
 
 # ── benchmark functions ────────────────────────────────────────────────────────
 
-def bench_rpyc_direct() -> list[float]:
-    """RPyC benchmark: Client → Server (single hop)."""
+def bench_rpyc_direct(data: dict) -> list[float]:
     import rpyc
 
     port = _free_port()
@@ -153,24 +144,20 @@ def bench_rpyc_direct() -> list[float]:
     proc.start()
     try:
         _wait_for_port(port)
-
-        conn = rpyc.connect(
-            HOST, port, config={"allow_public_attrs": True, "sync_request_timeout": TIMEOUT}
-        )
+        conn = rpyc.connect(HOST, port, config={"allow_public_attrs": True, "sync_request_timeout": TIMEOUT})
         svc = conn.root
 
         print(f"  [rpyc-direct] warming up ({WARMUP} calls)…", end="", flush=True)
-        for i in range(WARMUP):
-            assert svc.ping(i) == i
+        for _ in range(WARMUP):
+            svc.echo(data)
         print(" done")
 
         print(f"  [rpyc-direct] measuring {N} calls…", end="", flush=True)
         latencies: list[float] = []
-        for i in range(N):
+        for _ in range(N):
             t0 = time.perf_counter()
-            result = svc.ping(i)
+            svc.echo(data)
             latencies.append((time.perf_counter() - t0) * 1_000)
-            assert result == i, f"expected {i}, got {result}"
         print(" done")
 
         conn.close()
@@ -180,8 +167,7 @@ def bench_rpyc_direct() -> list[float]:
         proc.join(timeout=5)
 
 
-def bench_rpyc_via_proxy() -> list[float]:
-    """RPyC benchmark: Client → Proxy → Worker (two hops)."""
+def bench_rpyc_via_proxy(data: dict) -> list[float]:
     import rpyc
 
     worker_port = _free_port()
@@ -195,26 +181,22 @@ def bench_rpyc_via_proxy() -> list[float]:
         _wait_for_port(worker_port)
         proxy_proc.start()
         _wait_for_port(proxy_port)
-        time.sleep(0.1)  # let the proxy finish its on_connect handshake
+        time.sleep(0.1)
 
-        conn = rpyc.connect(
-            HOST, proxy_port,
-            config={"allow_public_attrs": True, "sync_request_timeout": TIMEOUT},
-        )
+        conn = rpyc.connect(HOST, proxy_port, config={"allow_public_attrs": True, "sync_request_timeout": TIMEOUT})
         svc = conn.root
 
         print(f"  [rpyc-proxy] warming up ({WARMUP} calls)…", end="", flush=True)
-        for i in range(WARMUP):
-            assert svc.ping(i) == i
+        for _ in range(WARMUP):
+            svc.echo(data)
         print(" done")
 
         print(f"  [rpyc-proxy] measuring {N} calls…", end="", flush=True)
         latencies: list[float] = []
-        for i in range(N):
+        for _ in range(N):
             t0 = time.perf_counter()
-            result = svc.ping(i)
+            svc.echo(data)
             latencies.append((time.perf_counter() - t0) * 1_000)
-            assert result == i, f"expected {i}, got {result}"
         print(" done")
 
         conn.close()
@@ -232,24 +214,25 @@ def main() -> None:
     logging.disable(logging.INFO)
 
     import rpyc as _rpyc
+
+    data: dict = json.loads(_DATA_FILE.read_text())
+    payload_bytes = len(json.dumps(data).encode())
+
     print(f"\nRPyC {_rpyc.__version__} performance benchmark  —  {N} sequential calls per layout")
-    print(f"host: {HOST}   warmup: {WARMUP} calls   timeout: {TIMEOUT}s\n")
+    print(f"host: {HOST}   warmup: {WARMUP} calls   timeout: {TIMEOUT}s")
+    print(f"payload: {_DATA_FILE.name}  ({payload_bytes} bytes JSON)\n")
 
     print("Layout 1: Direct (Client → Server)")
-    direct_lat = bench_rpyc_direct()
+    direct_lat = bench_rpyc_direct(data)
     _report("Direct: Client → Server", direct_lat)
 
     print("\nLayout 2: Via Proxy (Client → Proxy → Worker)")
-    proxy_lat = bench_rpyc_via_proxy()
+    proxy_lat = bench_rpyc_via_proxy(data)
     _report("Via Proxy: Client → Proxy → Worker", proxy_lat)
 
     d_avg_s = sum(direct_lat) / len(direct_lat) / 1_000
     r_avg_s = sum(proxy_lat)  / len(proxy_lat)  / 1_000
-    overhead_s = r_avg_s - d_avg_s
-    print(
-        f"\n  Proxy overhead vs direct: {overhead_s * 1000:+.3f} ms / call"
-        f"  ({overhead_s / d_avg_s * 100:+.1f}%)\n"
-    )
+    print(f"\n  Proxy overhead vs direct: {(r_avg_s - d_avg_s) * 1000:+.3f} ms / call\n")
 
 
 if __name__ == "__main__":

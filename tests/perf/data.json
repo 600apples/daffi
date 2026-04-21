@@ -1,0 +1,111 @@
+{
+  "order_id": "ORD-2024-00142857",
+  "created_at": "2024-04-17T08:23:11.402Z",
+  "status": "processing",
+  "customer": {
+    "id": "USR-98213",
+    "name": "Alice Müller",
+    "email": "alice.mueller@example.com",
+    "tier": "gold",
+    "since": "2019-11-03",
+    "addresses": [
+      {
+        "type": "shipping",
+        "line1": "Nördliche Münchner Str. 47",
+        "line2": null,
+        "city": "Grünwald",
+        "postcode": "82031",
+        "country": "DE",
+        "is_default": true
+      },
+      {
+        "type": "billing",
+        "line1": "Kaiserdamm 12",
+        "line2": "c/o Müller GmbH",
+        "city": "Berlin",
+        "postcode": "14057",
+        "country": "DE",
+        "is_default": false
+      }
+    ]
+  },
+  "items": [
+    {
+      "sku": "GPU-RTX4090-OC",
+      "name": "GeForce RTX 4090 Overclocked 24 GB",
+      "qty": 1,
+      "unit_price_eur": 1699.99,
+      "vat_rate": 0.19,
+      "weight_kg": 1.84,
+      "attributes": {
+        "brand": "ASUS",
+        "series": "ROG Strix",
+        "tdp_w": 480,
+        "warranty_months": 36
+      }
+    },
+    {
+      "sku": "CPU-7950X3D",
+      "name": "Ryzen 9 7950X3D",
+      "qty": 1,
+      "unit_price_eur": 589.00,
+      "vat_rate": 0.19,
+      "weight_kg": 0.04,
+      "attributes": {
+        "brand": "AMD",
+        "series": "Ryzen 9",
+        "cores": 16,
+        "threads": 32,
+        "base_ghz": 4.2,
+        "boost_ghz": 5.7,
+        "tdp_w": 120,
+        "warranty_months": 36
+      }
+    },
+    {
+      "sku": "RAM-DDR5-64GB-6000",
+      "name": "64 GB DDR5-6000 CL30 Kit (2×32 GB)",
+      "qty": 2,
+      "unit_price_eur": 179.99,
+      "vat_rate": 0.19,
+      "weight_kg": 0.08,
+      "attributes": {
+        "brand": "G.Skill",
+        "series": "Trident Z5 RGB",
+        "speed_mhz": 6000,
+        "cas": 30,
+        "voltage_v": 1.35,
+        "warranty_months": 120
+      }
+    }
+  ],
+  "shipping": {
+    "method": "express_24h",
+    "carrier": "DHL",
+    "tracking_id": null,
+    "estimated_delivery": "2024-04-18",
+    "cost_eur": 9.99,
+    "insured": true,
+    "signature_required": false
+  },
+  "payment": {
+    "method": "card",
+    "provider": "Stripe",
+    "last4": "4242",
+    "currency": "EUR",
+    "subtotal": 2649.96,
+    "vat_total": 503.49,
+    "grand_total": 3163.44,
+    "paid_at": null,
+    "refunds": []
+  },
+  "metadata": {
+    "source": "web",
+    "session_id": "sess_7f3b19e4a82cd0f1",
+    "ip": "93.184.216.34",
+    "user_agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36",
+    "ab_group": "B",
+    "flags": ["new_checkout_flow", "loyalty_applied"],
+    "promo_codes": ["SAVE10"]
+  }
+}

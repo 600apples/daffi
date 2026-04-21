@@ -1,4 +1,0 @@
-
-
-build:
-	zig build
