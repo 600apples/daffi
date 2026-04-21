@@ -63,7 +63,8 @@ def send_message_from_client(
         data = ctypes.create_string_buffer(data, len(data))
     else:
         data = str(data)
-        data = ctypes.create_string_buffer(data.encode(), len(data))
+        encoded = data.encode()
+        data = ctypes.create_string_buffer(encoded, len(encoded))
     return dfcore.sendMessageFromClient(
         data, uuid, flag, serde, is_bytes, receiver, func_name, return_result, conn_num
     )
@@ -119,7 +120,8 @@ def send_message_from_service(
         data = ctypes.create_string_buffer(data, len(data))
     else:
         data = str(data)
-        data = ctypes.create_string_buffer(data.encode(), len(data))
+        encoded = data.encode()
+        data = ctypes.create_string_buffer(encoded, len(encoded))
     return dfcore.sendMessageFromServer(
         data, uuid, flag, serde, is_bytes, receiver, func_name, return_result, conn_num
     )
@@ -162,6 +164,14 @@ def set_wakeup_fd(conn_num: int, fd: int) -> None:
                   ``os.pipe()`` (macOS / fallback).
     """
     dfcore.setWakeupFd(conn_num, fd)
+
+
+def set_client_disconnect_fd(conn_num: int, fd: int) -> None:
+    """Register the pipe write-end written to once by the native layer when the
+    client connection is lost.  Python selects on the corresponding read end so
+    AutoReconnect can react without a polling thread.
+    """
+    dfcore.setClientDisconnectFd(conn_num, fd)
 
 
 def set_client_wakeup_fd(conn_num: int, fd: int) -> None:

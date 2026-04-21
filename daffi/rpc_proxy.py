@@ -2,20 +2,23 @@
 Call-builder proxies and the :class:`ClientConnection` handle returned by
 :meth:`~daffi.app.Client.connect`.
 
-Four call styles are available on every :class:`ClientConnection`:
+Five call styles are available on every :class:`ClientConnection`:
 
 * :meth:`~ClientConnection.rpc`          — one worker, blocking, returns result
 * :meth:`~ClientConnection.rpc_nowait`   — one worker, fire-and-forget
 * :meth:`~ClientConnection.cast`         — all matching workers, blocking, returns ``{name: result}`` dict
 * :meth:`~ClientConnection.cast_nowait`  — all matching workers, fire-and-forget
+* :meth:`~ClientConnection.stream`         — iterate a generator, wait for ack per chunk (backpressure)
+* :meth:`~ClientConnection.stream_nowait`  — iterate a generator, fire-and-forget per chunk (no backpressure)
 """
 from __future__ import annotations
 
 import json
 import time
 import logging
+import threading
 from itertools import repeat
-from typing import TYPE_CHECKING, Union, Tuple, List, Optional
+from typing import TYPE_CHECKING, Any, Union, Tuple, List, Optional
 from contextlib import contextmanager
 
 if TYPE_CHECKING:
@@ -33,7 +36,7 @@ from daffi.bindings import (
     get_available_members,
     MessageFlag,
 )
-
+from . import dfcore
 
 METADATA_SEPARATOR = ","
 
@@ -158,7 +161,7 @@ class RpcProxy:
         self._uuid = None
 
     def __str__(self):
-        req_name = "rpc call" if self.return_result else "stream"
+        req_name = "rpc call" if self.return_result else "rpc_nowait"
         to_receiver = f" to {self.receiver}" if self.receiver else ""
         details = (
             f"(fn: {self._func_name!r}, uuid: {self._uuid})"
@@ -303,7 +306,7 @@ class RpcProxy:
                     conn_num=conn_num,
                     uuid=uuid,
                     ts=ts,
-                    timeout=5,
+                    timeout=30,
                     receivers=None,
                     proxy=None,
                 ).result()
@@ -549,35 +552,165 @@ class BroadcastProxy:
                 )
 
 
+class _StreamBase:
+    """Shared init/repr logic for the two stream proxy variants."""
+
+    def __init__(
+        self,
+        conn: "ClientConnection",
+        receiver: Union[str, None],
+        serde: SerdeFormat,
+        timeout: Union[int, None],
+        logger: logging.Logger,
+    ):
+        self.conn = conn
+        self.receiver = receiver or ""
+        self.serde = serde
+        self.timeout = int(timeout or 0)
+        self.logger = logger
+        self._func_name: Optional[str] = None
+        self._receiver = {receiver} if receiver else set()
+
+    def __str__(self):
+        return f"{self.__class__.__name__}(fn: {self._func_name!r}, receiver: {self.receiver!r})"
+
+    __repr__ = __str__
+
+    def __getattr__(self, item: str) -> "_StreamBase":
+        self._func_name = item
+        return self
+
+    def _send_chunk(self, conn_num: int, chunk, return_result: bool):
+        """Serialise and send one chunk; return (uuid, ts, found_receiver)."""
+        data, is_bytes = Serializer.serialize(self.serde, chunk)
+        with system_exception_handler(
+            f"Unable to stream to {self}: {{}}", TransmissionFailure
+        ):
+            uuid, ts, found_receiver = send_message_from_client(
+                data=data,
+                flag=MessageFlag.REQUEST,
+                serde=self.serde,
+                receiver=self.receiver,
+                func_name=self._func_name,
+                return_result=return_result,
+                conn_num=conn_num,
+                is_bytes=is_bytes,
+            )
+        if not found_receiver:
+            members = (
+                ""
+                if not (_members := get_available_members(conn_num))
+                else f"\nAvailable receivers: {_members}"
+            )
+            raise TransmissionFailure(f"No receiver found for {self}." + members)
+        elif missing := self._receiver - set(found_receiver.split(METADATA_SEPARATOR)):
+            self.logger.warning(f"Receiver(s) {missing} seem to be offline.")
+        return uuid, ts, found_receiver
+
+
+class StreamProxy(_StreamBase):
+    """Lazy call builder returned by :meth:`~ClientConnection.stream`.
+
+    Iterates a generator and sends each chunk as a **blocking** RPC call —
+    the client waits for the remote callback to complete before sending the
+    next chunk.  This provides natural backpressure: the producer can never
+    get ahead of the consumer.
+
+    The callback's return value is discarded; only the ack matters::
+
+        def data_source():
+            for i in range(5):
+                yield f"chunk-{i}".encode()
+
+        conn.stream(serde=SerdeFormat.OPAQUE).receive_chunk(data_source())
+    """
+
+    def __call__(self, gen) -> None:
+        """Iterate *gen*, sending each chunk and waiting for an ack before continuing.
+
+        Args:
+            gen: A generator, iterator, or any iterable.  Each yielded item is
+                 sent as a separate blocking message.  A single non-iterable
+                 value is wrapped in a list and sent as one message.
+
+        Raises:
+            TransmissionFailure: If no receiver is found for any chunk.
+            TimeoutError: If the per-chunk timeout expires waiting for an ack.
+        """
+        assert self._func_name is not None
+        conn_num = self.conn.client._conn_num
+        chunks = gen if iterable(gen) else [gen]
+        for chunk in chunks:
+            uuid, ts, _ = self._send_chunk(conn_num, chunk, return_result=True)
+            # Wait for the ack (result is discarded — only backpressure matters).
+            RpcResult(
+                conn_num=conn_num,
+                uuid=uuid,
+                ts=ts,
+                timeout=self.timeout,
+                receivers=self._receiver or None,
+                proxy=self,
+            ).result()
+
+
+class StreamNowaitProxy(_StreamBase):
+    """Lazy call builder returned by :meth:`~ClientConnection.stream_nowait`.
+
+    Iterates a generator and sends each chunk as a **fire-and-forget** message —
+    no acknowledgement is waited for.  The producer can outpace the consumer;
+    use this only when you control the rate yourself or can tolerate queue build-up::
+
+        conn.stream_nowait(serde=SerdeFormat.OPAQUE).receive_chunk(data_source())
+    """
+
+    def __call__(self, gen) -> None:
+        """Iterate *gen* and send each yielded value without waiting for replies.
+
+        Args:
+            gen: A generator, iterator, or any iterable.  Each yielded item is
+                 sent as a separate fire-and-forget message.
+
+        Raises:
+            TransmissionFailure: If no receiver is found for any chunk.
+        """
+        assert self._func_name is not None
+        conn_num = self.conn.client._conn_num
+        chunks = gen if iterable(gen) else [gen]
+        for chunk in chunks:
+            self._send_chunk(conn_num, chunk, return_result=False)
+
+
 class ClientConnection:
     """Proxy returned by :meth:`~daffi.app.Client.connect`.
 
-    Four call styles are available:
+    Six call styles are available:
 
-    * :meth:`rpc`         — one worker, blocking, returns result
-    * :meth:`rpc_nowait`  — one worker, fire-and-forget
-    * :meth:`cast`        — all matching workers, blocking, returns ``{name: result}``
-    * :meth:`cast_nowait` — all matching workers, fire-and-forget
+    * :meth:`rpc`            — one worker, blocking, returns result
+    * :meth:`rpc_nowait`     — one worker, fire-and-forget
+    * :meth:`cast`           — all matching workers, blocking, returns ``{name: result}``
+    * :meth:`cast_nowait`    — all matching workers, fire-and-forget
+    * :meth:`stream`         — iterate a generator, wait for ack per chunk (backpressure)
+    * :meth:`stream_nowait`  — iterate a generator, fire-and-forget per chunk (no backpressure)
 
     Example::
 
         conn = client.connect()
 
-        # One worker — blocking
         result = conn.rpc(timeout=5).add(1, 2)
-
-        # One worker — fire-and-forget
         conn.rpc_nowait().log_event(payload)
-
-        # All workers — collect all results
-        results = conn.cast().add(1, 2)     # {"worker-1": 3, "worker-2": 3}
-
-        # All workers — no results
+        results = conn.cast().add(1, 2)           # {"worker-1": 3, "worker-2": 3}
         conn.cast_nowait().invalidate_cache(key)
+
+        # Blocking stream — waits for ack per chunk (safe, natural backpressure)
+        conn.stream(serde=SerdeFormat.OPAQUE).receive_chunk(data_source())
+
+        # Fire-and-forget stream — no ack, user controls rate
+        conn.stream_nowait(serde=SerdeFormat.OPAQUE).receive_chunk(data_source())
     """
 
-    def __init__(self, client: "Client"):
-        self.client = client
+    def __init__(self, client: "Client", password: str = ""):
+        self.client   = client
+        self.password = password
 
     # ------------------------------------------------------------------
     # Primary API
@@ -716,64 +849,351 @@ class ClientConnection:
             logger=self.client.logger,
         )
 
-    # ------------------------------------------------------------------
-    # Deprecated aliases — kept for backward compatibility
-    # ------------------------------------------------------------------
-
     def stream(
         self,
         receiver: Union[str, None] = None,
-        serde: SerdeFormat = SerdeFormat.PICKLE,
-    ) -> RpcProxy:
-        """Deprecated — use :meth:`rpc_nowait` instead."""
-        import warnings
-        warnings.warn(
-            "stream() is deprecated, use rpc_nowait() instead",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        return self.rpc_nowait(receiver=receiver, serde=serde)
-
-    def call(
-        self,
+        serde: SerdeFormat = SerdeFormat.OPAQUE,
         timeout: Union[int, None] = None,
+    ) -> StreamProxy:
+        """Stream a generator to a remote callback with **per-chunk backpressure**.
+
+        Sends each yielded value as a blocking RPC and waits for the remote
+        callback to complete before sending the next chunk.  This prevents
+        the producer from outpacing the consumer and keeps the service queue
+        at most one message deep.
+
+        The callback's return value is discarded — only the acknowledgement
+        matters.
+
+        Args:
+            receiver: Pin to a specific worker by name.  ``None`` picks one
+                      using round-robin.
+            serde:    Serialisation format.  Defaults to
+                      :attr:`~daffi.serialization.SerdeFormat.OPAQUE`.
+            timeout:  Seconds to wait per chunk before raising
+                      :exc:`TimeoutError`.  ``None`` waits forever.
+
+        Example::
+
+            def data_source():
+                for i in range(5):
+                    yield f"chunk-{i}".encode()
+
+            conn.stream(serde=SerdeFormat.OPAQUE).receive_chunk(data_source())
+        """
+        return StreamProxy(
+            conn=self,
+            receiver=receiver,
+            serde=serde,
+            timeout=timeout,
+            logger=self.client.logger,
+        )
+
+    def stream_nowait(
+        self,
         receiver: Union[str, None] = None,
-        serde: SerdeFormat = SerdeFormat.PICKLE,
-    ) -> RpcProxy:
-        """Deprecated — use :meth:`rpc` instead."""
-        import warnings
-        warnings.warn(
-            "call() is deprecated, use rpc() instead",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        return self.rpc(timeout=timeout, receiver=receiver, serde=serde)
+        serde: SerdeFormat = SerdeFormat.OPAQUE,
+    ) -> StreamNowaitProxy:
+        """Stream a generator to a remote callback **fire-and-forget** (no backpressure).
 
-    def call_all(
-        self,
-        timeout: Union[int, None] = None,
-        receiver: Union[str, List[str], None] = None,
-        serde: SerdeFormat = SerdeFormat.PICKLE,
-    ) -> BroadcastProxy:
-        """Deprecated — use :meth:`cast` instead."""
-        import warnings
-        warnings.warn(
-            "call_all() is deprecated, use cast() instead",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        return self.cast(timeout=timeout, receiver=receiver, serde=serde)
+        Sends each yielded value without waiting for the remote callback to
+        complete.  The producer can outpace the consumer; messages accumulate
+        in the service queue.  Use this only when you control the rate
+        yourself or when losing messages is acceptable.
 
-    def cast_all(
-        self,
-        receiver: Union[str, List[str], None] = None,
-        serde: SerdeFormat = SerdeFormat.PICKLE,
-    ) -> BroadcastProxy:
-        """Deprecated — use :meth:`cast_nowait` instead."""
-        import warnings
-        warnings.warn(
-            "cast_all() is deprecated, use cast_nowait() instead",
-            DeprecationWarning,
-            stacklevel=2,
+        Args:
+            receiver: Pin to a specific worker by name.  ``None`` picks one
+                      using round-robin.
+            serde:    Serialisation format.  Defaults to
+                      :attr:`~daffi.serialization.SerdeFormat.OPAQUE`.
+
+        Example::
+
+            conn.stream_nowait(serde=SerdeFormat.OPAQUE).receive_chunk(data_source())
+        """
+        return StreamNowaitProxy(
+            conn=self,
+            receiver=receiver,
+            serde=serde,
+            timeout=None,
+            logger=self.client.logger,
         )
-        return self.cast_nowait(receiver=receiver, serde=serde)
+
+    def wait_for_members(
+        self,
+        *members: str,
+        timeout: Union[float, None] = None,
+        interval: float = 1.0,
+    ) -> None:
+        """Block until all requested members are visible in the network.
+
+        Polls the native ChannelsMapper every *interval* seconds and returns
+        as soon as every requested peer name appears in the member list.  Use
+        this to synchronise a multi-worker environment before issuing RPC calls
+        that require specific peers to be online.
+
+        Member names are compared without the ``" (this app)"`` suffix that the
+        native layer appends to the current client's own entry, so you can
+        safely pass the current app's own name if needed.
+
+        Args:
+            *members: One or more peer names to wait for.
+            timeout:  Maximum seconds to wait.  ``None`` (default) waits
+                      indefinitely.  Raises :exc:`TimeoutError` when exceeded.
+            interval: Poll interval in seconds.  Default ``1.0``.
+
+        Raises:
+            TimeoutError: When *timeout* is set and not all members appeared
+                          within that time.
+
+        Example::
+
+            conn = client.connect()
+
+            # Wait until both workers are online before issuing any calls.
+            conn.wait_for_members("worker-1", "worker-2")
+
+            # With a deadline — raises TimeoutError after 30 s.
+            conn.wait_for_members("worker-1", timeout=30)
+        """
+        if not members:
+            return
+        needed = set(members)
+        start = time.monotonic()
+        while True:
+            raw = get_available_members(self.client._conn_num)
+            current = {m["name"].removesuffix(" (this app)") for m in raw}
+            if needed.issubset(current):
+                return
+            if timeout is not None and (time.monotonic() - start) >= timeout:
+                missing = needed - current
+                raise TimeoutError(
+                    f"Timed out after {timeout}s waiting for members: {missing}"
+                )
+            time.sleep(interval)
+
+
+class _RetryCallProxy:
+    """Proxy returned by every :class:`AutoReconnect` call method.
+
+    Intercepts the remote function name and, when the function is eventually
+    called, executes it through :meth:`AutoReconnect._connection` so the
+    connection is guaranteed to be alive (or a reconnect is attempted first).
+
+    Usage (transparent — users call the same API as with a plain
+    :class:`ClientConnection`)::
+
+        conn = AutoReconnect(client, password)
+        result = conn.rpc(timeout=5).add(1, 2)   # retries on connection loss
+    """
+
+    __slots__ = ("_ar", "_method", "_args", "_kwargs")
+
+    def __init__(
+        self,
+        ar: "AutoReconnect",
+        method: str,
+        args: tuple,
+        kwargs: dict,
+    ) -> None:
+        self._ar     = ar
+        self._method = method
+        self._args   = args
+        self._kwargs = kwargs
+
+    def __getattr__(self, func_name: str):
+        def _invoke(*call_args: Any, **call_kwargs: Any) -> Any:
+            conn  = self._ar._live_conn()
+            proxy = getattr(conn, self._method)(*self._args, **self._kwargs)
+            return getattr(proxy, func_name)(*call_args, **call_kwargs)
+        return _invoke
+
+
+class AutoReconnect:
+    """Event-driven reconnect adapter wrapping a :class:`ClientConnection`.
+
+    Returned by :meth:`~daffi.app.Client.connect` when ``autoreconnect=True``:
+
+    .. code-block:: python
+
+        conn = ClientConnection(client, password)
+        if client._autoreconnect:
+            conn = AutoReconnect(conn)
+
+    **For callers** — every call method (:meth:`rpc`, :meth:`cast`, etc.)
+    returns a :class:`_RetryCallProxy`.  When invoked the proxy checks that
+    the connection is alive (via :meth:`_live_conn`) and reconnects with
+    exponential back-off before executing the call.
+
+    **For workers** (nodes that only receive callbacks and never make outgoing
+    calls) — when the native layer detects EOF it writes to a pipe registered
+    via ``dfcore.setClientDisconnectFd``.  The existing task-dispatcher poller
+    thread wakes from ``select.select`` on that pipe and calls
+    :meth:`_on_disconnect`, which reconnects without any additional thread.
+
+    No background polling thread is used.
+
+    Example::
+
+        client = Client(app_name="worker", host="127.0.0.1", port=6000,
+                        autoreconnect=True, reconnect_delay=2.0)
+        conn = client.connect()   # returns AutoReconnect wrapping ClientConnection
+
+    Attributes:
+        conn: The wrapped :class:`ClientConnection`.
+    """
+
+    def __init__(self, conn: "ClientConnection") -> None:
+        self.conn = conn
+        # Guards _do_reconnect so concurrent callers (_live_conn from multiple
+        # user threads) never attempt simultaneous reconnects.
+        self._lock = threading.Lock()
+        # For worker connections: register a disconnect notification fd with
+        # the task dispatcher so that EOF from the native layer wakes the
+        # existing poller thread and triggers _on_disconnect immediately.
+        client = conn.client
+        if client._task_dispatcher is not None:
+            client._task_dispatcher.register_disconnect(
+                client._conn_num,
+                self._on_disconnect,
+            )
+
+    def __str__(self) -> str:
+        return f"AutoReconnect[{self.conn.client}]"
+
+    def __repr__(self) -> str:
+        return str(self)
+
+    @property
+    def client(self):
+        """The underlying :class:`~daffi.app.Client`."""
+        return self.conn.client
+
+    def _is_alive(self) -> bool:
+        """Return ``True`` when the native connection slot is still active."""
+        conn_num = self.conn.client._conn_num
+        if conn_num is None:
+            return False
+        try:
+            return dfcore.getAvailableMembers(conn_num) is not None
+        except Exception:
+            return False
+
+    def _on_disconnect(self, old_conn_num: int) -> None:
+        """Called by the task-dispatcher poller thread when the native EOF fires.
+
+        Deregisters the dead connection's fds (without stopping the poller
+        thread — we are *in* it), then blocks in the retry loop.  Because the
+        connection is dead no useful work is lost while this thread is busy
+        reconnecting.
+        """
+        with self._lock:
+            client = self.conn.client
+            td = client._task_dispatcher
+            if td is not None:
+                td._deregister_fds(old_conn_num)
+                td.connections.discard(client)
+            self._do_reconnect()
+
+    def _live_conn(self) -> "ClientConnection":
+        """Return the wrapped :class:`ClientConnection`, reconnecting first if needed.
+
+        Used by callers (outgoing RPC).  If a disconnect fd is pending it is
+        cancelled here to prevent a double-reconnect when the poller also wakes.
+        """
+        if not self._is_alive():
+            with self._lock:
+                if not self._is_alive():
+                    # Cancel any pending disc-fd callback to avoid a race.
+                    client = self.conn.client
+                    td = client._task_dispatcher
+                    if td is not None:
+                        td._deregister_fds(client._conn_num)
+                        td.connections.discard(client)
+                    self._do_reconnect()
+        return self.conn
+
+    def _do_reconnect(self) -> None:
+        """Tear down stale native state and loop until reconnected.
+
+        Must be called with :attr:`_lock` held.  Safe from both the
+        task-dispatcher poller thread (via :meth:`_on_disconnect`) and regular
+        user threads (via :meth:`_live_conn`).  The task dispatcher is *not*
+        stopped — its threads are reused for the new connection.
+        """
+        client   = self.conn.client
+        password = self.conn.password
+
+        old_num = client._conn_num
+        client._conn_num  = None
+        client._conn_type = None
+
+        if old_num is not None:
+            try:
+                dfcore.stopClient(old_num)
+            except Exception:
+                pass
+
+        while True:
+            delay = client._reconnect_delay
+            client.logger.warning(
+                f"Connection lost — reconnecting in {delay:.1f}s…"
+            )
+            time.sleep(delay)
+            try:
+                client._do_connect(password)
+                client.logger.debug("Reconnected successfully.")
+                # Re-register the disconnect fd for the fresh connection so
+                # future drops are also caught without a polling thread.
+                if client._task_dispatcher is not None:
+                    client._task_dispatcher.register_disconnect(
+                        client._conn_num,
+                        self._on_disconnect,
+                    )
+                return
+            except Exception as exc:
+                client.logger.warning(
+                    f"Reconnect failed: {exc}"
+                )
+                if client._conn_num is not None:
+                    try:
+                        dfcore.stopClient(client._conn_num)
+                    except Exception:
+                        pass
+                    client._conn_num = None
+
+    def rpc(self, *args: Any, **kwargs: Any) -> _RetryCallProxy:
+        """Reconnect-aware :meth:`~ClientConnection.rpc` proxy."""
+        return _RetryCallProxy(self, "rpc", args, kwargs)
+
+    def rpc_nowait(self, *args: Any, **kwargs: Any) -> _RetryCallProxy:
+        """Reconnect-aware :meth:`~ClientConnection.rpc_nowait` proxy."""
+        return _RetryCallProxy(self, "rpc_nowait", args, kwargs)
+
+    def cast(self, *args: Any, **kwargs: Any) -> _RetryCallProxy:
+        """Reconnect-aware :meth:`~ClientConnection.cast` proxy."""
+        return _RetryCallProxy(self, "cast", args, kwargs)
+
+    def cast_nowait(self, *args: Any, **kwargs: Any) -> _RetryCallProxy:
+        """Reconnect-aware :meth:`~ClientConnection.cast_nowait` proxy."""
+        return _RetryCallProxy(self, "cast_nowait", args, kwargs)
+
+    def stream(self, *args: Any, **kwargs: Any) -> _RetryCallProxy:
+        """Reconnect-aware :meth:`~ClientConnection.stream` proxy."""
+        return _RetryCallProxy(self, "stream", args, kwargs)
+
+    def stream_nowait(self, *args: Any, **kwargs: Any) -> _RetryCallProxy:
+        """Reconnect-aware :meth:`~ClientConnection.stream_nowait` proxy."""
+        return _RetryCallProxy(self, "stream_nowait", args, kwargs)
+
+    def wait_for_members(self, *members: str, **kwargs: Any) -> None:
+        """Reconnect-aware :meth:`~ClientConnection.wait_for_members` proxy.
+
+        Ensures the connection is alive before polling, so it is safe to call
+        even before the first successful reconnect.
+        """
+        self._live_conn().wait_for_members(*members, **kwargs)
+
+    def stop(self) -> None:
+        """Stop the underlying client (no background thread to join)."""
+        self.conn.client.stop()

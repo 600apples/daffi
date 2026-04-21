@@ -134,18 +134,31 @@ export fn parseAndStoreMessage(data: [*:0]const u8, len: u32, conn_num: u32) voi
     const payload = msg.getData();
     switch (msg.getFlag()) {
         .HANDSHAKE => {
-            client_handler.onHandshake(connection, msg) catch |err| {
-                consoleLog("failed to parse and store message: {any}\n", .{err});
-                throwError("failed to parse and store message\n");
-            };
-            if (std.mem.eql(u8, msg.getTransmitter(), client_handler.app_name)) {
-                // Notify sender about handshake completion.
+            const is_own = std.mem.eql(u8, msg.getTransmitter(), client_handler.app_name);
+            if (is_own) {
+                // Own handshake response: clear + full rebuild, then resolve the JS promise.
+                client_handler.onHandshake(connection, msg) catch |err| {
+                    consoleLog("failed to handle own handshake: {any}\n", .{err});
+                    throwError("failed to handle own handshake\n");
+                };
                 _storeMessage(payload.ptr, payload.len, uuid, false, @intFromEnum(msg.getDecoder()));
+            } else {
+                // Broadcast from another worker's reconnect: add-only so a stale
+                // broadcast arriving out-of-order cannot wipe out freshly added members.
+                client_handler.addMembersFromHandshake(connection, msg) catch |err| {
+                    consoleLog("failed to merge handshake broadcast: {any}\n", .{err});
+                };
             }
         },
         .RESPONSE => _storeMessage(payload.ptr, payload.len, uuid, false, @intFromEnum(msg.getDecoder())),
         .ERROR => _storeMessage(payload.ptr, payload.len, uuid, true, @intFromEnum(msg.getDecoder())),
-        .EVENTS => _triggerEvent(payload.ptr, payload.len),
+        .EVENTS => {
+            // Update local chan_mapper before notifying JS event handlers so
+            // that any RPC triggered from within an event handler sees the
+            // correct (already-updated) member list.
+            client_handler.onEvent(connection, msg) catch {};
+            _triggerEvent(payload.ptr, payload.len);
+        },
         else => unreachable,
     }
 }
@@ -154,4 +167,10 @@ export fn initClient(data: [*:0]const u8) usize {
     defer free(data);
     const app_name = std.mem.span(data);
     return Client.init(allocator, app_name, .{}) catch throwError("failed to initialize client\n");
+}
+
+/// Release the client slot allocated by initClient.  Must be called on
+/// reconnect so that old slots do not accumulate in the 512-entry table.
+export fn stopClient(conn_num: usize) void {
+    Client.desctroyClient(conn_num) catch {};
 }

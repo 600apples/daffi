@@ -5,7 +5,7 @@ const serde = @import("../serde.zig");
 const network = @import("../network.zig");
 const tls_impl = @import("tls.zig");
 const handlers = @import("../handlers.zig");
-const repository = @import("../repository.zig");
+const store = @import("../store.zig");
 const ClientConnection = network.ClientConnection;
 const WasmConnection = network.WasmConnection;
 // On wasm, WebConnection and ServerConnection are aliased to WasmConnection
@@ -24,13 +24,40 @@ pub const ConnectionType = enum {
 
 /// Minimal network address type — replaces std.net.Address (removed in 0.16).
 /// Native builds should populate this from the OS; for wasm it is a stub.
+///
+/// The `bytes` field stores the raw `sockaddr` structure written by the kernel
+/// (same layout as `sockaddr_in` / `sockaddr_in6` / `sockaddr_un`).
+/// Use `fmtNetAddr(addr)` with `{f}` to print as "127.0.0.1:6009".
 pub const NetAddress = struct {
     bytes: [28]u8 = [_]u8{0} ** 28,
-
-    pub fn format(_: @This(), comptime _: []const u8, _: std.fmt.FormatOptions, writer: anytype) !void {
-        try writer.writeAll("<addr>");
-    }
 };
+
+/// Format a `NetAddress` for display.
+/// Example: `std.debug.print("from {f}\n", .{fmtNetAddr(addr)});`
+pub fn fmtNetAddr(addr: NetAddress) std.fmt.Alt(NetAddress, formatNetAddrFn) {
+    return .{ .data = addr };
+}
+
+fn formatNetAddrFn(addr: NetAddress, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+    // bytes[0..2] = sin_family (u16, native/little-endian on Linux/macOS)
+    const family = std.mem.readInt(u16, addr.bytes[0..2], .little);
+    switch (family) {
+        2 => { // AF_INET — sockaddr_in: [family u16][port u16 BE][addr u32 BE]
+            const port = std.mem.readInt(u16, addr.bytes[2..4], .big);
+            const ip   = addr.bytes[4..8];
+            try writer.print("{d}.{d}.{d}.{d}:{d}", .{ ip[0], ip[1], ip[2], ip[3], port });
+        },
+        10 => { // AF_INET6 — sockaddr_in6
+            const port = std.mem.readInt(u16, addr.bytes[2..4], .big);
+            try writer.print("[ipv6]:{d}", .{port});
+        },
+        1 => { // AF_UNIX — sun_path starts at bytes[2]
+            const path = std.mem.sliceTo(addr.bytes[2..], 0);
+            try writer.print("unix:{s}", .{path});
+        },
+        else => try writer.writeAll("<unknown addr>"),
+    }
+}
 
 /// Accepted connection descriptor — replaces std.net.Server.Connection (removed in 0.16).
 pub const AcceptedConnection = struct {
@@ -69,6 +96,8 @@ pub fn Connection(comptime contype: ConnectionType) type {
         wlock: bool = false,
         suspended: bool = false,
         is_websocket: bool = false,
+        /// Remote peer address, set on accepted client connections.
+        peer_addr: ?NetAddress = null,
 
         pub const Self = @This();
         pub const Config = T.Config;
@@ -128,13 +157,15 @@ pub fn Connection(comptime contype: ConnectionType) type {
 
                 const pnet_addr = @import("posix_net.zig").Address{};
                 if (is_wss) {
-                    std.debug.print("accepted WSS connection: {any}\n", .{addr});
+                    if (comptime @import("builtin").mode == .Debug)
+                        std.debug.print("accepted WSS connection from {f}\n", .{fmtNetAddr(addr)});
                     const client = try WebConnection.initWithTls(self.allocator, stream, pnet_addr, .{}, ssl);
-                    new_self.* = .{ .ctx = client, .op_table = WebConnection.op_table, .allocator = self.allocator, .is_websocket = true };
+                    new_self.* = .{ .ctx = client, .op_table = WebConnection.op_table, .allocator = self.allocator, .is_websocket = true, .peer_addr = addr };
                 } else {
-                    std.debug.print("accepted TLS connection: {any}\n", .{addr});
+                    if (comptime @import("builtin").mode == .Debug)
+                        std.debug.print("accepted TLS connection from {f}\n", .{fmtNetAddr(addr)});
                     const client = try ClientConnection.initFromTlsHandshake(self.allocator, conn.fd, ssl);
-                    new_self.* = .{ .ctx = client, .op_table = ClientConnection.op_table, .allocator = self.allocator };
+                    new_self.* = .{ .ctx = client, .op_table = ClientConnection.op_table, .allocator = self.allocator, .peer_addr = addr };
                 }
                 return new_self;
             }
@@ -144,14 +175,16 @@ pub fn Connection(comptime contype: ConnectionType) type {
             defer sync_parser.deinit();
             const is_websocket = try sync_parser.tryWebSocket(stream);
             if (is_websocket) {
-                std.debug.print("accepted web connection: {any}\n", .{addr});
+                if (comptime @import("builtin").mode == .Debug)
+                    std.debug.print("accepted web connection from {f}\n", .{fmtNetAddr(addr)});
                 const pnet_addr = @import("posix_net.zig").Address{};
                 const client = try WebConnection.init(self.allocator, stream, pnet_addr, .{});
-                new_self.* = .{ .ctx = client, .op_table = WebConnection.op_table, .allocator = self.allocator, .is_websocket = true };
+                new_self.* = .{ .ctx = client, .op_table = WebConnection.op_table, .allocator = self.allocator, .is_websocket = true, .peer_addr = addr };
             } else {
-                std.debug.print("accepted connection: {any}\n", .{addr});
+                if (comptime @import("builtin").mode == .Debug)
+                    std.debug.print("accepted connection from {f}\n", .{fmtNetAddr(addr)});
                 const client = try ClientConnection.initFromAccepted(self.allocator, conn.fd);
-                new_self.* = .{ .ctx = client, .op_table = ClientConnection.op_table, .allocator = self.allocator };
+                new_self.* = .{ .ctx = client, .op_table = ClientConnection.op_table, .allocator = self.allocator, .peer_addr = addr };
             }
             return new_self;
         }

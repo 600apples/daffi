@@ -5,22 +5,25 @@ const net = std.net;
 const handlers = @import("../handlers.zig");
 const serde = @import("../serde.zig");
 const network = @import("../network.zig");
-const repository = @import("../repository.zig");
+const fmtNetAddr = @import("../network/connection.zig").fmtNetAddr;
+const store = @import("../store.zig");
 const Allocator = mem.Allocator;
 const ArenaAllocator = std.heap.ArenaAllocator;
 const Message = serde.Message;
 const RawMessage = serde.RawMessage;
 const Handshake = serde.Handshake;
+const Event = serde.Event;
 const MessageFlag = serde.MessageFlag;
 const ConnectionType = network.ConnectionType;
 const Connection = network.Connection;
 const MessagePool = serde.MessagePool;
 const MessageHandler = handlers.MessageHandler;
-const ClientMessageStore = repository.ClientMessageStore;
-const ChannelsMapper = repository.ChannelsMapper;
-const TasksQueue = repository.TasksQueue;
+const ClientMessageStore = store.ClientMessageStore;
+const ChannelsMapper = store.ChannelsMapper;
+const TasksQueue = store.TasksQueue;
 const misc = @import("../misc.zig");
 const print = misc.print;
+const debugPrint = misc.debugPrint;
 const Mutex = misc.Mutex;
 
 pub const HandlerMode = enum {
@@ -126,8 +129,14 @@ pub fn ServerHandler(comptime HandlerConnectionT: ConnectionType) type {
             fn sendToConnection(_: *Self, comptime MessageT: type, conn: *ParentConnT, message: *MessageT) !void {
                 message.sendTo(conn) catch |err| {
                     switch (err) {
-                        error.NotOpenForWriting, error.BrokenPipe => print("error while sending message\n", .{}),
-                        else => print("failed to send message to {any}: {any}\n", .{ conn.getAddr().?, err }),
+                        error.NotOpenForWriting, error.BrokenPipe, error.WriteError => {},
+                        else => {
+                            if (conn.getAddr()) |addr| {
+                                print("failed to send message to {f}: {any}\n", .{ fmtNetAddr(addr), err });
+                            } else {
+                                print("failed to send message (connection already closed): {any}\n", .{err});
+                            }
+                        },
                     }
                 };
             }
@@ -186,11 +195,13 @@ pub fn ServerHandler(comptime HandlerConnectionT: ConnectionType) type {
             }
 
             fn errorHandler(_: *Self, conn: *ParentConnT, err: anyerror) !void {
-                const addr = conn.getAddr() orelse null;
                 switch (err) {
-                    error.EOF => print("connection closed by peer: {any}\n", .{addr}),
-                    error.IncompleteMessage => print("incomplete message from {any}\n", .{addr}),
-                    else => print("failed to receive message from none: {any}\n", .{err}),
+                    error.EOF => {},
+                    error.IncompleteMessage => if (comptime @import("builtin").mode == .Debug) {
+                        const addr = conn.getAddr();
+                        print("incomplete message from {?}\n", .{addr});
+                    },
+                    else => print("failed to receive message: {}\n", .{err}),
                 }
             }
         };
@@ -199,6 +210,7 @@ pub fn ServerHandler(comptime HandlerConnectionT: ConnectionType) type {
             chan_mapper: *ChannelsMapperT,
             app_name: []const u8,
             allocator: Allocator,
+            mutex: Mutex = .{},
 
             const Self = @This();
             pub const ParentConnT = ConnectionT;
@@ -217,7 +229,7 @@ pub fn ServerHandler(comptime HandlerConnectionT: ConnectionType) type {
 
             fn findChannel(self: *Self, method: ?[]const u8, receiver: []const u8) ?ChannelsMapperT.Channel {
                 var chan = self.chan_mapper.getChannel(receiver) catch {
-                    print("Something went wrong. No channel for receiver: {s}\n", .{receiver});
+                    debugPrint("No channel for receiver: {s}\n", .{receiver});
                     return null;
                 };
                 if (method == null or chan.containsMethod(method.?)) return chan;
@@ -227,14 +239,22 @@ pub fn ServerHandler(comptime HandlerConnectionT: ConnectionType) type {
             fn sendToConnection(_: *Self, comptime MessageT: type, conn: *ParentConnT, message: *MessageT) !void {
                 message.sendTo(conn) catch |err| {
                     switch (err) {
-                        error.NotOpenForWriting, error.BrokenPipe => print("error while sending message\n", .{}),
-                        else => print("failed to send message to {any}: {any}\n", .{ conn.getAddr().?, err }),
+                        error.NotOpenForWriting, error.BrokenPipe, error.WriteError => {},
+                        else => {
+                            if (conn.getAddr()) |addr| {
+                                print("failed to send message to {f}: {any}\n", .{ fmtNetAddr(addr), err });
+                            } else {
+                                print("failed to send message (connection already closed): {any}\n", .{err});
+                            }
+                        },
                     }
                 };
             }
 
             // ----------------------------- ROUTER HANDLERS -----------------------------
             fn onHandshake(self: *Self, conn: *ParentConnT, message: *Message) !void {
+                self.mutex.lock();
+                defer self.mutex.unlock();
                 var arena = ArenaAllocator.init(self.allocator);
                 defer arena.deinit();
                 var allocator = arena.allocator();
@@ -251,9 +271,12 @@ pub fn ServerHandler(comptime HandlerConnectionT: ConnectionType) type {
                         for (methods) |mt| try chan.addMethod(mt);
                     }
                 }
-                const chan_count = self.chan_mapper.ChannelsCount();
-                var memberdata = try allocator.alloc(Handshake.MemberData, chan_count);
-                for (self.chan_mapper.allChannels(), 0..) |*c, idx| {
+                // Capture allChannels() once so chan_count and the slice are consistent.
+                // Holding self.mutex prevents concurrent onHandshake/diconnectionHandler
+                // from modifying the ChannelsMapper between the count check and iteration.
+                const all_chans = self.chan_mapper.allChannels();
+                var memberdata = try allocator.alloc(Handshake.MemberData, all_chans.len);
+                for (all_chans, 0..) |*c, idx| {
                     memberdata[idx] = .{ .name = c.connection_name, .methods = try c.joinedMethods(allocator, serde.UNIT_SEPARATOR) };
                 }
                 var router_hs = try Handshake.create(allocator, memberdata, null, "router");
@@ -271,15 +294,17 @@ pub fn ServerHandler(comptime HandlerConnectionT: ConnectionType) type {
             }
 
             fn onRequest(self: *Self, _: *ParentConnT, message: *Message) !void {
-                if (self.findChannel(message.getFuncName(), message.getReceiver())) |c| try self.sendToConnection(Message, c.conn, message) else print("No connections found for message: {any}\n", .{message});
+                if (self.findChannel(message.getFuncName(), message.getReceiver())) |c| try self.sendToConnection(Message, c.conn, message) else debugPrint("No route for request to: {s}\n", .{message.getReceiver()});
             }
 
             fn onResponse(self: *Self, _: *ParentConnT, message: *Message) !void {
-                if (self.findChannel(null, message.getReceiver())) |*c| try self.sendToConnection(Message, c.conn, message) else print("No connections found for message: {any}\n", .{message});
+                if (self.findChannel(null, message.getReceiver())) |*c| try self.sendToConnection(Message, c.conn, message) else debugPrint("No route for response to: {s}\n", .{message.getReceiver()});
             }
 
             // --------------------- ROUTER CONNECTION LIFECYCLE ----------------------
             fn diconnectionHandler(self: *Self, conn: *ParentConnT) !void {
+                self.mutex.lock();
+                defer self.mutex.unlock();
                 var arena = ArenaAllocator.init(self.allocator);
                 defer arena.deinit();
                 var allocator = arena.allocator();
@@ -287,10 +312,10 @@ pub fn ServerHandler(comptime HandlerConnectionT: ConnectionType) type {
                 const chan = self.chan_mapper.getChannelByConnection(conn) orelse return error.ChannelNotFound;
                 const connection_name = try allocator.dupe(u8, chan.connection_name); // for event
                 self.chan_mapper.destroyChannel(chan);
-                // Updated handshake message for all channels.
-                const chan_count = self.chan_mapper.ChannelsCount();
-                var memberdata = try allocator.alloc(Handshake.MemberData, chan_count);
-                for (self.chan_mapper.allChannels(), 0..) |*c, idx| {
+                // Capture allChannels() once after the removal so count and slice are consistent.
+                const all_chans = self.chan_mapper.allChannels();
+                var memberdata = try allocator.alloc(Handshake.MemberData, all_chans.len);
+                for (all_chans, 0..) |*c, idx| {
                     memberdata[idx] = .{ .name = c.connection_name, .methods = try c.joinedMethods(allocator, serde.UNIT_SEPARATOR) };
                 }
                 var handshake_message = try serde.createHandshakeMessage(self.allocator, memberdata, 0, null, "router");
@@ -304,11 +329,13 @@ pub fn ServerHandler(comptime HandlerConnectionT: ConnectionType) type {
             }
 
             fn errorHandler(_: *Self, conn: *ParentConnT, err: anyerror) !void {
-                const addr = conn.getAddr() orelse null;
                 switch (err) {
-                    error.EOF => print("connection closed by peer: {any}\n", .{addr}),
-                    error.IncompleteMessage => print("incomplete message from {any}\n", .{addr}),
-                    else => print("failed to receive message from none: {any}\n", .{err}),
+                    error.EOF => {},
+                    error.IncompleteMessage => if (comptime @import("builtin").mode == .Debug) {
+                        const addr = conn.getAddr();
+                        print("incomplete message from {?}\n", .{addr});
+                    },
+                    else => print("failed to receive message: {}\n", .{err}),
                 }
             }
         };
@@ -361,7 +388,7 @@ pub const ClientHandler = struct {
         if (receiver) |rec| {
             if (mem.eql(u8, rec, self.app_name)) return error.ReceiverNotFound;
             var chan = self.chan_mapper.getChannel(rec) catch {
-                print("Something went wrong. No channel for receiver: {s}\n", .{rec});
+                debugPrint("No channel for receiver: {s}\n", .{rec});
                 return error.ReceiverNotFound;
             };
             if (chan.containsMethod(method)) return chan.connection_name;
@@ -388,6 +415,10 @@ pub const ClientHandler = struct {
     }
 
     // ----------------------------- CLIENT HANDLERS -----------------------------
+
+    /// Full (re)build of the local chan_mapper from a HANDSHAKE response.
+    /// Used for the client's *own* handshake response (transmitter == app_name)
+    /// so the initial authoritative member list is applied cleanly.
     pub fn onHandshake(self: *Self, conn: *ParentConnT, message: *Message) !void {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -410,6 +441,42 @@ pub const ClientHandler = struct {
         }
     }
 
+    /// Add-only update of the chan_mapper from a broadcast HANDSHAKE message.
+    /// Unlike onHandshake this does NOT call clearAllChannels, so a stale
+    /// broadcast arriving out-of-order cannot wipe out members that a fresher
+    /// broadcast already added.  Existing channels that are absent from the
+    /// broadcast are left untouched; they are removed when a "disconnected"
+    /// event arrives via onEvent.
+    pub fn addMembersFromHandshake(self: *Self, conn: *ParentConnT, message: *Message) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        var arena = ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const alloc = arena.allocator();
+        const client_hs = Handshake.fromJson(alloc, message.getData()) catch |err| {
+            print("failed to parse broadcast handshake: {s}", .{@errorName(err)});
+            return;
+        };
+        for (client_hs.value.members) |mb| {
+            var chan = try self.chan_mapper.getOrCreateChannel(conn, mb.name);
+            chan.clear();
+            if (mb.methods) |methods| {
+                for (methods) |mt| try chan.addMethod(mt);
+            }
+        }
+    }
+
+    /// Remove a disconnected member from the local chan_mapper when a
+    /// "disconnected" event arrives from the router.
+    pub fn onEvent(self: *Self, _: *ParentConnT, message: *Message) !void {
+        var arena = ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const event = Event.fromJson(arena.allocator(), message.getData()) catch return;
+        if (std.mem.eql(u8, event.value.type, "disconnected")) {
+            self.chan_mapper.destroyChannelByName(event.value.member);
+        }
+    }
+
     pub fn onRequest(self: *Self, _: *ParentConnT, message: *Message) !void {
         // put message to message queue for processing by client worker.
         message.setDurable();
@@ -427,12 +494,13 @@ pub const ClientHandler = struct {
 
     fn errorHandler(_: *Self, conn: *ParentConnT, err: anyerror) !void {
         conn.suspended = true;
-        // conn.kin.close(); // TODO: use deinit
-        const addr = conn.getAddr() orelse null;
         switch (err) {
-            error.EOF => print("connection closed by peer: {any}\n", .{addr}),
-            error.IncompleteMessage => print("incomplete message from {any}\n", .{addr}),
-            else => print("failed to receive message from none: {any}\n", .{err}),
+            error.EOF => {},
+            error.IncompleteMessage => if (comptime @import("builtin").mode == .Debug) {
+                const addr = conn.getAddr();
+                print("incomplete message from {?}\n", .{addr});
+            },
+            else => print("failed to receive message: {}\n", .{err}),
         }
     }
 };

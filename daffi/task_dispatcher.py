@@ -46,6 +46,7 @@ from daffi.bindings import (
     send_message_from_service,
     set_wakeup_fd,
     set_client_wakeup_fd,
+    set_client_disconnect_fd,
     MessageFlag,
 )
 
@@ -207,19 +208,50 @@ class TaskDispatcher:
         self._wakeup: dict[int, _WakeupFd] = {}
         # read_fd → connection object
         self._fd_to_conn: dict[int, Any] = {}
+        # read_fd → (conn_num, callback, _WakeupFd) for disconnect notifications
+        self._disc_by_rfd: dict[int, tuple] = {}
 
     def stop_for_connection(self, connection) -> None:
         """Deregister *connection* and, if no connections remain, stop all threads."""
         self.connections.discard(connection)
         conn_num = getattr(connection, "_conn_num", None)
-        if conn_num is not None and conn_num in self._wakeup:
-            wakeup = self._wakeup.pop(conn_num)
-            self._fd_to_conn.pop(wakeup.read_fd, None)
-            wakeup.close()
+        self._deregister_fds(conn_num)
         if not self.connections:
             self.stop_event.set()
             for thread in self.threads:
                 thread.join()
+
+    def _deregister_fds(self, conn_num) -> None:
+        """Remove wakeup and disconnect fds for *conn_num* without stopping threads.
+
+        Safe to call from the poller thread during reconnect.
+        """
+        if conn_num is None:
+            return
+        if conn_num in self._wakeup:
+            wakeup = self._wakeup.pop(conn_num)
+            self._fd_to_conn.pop(wakeup.read_fd, None)
+            wakeup.close()
+        # Remove any pending disconnect fd for this conn_num.
+        to_remove = [rfd for rfd, (cn, _, _) in self._disc_by_rfd.items() if cn == conn_num]
+        for rfd in to_remove:
+            _, _, disc = self._disc_by_rfd.pop(rfd)
+            disc.close()
+
+    def register_disconnect(self, conn_num: int, callback) -> None:
+        """Register an event-driven disconnect notification for *conn_num*.
+
+        Creates a pipe whose write end is handed to the native layer.  When the
+        connection drops the native layer writes to it; the poller thread wakes
+        from ``select.select``, drains the fd, and calls *callback(conn_num)*.
+
+        *callback* is invoked **from the poller thread** and may block (e.g.
+        during a reconnect retry loop) — that is intentional: the connection is
+        dead anyway so stalling the poller is acceptable.
+        """
+        disc = _WakeupFd()
+        self._disc_by_rfd[disc.read_fd] = (conn_num, callback, disc)
+        set_client_disconnect_fd(conn_num, disc.write_fd)
 
     def start_for_connection(self, connection) -> None:
         """Register *connection* and start background threads if not already running."""
@@ -258,22 +290,44 @@ class TaskDispatcher:
     def handle_task_queue(self) -> None:
         """Wait for native notifications, then execute or enqueue each task.
 
-        * ``workers == 0``: callbacks run here, inline — no queue, no thread hop.
-        * ``workers  > 0``: tasks are put into the shared queue for worker threads.
+        * ``workers == 1``: callbacks run here, inline — no queue, no thread hop.
+        * ``workers  > 1``: tasks are put into the shared queue for worker threads.
+
+        Disconnect fds (registered via :meth:`register_disconnect`) are also
+        monitored here.  When one fires the registered callback is invoked
+        directly in this thread — it may block during a reconnect retry loop,
+        which is intentional (the connection is dead anyway).
         """
         inline = self.workers == 1
 
         while not self.stop_event.is_set():
-            read_fds = list(self._fd_to_conn.keys())
-            if read_fds:
+            wakeup_fds = list(self._fd_to_conn.keys())
+            disc_fds = list(self._disc_by_rfd.keys())
+            all_fds = wakeup_fds + disc_fds
+            if all_fds:
                 try:
-                    readable, _, _ = select.select(read_fds, [], [], self._POLL_INTERVAL)
+                    readable, _, _ = select.select(all_fds, [], [], self._POLL_INTERVAL)
                 except (ValueError, OSError):
                     readable = []
             else:
                 time.sleep(self._POLL_INTERVAL)
                 readable = []
 
+            # --- Handle disconnect notifications first ---
+            for rfd in readable:
+                if rfd not in self._disc_by_rfd:
+                    continue
+                conn_num, callback, disc = self._disc_by_rfd.pop(rfd)
+                disc.drain()
+                disc.close()
+                # callback(conn_num) may block here during the reconnect loop.
+                # That is intentional — the connection is dead anyway.
+                try:
+                    callback(conn_num)
+                except Exception:
+                    pass
+
+            # --- Handle normal wakeup notifications ---
             notified: set = set()
             for rfd in readable:
                 conn = self._fd_to_conn.get(rfd)

@@ -31,10 +31,14 @@ def _warn_if_no_return(name: str, func) -> None:
 
     Functions without a return annotation are left unchecked — they may
     intentionally return ``None`` or be used only with ``stream()``.
+
+    Handles both evaluated annotations (``ret is None``) and PEP 563 stringified
+    annotations (``from __future__ import annotations``) where the raw annotation
+    is the string ``'None'`` rather than the ``None`` singleton.
     """
     try:
         ret = signature(func).return_annotation
-        if ret is None:
+        if ret is None or ret == "None":
             warnings.warn(
                 f"Callback {name!r} is annotated '-> None'. Callers using "
                 f"rpc() will always receive None. Use stream() for "

@@ -1,10 +1,9 @@
 const std = @import("std");
 const misc = @import("misc.zig");
-const web = @import("web.zig");
 const serde = @import("serde.zig");
 const network = @import("network.zig");
 const handlers = @import("handlers.zig");
-const repository = @import("repository.zig");
+const store = @import("store.zig");
 const posix = std.posix;
 
 const Allocator = std.mem.Allocator;
@@ -58,7 +57,6 @@ fn setSignalHandler() !void {
                     entry.connection.close();
                 }
             }
-            std.debug.print("Exiting...\n", .{});
             std.process.exit(0);
         }
     }.internal_handler;
@@ -170,7 +168,12 @@ pub fn messageDispatcher(allocator: Allocator, app_name: []const u8, config: Ser
 }
 
 fn serverLoop(conn: *ServerHandler.ConnectionT, msgpool: *MessagePool, msg_handler: anytype) !void {
-    defer conn.destroy();
+    defer {
+        if (comptime @import("builtin").mode == .Debug)
+            if (conn.peer_addr) |addr|
+                std.debug.print("connection closed from {f}\n", .{@import("network/connection.zig").fmtNetAddr(addr)});
+        conn.destroy();
+    }
     while (msgpool.receiveMessage(conn)) |message| {
         // OWNERSHIP PROTOCOL
         // ------------------
@@ -216,7 +219,12 @@ fn serverLoop(conn: *ServerHandler.ConnectionT, msgpool: *MessagePool, msg_handl
 }
 
 fn serverWsLoop(conn: *ServerHandler.ConnectionT, msgpool: *MessagePool, msg_handler: anytype) !void {
-    defer conn.destroy();
+    defer {
+        if (comptime @import("builtin").mode == .Debug)
+            if (conn.peer_addr) |addr|
+                std.debug.print("connection closed from {f}\n", .{@import("network/connection.zig").fmtNetAddr(addr)});
+        conn.destroy();
+    }
     while (msgpool.receiveWsMessage(conn)) |maybe_message| {
         var message = maybe_message orelse break;
         // Apply the same ownership protocol as serverLoop (see detailed comment

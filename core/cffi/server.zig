@@ -58,9 +58,6 @@ pub fn startServer(_: [*c]PyObject, args: [*c]PyObject) callconv(.c) [*c]PyObjec
     const ptls = tls_enabled != 0;
     const pcert_file = std.mem.span(cert_file);
     const pkey_file = std.mem.span(key_file);
-    std.debug.print("host: {s}, port: {d}\n", .{ phost, pport });
-    std.debug.print("mode: {s}\n", .{if (pmode == .Router) "Router" else "Service"});
-
     if (serverHandlerThreads == null) {
         serverHandlerThreads = ThreadArray{};
     }

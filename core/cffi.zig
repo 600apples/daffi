@@ -20,3 +20,4 @@ pub const getMessageFromClientStore = @import("cffi/client.zig").getMessageFromC
 pub const setTimeoutError           = @import("cffi/client.zig").setTimeoutError;
 pub const getMessageForClientWorker = @import("cffi/client.zig").getMessageForClientWorker;
 pub const setClientWakeupFd         = @import("cffi/client.zig").setClientWakeupFd;
+pub const setClientDisconnectFd     = @import("cffi/client.zig").setClientDisconnectFd;

@@ -60,10 +60,6 @@ class SerdeFormat:
     or tracebacks).  Requires the optional ``msgpack`` package — install with
     ``pip install 'daffi[msgpack]'``."""
 
-    # Deprecated alias — ``RAW`` was renamed to ``OPAQUE`` to better convey
-    # that the framework does not interpret the payload (the data is opaque
-    # to it, not necessarily binary).  Kept for backward compatibility.
-    RAW = OPAQUE
 
 
 class Serializer:

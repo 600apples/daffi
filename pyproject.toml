@@ -1,22 +1,21 @@
 [build-system]
-requires = ["setuptools>=68", "wheel"]
+requires = ["setuptools>=77", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "daffi"
 version = "0.1.0"
-description = "Lightweight inter-process RPC framework with a Zig native core"
+description = "Lightweight inter-process RPC framework with a high-performance native core"
 readme = "README.md"
-license = { text = "MIT" }
+license = "MIT"
 requires-python = ">=3.10"
 authors = [
     { name = "Volodymyr Boiko", email = "600apples@gmail.com" },
 ]
-keywords = ["rpc", "ipc", "distributed", "messaging", "networking", "zig"]
+keywords = ["rpc", "ipc", "distributed", "messaging", "networking", "websocket"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
-    "License :: OSI Approved :: MIT License",
     "Operating System :: POSIX :: Linux",
     "Operating System :: MacOS",
     "Programming Language :: Python :: 3",
@@ -92,3 +91,18 @@ before-all = """
 
 # delocate bundles dylibs into the wheel automatically
 repair-wheel-command = "delocate-wheel --require-archs {delocate_archs} -w {dest_dir} {wheel}"
+
+
+[tool.hatch.envs.docs]
+dependencies = [
+    "mkdocs-material>=9.4",
+    "mkdocs-section-index>=0.3",
+]
+
+[tool.hatch.envs.docs.env-vars]
+DISABLE_MKDOCS_2_WARNING = "true"
+
+[tool.hatch.envs.docs.scripts]
+serve = "mkdocs serve --dev-addr 127.0.0.1:8000"
+build = "mkdocs build --strict"
+clean = "rm -rf mkdocs_files"

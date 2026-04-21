@@ -68,34 +68,50 @@
     el.scrollTop = el.scrollHeight;
   };
 
-  let conn = null;
+  let client = null;
+  let conn   = null;
+
+  const setConnected = (yes) => {
+    ['btnSummarise','btnTransform','btnDisconnect'].forEach(id =>
+      document.getElementById(id).disabled = !yes);
+    document.getElementById('btnConnect').disabled = yes;
+  };
 
   document.getElementById('btnConnect').onclick = async () => {
     const url = document.getElementById('wsUrl').value;
     log(`Connecting to router at ${url} …`, 'inf');
     try {
-      const client = new DaffiClient('browser-mp-caller', {
-        wsUrl:    url,
-        wasmPath: '../../app.wasm',
+      client = new DaffiClient('browser-mp-caller', {
+        wsUrl:          url,
+        wasmPath:       '../../app.wasm',
+        autoreconnect:  true,   // reconnect automatically when the router restarts
+        reconnectDelay: 2000,   // first retry after 2 s; then 4 s, 8 s … up to 60 s
       });
-      client.addEventHandler(e => log(`event: ${e.member} → ${e.type}`, 'inf'));
+      client.addEventHandler((e) => {
+        log(`event: ${e.member} → ${e.type}`, 'inf');
+        // Update button state when our own connection drops / comes back.
+        if (e.member === 'browser-mp-caller') {
+          setConnected(e.type === 'connected');
+        }
+      });
       conn = await client.connect();
-      log('Connected to router!', 'ok');
-      ['btnSummarise','btnTransform','btnDisconnect'].forEach(id => document.getElementById(id).disabled = false);
-      document.getElementById('btnConnect').disabled = true;
+      log('Connected to router! (auto-reconnect enabled)', 'ok');
+      setConnected(true);
     } catch (err) {
       log(`Connect failed: ${err}`, 'err');
     }
   };
 
   document.getElementById('btnDisconnect').onclick = () => {
-    conn = null;
+    if (client) client.stop();
+    client = null;
+    conn   = null;
     log('Disconnected.', 'inf');
-    ['btnSummarise','btnTransform','btnDisconnect'].forEach(id => document.getElementById(id).disabled = true);
-    document.getElementById('btnConnect').disabled = false;
+    setConnected(false);
   };
 
   document.getElementById('btnSummarise').onclick = async () => {
+    if (!conn) { log('Not connected', 'err'); return; }
     let records;
     try { records = JSON.parse(document.getElementById('records').value); }
     catch { log('Invalid JSON in records field', 'err'); return; }
@@ -107,6 +123,7 @@
   };
 
   document.getElementById('btnTransform').onclick = async () => {
+    if (!conn) { log('Not connected', 'err'); return; }
     let item;
     try { item = JSON.parse(document.getElementById('item').value); }
     catch { log('Invalid JSON in item field', 'err'); return; }

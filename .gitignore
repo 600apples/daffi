@@ -28,6 +28,9 @@ env/
 /.lh/
 /.history/
 
+# MkDocs generated site (mkdocs build output)
+/mkdocs_files/
+
 # JetBrains (IntelliJ, PyCharm, CLion, GoLand, RustRover, etc.)
 .idea/
 *.iml
@@ -81,4 +84,3 @@ htmlcov/
 *.bak
 *.tmp
 test_map
-app.wasm

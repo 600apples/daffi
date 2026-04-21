@@ -1,0 +1,214 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>daffi — cast_nowait()</title>
+  <script src="../../daffi.js"></script>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 740px; margin: 40px auto; padding: 0 16px; background: #0f0f0f; color: #e0e0e0; }
+    h1   { color: #60a5fa; margin-bottom: 4px; }
+    p    { color: #94a3b8; margin-top: 0; font-size: 0.9rem; }
+    code { background: #1e1e2e; padding: 1px 6px; border-radius: 4px; font-size: 0.85em; }
+    .card { background: #1e1e2e; border-radius: 8px; padding: 16px 20px; margin-bottom: 16px; }
+    label { display: block; margin-bottom: 8px; color: #94a3b8; font-size: 0.85rem; }
+    input[type=text], textarea {
+      background: #13131f; border: 1px solid #374151; border-radius: 6px;
+      color: #e0e0e0; padding: 6px 10px; margin-right: 6px;
+    }
+    textarea { width: 100%; box-sizing: border-box; font-family: monospace; font-size: 0.82rem; resize: vertical; }
+    button {
+      background: #2563eb; color: #fff; border: none; border-radius: 6px;
+      padding: 7px 16px; cursor: pointer; font-size: 0.9rem; margin-right: 6px; margin-top: 4px;
+    }
+    button:disabled { background: #374151; cursor: not-allowed; }
+    button.connect  { background: #10b981; }
+    button.danger   { background: #ef4444; }
+    button.partial  { background: #7c3aed; }
+
+    /* worker checkboxes */
+    .worker-checks { display: flex; gap: 14px; margin: 10px 0 14px; flex-wrap: wrap; }
+    .worker-checks label {
+      display: flex; align-items: center; gap: 6px; cursor: pointer;
+      font-size: 0.88rem; color: #c4b5fd; user-select: none; margin-bottom: 0;
+    }
+    .worker-checks input[type=checkbox] { accent-color: #7c3aed; width: 15px; height: 15px; cursor: pointer; }
+
+    /* worker status badges */
+    .workers { display: flex; gap: 10px; margin-top: 10px; flex-wrap: wrap; }
+    .worker-badge {
+      background: #1f2937; border: 1px solid #374151; border-radius: 6px;
+      padding: 6px 14px; font-family: monospace; font-size: 0.82rem; color: #9ca3af;
+      transition: all 0.2s;
+    }
+    .worker-badge.sent { border-color: #3b82f6; color: #93c5fd; background: #1e3a5f; }
+
+    #log { background: #13131f; border-radius: 6px; padding: 12px; min-height: 100px;
+           font-family: monospace; font-size: 0.82rem; white-space: pre-wrap;
+           color: #a0aec0; overflow-y: auto; max-height: 220px; }
+    .ok  { color: #34d399; }
+    .err { color: #f87171; }
+    .inf { color: #60a5fa; }
+    .dim { color: #6b7280; }
+  </style>
+</head>
+<body>
+
+<h1>daffi — <code>cast_nowait()</code></h1>
+<p>
+  Broadcasts a call to <strong>all three workers</strong> — no waiting, no result.
+  Check each worker's terminal to confirm the message arrived.
+</p>
+<p>Start order: <code>1_router.py</code> → <code>2_worker_a.py</code> →
+  <code>3_worker_b.py</code> → <code>4_worker_c.py</code> → open this page.</p>
+
+<div class="card">
+  <label>Router WebSocket URL</label>
+  <input type="text" id="wsUrl" value="ws://127.0.0.1:6021" style="width:220px">
+  <button class="connect" id="btnConnect">Connect</button>
+  <button class="danger"  id="btnDisconnect" disabled>Disconnect</button>
+</div>
+
+<!-- notify -->
+<div class="card">
+  <label>
+    <strong>cast_nowait notify(message)</strong> — fire a string message to all workers.
+    No reply is expected; verify delivery in each worker's terminal.
+  </label>
+  <input type="text" id="notifyMsg" value="hello from the browser" style="width:280px">
+  <button id="btnNotify" disabled>cast_nowait().notify()</button>
+
+  <div class="workers" id="workersBadges">
+    <div class="worker-badge" id="badge-A">worker-A</div>
+    <div class="worker-badge" id="badge-B">worker-B</div>
+    <div class="worker-badge" id="badge-C">worker-C</div>
+  </div>
+</div>
+
+<!-- process -->
+<div class="card">
+  <label>
+    <strong>cast_nowait process(payload)</strong> — fire a JSON payload to all workers.
+  </label>
+  <textarea id="processPayload" rows="3">{"event": "user_action", "data": {"clicks": 42, "page": "/home"}}</textarea>
+  <br><br>
+  <button id="btnProcess" disabled>cast_nowait().process()</button>
+</div>
+
+<!-- partial cast_nowait -->
+<div class="card">
+  <label>
+    <strong>Partial cast_nowait</strong> — fire <code>notify()</code> only to a chosen
+    subset via <code>options.receiver</code>.  Only the ticked worker badges will flash.
+  </label>
+  <div class="worker-checks">
+    <label><input type="checkbox" id="chkA"         > worker-A</label>
+    <label><input type="checkbox" id="chkB" checked > worker-B</label>
+    <label><input type="checkbox" id="chkC"         > worker-C</label>
+  </div>
+  <input type="text" id="partialMsg" value="targeted broadcast" style="width:240px">
+  <button class="partial" id="btnPartialNotify" disabled>cast_nowait(receiver=[…]).notify()</button>
+</div>
+
+<div class="card">
+  <label>Log</label>
+  <div id="log"></div>
+</div>
+
+<script>
+  const log = (msg, cls) => {
+    const el = document.getElementById('log');
+    el.innerHTML += `<span class="${cls||''}">${msg}</span>\n`;
+    el.scrollTop = el.scrollHeight;
+  };
+
+  /* Briefly highlight the specified badges (default: all three). */
+  function flashWorkers(names) {
+    const map = { 'worker-A': 'badge-A', 'worker-B': 'badge-B', 'worker-C': 'badge-C' };
+    const ids = names
+      ? names.map(n => map[n]).filter(Boolean)
+      : ['badge-A','badge-B','badge-C'];
+    ids.forEach(id => {
+      const el = document.getElementById(id);
+      el.classList.add('sent');
+      setTimeout(() => el.classList.remove('sent'), 1200);
+    });
+  }
+
+  let conn = null;
+
+  const setButtons = (on) => {
+    ['btnNotify','btnProcess','btnPartialNotify','btnDisconnect']
+      .forEach(id => document.getElementById(id).disabled = !on);
+    document.getElementById('btnConnect').disabled = on;
+  };
+
+  /* Return array of checked worker names (null = no filter = all). */
+  function selectedWorkers() {
+    const checked = [
+      document.getElementById('chkA').checked ? 'worker-A' : null,
+      document.getElementById('chkB').checked ? 'worker-B' : null,
+      document.getElementById('chkC').checked ? 'worker-C' : null,
+    ].filter(Boolean);
+    return checked.length === 3 ? null : checked;
+  }
+
+  document.getElementById('btnConnect').onclick = async () => {
+    const url = document.getElementById('wsUrl').value;
+    log(`Connecting to ${url} …`, 'inf');
+    try {
+      const client = new DaffiClient('browser-cast-nw-client', {
+        wsUrl:    url,
+        wasmPath: '../../app.wasm',
+      });
+      client.addEventHandler(e => log(`  ← event: ${e.type} [${e.member}]`, 'dim'));
+      conn = await client.connect();
+      log('Connected!', 'ok');
+      setButtons(true);
+    } catch (err) { log(`Connect failed: ${err}`, 'err'); }
+  };
+
+  document.getElementById('btnDisconnect').onclick = () => {
+    conn = null;
+    log('Disconnected.', 'inf');
+    setButtons(false);
+  };
+
+  document.getElementById('btnNotify').onclick = () => {
+    const msg = document.getElementById('notifyMsg').value;
+    log(`→ cast_nowait().notify(${JSON.stringify(msg)}) — sent to all workers`, 'inf');
+    try {
+      conn.cast_nowait({ serde: 'json' }).notify(msg);
+      flashWorkers(null);
+      log('  (check each worker terminal for confirmation)', 'dim');
+    } catch (err) { log(`Error: ${err}`, 'err'); }
+  };
+
+  document.getElementById('btnProcess').onclick = () => {
+    let payload;
+    try { payload = JSON.parse(document.getElementById('processPayload').value); }
+    catch { log('Invalid JSON in payload field', 'err'); return; }
+    log(`→ cast_nowait().process(${JSON.stringify(payload)}) — sent to all workers`, 'inf');
+    try {
+      conn.cast_nowait({ serde: 'json' }).process(payload);
+      flashWorkers(null);
+      log('  (check each worker terminal for confirmation)', 'dim');
+    } catch (err) { log(`Error: ${err}`, 'err'); }
+  };
+
+  // ── partial cast_nowait ────────────────────────────────────────────────────
+
+  document.getElementById('btnPartialNotify').onclick = () => {
+    const msg      = document.getElementById('partialMsg').value;
+    const receiver = selectedWorkers();
+    const label    = receiver ? `[${receiver.join(', ')}]` : 'all';
+    log(`→ cast_nowait({ receiver: ${label} }).notify(${JSON.stringify(msg)})`, 'inf');
+    try {
+      conn.cast_nowait({ serde: 'json', receiver }).notify(msg);
+      flashWorkers(receiver);
+      log('  (only ticked workers received it)', 'dim');
+    } catch (err) { log(`Error: ${err}`, 'err'); }
+  };
+</script>
+</body>
+</html>

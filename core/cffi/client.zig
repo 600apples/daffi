@@ -163,6 +163,20 @@ pub fn setClientWakeupFd(_: [*c]PyObject, args: [*c]PyObject) callconv(.c) [*c]P
     return Py_BuildValue("");
 }
 
+/// Register the pipe write-end that the native layer writes to once when the
+/// connection is lost (EOF / network error).  The Python task dispatcher
+/// selects on the corresponding read end so AutoReconnect can react
+/// immediately without a dedicated polling thread.
+///
+/// setClientDisconnectFd(conn_num: int, fd: int) -> None
+pub fn setClientDisconnectFd(_: [*c]PyObject, args: [*c]PyObject) callconv(.c) [*c]PyObject {
+    var conn_num: c_ulong = undefined;
+    var fd: c_int = undefined;
+    if (!(py.PyArg_ParseTuple(args, "ki", &conn_num, &fd) != 0)) return null;
+    Client.setDisconnectFd(@intCast(conn_num), @intCast(fd)) catch return Py_BuildValue("");
+    return Py_BuildValue("");
+}
+
 /// Return a JSON-encoded list of currently connected nodes, or None on error.
 pub fn getAvailableMembers(_: [*c]PyObject, args: [*c]PyObject) callconv(.c) [*c]PyObject {
     var conn_num: usize = undefined;

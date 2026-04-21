@@ -19,6 +19,11 @@ pub fn milliTimestamp() i64 {
 }
 pub const print = if (is_wasm) @import("wasm.zig").consoleLog else std.debug.print;
 
+/// Like `print` but compiled away in non-Debug builds.
+pub inline fn debugPrint(comptime fmt: []const u8, args: anytype) void {
+    if (builtin.mode == .Debug) print(fmt, args);
+}
+
 /// std.Thread.Mutex was removed in 0.16.
 /// For wasm (single-threaded) this is a no-op. For native targets it is a
 /// simple atomic spinlock until the codebase is ported to std.Io.Mutex.

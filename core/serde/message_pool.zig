@@ -104,7 +104,7 @@ pub const MessagePool = struct {
         const msg_len = header.msg_len + header_buf.len;
         const data_buf = try self.allocator.alloc(u8, msg_len);
         errdefer self.allocator.free(data_buf);
-        @memcpy(data_buf, &header_buf);
+        @memcpy(data_buf[0..header_buf.len], &header_buf);
         try mustRead(reader, data_buf[header_buf.len..]);
         return try Message.create(self.allocator, header, data_buf);
     }
@@ -121,61 +121,3 @@ pub const MessagePool = struct {
         return try Message.create(self.allocator, header, data_buf);
     }
 };
-//
-// test "test message fields" {
-//     var allocator = std.testing.allocator;
-//     var buf: [120]u8 = undefined;
-//     var bufstream = std.io.fixedBufferStream(&buf);
-//
-//     var msgpool = try MessagePool.init(allocator);
-//     defer msgpool.deinit();
-//     _ = try msgpool.sendMessage(&bufstream, "hello world@", .REQUEST, .JSON, false, 12345, "receiver@", "func_name@", 555, true, "metadata");
-//     bufstream.reset();
-//     var msg = try msgpool.receiveMessage(bufstream.reader());
-//     defer msg.deinit();
-//     bufstream.reset();
-//     try expect(msg.hasReceiver());
-//     try msg.setFields(&[_]Message.Entry{ .{ .flag = .BROADCAST }, .{ .transmitter = 12345 }, .{ .receiver = 12345 }, .{ .func_name = "func_name" }, .{ .uuid = 11111 }, .{ .timeout = 999 }, .{ .payload = "**************************************" } });
-//     msg.setDecoder(.PICKLE);
-//     _ = try bufstream.write(msg.data);
-//     bufstream.reset();
-//     var msg2 = try msgpool.receiveMessage(bufstream.reader());
-//     defer msg2.deinit();
-//
-//     try expect(msg2.getFlag() == .BROADCAST);
-//     try expect(msg2.getDecoder() == .PICKLE);
-//     try expect(msg2.getTransmitter() == 12345);
-//     try expect(msg2.getReceiver() == 12345);
-//     try expect(msg2.getTimeout() == 999);
-//     try expect(msg2.getFuncName() == 41305);
-//     try expect(std.mem.eql(u8, msg2.getPayload(), "**************************************"));
-//     try expect(std.mem.eql(u8, msg2.getMetadataContext(), "metadata"));
-// }
-//
-// test "test message fields empty fields" {
-//     var allocator = std.testing.allocator;
-//     var buf: [120]u8 = undefined;
-//     var bufstream = std.io.fixedBufferStream(&buf);
-//
-//     var msgpool = try MessagePool.init(allocator);
-//     defer msgpool.deinit();
-//
-//     _ = try msgpool.sendMessage(&bufstream, "node1☆result1★node2☆result1☆result2☆result3☆result4★node3☆result1", .REQUEST, .JSON, false, 0, "", "func_name@", 555, true, "metadata");
-//     bufstream.reset();
-//     var msg = try msgpool.receiveMessage(bufstream.reader());
-//     defer msg.deinit();
-//     bufstream.reset();
-//     try expect(!msg.hasReceiver());
-//
-//     try expect(msg.getFlag() == .REQUEST);
-//     try expect(msg.getTransmitter() == 0);
-//     try expect(msg.getReceiver() == 0);
-//     try expect(msg.getTimeout() == 555);
-//     try expect(msg.getFuncName() == 59636);
-//     try expect(std.mem.eql(u8, msg.getPayload(), "node1☆result1★node2☆result1☆result2☆result3☆result4★node3☆result1"));
-//
-//     // var iterator = msg.dataIterator();
-//     // while (iterator.next()) |entry| {
-//     //     std.debug.print("{s} - {}\n", .{entry.value, entry.is_unit});
-//     // }
-// }

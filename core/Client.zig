@@ -6,7 +6,7 @@ const posix = std.posix;
 const network = @import("network.zig");
 const handlers = @import("handlers.zig");
 const serde = @import("serde.zig");
-const repository = @import("repository.zig");
+const store = @import("store.zig");
 
 const assert = std.debug.assert;
 const MessageFlag = serde.MessageFlag;
@@ -17,7 +17,7 @@ const MessageDecoder = serde.MessageDecoder;
 const ClientConnection = network.Connection(.ClientConnectionType);
 const ClientHandler = handlers.ClientHandler;
 const MessageHandler = handlers.MessageHandler;
-const ClientMessageStore = repository.ClientMessageStore;
+const ClientMessageStore = store.ClientMessageStore;
 const PLACEHOLDER = serde.PLACEHOLDER;
 const Allocator = std.mem.Allocator;
 const ArenaAllocator = std.heap.ArenaAllocator;
@@ -27,10 +27,10 @@ const is_wasm = misc.is_wasm;
 
 const Client = @This();
 
-/// Replacement for std.BoundedArray (removed in 0.16) — fixed 256-slot array.
+/// Replacement for std.BoundedArray (removed in 0.16) — fixed 512-slot array.
 const ClientEntryArray = struct {
-    buffer: [256]?*ClientEntry = [_]?*ClientEntry{null} ** 256,
-    len: usize = 256,
+    buffer: [512]?*ClientEntry = [_]?*ClientEntry{null} ** 512,
+    len: usize = 512,
 
     pub fn init() @This() {
         return .{};
@@ -46,11 +46,11 @@ const ClientEntryArray = struct {
 };
 
 var clientEntries: ?ClientEntryArray = null;
+var nextConnNumHint: usize = 0; // start-of-search hint, wraps at 512
 
 fn setSignalHandler() !void {
     const internal_handler = struct {
         fn internal_handler(_: posix.SIG) callconv(.c) void {
-            std.debug.print("Exiting...\n", .{});
             std.process.exit(0);
         }
     }.internal_handler;
@@ -119,6 +119,10 @@ const ClientEntry = struct {
             print("exit client connection with error: {}\n", .{err});
             try msg_handler.handleErr(self.connection, err);
         }
+        // Notify Python that this connection is dead so AutoReconnect can
+        // react immediately without polling.  Must happen before the slot is
+        // nulled so the wakeup fd is still valid when Python reads it.
+        self.client_handler.tasks_queue.triggerDisconnect();
         try msg_handler.handleDisconnect(self.connection);
         { const ts = std.c.timespec{ .sec = 0, .nsec = 5000 }; _ = std.c.nanosleep(&ts, null); }
         if (clientEntries) |*entries| entries.set(conn_num, null);
@@ -198,6 +202,10 @@ const ClientEntry = struct {
         self.client_handler.tasks_queue.wakeup_fd = fd;
     }
 
+    pub fn setDisconnectFdClientEntry(self: *ClientEntry, fd: i32) void {
+        self.client_handler.tasks_queue.disconnect_fd = fd;
+    }
+
     pub fn getAvailableMembersClientEntry(self: *ClientEntry, allocator: Allocator) ![]const u8 {
         const chan_count = self.client_handler.chan_mapper.ChannelsCount();
         // Always return allocator-owned memory so the CFFI caller can safely
@@ -243,7 +251,19 @@ pub fn init(allocator: std.mem.Allocator, app_name: []const u8, config: ClientCo
     if (clientEntries == null) {
         clientEntries = ClientEntryArray.init();
     }
-    const conn_num: usize = @rem(clientEntries.?.len, 256);
+    // Find the first slot that is genuinely free (null).  The hint avoids
+    // always scanning from 0, but correctness depends on the null check.
+    const conn_num: usize = blk: {
+        for (0..512) |i| {
+            const slot = (nextConnNumHint + i) % 512;
+            if (clientEntries.?.get(slot) == null) {
+                nextConnNumHint = (slot + 1) % 512;
+                break :blk slot;
+            }
+        }
+        // All 512 slots occupied — hard limit reached.
+        return error.TooManyClients;
+    };
     clientEntries.?.set(conn_num, cl_entry);
     if (!is_wasm) _ = try std.Thread.spawn(.{}, messageDispatcher, .{conn_num});
     return conn_num;
@@ -251,7 +271,13 @@ pub fn init(allocator: std.mem.Allocator, app_name: []const u8, config: ClientCo
 
 pub fn desctroyClient(conn_num: usize) !void {
     var entry = try ClientEntry.get(conn_num);
-    entry.desctroyClientEntry();
+    if (is_wasm) {
+        // In WASM there is no dispatcher thread to clean up the slot after use.
+        // Null the slot immediately so the next initClient call can reuse it.
+        if (clientEntries) |*entries| entries.set(conn_num, null);
+    } else {
+        entry.desctroyClientEntry();
+    }
 }
 
 pub fn createMessage(allocator: Allocator, data: []const u8, uuid: u16, flag: MessageFlag, decoder: MessageDecoder, is_bytes: bool, return_result: bool, receiver: []const u8, func_name: []const u8, conn_num: usize) !MessageAndDataIndentifier {
@@ -300,6 +326,14 @@ pub fn getAvailableMembers(allocator: Allocator, conn_num: usize) ![]const u8 {
 pub fn setWakeupFd(conn_num: usize, fd: i32) !void {
     var entry = try ClientEntry.get(conn_num);
     entry.setWakeupFdClientEntry(fd);
+}
+
+/// Register the pipe write-end that the native layer writes to once when the
+/// connection is lost (EOF / error).  Python's task dispatcher selects on the
+/// read end so AutoReconnect can react without a polling thread.
+pub fn setDisconnectFd(conn_num: usize, fd: i32) !void {
+    var entry = try ClientEntry.get(conn_num);
+    entry.setDisconnectFdClientEntry(fd);
 }
 
 pub fn getClientEntry(conn_num: usize) !*ClientEntry {
