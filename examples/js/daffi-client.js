@@ -76,16 +76,27 @@ function DaffiClient(name, options) {
         };
 
         // ── WASM imports ────────────────────────────────────────────────────
-        // The WASM is built as a dynamic library (linkage = .dynamic in build.zig)
-        // so memory is *imported* from env rather than exported.  We create it here
-        // and pass the same object to both the imports and the helper closures below.
-        const memory = new WebAssembly.Memory({ initial: 256, maximum: 65536 });
+        // The WASM is built as a position-independent dynamic library
+        // (linkage = .dynamic, pic = true in build.zig).  All five PIC-mode
+        // symbols must be supplied by the host at instantiation time.
+        const INITIAL_PAGES = 256;  // 16 MB
+        const memory = new WebAssembly.Memory({ initial: INITIAL_PAGES, maximum: 65536 });
+        // Indirect-call table — size 128 covers typical Zig stdlib usage.
+        const indirectFunctionTable = new WebAssembly.Table({ initial: 128, element: 'anyfunc' });
+        // Stack grows downward from the top of initial memory.
+        const stackPointer = new WebAssembly.Global({ value: 'i32', mutable: true  }, INITIAL_PAGES * 65536);
+        const memoryBase    = new WebAssembly.Global({ value: 'i32', mutable: false }, 0);
+        const tableBase     = new WebAssembly.Global({ value: 'i32', mutable: false }, 1);
 
         const {
             exports: { allocUint8, free, sendHandshake, sendMessage, parseAndStoreMessage, initClient },
         } = await WebAssembly.instantiate(module, {
             env: {
                 memory,
+                __indirect_function_table: indirectFunctionTable,
+                __stack_pointer:           stackPointer,
+                __memory_base:             memoryBase,
+                __table_base:              tableBase,
                 _throwError(pointer, length) { throw new Error(decodeString(pointer, length)); },
                 _consoleLog(pointer, length)  { console.log(decodeString(pointer, length));   },
             },
