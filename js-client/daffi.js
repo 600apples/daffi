@@ -85,7 +85,7 @@ function DaffiClient(name, options) {
         const tableBase     = new WebAssembly.Global({ value: 'i32', mutable: false }, 0);
 
         const {
-            exports: { allocUint8, free, sendHandshake, sendMessage, parseAndStoreMessage, initClient },
+            exports: { allocUint8, free, sendHandshake, sendMessage, parseAndStoreMessage, initClient, getAvailableMembers },
         } = await WebAssembly.instantiate(module, {
             env: {
                 memory,
@@ -301,6 +301,104 @@ function DaffiClient(name, options) {
 
             /** Stream — alias for rpc_nowait, accepts generator functions. */
             stream(options) { return this.rpc_nowait(options); }
+
+            /**
+             * Return the list of currently connected members from the native layer.
+             * Each entry: { name: string, methods: string[] | null }
+             * Members representing this client have "(this app)" appended to their name.
+             */
+            _members() {
+                const ptr = getAvailableMembers(this.connNum);
+                const json = decodeString(ptr, new Uint8Array(memory.buffer, ptr).indexOf(0));
+                free(ptr);
+                return JSON.parse(json).members || [];
+            }
+
+            /**
+             * Broadcast a call to every connected peer that exposes the requested
+             * method and collect all results.
+             *
+             * Returns a Promise resolving to { receiverName: result, ... }.
+             *
+             * Options:
+             *   receiver  — string | string[] — restrict broadcast to these names
+             *   timeout   — ms (default: no timeout)
+             *   serde     — "json" | "msgpack" | "raw"  (default: "json")
+             *
+             * Example:
+             *   const results = await conn.cast({ timeout: 5000 }).add(1, 2);
+             *   // { "worker-1": 3, "worker-2": 3 }
+             */
+            cast(options) {
+                if (self.closed) throw new Error('Connection is closed');
+                options = options || {};
+                const serde   = this._serde(options.serde);
+                const timeout = options.timeout || null;
+                const filter  = options.receiver
+                    ? (Array.isArray(options.receiver) ? options.receiver : [options.receiver])
+                    : null;
+                const connNum = this.connNum;
+                const conn    = this;
+
+                return new Proxy({}, {
+                    get(_, prop) {
+                        return async (...args) => {
+                            const members = conn._members();
+                            const targets = members.filter(m => {
+                                if (!m.methods) return false;           // no callbacks (e.g. JS client)
+                                if (m.name.endsWith('(this app)')) return false;
+                                if (!m.methods.includes(prop)) return false;
+                                if (filter) return filter.some(f => m.name.startsWith(f));
+                                return true;
+                            });
+                            if (targets.length === 0) throw new Error(`No connected peer exposes "${prop}"`);
+                            const results = await Promise.all(
+                                targets.map(async (m) => {
+                                    const h = new Handler(m.name, timeout, serde, true, connNum);
+                                    const result = await h.get({}, prop)(...args);
+                                    return [m.name, result];
+                                })
+                            );
+                            return Object.fromEntries(results);
+                        };
+                    },
+                });
+            }
+
+            /**
+             * Fire-and-forget broadcast — send to all peers that expose the method,
+             * do not wait for any results.
+             *
+             * Options: same as cast() except timeout is ignored.
+             */
+            cast_nowait(options) {
+                if (self.closed) throw new Error('Connection is closed');
+                options = options || {};
+                const serde  = this._serde(options.serde);
+                const filter = options.receiver
+                    ? (Array.isArray(options.receiver) ? options.receiver : [options.receiver])
+                    : null;
+                const connNum = this.connNum;
+                const conn    = this;
+
+                return new Proxy({}, {
+                    get(_, prop) {
+                        return (...args) => {
+                            const members = conn._members();
+                            const targets = members.filter(m => {
+                                if (!m.methods) return false;
+                                if (m.name.endsWith('(this app)')) return false;
+                                if (!m.methods.includes(prop)) return false;
+                                if (filter) return filter.some(f => m.name.startsWith(f));
+                                return true;
+                            });
+                            for (const m of targets) {
+                                new Handler(m.name, null, serde, false, connNum).get({}, prop)(...args);
+                            }
+                        };
+                    },
+                });
+            }
         }
 
         // ── Handshake ─────────────────────────────────────────────────────────

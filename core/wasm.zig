@@ -112,6 +112,15 @@ export fn sendMessage(data: [*:0]const u8, receiver: [*:0]const u8, func_name: [
     return result.ptr;
 }
 
+/// Return a null-terminated JSON string describing all connected members and
+/// their registered methods.  Format: {"meta":{...},"members":[{"name":...,"methods":[...]},...]}
+/// The caller must pass the returned pointer to free() when done.
+export fn getAvailableMembers(conn_num: usize) [*:0]const u8 {
+    const json = Client.getAvailableMembers(allocator, conn_num) catch throwError("failed to get available members\n");
+    defer allocator.free(json);
+    return (allocator.dupeZ(u8, json) catch @panic("OOM")).ptr;
+}
+
 export fn parseAndStoreMessage(data: [*:0]const u8, len: u32, conn_num: u32) void {
     defer free(data);
     var actual_data = data[0..len];
