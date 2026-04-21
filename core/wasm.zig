@@ -32,7 +32,11 @@ pub const os = struct {
 extern "env" fn _throwError(pointer: [*]const u8, length: u32) noreturn;
 extern "env" fn _consoleLog(pointer: [*]const u8, length: u32) void;
 extern "window" fn _sendToSocket(data_ptr: [*]const u8, data_len: u32) void;
-extern "window" fn _storeMessage(data_ptr: [*]const u8, data_len: u32, uuid: u32, is_error: bool) void;
+/// decoder mirrors MessageDecoder: 0=OPAQUE, 1=JSON, 2=PICKLE, 3=MSGPACK.
+/// The JS side uses this to choose the right deserialiser for the payload.
+/// Passing it as a 5th argument is backward-compatible: older JS handlers
+/// that only declare 4 parameters will simply ignore the extra value.
+extern "window" fn _storeMessage(data_ptr: [*]const u8, data_len: u32, uuid: u32, is_error: bool, decoder: u32) void;
 extern "window" fn _triggerEvent(data_ptr: [*]const u8, data_len: u32) void;
 
 pub fn throwError(message: []const u8) noreturn {
@@ -127,11 +131,11 @@ export fn parseAndStoreMessage(data: [*:0]const u8, len: u32, conn_num: u32) voi
             };
             if (std.mem.eql(u8, msg.getTransmitter(), client_handler.app_name)) {
                 // Notify sender about handshake completion.
-                _storeMessage(payload.ptr, payload.len, uuid, false);
+                _storeMessage(payload.ptr, payload.len, uuid, false, @intFromEnum(msg.getDecoder()));
             }
         },
-        .RESPONSE => _storeMessage(payload.ptr, payload.len, uuid, false),
-        .ERROR => _storeMessage(payload.ptr, payload.len, uuid, true),
+        .RESPONSE => _storeMessage(payload.ptr, payload.len, uuid, false, @intFromEnum(msg.getDecoder())),
+        .ERROR => _storeMessage(payload.ptr, payload.len, uuid, true, @intFromEnum(msg.getDecoder())),
         .EVENTS => _triggerEvent(payload.ptr, payload.len),
         else => unreachable,
     }

@@ -1,0 +1,118 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>daffi — JS client · JSON</title>
+  <script src="../daffi-client.js"></script>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 640px; margin: 40px auto; padding: 0 16px; background: #0f0f0f; color: #e0e0e0; }
+    h1   { color: #7dd3fc; margin-bottom: 4px; }
+    p    { color: #94a3b8; margin-top: 0; }
+    .card { background: #1e1e2e; border-radius: 8px; padding: 16px 20px; margin-bottom: 16px; }
+    label { display: block; margin-bottom: 6px; color: #94a3b8; font-size: 0.85rem; }
+    input[type=text], input[type=number] {
+      background: #13131f; border: 1px solid #374151; border-radius: 6px;
+      color: #e0e0e0; padding: 6px 10px; width: 80px; margin-right: 6px;
+    }
+    button {
+      background: #3b82f6; color: #fff; border: none; border-radius: 6px;
+      padding: 7px 16px; cursor: pointer; font-size: 0.9rem; margin-right: 6px;
+    }
+    button:disabled { background: #374151; cursor: not-allowed; }
+    button.connect  { background: #10b981; }
+    button.danger   { background: #ef4444; }
+    #log { background: #13131f; border-radius: 6px; padding: 12px; min-height: 120px;
+           font-family: monospace; font-size: 0.82rem; white-space: pre-wrap; color: #a0aec0; overflow-y: auto; max-height: 260px; }
+    .ok  { color: #34d399; }
+    .err { color: #f87171; }
+    .inf { color: #60a5fa; }
+  </style>
+</head>
+<body>
+
+<h1>daffi browser client — JSON</h1>
+<p>Connects via WebSocket to a running Python <code>1_service.py</code>.</p>
+
+<div class="card">
+  <label>WebSocket URL</label>
+  <input type="text" id="wsUrl" value="ws://127.0.0.1:5010" style="width:220px">
+  <button class="connect" id="btnConnect">Connect</button>
+  <button class="danger"  id="btnDisconnect" disabled>Disconnect</button>
+</div>
+
+<div class="card">
+  <label>add(a, b)</label>
+  <input type="number" id="numA" value="3" style="width:60px">
+  +
+  <input type="number" id="numB" value="4" style="width:60px">
+  <button id="btnAdd" disabled>Call add()</button>
+</div>
+
+<div class="card">
+  <label>greet(name)</label>
+  <input type="text" id="greetName" value="Alice" style="width:120px">
+  <button id="btnGreet" disabled>Call greet()</button>
+</div>
+
+<div class="card">
+  <label>Log</label>
+  <div id="log"></div>
+</div>
+
+<script>
+  const log = (msg, cls) => {
+    const el = document.getElementById('log');
+    el.innerHTML += `<span class="${cls||''}">${msg}</span>\n`;
+    el.scrollTop = el.scrollHeight;
+  };
+
+  let conn = null;
+  let client = null;
+
+  document.getElementById('btnConnect').onclick = async () => {
+    const url = document.getElementById('wsUrl').value;
+    log(`Connecting to ${url} …`, 'inf');
+    try {
+      client = new DaffiClient('browser-json-client', {
+        wsUrl:    url,
+        wasmPath: '/zig-out/lib/app.wasm',
+      });
+      client.addEventHandler(e => log(`event: ${e.member} → ${e.type}`, 'inf'));
+      conn = await client.connect();
+      log('Connected!', 'ok');
+      ['btnAdd','btnGreet','btnDisconnect'].forEach(id => document.getElementById(id).disabled = false);
+      document.getElementById('btnConnect').disabled = true;
+    } catch (err) {
+      log(`Connect failed: ${err}`, 'err');
+    }
+  };
+
+  document.getElementById('btnDisconnect').onclick = () => {
+    conn = null; client = null;
+    log('Disconnected.', 'inf');
+    ['btnAdd','btnGreet','btnDisconnect'].forEach(id => document.getElementById(id).disabled = true);
+    document.getElementById('btnConnect').disabled = false;
+  };
+
+  document.getElementById('btnAdd').onclick = async () => {
+    const a = parseFloat(document.getElementById('numA').value);
+    const b = parseFloat(document.getElementById('numB').value);
+    log(`→ add(${a}, ${b}) …`);
+    try {
+      const result = await conn.rpc({ serde: 'json', timeout: 5000 }).add(a, b);
+      log(`← add = ${result}`, 'ok');
+    } catch (err) { log(`Error: ${err}`, 'err'); }
+  };
+
+  document.getElementById('btnGreet').onclick = async () => {
+    const name = document.getElementById('greetName').value;
+    log(`→ greet(${JSON.stringify(name)}) …`);
+    try {
+      const result = await conn.rpc({ serde: 'json', timeout: 5000 }).greet(name);
+      log(`← greet = ${JSON.stringify(result)}`, 'ok');
+    } catch (err) { log(`Error: ${err}`, 'err'); }
+  };
+</script>
+</body>
+</html>
