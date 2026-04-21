@@ -1,9 +1,35 @@
 """
-Serialisation and deserialisation for the three supported wire formats.
+Serialisation and deserialisation for the four supported wire formats.
 """
 import json
 import pickle
 from typing import Union, Tuple, Dict, Callable
+
+
+# Lazy import — msgpack is an optional extra (``pip install daffi[msgpack]``).
+# We import on first use so users without the extra installed can still use
+# OPAQUE / JSON / PICKLE without any import errors at module load time.
+_msgpack = None
+
+
+def _require_msgpack():
+    """Return the imported ``msgpack`` module or raise a helpful ImportError.
+
+    The first call performs the import and caches it; subsequent calls reuse
+    the cached reference.
+    """
+    global _msgpack
+    if _msgpack is not None:
+        return _msgpack
+    try:
+        import msgpack as _m
+    except ImportError as exc:
+        raise ImportError(
+            "SerdeFormat.MSGPACK requires the optional 'msgpack' dependency. "
+            "Install it with:  pip install 'daffi[msgpack]'"
+        ) from exc
+    _msgpack = _m
+    return _m
 
 
 class SerdeFormat:
@@ -13,9 +39,11 @@ class SerdeFormat:
     :meth:`~daffi.app.ClientConnection.stream` via the *serde* argument.
     """
 
-    RAW = 0
-    """Zero-copy pass-through.  The single argument must already be ``bytes``
-    or ``str``; it is placed on the wire as-is."""
+    OPAQUE = 0
+    """Zero-copy pass-through.  daffi does not interpret the payload and
+    ships it on the wire unchanged.  The single argument must already be
+    ``bytes`` or ``str`` — both are accepted and the wire layer preserves the
+    original type for the receiver."""
 
     JSON = 1
     """All positional and keyword arguments are encoded as a JSON object
@@ -24,6 +52,18 @@ class SerdeFormat:
     PICKLE = 2
     """All positional and keyword arguments are pickled as a ``(args, kwargs)``
     tuple."""
+
+    MSGPACK = 3
+    """All positional and keyword arguments are msgpack-encoded as an
+    ``[args, kwargs]`` array.  Smaller and language-agnostic compared to
+    PICKLE, but supports a narrower set of types (no tuples, custom classes,
+    or tracebacks).  Requires the optional ``msgpack`` package — install with
+    ``pip install 'daffi[msgpack]'``."""
+
+    # Deprecated alias — ``RAW`` was renamed to ``OPAQUE`` to better convey
+    # that the framework does not interpret the payload (the data is opaque
+    # to it, not necessarily binary).  Kept for backward compatibility.
+    RAW = OPAQUE
 
 
 class Serializer:
@@ -35,20 +75,20 @@ class Serializer:
     """
 
     @staticmethod
-    def _serialize_raw(*args, **kwargs) -> Tuple[Union[bytes, str], bool]:
-        """RAW: enforce a single argument, pass it through unchanged.
+    def _serialize_opaque(*args, **kwargs) -> Tuple[Union[bytes, str], bool]:
+        """OPAQUE: enforce a single argument, pass it through unchanged.
 
         Raises:
             TypeError: If more than one argument (positional or keyword) is
-                       supplied, since RAW has no framing to separate multiple
-                       values.
+                       supplied, since OPAQUE has no framing to separate
+                       multiple values.
         """
         n_args, n_kwargs = len(args), len(kwargs)
         if n_args + n_kwargs > 1:
             raise TypeError(
-                f"SerdeFormat.RAW accepts exactly one argument "
+                f"SerdeFormat.OPAQUE accepts exactly one argument "
                 f"(got {n_args} positional, {n_kwargs} keyword). "
-                f"Use JSON or PICKLE to pass multiple arguments."
+                f"Use JSON, PICKLE, or MSGPACK to pass multiple arguments."
             )
         if args:
             data = args[0]
@@ -69,8 +109,8 @@ class Serializer:
         return pickle.dumps((args, kwargs)), True
 
     @staticmethod
-    def _deserialize_raw(data: Union[bytes, str]) -> Tuple:
-        """RAW: wrap the payload in a one-element tuple to match the
+    def _deserialize_opaque(data: Union[bytes, str]) -> Tuple:
+        """OPAQUE: wrap the payload in a one-element tuple to match the
         ``(args, kwargs)`` contract expected by callers."""
         return (data,), {}
 
@@ -85,6 +125,28 @@ class Serializer:
         """PICKLE: unpickle and return the ``(args, kwargs)`` tuple."""
         return pickle.loads(data)
 
+    @staticmethod
+    def _serialize_msgpack(*args, **kwargs) -> Tuple[bytes, bool]:
+        """MSGPACK: pack ``[args, kwargs]`` as a single msgpack array.
+
+        ``use_bin_type=True`` keeps ``bytes`` and ``str`` distinguishable on
+        the wire (msgpack's default since 1.0, but we set it explicitly).
+        """
+        msgpack = _require_msgpack()
+        return msgpack.packb([args, kwargs], use_bin_type=True), True
+
+    @staticmethod
+    def _deserialize_msgpack(data: bytes) -> Tuple:
+        """MSGPACK: unpack the ``[args, kwargs]`` array.
+
+        ``raw=False`` decodes msgpack strings as ``str`` (not ``bytes``);
+        ``strict_map_key=False`` allows non-string dict keys, matching
+        Python's permissiveness.
+        """
+        msgpack = _require_msgpack()
+        args, kwargs = msgpack.unpackb(data, raw=False, strict_map_key=False)
+        return args, kwargs
+
     @classmethod
     def serialize(
         cls, serde: SerdeFormat, *args, **kwargs
@@ -97,7 +159,7 @@ class Serializer:
             (``False``).
 
         Raises:
-            TypeError:  For ``RAW`` when more than one argument is supplied.
+            TypeError:  For ``OPAQUE`` when more than one argument is supplied.
             ValueError: When *serde* is not a recognised :class:`SerdeFormat`.
         """
         try:
@@ -129,13 +191,15 @@ class Serializer:
 
 
 Serializer._SERIALIZE = {
-    SerdeFormat.RAW:    Serializer._serialize_raw,
-    SerdeFormat.JSON:   Serializer._serialize_json,
-    SerdeFormat.PICKLE: Serializer._serialize_pickle,
+    SerdeFormat.OPAQUE:  Serializer._serialize_opaque,
+    SerdeFormat.JSON:    Serializer._serialize_json,
+    SerdeFormat.PICKLE:  Serializer._serialize_pickle,
+    SerdeFormat.MSGPACK: Serializer._serialize_msgpack,
 }
 
 Serializer._DESERIALIZE = {
-    SerdeFormat.RAW:    Serializer._deserialize_raw,
-    SerdeFormat.JSON:   Serializer._deserialize_json,
-    SerdeFormat.PICKLE: Serializer._deserialize_pickle,
+    SerdeFormat.OPAQUE:  Serializer._deserialize_opaque,
+    SerdeFormat.JSON:    Serializer._deserialize_json,
+    SerdeFormat.PICKLE:  Serializer._deserialize_pickle,
+    SerdeFormat.MSGPACK: Serializer._deserialize_msgpack,
 }

@@ -5,16 +5,16 @@ pub const is_wasm = builtin.cpu.arch == .wasm32 or builtin.cpu.arch == .wasm64;
 /// Returns seconds since Unix epoch (replaces std.time.timestamp removed in 0.16).
 pub fn timestamp() i64 {
     if (is_wasm) return 0;
-    var ts: std.os.linux.timespec = undefined;
-    _ = std.os.linux.clock_gettime(.REALTIME, &ts);
+    var ts: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(.REALTIME, &ts);
     return ts.sec;
 }
 
 /// Returns milliseconds since Unix epoch (replaces std.time.milliTimestamp removed in 0.16).
 pub fn milliTimestamp() i64 {
     if (is_wasm) return 0;
-    var ts: std.os.linux.timespec = undefined;
-    _ = std.os.linux.clock_gettime(.REALTIME, &ts);
+    var ts: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(.REALTIME, &ts);
     return ts.sec * 1000 + @divTrunc(ts.nsec, std.time.ns_per_ms);
 }
 pub const print = if (is_wasm) @import("wasm.zig").consoleLog else std.debug.print;

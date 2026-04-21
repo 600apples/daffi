@@ -81,8 +81,7 @@ export fn sendMessage(data: [*:0]const u8, receiver: [*:0]const u8, func_name: [
     const decoder: MessageDecoder = @enumFromInt(serde);
     const is_bytes = switch (decoder) {
         .JSON => false,
-        .RAW => true,
-        else => unreachable,
+        .OPAQUE, .PICKLE, .MSGPACK => true,
     };
     defer {
         allocator.free(actual_data);

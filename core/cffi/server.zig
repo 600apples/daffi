@@ -76,10 +76,10 @@ pub fn startServer(_: [*c]PyObject, args: [*c]PyObject) callconv(.c) [*c]PyObjec
     // Python's setServiceMethods() call immediately after startServer() would
     // race against the Zig thread and silently fail.
     // 100 µs × 100 000 = 10 s maximum wait.
-    const sleep_ts = std.os.linux.timespec{ .sec = 0, .nsec = 100_000 };
+    const sleep_ts = std.c.timespec{ .sec = 0, .nsec = 100_000 };
     var wait_iters: usize = 0;
     while (!Server.isReady(conn_num) and wait_iters < 100_000) : (wait_iters += 1) {
-        _ = std.os.linux.nanosleep(&sleep_ts, null);
+        _ = std.c.nanosleep(&sleep_ts, null);
     }
     return Py_BuildValue("k", @as(c_ulong, conn_num));
 }

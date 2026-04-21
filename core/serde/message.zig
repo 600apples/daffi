@@ -20,9 +20,10 @@ pub const UNIT_SEPARATOR_SEQ: []const u8 = &[_]u8{UNIT_SEPARATOR};
 const print = std.debug.print;
 
 pub const MessageDecoder = enum(u2) {
-    RAW,
+    OPAQUE,
     JSON,
     PICKLE,
+    MSGPACK,
 };
 
 pub const MessageFlag = enum(u4) {
@@ -333,7 +334,7 @@ pub const Message = struct {
     pub fn writeErrorMessage(self: *Message, comptime fmt_format: []const u8, args: anytype) !void {
         // For setting errors outside of python
         try self.writeData(fmt_format, args);
-        self.setDecoder(.RAW);
+        self.setDecoder(.OPAQUE);
         self.setFlag(.ERROR);
     }
 

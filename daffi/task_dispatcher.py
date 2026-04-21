@@ -140,7 +140,7 @@ def _execute_task(
         flag = MessageFlag.RESPONSE
     except:
         flag = MessageFlag.ERROR
-        if serde == SerdeFormat.RAW:
+        if serde == SerdeFormat.OPAQUE:
             serde = SerdeFormat.PICKLE
         err_type, err_obj, tb = sys.exc_info()
         if serde == SerdeFormat.PICKLE:

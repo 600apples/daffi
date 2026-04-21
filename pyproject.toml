@@ -31,6 +31,9 @@ classifiers = [
 ]
 dependencies = []
 
+[project.optional-dependencies]
+msgpack = ["msgpack>=1.0"]
+
 [project.urls]
 Homepage    = "https://github.com/600apples/dafi"
 Source      = "https://github.com/600apples/dafi"

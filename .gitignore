@@ -25,11 +25,47 @@ env/
 
 /.lh/
 /.history/
+
+# JetBrains (IntelliJ, PyCharm, CLion, GoLand, RustRover, etc.)
 .idea/
+*.iml
+*.iws
+*.ipr
+out/
+.idea_modules/
+
+# VS Code / Cursor / Windsurf
 .vscode/
+*.code-workspace
+.history/
+
+# Cursor agent / project state
+.cursor/
+
+# Sublime Text
+*.sublime-project
+*.sublime-workspace
+
+# Eclipse
+.project
+.classpath
+.settings/
+
+# NetBeans
+nbproject/private/
+
+# Vim / Neovim / Emacs
 *.swp
 *.swo
+*.swn
 *~
+.netrwhist
+Session.vim
+[._]*.s[a-w][a-z]
+[._]s[a-w][a-z]
+
+# JetBrains Fleet
+.fleet/
 
 .DS_Store
 Thumbs.db

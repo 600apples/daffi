@@ -62,7 +62,7 @@ pub fn init(allocator: Allocator, config: Config) !*ServerConnection {
         if (host.len >= path_buf.len) return error.NameTooLong;
         @memcpy(path_buf[0..host.len], host);
         path_buf[host.len] = 0;
-        _ = std.os.linux.unlink(@ptrCast(&path_buf));
+        _ = std.c.unlink(@ptrCast(&path_buf));
         var addr = try net.Address.initUnix(host);
         listener = addr.listen(options);
     }

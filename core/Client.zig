@@ -120,7 +120,7 @@ const ClientEntry = struct {
             try msg_handler.handleErr(self.connection, err);
         }
         try msg_handler.handleDisconnect(self.connection);
-        { const ts = std.os.linux.timespec{ .sec = 0, .nsec = 5000 }; _ = std.os.linux.nanosleep(&ts, null); }
+        { const ts = std.c.timespec{ .sec = 0, .nsec = 5000 }; _ = std.c.nanosleep(&ts, null); }
         if (clientEntries) |*entries| entries.set(conn_num, null);
         // Now safe to free: no Python thread or Zig code references this connection.
         self.connection.destroy();

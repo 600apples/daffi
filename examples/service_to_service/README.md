@@ -73,4 +73,5 @@ Pass `serde=` to `conn.rpc()` or `conn.stream()`:
 |--------|--------|-------|
 | `SerdeFormat.PICKLE` | `from daffi import SerdeFormat` | Default; supports arbitrary Python objects |
 | `SerdeFormat.JSON` | same | Arguments must be JSON-serializable |
-| `SerdeFormat.RAW` | same | Single `bytes` or `str` argument, no wrapping |
+| `SerdeFormat.MSGPACK` | `pip install 'daffi[msgpack]'` | Compact, language-agnostic; no tuples/custom classes |
+| `SerdeFormat.OPAQUE` | `from daffi import SerdeFormat` | Single `bytes` or `str` argument, no wrapping (was `RAW`) |

@@ -11,7 +11,10 @@ Client
     Connect to a Router or Service and call remote functions via ``.rpc()``
     or fire-and-forget via ``.stream()``.
 SerdeFormat
-    Serialisation format enum (``RAW``, ``JSON``, ``PICKLE``).
+    Serialisation format enum (``OPAQUE``, ``JSON``, ``PICKLE``, ``MSGPACK``).
+    ``MSGPACK`` requires the optional dependency installed via
+    ``pip install 'daffi[msgpack]'``.  ``RAW`` is kept as a deprecated alias
+    of ``OPAQUE`` for backward compatibility.
 callback
     Decorator that registers a function or class as a remote executor.
 local
