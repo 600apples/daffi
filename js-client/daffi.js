@@ -4,6 +4,34 @@
  * DaffiClient — browser WebSocket + WASM client for daffi.
  *
  * ─────────────────────────────────────────────────────────────────────────────
+ * DISTRIBUTION — using daffi.js from a CDN
+ * ─────────────────────────────────────────────────────────────────────────────
+ * daffi.js ships together with app.wasm in the js-client/ folder of the
+ * repository.  Both files are required; daffi.js loads app.wasm at runtime
+ * via WebAssembly.compileStreaming() and the server must serve it with the
+ * correct MIME type (application/wasm).
+ *
+ * The simplest way to consume them without hosting your own copy is via the
+ * jsDelivr CDN, which serves any public GitHub file automatically:
+ *
+ *   <!-- 1. Load the JS client (replace TAG with a git tag or commit hash) -->
+ *   <script src="https://cdn.jsdelivr.net/gh/600apples/daffi@TAG/js-client/daffi.js"></script>
+ *
+ *   <!-- 2. (optional) msgpack-lite — only needed for serde: "msgpack" -->
+ *   <script src="https://unpkg.com/msgpack-lite/dist/msgpack.min.js"></script>
+ *
+ *   <script>
+ *     const client = new DaffiClient("my-app", {
+ *       wsUrl:    "ws://127.0.0.1:5000",
+ *       // Point wasmPath at the same CDN release so the browser can fetch it:
+ *       wasmPath: "https://cdn.jsdelivr.net/gh/600apples/daffi@TAG/js-client/app.wasm",
+ *     });
+ *   </script>
+ *
+ * For local development both files can live in the same directory.  The
+ * default wasmPath ("./app.wasm") then resolves relative to the HTML page.
+ *
+ * ─────────────────────────────────────────────────────────────────────────────
  * QUICK START
  * ─────────────────────────────────────────────────────────────────────────────
  *   const client = new DaffiClient("my-app", { wsUrl: "ws://127.0.0.1:5000" });
@@ -103,7 +131,7 @@ function DaffiClient(name, options) {
     options = options || {};
     this.name       = name;
     this.wsUrl      = options.wsUrl      || 'ws://127.0.0.1:5000';
-    this.wasmPath   = options.wasmPath   || '/zig-out/lib/app.wasm';
+    this.wasmPath   = options.wasmPath   || './app.wasm';
     this.pendingMessages = {};
     this.eventHandlers   = [];
     this.closed = true;

@@ -4,6 +4,8 @@
 core/zig-cache/
 *.wasm
 *.wasm.o
+# The distributable WASM that lives next to daffi.js is intentionally tracked.
+!js-client/app.wasm
 
 __pycache__/
 *.py[cod]

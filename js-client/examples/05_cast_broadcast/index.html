@@ -1,0 +1,155 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>daffi — JS broadcast · cast / cast_nowait</title>
+  <script src="../../daffi.js"></script>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 700px; margin: 40px auto; padding: 0 16px; background: #0f0f0f; color: #e0e0e0; }
+    h1   { color: #34d399; margin-bottom: 4px; }
+    p    { color: #94a3b8; margin-top: 0; }
+    .badge { display: inline-block; background: #065f46; color: #a7f3d0; font-size: 0.75rem; padding: 2px 8px; border-radius: 12px; margin-left: 8px; vertical-align: middle; }
+    .card { background: #1e1e2e; border-radius: 8px; padding: 16px 20px; margin-bottom: 16px; }
+    label { display: block; margin-bottom: 6px; color: #94a3b8; font-size: 0.85rem; }
+    input[type=text], input[type=number] {
+      background: #13131f; border: 1px solid #374151; border-radius: 6px;
+      color: #e0e0e0; padding: 6px 10px; margin-right: 6px;
+    }
+    button {
+      background: #059669; color: #fff; border: none; border-radius: 6px;
+      padding: 7px 16px; cursor: pointer; font-size: 0.9rem; margin-right: 6px;
+    }
+    button:disabled { background: #374151; cursor: not-allowed; }
+    button.connect { background: #10b981; }
+    button.danger  { background: #ef4444; }
+    button.nowait  { background: #0284c7; }
+    #log { background: #13131f; border-radius: 6px; padding: 12px; min-height: 140px;
+           font-family: monospace; font-size: 0.82rem; white-space: pre-wrap;
+           color: #a0aec0; overflow-y: auto; max-height: 320px; }
+    .ok  { color: #34d399; }
+    .err { color: #f87171; }
+    .inf { color: #60a5fa; }
+    .dim { color: #6b7280; }
+  </style>
+</head>
+<body>
+
+<h1>daffi broadcast <span class="badge">cast / cast_nowait</span></h1>
+<p>
+  Browser connects to the Router and broadcasts calls to <em>every</em> connected
+  Python worker simultaneously.
+</p>
+<p class="dim" style="font-size:0.82rem">
+  Start order: &nbsp;<code>python 1_router.py</code> &nbsp;→&nbsp;
+  <code>python 2_worker.py worker-A</code> &nbsp;→&nbsp;
+  <code>python 2_worker.py worker-B</code> &nbsp;→&nbsp; open this page
+</p>
+
+<div class="card">
+  <label>Router WebSocket URL</label>
+  <input type="text" id="wsUrl" value="ws://127.0.0.1:6020" style="width:220px">
+  <button class="connect" id="btnConnect">Connect</button>
+  <button class="danger"  id="btnDisconnect" disabled>Disconnect</button>
+</div>
+
+<div class="card">
+  <label>
+    <strong>cast()</strong> — broadcast <code>ping()</code> to every worker, collect all results
+  </label>
+  <button id="btnPing" disabled>cast ping()</button>
+</div>
+
+<div class="card">
+  <label>
+    <strong>cast()</strong> — broadcast <code>compute(x, y)</code> to every worker
+  </label>
+  <input type="number" id="cx" value="6"  style="width:60px"> ×
+  <input type="number" id="cy" value="7"  style="width:60px">
+  <button id="btnCompute" disabled>cast compute()</button>
+</div>
+
+<div class="card">
+  <label>
+    <strong>cast_nowait()</strong> — fire-and-forget <code>ping()</code> to every worker (no results)
+  </label>
+  <button class="nowait" id="btnPingNw" disabled>cast_nowait ping()</button>
+</div>
+
+<div class="card">
+  <label>Log</label>
+  <div id="log"></div>
+</div>
+
+<script>
+  const log = (msg, cls) => {
+    const el = document.getElementById('log');
+    el.innerHTML += `<span class="${cls||''}">${msg}</span>\n`;
+    el.scrollTop = el.scrollHeight;
+  };
+
+  let conn = null;
+
+  const setButtons = (connected) => {
+    ['btnPing','btnCompute','btnPingNw','btnDisconnect']
+      .forEach(id => document.getElementById(id).disabled = !connected);
+    document.getElementById('btnConnect').disabled = connected;
+  };
+
+  document.getElementById('btnConnect').onclick = async () => {
+    const url = document.getElementById('wsUrl').value;
+    log(`Connecting to router at ${url} …`, 'inf');
+    try {
+      const client = new DaffiClient('browser-cast-client', {
+        wsUrl:    url,
+        wasmPath: '../../app.wasm',
+      });
+      client.addEventHandler(e => log(`  event: ${e.type} ← ${e.member}`, 'dim'));
+      conn = await client.connect();
+      log('Connected!  (start worker-A and worker-B if not already running)', 'ok');
+      setButtons(true);
+    } catch (err) {
+      log(`Connect failed: ${err}`, 'err');
+    }
+  };
+
+  document.getElementById('btnDisconnect').onclick = () => {
+    conn = null;
+    log('Disconnected.', 'inf');
+    setButtons(false);
+  };
+
+  // ── cast ping() ────────────────────────────────────────────────────────────
+  document.getElementById('btnPing').onclick = async () => {
+    log('→ cast ping() to all workers …');
+    try {
+      const results = await conn.cast({ serde: 'json', timeout: 5000 }).ping();
+      for (const [name, val] of Object.entries(results)) {
+        log(`  ← ${name}: ${JSON.stringify(val)}`, 'ok');
+      }
+    } catch (err) { log(`Error: ${err}`, 'err'); }
+  };
+
+  // ── cast compute() ─────────────────────────────────────────────────────────
+  document.getElementById('btnCompute').onclick = async () => {
+    const x = parseFloat(document.getElementById('cx').value);
+    const y = parseFloat(document.getElementById('cy').value);
+    log(`→ cast compute(${x}, ${y}) to all workers …`);
+    try {
+      const results = await conn.cast({ serde: 'json', timeout: 5000 }).compute(x, y);
+      for (const [name, val] of Object.entries(results)) {
+        log(`  ← ${name}: ${JSON.stringify(val)}`, 'ok');
+      }
+    } catch (err) { log(`Error: ${err}`, 'err'); }
+  };
+
+  // ── cast_nowait ping() ─────────────────────────────────────────────────────
+  document.getElementById('btnPingNw').onclick = () => {
+    log('→ cast_nowait ping() — sent to all workers (no results expected)', 'inf');
+    try {
+      conn.cast_nowait({ serde: 'json' }).ping();
+    } catch (err) { log(`Error: ${err}`, 'err'); }
+  };
+</script>
+</body>
+</html>
