@@ -210,6 +210,9 @@ fn serverLoop(conn: *ServerHandler.ConnectionT, msgpool: *MessagePool, msg_handl
         msg_handler.triggerWakeup();
     } else |err| try msg_handler.handleErr(conn, err);
     try msg_handler.handleDisconnect(conn);
+    // Wake the Python poller so it can pick up the "disconnected" event message
+    // that handleDisconnect() pushed onto the task queue.
+    msg_handler.triggerWakeup();
 }
 
 fn serverWsLoop(conn: *ServerHandler.ConnectionT, msgpool: *MessagePool, msg_handler: anytype) !void {
@@ -229,6 +232,8 @@ fn serverWsLoop(conn: *ServerHandler.ConnectionT, msgpool: *MessagePool, msg_han
         msg_handler.triggerWakeup();
     } else |err| try msg_handler.handleErr(conn, err);
     try msg_handler.handleDisconnect(conn);
+    // Same as above: wake the Python poller after pushing the disconnect event.
+    msg_handler.triggerWakeup();
 }
 
 pub fn sendMessage(data: []const u8, uuid: u16, flag: MessageFlag, decoder: MessageDecoder, is_bytes: bool, return_result: bool, receiver: []const u8, func_name: []const u8, conn_num: usize) !MessageIdentifier {
