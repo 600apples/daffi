@@ -82,11 +82,11 @@ function DaffiClient(name, options) {
         const INITIAL_PAGES = 256;  // 16 MB
         const memory = new WebAssembly.Memory({ initial: INITIAL_PAGES, maximum: 65536 });
         // Indirect-call table — size 128 covers typical Zig stdlib usage.
-        const indirectFunctionTable = new WebAssembly.Table({ initial: 128, element: 'anyfunc' });
+        const indirectFunctionTable = new WebAssembly.Table({ initial: 128, element: 'funcref' });
         // Stack grows downward from the top of initial memory.
         const stackPointer = new WebAssembly.Global({ value: 'i32', mutable: true  }, INITIAL_PAGES * 65536);
         const memoryBase    = new WebAssembly.Global({ value: 'i32', mutable: false }, 0);
-        const tableBase     = new WebAssembly.Global({ value: 'i32', mutable: false }, 1);
+        const tableBase     = new WebAssembly.Global({ value: 'i32', mutable: false }, 0);
 
         const {
             exports: { allocUint8, free, sendHandshake, sendMessage, parseAndStoreMessage, initClient },
