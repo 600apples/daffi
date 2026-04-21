@@ -3,19 +3,101 @@
 /**
  * DaffiClient — browser WebSocket + WASM client for daffi.
  *
- * Usage:
- *   const client = new DaffiClient("my-app", {
- *     wsUrl:    "ws://127.0.0.1:5000",   // default
- *     wasmPath: "/zig-out/lib/app.wasm", // default
- *   });
- *   const conn = await client.connect();           // optional password string
- *   const result = await conn.rpc({ timeout: 5000 }).add(3, 4);
+ * ─────────────────────────────────────────────────────────────────────────────
+ * QUICK START
+ * ─────────────────────────────────────────────────────────────────────────────
+ *   const client = new DaffiClient("my-app", { wsUrl: "ws://127.0.0.1:5000" });
+ *   const conn   = await client.connect();          // optional password string
  *
- * Supported serde values in rpc() / rpc_nowait():
- *   "json"    | 1  — JSON-encoded args / result (default)
- *   "raw"     | 0  — OPAQUE: pass a single Uint8Array or string, get raw bytes
- *   "msgpack" | 3  — binary msgpack; requires msgpack-lite loaded before this file:
+ *   // Call a remote function and get the result
+ *   const sum = await conn.rpc({ timeout: 5000 }).add(3, 4);
+ *
+ *   // Fire-and-forget (no result)
+ *   conn.rpc_nowait().log("hello");
+ *
+ *   // Broadcast to every peer that exposes the method, collect all results
+ *   const all = await conn.cast({ timeout: 5000 }).add(3, 4);
+ *   // → { "worker-1": 7, "worker-2": 7 }
+ *
+ *   // Fire-and-forget broadcast
+ *   conn.cast_nowait().notify("event");
+ *
+ * ─────────────────────────────────────────────────────────────────────────────
+ * DaffiClient(name, options)
+ * ─────────────────────────────────────────────────────────────────────────────
+ *   name              string   — Unique name for this browser client.
+ *
+ *   options.wsUrl     string   — WebSocket URL of the daffi Service or Router.
+ *                                Default: "ws://127.0.0.1:5000"
+ *
+ *   options.wasmPath  string   — Absolute URL path to app.wasm served by your
+ *                                HTTP server.
+ *                                Default: "/zig-out/lib/app.wasm"
+ *
+ * ─────────────────────────────────────────────────────────────────────────────
+ * client.connect(password?) → Promise<Connection>
+ * ─────────────────────────────────────────────────────────────────────────────
+ *   password  string (optional) — Server password, if configured.
+ *
+ * ─────────────────────────────────────────────────────────────────────────────
+ * client.addEventHandler(fn)
+ * ─────────────────────────────────────────────────────────────────────────────
+ *   Subscribe to server-side events.  fn receives an event object:
+ *     { type: "connected" | "disconnected", member: string }
+ *
+ *   Example:
+ *     client.addEventHandler(e => console.log(e.type, e.member));
+ *
+ * ─────────────────────────────────────────────────────────────────────────────
+ * Connection methods  (returned by client.connect())
+ * ─────────────────────────────────────────────────────────────────────────────
+ *
+ *   conn.rpc(options) → Proxy
+ *     Call a single remote function and await the result.
+ *     Returns a Proxy — call any method name on it to issue the RPC.
+ *
+ *     options.receiver  string         — Pin call to a specific peer name.
+ *                                        Omit to let the server pick any peer.
+ *     options.timeout   number (ms)    — Reject if no reply within this time.
+ *     options.serde     string|number  — Serialisation format (see SERDE below).
+ *
+ *   conn.rpc_nowait(options) → Proxy
+ *     Fire-and-forget: send the call, do not wait for a result.
+ *     Same options as rpc() except timeout is ignored.
+ *
+ *   conn.cast(options) → Proxy
+ *     Broadcast to EVERY connected peer that exposes the method.
+ *     Awaits all results and returns { peerName: result, … }.
+ *
+ *     options.receiver  string|string[] — Restrict broadcast to these peer names.
+ *     options.timeout   number (ms)     — Per-peer timeout.
+ *     options.serde     string|number   — Serialisation format (see SERDE below).
+ *
+ *   conn.cast_nowait(options) → Proxy
+ *     Fire-and-forget broadcast to all matching peers.  No result.
+ *     Same options as cast() except timeout is ignored.
+ *
+ *   conn.stream(options) → Proxy
+ *     Alias for rpc_nowait().  Accepts generator functions as the single
+ *     argument to send a sequence of OPAQUE messages:
+ *       conn.stream({ serde: "raw" }).pipe(function* () { yield buf1; yield buf2; });
+ *
+ * ─────────────────────────────────────────────────────────────────────────────
+ * SERDE — serialisation formats
+ * ─────────────────────────────────────────────────────────────────────────────
+ *   "json"    | 1  — JSON (default).  Works with any JSON-serialisable value.
+ *
+ *   "raw"     | 0  — OPAQUE / raw bytes.  Pass a single Uint8Array or string;
+ *                    receive a Uint8Array (or parsed JSON if the bytes happen
+ *                    to be valid JSON).  Use when the Python side is decorated
+ *                    with @callback and expects bytes.
+ *
+ *   "msgpack" | 3  — Binary MessagePack.  More compact than JSON for
+ *                    structured data.  Requires msgpack-lite to be loaded
+ *                    before this file:
  *                      <script src="https://unpkg.com/msgpack-lite/dist/msgpack.min.js"></script>
+ *
+ *   Note: PICKLE (2) is Python-only and is not supported in the JS client.
  */
 function DaffiClient(name, options) {
     options = options || {};
