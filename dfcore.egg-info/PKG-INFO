@@ -1,7 +1,0 @@
-Metadata-Version: 2.4
-Name: dfcore
-Version: 0.0.1
-Summary: a experiment create Python module in Zig
-License-File: LICENSE.txt
-Dynamic: license-file
-Dynamic: summary
