@@ -76,9 +76,19 @@ function DaffiClient(name, options) {
         };
 
         // ── WASM imports ────────────────────────────────────────────────────
+        // The WASM is built as a dynamic library (linkage = .dynamic in build.zig)
+        // so memory is *imported* from env rather than exported.  We create it here
+        // and pass the same object to both the imports and the helper closures below.
+        const memory = new WebAssembly.Memory({ initial: 256, maximum: 65536 });
+
         const {
-            exports: { memory, allocUint8, free, sendHandshake, sendMessage, parseAndStoreMessage, initClient },
+            exports: { allocUint8, free, sendHandshake, sendMessage, parseAndStoreMessage, initClient },
         } = await WebAssembly.instantiate(module, {
+            env: {
+                memory,
+                _throwError(pointer, length) { throw new Error(decodeString(pointer, length)); },
+                _consoleLog(pointer, length)  { console.log(decodeString(pointer, length));   },
+            },
             window: {
                 _sendToSocket(pointer, length) {
                     socket.send(memory.buffer.slice(pointer, pointer + length));
@@ -135,10 +145,6 @@ function DaffiClient(name, options) {
                     }
                     for (const handler of self.eventHandlers) handler(event);
                 },
-            },
-            env: {
-                _throwError(pointer, length) { throw new Error(decodeString(pointer, length)); },
-                _consoleLog(pointer, length) { console.log(decodeString(pointer, length)); },
             },
         });
 
