@@ -25,6 +25,14 @@ test-interruptions:  ## Run connection-interruption tests (SIGSTOP / SIGKILL / r
 test-serde:  ## Run serialisation-format tests (PICKLE / JSON / OPAQUE / MSGPACK)
 	$(PYTEST) tests/integration/test_serde.py $(PYTEST_OPTS)
 
+.PHONY: test-overflow
+test-overflow:  ## Run ClientMessageStore overflow / StoreFull tests
+	$(PYTEST) tests/integration/test_store_overflow.py $(PYTEST_OPTS)
+
+.PHONY: test-timeouts
+test-timeouts:  ## Run timeout-behaviour tests (rpc, cast, rpc_nowait)
+	$(PYTEST) tests/integration/test_timeouts.py $(PYTEST_OPTS)
+
 .PHONY: test-cov
 test-cov:  ## Run all tests with coverage report
 	$(PYTEST) tests/unit tests/integration \

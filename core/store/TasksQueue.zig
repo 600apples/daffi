@@ -4,8 +4,7 @@ const Mutex = @import("../misc.zig").Mutex;
 const Message = serde.Message;
 const Allocator = std.mem.Allocator;
 
-// std.DoublyLinkedList is now non-generic (intrusive) in 0.16.
-// We wrap each Message pointer in a node struct and use @fieldParentPtr.
+
 const MessageNode = struct {
     node: std.DoublyLinkedList.Node = .{},
     data: *Message,
@@ -72,6 +71,7 @@ pub fn deinit(self: *TasksQueue) void {
     defer self.mutex.unlock();
     while (self.queue.popFirst()) |raw_node| {
         const msg_node: *MessageNode = @fieldParentPtr("node", raw_node);
+        msg_node.data.undurableAndDeinit();
         self.allocator.destroy(msg_node);
     }
 }
@@ -99,15 +99,8 @@ pub fn pushMessageToQueue(self: *TasksQueue, message: *Message) !void {
     // message before serverLoop's ownership check completes.
 }
 
-pub fn shiftMessageToQueue(self: *TasksQueue, message: *Message) !void {
+pub fn len(self: *TasksQueue) usize {
     self.mutex.lock();
     defer self.mutex.unlock();
-    const msg_node = try self.allocator.create(MessageNode);
-    msg_node.* = .{ .data = message };
-    self.queue.prepend(&msg_node.node);
-    // Same reasoning as pushMessageToQueue: caller triggers wakeup explicitly.
-}
-
-pub fn len(self: *TasksQueue) usize {
     return self.queue.len();
 }

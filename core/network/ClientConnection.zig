@@ -82,6 +82,7 @@ pub fn init(allocator: Allocator, config: Config) !*ClientConnection {
     }
 
     try self.writeTimeout(1000);
+    self.enableKeepalive(10, 5, 3);
     return self;
 }
 
@@ -90,6 +91,7 @@ pub fn initFromAccepted(allocator: Allocator, fd: posix.socket_t) !*ClientConnec
     const stream = net.Stream{ .handle = fd };
     const self = try allocator.create(ClientConnection);
     self.* = .{ .stream = stream, .addr = null, .allocator = allocator };
+    self.enableKeepalive(10, 5, 3);
     return self;
 }
 
@@ -102,6 +104,7 @@ pub fn initFromTlsHandshake(allocator: Allocator, fd: posix.socket_t, ssl: *tls_
     const stream = net.Stream{ .handle = fd };
     const self = try allocator.create(ClientConnection);
     self.* = .{ .stream = stream, .addr = null, .allocator = allocator, .ssl = ssl };
+    self.enableKeepalive(10, 5, 3);
     return self;
 }
 
@@ -162,4 +165,40 @@ pub fn writeTimeout(self: *ClientConnection, ms: u32) !void {
         .usec = @intCast(@mod(ms, 1000) * 1000),
     });
     return posix.setsockopt(self.stream.handle, posix.SOL.SOCKET, posix.SO.SNDTIMEO, &timeout);
+}
+
+/// Enable TCP keepalive so that a silently-dropped network path (e.g. Wi-Fi
+/// turned off while the socket is idle) is detected within a bounded time
+/// instead of leaving the read thread blocked forever.
+///
+/// Parameters (all in seconds):
+///   idle     – inactivity before the first probe is sent   (default: 10)
+///   interval – gap between subsequent probes               (default:  5)
+///   count    – probes without a reply before declaring dead (default:  3)
+///
+/// Total worst-case detection: idle + interval * count  (default: 25 s)
+///
+/// Silently ignored on Unix-domain sockets, which do not support keepalive.
+pub fn enableKeepalive(self: *ClientConnection, idle: u32, interval: u32, count: u32) void {
+    const fd = self.stream.handle;
+
+    const one: c_int = 1;
+    posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.KEEPALIVE, std.mem.asBytes(&one)) catch return;
+
+    const idle_i: c_int  = @intCast(idle);
+    const intvl_i: c_int = @intCast(interval);
+    const cnt_i: c_int   = @intCast(count);
+
+    const tag = @import("builtin").target.os.tag;
+    if (tag == .linux or tag == .emscripten) {
+        posix.setsockopt(fd, posix.IPPROTO.TCP, posix.TCP.KEEPIDLE,  std.mem.asBytes(&idle_i))  catch {};
+        posix.setsockopt(fd, posix.IPPROTO.TCP, posix.TCP.KEEPINTVL, std.mem.asBytes(&intvl_i)) catch {};
+        posix.setsockopt(fd, posix.IPPROTO.TCP, posix.TCP.KEEPCNT,   std.mem.asBytes(&cnt_i))   catch {};
+    } else if (tag == .macos or tag == .ios or tag == .tvos or tag == .watchos) {
+        // macOS uses TCP_KEEPALIVE for the idle timeout (Linux calls it TCP_KEEPIDLE).
+        posix.setsockopt(fd, posix.IPPROTO.TCP, posix.TCP.KEEPALIVE, std.mem.asBytes(&idle_i))  catch {};
+        posix.setsockopt(fd, posix.IPPROTO.TCP, posix.TCP.KEEPINTVL, std.mem.asBytes(&intvl_i)) catch {};
+        posix.setsockopt(fd, posix.IPPROTO.TCP, posix.TCP.KEEPCNT,   std.mem.asBytes(&cnt_i))   catch {};
+    }
+    // Other platforms: SO_KEEPALIVE is still set above; fine-tuning is best-effort.
 }

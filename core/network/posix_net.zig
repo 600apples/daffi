@@ -90,6 +90,11 @@ pub const Stream = struct {
     }
 
     pub fn close(self: Stream) void {
+        // shutdown(SHUT_RDWR) reliably unblocks any thread currently blocked in
+        // recv()/read() on this fd before we release the fd with close().
+        // POSIX close() alone does not guarantee that a concurrent recv() is
+        // interrupted — this is the canonical fix for that race.
+        _ = c.shutdown(self.handle, c.SHUT_RDWR);
         _ = c.close(self.handle);
     }
 };

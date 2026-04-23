@@ -48,17 +48,18 @@ pub const Config = struct {};
 
 pub fn init(allocator: Allocator, stream: net.Stream, addr: net.Address, _: Config) !*WebConnection {
     const self = try allocator.create(WebConnection);
-    var buffer_pool = try buffer.Pool.init(allocator, 32, 32768);
-    var buffer_provider = buffer.Provider.init(allocator, &buffer_pool, 32768);
-    const reader = try Reader.init(5120, serde.MAX_BYTES_MESSAGE, &buffer_provider);
-    self.* = .{
-        .buffer_pool = buffer_pool,
-        .buffer_provider = buffer_provider,
-        .reader = reader,
-        .stream = stream,
-        .addr = addr,
-        .allocator = allocator,
-    };
+    errdefer allocator.destroy(self);
+    // Assign fields directly into the heap struct so that the internal
+    // pointers (buffer_provider.pool → buffer_pool, reader.bp → buffer_provider)
+    // reference stable heap addresses rather than local stack variables that
+    // would become dangling as soon as this function returns.
+    self.allocator = allocator;
+    self.stream = stream;
+    self.addr = addr;
+    self.ssl = null;
+    self.buffer_pool = try buffer.Pool.init(allocator, 32, 32768);
+    self.buffer_provider = buffer.Provider.init(allocator, &self.buffer_pool, 32768);
+    self.reader = try Reader.init(5120, serde.MAX_BYTES_MESSAGE, &self.buffer_provider);
     return self;
 }
 
@@ -66,18 +67,14 @@ pub fn init(allocator: Allocator, stream: net.Stream, addr: net.Address, _: Conf
 /// Takes ownership of `ssl`; it will be freed in close().
 pub fn initWithTls(allocator: Allocator, stream: net.Stream, addr: net.Address, _: Config, ssl: *tls_impl.SslConn) !*WebConnection {
     const self = try allocator.create(WebConnection);
-    var buffer_pool = try buffer.Pool.init(allocator, 32, 32768);
-    var buffer_provider = buffer.Provider.init(allocator, &buffer_pool, 32768);
-    const reader = try Reader.init(5120, serde.MAX_BYTES_MESSAGE, &buffer_provider);
-    self.* = .{
-        .buffer_pool = buffer_pool,
-        .buffer_provider = buffer_provider,
-        .reader = reader,
-        .stream = stream,
-        .addr = addr,
-        .allocator = allocator,
-        .ssl = ssl,
-    };
+    errdefer allocator.destroy(self);
+    self.allocator = allocator;
+    self.stream = stream;
+    self.addr = addr;
+    self.ssl = ssl;
+    self.buffer_pool = try buffer.Pool.init(allocator, 32, 32768);
+    self.buffer_provider = buffer.Provider.init(allocator, &self.buffer_pool, 32768);
+    self.reader = try Reader.init(5120, serde.MAX_BYTES_MESSAGE, &self.buffer_provider);
     return self;
 }
 
@@ -139,55 +136,45 @@ fn readInternal(self: *WebConnection) !?[]const u8 {
             return message.data;
         },
         .pong => {
-            if (true) {
-                std.debug.print("message: {s}\n", .{message.data});
-            }
+            // Unsolicited pong from the browser — ignore silently.
         },
         .ping => {
-            if (true) {
-                std.debug.print("message: {s}\n", .{message.data});
-            } else {
-                const data = message.data;
-                if (data.len == 0) {
-                    // try self.writeAllBuf(EMPTY_PONG);
-                } else {
-                    try self.writeFrame(.pong, data);
-                }
+            // Respond to keep-alive pings from the browser.
+            const data = message.data;
+            if (data.len > 0) {
+                try self.writeFrame(.pong, data);
             }
         },
         .close => {
-            if (true) {
-                std.debug.print("message: {s}\n", .{message.data});
-                return null;
-            }
+            // Browser initiated close handshake: validate the payload and echo
+            // back an appropriate close frame, then return null so the receive
+            // loop breaks and triggers the normal disconnect path.
             const data = message.data;
             const l = data.len;
             if (l == 0) {
-                _ = self.writeClose();
+                self.writeClose() catch {};
                 return null;
             }
             if (l == 1) {
-                // close with a payload always has to have at least a 2-byte payload,
-                // since a 2-byte code is required
-                _ = self.writeAllBuf(CLOSE_PROTOCOL_ERROR);
+                // close payload must be either empty or at least 2 bytes (status code)
+                self.writeAllBuf(CLOSE_PROTOCOL_ERROR) catch {};
                 return null;
             }
             const code = @as(u16, @intCast(data[1])) | (@as(u16, @intCast(data[0])) << 8);
             if (code < 1000 or code == 1004 or code == 1005 or code == 1006 or (code > 1013 and code < 3000)) {
-                _ = self.writeAllBuf(CLOSE_PROTOCOL_ERROR);
+                self.writeAllBuf(CLOSE_PROTOCOL_ERROR) catch {};
                 return null;
             }
             if (l == 2) {
-                try self.writeAllBuf(CLOSE_NORMAL);
+                self.writeAllBuf(CLOSE_NORMAL) catch {};
                 return null;
             }
             const payload = data[2..];
             if (!std.unicode.utf8ValidateSlice(payload)) {
-                // if we have a payload, it must be UTF8 (why?!)
-                try self.writeAllBuf(CLOSE_PROTOCOL_ERROR);
+                self.writeAllBuf(CLOSE_PROTOCOL_ERROR) catch {};
                 return null;
             }
-            _ = self.writeClose();
+            self.writeClose() catch {};
             return null;
         },
     }
@@ -247,7 +234,6 @@ fn writeFrame(self: *WebConnection, op_code: WebConnection.OpCode, data: []const
 pub fn deinit(self: *WebConnection) void {
     self.reader.deinit();
     self.buffer_pool.deinit();
-    self.buffer_provider.deinit();
     self.allocator.destroy(self);
 }
 

@@ -3,8 +3,6 @@ const network = @import("../network.zig");
 const Allocator = std.mem.Allocator;
 const Mutex = @import("../misc.zig").Mutex;
 
-const expect = std.testing.expect;
-
 pub fn ChannelsMapper(comptime ConnectionT: type) type {
     return struct {
         channels: Channels,
@@ -28,8 +26,11 @@ pub fn ChannelsMapper(comptime ConnectionT: type) type {
                 return .{ .conn = conn, .methods = methods, .connection_name = conn_name };
             }
 
+            /// Free the methods BufSet (internals + the struct pointer) and the
+            /// connection_name string.
             pub fn deinit(self: *Channel, allocator: Allocator) void {
                 self.methods.deinit();
+                allocator.destroy(self.methods);
                 allocator.free(self.connection_name);
             }
 
@@ -41,6 +42,8 @@ pub fn ChannelsMapper(comptime ConnectionT: type) type {
                 return self.methods.contains(method_name);
             }
 
+            /// Clear all method entries without freeing the BufSet struct itself.
+            /// Used when a handshake update replaces the method list in-place.
             pub fn clear(self: *Channel) void {
                 self.methods.hash_map.clearAndFree();
             }
@@ -66,10 +69,28 @@ pub fn ChannelsMapper(comptime ConnectionT: type) type {
             return self;
         }
 
+        /// Free all channels and the mapper itself.
+        /// Must be called when the connection owning this mapper is torn down.
+        /// No other thread must access this mapper concurrently after this call.
+        pub fn deinit(self: *Self) void {
+            for (self.channels.values()) |*chan| {
+                chan.methods.deinit();
+                self.allocator.destroy(chan.methods);
+                self.allocator.free(chan.connection_name);
+            }
+            self.channels.clearAndFree(self.allocator);
+            self.allocator.destroy(self);
+        }
+
         pub fn ChannelsCount(self: *Self) usize {
+            self.mutex.lock();
+            defer self.mutex.unlock();
             return self.channels.count();
         }
 
+        /// Returns a live slice into the map's backing array without locking.
+        /// Caller is responsible for ensuring no concurrent mutations occur while
+        /// the slice is in use (typically by holding its own handler-level mutex).
         pub fn allChannels(self: *Self) []Channel {
             return self.channels.values();
         }
@@ -96,23 +117,36 @@ pub fn ChannelsMapper(comptime ConnectionT: type) type {
             return chan;
         }
 
+        /// Find the channel associated with a specific connection pointer.
+        /// Thread-safe; acquires the mutex internally.
         pub fn getChannelByConnection(self: *Self, conn: *ConnectionT) ?*Channel {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            return self.getChannelByConnectionLocked(conn);
+        }
+
+        fn getChannelByConnectionLocked(self: *Self, conn: *ConnectionT) ?*Channel {
             for (self.channels.values()) |*chan| {
                 if (chan.conn == conn) return chan;
             }
             return null;
         }
 
+        /// Remove a channel by its connection pointer, freeing all owned resources.
+        /// Thread-safe; acquires the mutex only once (avoids double-lock vs
+        /// calling getChannelByConnection + destroyChannel separately).
+        pub fn destroyChannelByConnection(self: *Self, conn: *ConnectionT) void {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            if (self.getChannelByConnectionLocked(conn)) |chan| {
+                self.destroyChannelLocked(chan);
+            }
+        }
+
         pub fn destroyChannel(self: *Self, chan: *Channel) void {
             self.mutex.lock();
             defer self.mutex.unlock();
-            const conn_name = chan.connection_name;
-            defer self.allocator.free(conn_name);
-            std.debug.assert(self.channels.swapRemove(conn_name));
-        }
-
-        pub fn destroyChannelByConnection(self: *Self, conn: *ConnectionT) void {
-            if (self.getChannelByConnection(conn)) |chan| self.destroyChannel(chan);
+            self.destroyChannelLocked(chan);
         }
 
         /// Remove a channel by name (used when a "disconnected" event arrives).
@@ -120,38 +154,35 @@ pub fn ChannelsMapper(comptime ConnectionT: type) type {
         pub fn destroyChannelByName(self: *Self, name: []const u8) void {
             self.mutex.lock();
             defer self.mutex.unlock();
-            _ = self.channels.swapRemove(name);
+            const chan = self.channels.getPtr(name) orelse return;
+            self.destroyChannelLocked(chan);
+        }
+
+        /// Remove and free a channel.  Caller MUST hold self.mutex.
+        ///
+        /// Resources are freed in this order so that pointers remain valid at
+        /// each step:
+        ///   1. methods internals + *BufSet struct (while chan pointer is valid)
+        ///   2. swapRemove by connection_name (may move another entry into chan's
+        ///      slot, invalidating the chan pointer)
+        ///   3. free the connection_name string (no longer needed as map key)
+        fn destroyChannelLocked(self: *Self, chan: *Channel) void {
+            chan.methods.deinit();
+            self.allocator.destroy(chan.methods);
+            const conn_name = chan.connection_name;
+            std.debug.assert(self.channels.swapRemove(conn_name));
+            self.allocator.free(conn_name);
         }
 
         pub fn clearAllChannels(self: *Self) void {
             self.mutex.lock();
             defer self.mutex.unlock();
             for (self.channels.values()) |*chan| {
-                chan.clear();
+                chan.methods.deinit();
+                self.allocator.destroy(chan.methods);
+                self.allocator.free(chan.connection_name);
             }
             self.channels.clearAndFree(self.allocator);
         }
     };
-}
-
-test "test ChannelsMapper" {
-    const alloc = std.testing.allocator;
-    const mapper = try ChannelsMapper.init(alloc);
-    defer mapper.deinit();
-    try expect(!mapper.containsMethod("chan1", "method1"));
-    try mapper.addMethod("chan1", "method1");
-    try expect(mapper.containsMethod("chan1", "method1"));
-    try expect(!mapper.containsMethod("chan2", "method1"));
-    try mapper.addMethod("chan2", "method1");
-    try expect(mapper.containsMethod("chan2", "method1"));
-
-    try mapper.addMethod("chan2", "method2");
-    try mapper.addMethod("chan2", "method3");
-    try mapper.addMethod("chan2", "method4");
-    try mapper.addMethod("chan2", "method5");
-
-    try expect(mapper.containsMethod("chan2", "method2"));
-    try expect(mapper.containsMethod("chan2", "method3"));
-    try expect(mapper.containsMethod("chan2", "method4"));
-    try expect(mapper.containsMethod("chan2", "method5"));
 }

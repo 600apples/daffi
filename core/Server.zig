@@ -137,6 +137,7 @@ pub fn messageDispatcher(allocator: Allocator, app_name: []const u8, config: Ser
     var msgpool: *MessagePool = try MessagePool.init(allocator);
     const conn: *ServerConnection = try ServerConnection.init(allocator, config);
     var server_handler = try ServerHandler.init(config.mode, allocator, app_name);
+    defer server_handler.deinit();
     if (serverEntries == null) {
         serverEntries = ServerEntryArray{};
     }

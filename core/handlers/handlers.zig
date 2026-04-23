@@ -88,9 +88,18 @@ pub fn ServerHandler(comptime HandlerConnectionT: ConnectionType) type {
         }
 
         pub fn deinit(self: *HandlerUnion) void {
-            switch (self) {
-                inline else => |e| e.allocator.destroy(e),
-            }
+            const allocator = switch (self.*) {
+                .Service => |*s| blk: {
+                    s.tasks_queue.deinit();
+                    s.chan_mapper.deinit();
+                    break :blk s.allocator;
+                },
+                .Router => |*r| blk: {
+                    r.chan_mapper.deinit();
+                    break :blk r.allocator;
+                },
+            };
+            allocator.destroy(self);
         }
 
         const ServiceHandler = struct {
@@ -184,8 +193,7 @@ pub fn ServerHandler(comptime HandlerConnectionT: ConnectionType) type {
                 var arena = ArenaAllocator.init(self.allocator);
                 defer arena.deinit();
                 var allocator = arena.allocator();
-
-                const chan = self.chan_mapper.getChannelByConnection(conn) orelse return error.ChannelNotFound;
+                const chan = self.chan_mapper.getChannelByConnection(conn) orelse return;
                 const connection_name = try allocator.dupe(u8, chan.connection_name); // for event
                 self.chan_mapper.destroyChannel(chan);
 
@@ -309,7 +317,7 @@ pub fn ServerHandler(comptime HandlerConnectionT: ConnectionType) type {
                 defer arena.deinit();
                 var allocator = arena.allocator();
 
-                const chan = self.chan_mapper.getChannelByConnection(conn) orelse return error.ChannelNotFound;
+                const chan = self.chan_mapper.getChannelByConnection(conn) orelse return;
                 const connection_name = try allocator.dupe(u8, chan.connection_name); // for event
                 self.chan_mapper.destroyChannel(chan);
                 // Capture allChannels() once after the removal so count and slice are consistent.
@@ -366,6 +374,8 @@ pub const ClientHandler = struct {
     }
 
     pub fn deinit(self: *ClientHandler) void {
+        self.tasks_queue.deinit();
+        self.chan_mapper.deinit();
         self.allocator.free(self.app_name);
         self.allocator.destroy(self);
     }
@@ -486,7 +496,15 @@ pub const ClientHandler = struct {
     pub fn onResponse(self: *Self, _: *ParentConnT, message: *Message) !void {
         // put message to client store for taking result by client.
         message.setDurable();
-        try self.msg_store.insert(message);
+        self.msg_store.insert(message) catch {
+            // Store is full (>= buf_size simultaneous in-flight RPCs sharing the
+            // same hash slot).  Drop this response — the waiting Python thread will
+            // time out and call setTimeoutError to clean up.  We must NOT propagate
+            // the error: doing so would crash the entire dispatcher and kill the
+            // connection, which is far worse than a single timed-out call.
+            print("warning: message store full, dropping response for uuid {}\n", .{message.getUuid()});
+            message.undurableAndDeinit();
+        };
     }
 
     // ---------------------- CLIENT CONNECTION LIFECYCLE ------------------------

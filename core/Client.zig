@@ -27,26 +27,6 @@ const is_wasm = misc.is_wasm;
 
 const Client = @This();
 
-/// Replacement for std.BoundedArray (removed in 0.16) — fixed 512-slot array.
-const ClientEntryArray = struct {
-    buffer: [512]?*ClientEntry = [_]?*ClientEntry{null} ** 512,
-    len: usize = 512,
-
-    pub fn init() @This() {
-        return .{};
-    }
-
-    pub fn get(self: *const @This(), idx: usize) ?*ClientEntry {
-        return self.buffer[idx];
-    }
-
-    pub fn set(self: *@This(), idx: usize, val: ?*ClientEntry) void {
-        self.buffer[idx] = val;
-    }
-};
-
-var clientEntries: ?ClientEntryArray = null;
-var nextConnNumHint: usize = 0; // start-of-search hint, wraps at 512
 
 fn setSignalHandler() !void {
     const internal_handler = struct {
@@ -79,15 +59,20 @@ const ClientEntry = struct {
     msgpool: *MessagePool,
     client_handler: *ClientHandler,
     uuid: u16 = 0,
+    /// Set to true (with release ordering) by the dispatcher thread after it
+    /// has freed connection/msgpool resources.  Python reads this (acquire) to
+    /// detect a dead connection before calling stopClient(), which frees the
+    /// ClientEntry itself.
+    disconnected: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// Allocator used to create this entry; stored so stopClient can free it.
+    alloc: Allocator,
 
     pub fn get(conn_num: usize) !*ClientEntry {
-        if (clientEntries) |entries| {
-            if (entries.get(conn_num)) |client_entry| {
-                if (!client_entry.connection.suspended) return client_entry;
-                return error.ConnectionLost;
-            }
-        }
-        return error.ClientNotInitialized;
+        if (conn_num == 0) return error.ClientNotInitialized;
+        const entry: *ClientEntry = @ptrFromInt(conn_num);
+        if (entry.disconnected.load(.acquire)) return error.ClientNotInitialized;
+        if (entry.connection.suspended) return error.ConnectionLost;
+        return entry;
     }
 
     pub fn generateUUID(self: *ClientEntry) u16 {
@@ -97,38 +82,59 @@ const ClientEntry = struct {
         return self.uuid;
     }
 
-    pub fn desctroyClientEntry(self: *const ClientEntry) void {
-        // Only close the socket so the dispatcher thread can detect disconnect and exit.
-        // The Connection struct and msgpool are freed by messageDispatcherClientEntry
-        // after the thread finishes, avoiding use-after-free races.
-        self.connection.close();
+    /// Close the connection and free all associated resources.
+    ///
+    /// For native targets: closes the socket (which unblocks the dispatcher's
+    /// recv via shutdown), waits for the dispatcher's defer block to finish
+    /// freeing connection/msgpool and set disconnected=true, then frees the
+    /// ClientEntry struct itself.
+    ///
+    /// For WASM: no dispatcher thread exists, so resources are freed directly.
+    pub fn destroy(self: *ClientEntry) void {
+        if (is_wasm) {
+            self.connection.destroy();
+            self.msgpool.deinit();
+            self.client_handler.deinit();
+            self.alloc.destroy(self);
+            return;
+        }
+        if (!self.disconnected.load(.acquire)) {
+            self.connection.close();
+            while (!self.disconnected.load(.acquire)) {
+                const ts = std.c.timespec{ .sec = 0, .nsec = 1_000_000 };
+                _ = std.c.nanosleep(&ts, null);
+            }
+        }
+        self.client_handler.deinit();
+        self.alloc.destroy(self);
     }
 
-    fn messageDispatcherClientEntry(self: *ClientEntry, conn_num: usize) !void {
+    fn messageDispatcherClientEntry(self: *ClientEntry) !void {
+        defer {
+            self.connection.destroy();
+            self.msgpool.deinit();
+            self.disconnected.store(true, .release);
+        }
         var msg_handler = self.client_handler.handler();
         while (self.msgpool.receiveMessage(self.connection)) |message| {
             try msg_handler.handle(self.connection, message);
             // Notify the Python task dispatcher that a new task-queue message
-            // may be waiting.  This eliminates the 1 ms fallback poll delay for
-            // Client connections used as workers in a router topology.
-            // ClientHandler always marks inbound messages as durable (they go
-            // into msg_store or tasks_queue), so there is no double-free risk
-            // — unlike serverLoop, this loop has no defer message.deinit().
+            // may be waiting.
             msg_handler.triggerWakeup();
         } else |err| {
-            print("exit client connection with error: {}\n", .{err});
+            // Suppress the log when the disconnect was intentional: close()
+            // sets suspended = true before shutting down the socket, so by
+            // the time we land here with an EOF the flag is already set.
+            if (!self.connection.suspended) {
+                print("exit client connection with error: {}\n", .{err});
+            }
             try msg_handler.handleErr(self.connection, err);
         }
         // Notify Python that this connection is dead so AutoReconnect can
-        // react immediately without polling.  Must happen before the slot is
-        // nulled so the wakeup fd is still valid when Python reads it.
+        // react immediately without polling.  Must happen before the defer
+        // frees resources so wakeup/disconnect fds are still valid.
         self.client_handler.tasks_queue.triggerDisconnect();
         try msg_handler.handleDisconnect(self.connection);
-        { const ts = std.c.timespec{ .sec = 0, .nsec = 5000 }; _ = std.c.nanosleep(&ts, null); }
-        if (clientEntries) |*entries| entries.set(conn_num, null);
-        // Now safe to free: no Python thread or Zig code references this connection.
-        self.connection.destroy();
-        self.msgpool.deinit();
     }
 
     pub fn createMessageClientEntry(self: *ClientEntry, allocator: Allocator, data: []const u8, uuid: u16, flag: MessageFlag, decoder: MessageDecoder, is_bytes: bool, return_result: bool, receiver: []const u8, func_name: []const u8) !MessageAndDataIndentifier {
@@ -229,7 +235,7 @@ const ClientEntry = struct {
 
 fn messageDispatcher(conn_num: usize) !void {
     var entry = try ClientEntry.get(conn_num);
-    try entry.messageDispatcherClientEntry(conn_num);
+    try entry.messageDispatcherClientEntry();
 }
 
 pub fn init(allocator: std.mem.Allocator, app_name: []const u8, config: ClientConnection.Config) !usize {
@@ -247,37 +253,18 @@ pub fn init(allocator: std.mem.Allocator, app_name: []const u8, config: ClientCo
         try msgpool.sendSynMessage(conn);
     }
     const cl_entry = try allocator.create(ClientEntry);
-    cl_entry.* = ClientEntry{ .connection = conn, .msgpool = msgpool, .client_handler = client_handler };
-    if (clientEntries == null) {
-        clientEntries = ClientEntryArray.init();
-    }
-    // Find the first slot that is genuinely free (null).  The hint avoids
-    // always scanning from 0, but correctness depends on the null check.
-    const conn_num: usize = blk: {
-        for (0..512) |i| {
-            const slot = (nextConnNumHint + i) % 512;
-            if (clientEntries.?.get(slot) == null) {
-                nextConnNumHint = (slot + 1) % 512;
-                break :blk slot;
-            }
-        }
-        // All 512 slots occupied — hard limit reached.
-        return error.TooManyClients;
-    };
-    clientEntries.?.set(conn_num, cl_entry);
+    cl_entry.* = ClientEntry{ .connection = conn, .msgpool = msgpool, .client_handler = client_handler, .alloc = allocator };
+    // The heap address of the ClientEntry is the connection number: unbounded,
+    // unique, and O(1) to resolve — just @ptrFromInt(conn_num).
+    const conn_num: usize = @intFromPtr(cl_entry);
     if (!is_wasm) _ = try std.Thread.spawn(.{}, messageDispatcher, .{conn_num});
     return conn_num;
 }
 
 pub fn desctroyClient(conn_num: usize) !void {
-    var entry = try ClientEntry.get(conn_num);
-    if (is_wasm) {
-        // In WASM there is no dispatcher thread to clean up the slot after use.
-        // Null the slot immediately so the next initClient call can reuse it.
-        if (clientEntries) |*entries| entries.set(conn_num, null);
-    } else {
-        entry.desctroyClientEntry();
-    }
+    if (conn_num == 0) return error.ClientNotInitialized;
+    const entry: *ClientEntry = @ptrFromInt(conn_num);
+    entry.destroy();
 }
 
 pub fn createMessage(allocator: Allocator, data: []const u8, uuid: u16, flag: MessageFlag, decoder: MessageDecoder, is_bytes: bool, return_result: bool, receiver: []const u8, func_name: []const u8, conn_num: usize) !MessageAndDataIndentifier {
