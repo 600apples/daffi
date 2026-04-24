@@ -91,6 +91,21 @@ before-all = """
     RAW_ARCH=$(uname -m)
     if [ "$RAW_ARCH" = "arm64" ]; then ZIG_ARCH="aarch64"; else ZIG_ARCH="$RAW_ARCH"; fi
 
+    # GitHub macOS runners sometimes install Homebrew packages as universal2
+    # (arm64+x86_64) fat binaries.  delocate-wheel --require-archs <arch>
+    # rejects any bundled dylib that is not single-arch, so thin the OpenSSL
+    # dylibs to the native architecture now, before Zig links against them.
+    OPENSSL_LIB=$(brew --prefix openssl@3)/lib
+    for f in "$OPENSSL_LIB"/libssl*.dylib "$OPENSSL_LIB"/libcrypto*.dylib; do
+        [ -f "$f" ] || continue
+        if lipo -info "$f" 2>/dev/null | grep -q "Non-fat"; then
+            echo "  $(basename $f): already single-arch — nothing to thin"
+        else
+            echo "  $(basename $f): thinning to $RAW_ARCH ..."
+            lipo -thin "$RAW_ARCH" "$f" -output "${f}.thin" && mv "${f}.thin" "$f"
+        fi
+    done
+
     ZIG_VERSION="0.16.0"
     ZIG_TAR="zig-${ZIG_ARCH}-macos-${ZIG_VERSION}.tar.xz"
     ZIG_URL="https://ziglang.org/download/${ZIG_VERSION}/${ZIG_TAR}"
@@ -102,8 +117,11 @@ before-all = """
     zig version
 """
 
-# delocate bundles dylibs into the wheel automatically
-repair-wheel-command = "delocate-wheel --require-archs {delocate_archs} -w {dest_dir} {wheel}"
+# delocate bundles dylibs into the wheel automatically.
+# --require-archs is intentionally omitted: the extension itself is always
+# native (Zig builds for the runner's own arch), and the thinned OpenSSL
+# dylibs are already single-arch after the before-all step above.
+repair-wheel-command = "delocate-wheel -w {dest_dir} {wheel}"
 
 
 [tool.hatch.envs.docs]
