@@ -6,6 +6,14 @@ OpenSSL discovery order
 1. ``OPENSSL_DIR`` environment variable
 2. macOS: ``brew --prefix openssl@3``  (falls back to @1.1 then bare openssl)
 3. System default paths
+
+Cross-compilation
+-----------------
+cibuildwheel sets ``ARCHFLAGS`` (e.g. ``-arch x86_64``) when building a wheel
+for an architecture other than the runner's native one (e.g. x86_64 wheel on
+an Apple Silicon macos-14 runner).  ``ZigBuilder`` reads that variable and
+passes the appropriate ``-target`` triple to ``zig build-lib`` so the emitted
+shared library has the correct architecture.
 """
 import os
 import sys
@@ -40,6 +48,34 @@ def _find_openssl():
     return None, None
 
 
+def _zig_target():
+    """Return a Zig target triple only when genuinely cross-compiling.
+
+    Returns ``None`` for native builds so Zig can auto-detect the target and
+    use its normal system-library search paths (no ``-L`` required).
+
+    When ``ARCHFLAGS`` is explicitly set (cibuildwheel cross-compilation or
+    a manual ``ARCHFLAGS=-arch x86_64 pip install``), returns the appropriate
+    triple, e.g. ``x86_64-macos`` or ``aarch64-linux``.
+    """
+    archflags = os.environ.get("ARCHFLAGS", "").strip()
+    if not archflags:
+        return None  # Native build — let Zig pick the target automatically.
+
+    if "-arch x86_64" in archflags:
+        cpu = "x86_64"
+    elif "-arch arm64" in archflags:
+        cpu = "aarch64"
+    else:
+        return None  # Unrecognised ARCHFLAGS — fall back to native.
+
+    if sys.platform == "darwin":
+        return f"{cpu}-macos"
+    if sys.platform.startswith("linux"):
+        return f"{cpu}-linux"
+    return None
+
+
 class ZigBuilder(build_ext):
     def build_extension(self, ext):
         assert len(ext.sources) == 1, "ZigBuilder expects exactly one source file"
@@ -49,6 +85,7 @@ class ZigBuilder(build_ext):
 
         mode = "Debug" if self.debug else "ReleaseFast"
         openssl_include, openssl_lib = _find_openssl()
+        target = _zig_target()
 
         cmd = [
             "zig",
@@ -63,6 +100,8 @@ class ZigBuilder(build_ext):
             *[f"-I{d}" for d in self.include_dirs],
         ]
 
+        if target:
+            cmd += ["-target", target]
         if openssl_include:
             cmd.append(f"-I{openssl_include}")
         if openssl_lib:

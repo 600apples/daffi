@@ -79,7 +79,9 @@ repair-wheel-command = "auditwheel repair -w {dest_dir} {wheel}"
 
 # ── macOS ─────────────────────────────────────────────────────────────────────
 [tool.cibuildwheel.macos]
-archs = ["x86_64", "arm64"]
+# macos-13 runner is x86_64 (Intel); macos-14 runner is arm64 (Apple Silicon).
+# Each runner builds its native arch — no cross-compilation needed or wanted.
+archs = ["native"]
 
 before-all = """
     # xz is needed by BSD tar's -J flag; openssl@3 for the native extension.
