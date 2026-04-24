@@ -58,8 +58,9 @@ manylinux-x86_64-image  = "quay.io/pypa/manylinux_2_28_x86_64"
 manylinux-aarch64-image = "quay.io/pypa/manylinux_2_28_aarch64"
 
 before-all = """
-    # Ensure curl and xz are available (minimal manylinux images may omit them).
-    yum install -y curl xz 2>/dev/null || dnf install -y curl xz 2>/dev/null || true
+    # Ensure required build tools are available in the minimal manylinux image.
+    # openssl-devel provides <openssl/ssl.h> needed by core/network/tls.zig.
+    yum install -y curl xz openssl-devel 2>/dev/null || dnf install -y curl xz openssl-devel 2>/dev/null || true
 
     ARCH=$(uname -m)
     ZIG_VERSION="0.16.0"
