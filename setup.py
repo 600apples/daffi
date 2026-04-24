@@ -7,13 +7,24 @@ OpenSSL discovery order
 2. macOS: ``brew --prefix openssl@3``  (falls back to @1.1 then bare openssl)
 3. System default paths
 
+OpenSSL linking strategy
+------------------------
+On macOS the extension is linked against OpenSSL *statically* (using the
+``.a`` archives from Homebrew).  Dynamic dylib references cause ``delocate``
+to try to bundle ``libssl.dylib``/``libcrypto.dylib`` into the wheel; on
+GitHub Actions the Homebrew dylibs may be universal2 fat binaries which
+``delocate`` can't process cleanly.  Static linking embeds the OpenSSL code
+directly and produces a wheel with no external dylib dependency.
+
+On Linux dynamic linking is used instead — ``auditwheel repair`` handles
+bundling ``libssl.so``/``libcrypto.so`` into the wheel correctly.
+
 Cross-compilation
 -----------------
 cibuildwheel sets ``ARCHFLAGS`` (e.g. ``-arch x86_64``) when building a wheel
-for an architecture other than the runner's native one (e.g. x86_64 wheel on
-an Apple Silicon macos-14 runner).  ``ZigBuilder`` reads that variable and
-passes the appropriate ``-target`` triple to ``zig build-lib`` so the emitted
-shared library has the correct architecture.
+for an architecture other than the runner's native one.  ``ZigBuilder`` reads
+that variable and passes the appropriate ``-target`` triple to ``zig
+build-lib`` so the emitted shared library has the correct architecture.
 """
 import os
 import sys
@@ -92,8 +103,6 @@ class ZigBuilder(build_ext):
             "build-lib",
             "-O", mode,
             "-lc",
-            "-lssl",
-            "-lcrypto",
             f"-femit-bin={self.get_ext_fullpath(ext.name)}",
             "-fallow-shlib-undefined",
             "-dynamic",
@@ -104,8 +113,24 @@ class ZigBuilder(build_ext):
             cmd += ["-target", target]
         if openssl_include:
             cmd.append(f"-I{openssl_include}")
-        if openssl_lib:
-            cmd.append(f"-L{openssl_lib}")
+
+        # On macOS: link OpenSSL statically using the Homebrew .a archives so
+        # the wheel contains no LC_LOAD_DYLIB references to libssl/libcrypto.
+        # delocate then has nothing to bundle and the repair step is a no-op.
+        #
+        # On Linux: link dynamically; auditwheel bundles the .so files fine.
+        if sys.platform == "darwin" and openssl_lib:
+            ssl_a = os.path.join(openssl_lib, "libssl.a")
+            crypto_a = os.path.join(openssl_lib, "libcrypto.a")
+            if os.path.exists(ssl_a) and os.path.exists(crypto_a):
+                cmd.extend([ssl_a, crypto_a])
+            else:
+                # Static archives missing — fall back to dynamic linking.
+                cmd.extend([f"-L{openssl_lib}", "-lssl", "-lcrypto"])
+        else:
+            if openssl_lib:
+                cmd.append(f"-L{openssl_lib}")
+            cmd.extend(["-lssl", "-lcrypto"])
 
         cmd.append(ext.sources[0])
         self.spawn(cmd)
