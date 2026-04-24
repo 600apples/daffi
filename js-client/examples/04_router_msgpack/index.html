@@ -1,0 +1,138 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>daffi — JS caller via Router · MSGPACK</title>
+  <!-- msgpack-lite: exposes globalThis.msgpack -->
+  <script src="https://unpkg.com/msgpack-lite/dist/msgpack.min.js"></script>
+  <script src="../../daffi.js"></script>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 700px; margin: 40px auto; padding: 0 16px; background: #0f0f0f; color: #e0e0e0; }
+    h1   { color: #a78bfa; margin-bottom: 4px; }
+    p    { color: #94a3b8; margin-top: 0; }
+    .badge { display: inline-block; background: #4c1d95; color: #ddd6fe; font-size: 0.75rem; padding: 2px 8px; border-radius: 12px; margin-left: 8px; vertical-align: middle; }
+    .card { background: #1e1e2e; border-radius: 8px; padding: 16px 20px; margin-bottom: 16px; }
+    label { display: block; margin-bottom: 6px; color: #94a3b8; font-size: 0.85rem; }
+    input[type=text] { background: #13131f; border: 1px solid #374151; border-radius: 6px; color: #e0e0e0; padding: 6px 10px; width: 200px; margin-right: 6px; }
+    textarea { width: 100%; box-sizing: border-box; background: #13131f; border: 1px solid #374151; border-radius: 6px; color: #e0e0e0; padding: 8px; font-family: monospace; font-size: 0.82rem; }
+    button { background: #7c3aed; color: #fff; border: none; border-radius: 6px; padding: 7px 16px; cursor: pointer; font-size: 0.9rem; margin-right: 6px; }
+    button:disabled { background: #374151; cursor: not-allowed; }
+    button.connect { background: #10b981; }
+    button.danger  { background: #ef4444; }
+    #log { background: #13131f; border-radius: 6px; padding: 12px; min-height: 120px; font-family: monospace; font-size: 0.82rem; white-space: pre-wrap; color: #a0aec0; overflow-y: auto; max-height: 300px; }
+    .ok  { color: #34d399; }
+    .err { color: #f87171; }
+    .inf { color: #a78bfa; }
+  </style>
+</head>
+<body>
+
+<h1>daffi browser caller — Router <span class="badge">MSGPACK</span></h1>
+<p>Browser → Router → Python worker, all using binary msgpack serialisation.</p>
+
+<div class="card">
+  <label>Router WebSocket URL</label>
+  <input type="text" id="wsUrl" value="ws://127.0.0.1:6011" style="width:220px">
+  <button class="connect" id="btnConnect">Connect</button>
+  <button class="danger"  id="btnDisconnect" disabled>Disconnect</button>
+</div>
+
+<div class="card">
+  <label>summarise(records) — JSON array of <code>{value, label}</code> objects</label>
+  <textarea id="records" rows="4">[
+  {"value": 10, "label": "a"},
+  {"value": 25, "label": "b"},
+  {"value": 15, "label": "c"}
+]</textarea>
+  <br><br>
+  <button id="btnSummarise" disabled>Call summarise()</button>
+</div>
+
+<div class="card">
+  <label>transform(item) — a single JSON object</label>
+  <textarea id="item" rows="3">{"  Name  ": "Alice", "SCORE": 99, "Active": true}</textarea>
+  <br><br>
+  <button id="btnTransform" disabled>Call transform()</button>
+</div>
+
+<div class="card">
+  <label>Log</label>
+  <div id="log"></div>
+</div>
+
+<script>
+  const log = (msg, cls) => {
+    const el = document.getElementById('log');
+    el.innerHTML += `<span class="${cls||''}">${msg}</span>\n`;
+    el.scrollTop = el.scrollHeight;
+  };
+
+  let client = null;
+  let conn   = null;
+
+  const setConnected = (yes) => {
+    ['btnSummarise','btnTransform','btnDisconnect'].forEach(id =>
+      document.getElementById(id).disabled = !yes);
+    document.getElementById('btnConnect').disabled = yes;
+  };
+
+  document.getElementById('btnConnect').onclick = async () => {
+    const url = document.getElementById('wsUrl').value;
+    log(`Connecting to router at ${url} …`, 'inf');
+    try {
+      client = new DaffiClient('browser-mp-caller', {
+        wsUrl:          url,
+        wasmPath:       '../../app.wasm',
+        autoreconnect:  true,   // reconnect automatically when the router restarts
+        reconnectDelay: 2000,   // first retry after 2 s; then 4 s, 8 s … up to 60 s
+      });
+      client.addEventHandler((e) => {
+        log(`event: ${e.member} → ${e.type}`, 'inf');
+        // Update button state when our own connection drops / comes back.
+        if (e.member === 'browser-mp-caller') {
+          setConnected(e.type === 'connected');
+        }
+      });
+      conn = await client.connect();
+      log('Connected to router! (auto-reconnect enabled)', 'ok');
+      setConnected(true);
+    } catch (err) {
+      log(`Connect failed: ${err}`, 'err');
+    }
+  };
+
+  document.getElementById('btnDisconnect').onclick = () => {
+    if (client) client.stop();
+    client = null;
+    conn   = null;
+    log('Disconnected.', 'inf');
+    setConnected(false);
+  };
+
+  document.getElementById('btnSummarise').onclick = async () => {
+    if (!conn) { log('Not connected', 'err'); return; }
+    let records;
+    try { records = JSON.parse(document.getElementById('records').value); }
+    catch { log('Invalid JSON in records field', 'err'); return; }
+    log(`→ summarise(${records.length} records) …`);
+    try {
+      const result = await conn.rpc({ serde: 'msgpack', timeout: 5000 }).summarise(records);
+      log(`← summarise = ${JSON.stringify(result, null, 2)}`, 'ok');
+    } catch (err) { log(`Error: ${err}`, 'err'); }
+  };
+
+  document.getElementById('btnTransform').onclick = async () => {
+    if (!conn) { log('Not connected', 'err'); return; }
+    let item;
+    try { item = JSON.parse(document.getElementById('item').value); }
+    catch { log('Invalid JSON in item field', 'err'); return; }
+    log(`→ transform(${JSON.stringify(item)}) …`);
+    try {
+      const result = await conn.rpc({ serde: 'msgpack', timeout: 5000 }).transform(item);
+      log(`← transform = ${JSON.stringify(result)}`, 'ok');
+    } catch (err) { log(`Error: ${err}`, 'err'); }
+  };
+</script>
+</body>
+</html>

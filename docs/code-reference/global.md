@@ -1,2 +1,0 @@
-::: daffi.globals.Global
-    

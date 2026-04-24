@@ -1,0 +1,116 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>daffi — JS client · MSGPACK</title>
+  <!-- msgpack-lite: exposes globalThis.msgpack -->
+  <script src="https://unpkg.com/msgpack-lite/dist/msgpack.min.js"></script>
+  <script src="../../daffi.js"></script>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 640px; margin: 40px auto; padding: 0 16px; background: #0f0f0f; color: #e0e0e0; }
+    h1   { color: #a78bfa; margin-bottom: 4px; }
+    p    { color: #94a3b8; margin-top: 0; }
+    .card { background: #1e1e2e; border-radius: 8px; padding: 16px 20px; margin-bottom: 16px; }
+    label { display: block; margin-bottom: 6px; color: #94a3b8; font-size: 0.85rem; }
+    input[type=text] { background: #13131f; border: 1px solid #374151; border-radius: 6px; color: #e0e0e0; padding: 6px 10px; margin-right: 6px; }
+    button { background: #7c3aed; color: #fff; border: none; border-radius: 6px; padding: 7px 16px; cursor: pointer; font-size: 0.9rem; margin-right: 6px; }
+    button:disabled { background: #374151; cursor: not-allowed; }
+    button.connect { background: #10b981; }
+    button.danger  { background: #ef4444; }
+    textarea { width: 100%; box-sizing: border-box; background: #13131f; border: 1px solid #374151; border-radius: 6px; color: #e0e0e0; padding: 8px; font-family: monospace; font-size: 0.82rem; }
+    #log { background: #13131f; border-radius: 6px; padding: 12px; min-height: 120px; font-family: monospace; font-size: 0.82rem; white-space: pre-wrap; color: #a0aec0; overflow-y: auto; max-height: 260px; }
+    .ok  { color: #34d399; }
+    .err { color: #f87171; }
+    .inf { color: #a78bfa; }
+  </style>
+</head>
+<body>
+
+<h1>daffi browser client — MSGPACK</h1>
+<p>Uses <strong>msgpack-lite</strong> for binary serialisation end-to-end.</p>
+
+<div class="card">
+  <label>WebSocket URL</label>
+  <input type="text" id="wsUrl" value="ws://127.0.0.1:5011" style="width:220px">
+  <button class="connect" id="btnConnect">Connect</button>
+  <button class="danger"  id="btnDisconnect" disabled>Disconnect</button>
+</div>
+
+<div class="card">
+  <label>compute(data) — data.values is a JSON array of numbers</label>
+  <input type="text" id="values" value="[10, 20, 30, 40, 50]" style="width:240px">
+  <button id="btnCompute" disabled>Call compute()</button>
+</div>
+
+<div class="card">
+  <label>echo(payload) — send arbitrary JSON, get it back msgpack-roundtripped</label>
+  <textarea id="echoPayload" rows="3">{"hello": "world", "num": 42, "list": [1, 2, 3]}</textarea>
+  <br><br>
+  <button id="btnEcho" disabled>Call echo()</button>
+</div>
+
+<div class="card">
+  <label>Log</label>
+  <div id="log"></div>
+</div>
+
+<script>
+  const log = (msg, cls) => {
+    const el = document.getElementById('log');
+    el.innerHTML += `<span class="${cls||''}">${msg}</span>\n`;
+    el.scrollTop = el.scrollHeight;
+  };
+
+  let conn = null;
+
+  document.getElementById('btnConnect').onclick = async () => {
+    const url = document.getElementById('wsUrl').value;
+    log(`Connecting to ${url} …`, 'inf');
+    try {
+      const client = new DaffiClient('browser-mp-client', {
+        wsUrl:    url,
+        wasmPath: '../../app.wasm',
+      });
+      client.addEventHandler(e => log(`event: ${e.member} → ${e.type}`, 'inf'));
+      conn = await client.connect();
+      log('Connected!', 'ok');
+      ['btnCompute','btnEcho','btnDisconnect'].forEach(id => document.getElementById(id).disabled = false);
+      document.getElementById('btnConnect').disabled = true;
+    } catch (err) {
+      log(`Connect failed: ${err}`, 'err');
+    }
+  };
+
+  document.getElementById('btnDisconnect').onclick = () => {
+    conn = null;
+    log('Disconnected.', 'inf');
+    ['btnCompute','btnEcho','btnDisconnect'].forEach(id => document.getElementById(id).disabled = true);
+    document.getElementById('btnConnect').disabled = false;
+  };
+
+  document.getElementById('btnCompute').onclick = async () => {
+    let values;
+    try { values = JSON.parse(document.getElementById('values').value); }
+    catch { log('Invalid JSON for values array', 'err'); return; }
+    const data = { values };
+    log(`→ compute(${JSON.stringify(data)}) …`);
+    try {
+      const result = await conn.rpc({ serde: 'msgpack', timeout: 5000 }).compute(data);
+      log(`← compute = ${JSON.stringify(result)}`, 'ok');
+    } catch (err) { log(`Error: ${err}`, 'err'); }
+  };
+
+  document.getElementById('btnEcho').onclick = async () => {
+    let payload;
+    try { payload = JSON.parse(document.getElementById('echoPayload').value); }
+    catch { log('Invalid JSON in echo payload', 'err'); return; }
+    log(`→ echo(${JSON.stringify(payload)}) …`);
+    try {
+      const result = await conn.rpc({ serde: 'msgpack', timeout: 5000 }).echo(payload);
+      log(`← echo = ${JSON.stringify(result)}`, 'ok');
+    } catch (err) { log(`Error: ${err}`, 'err'); }
+  };
+</script>
+</body>
+</html>

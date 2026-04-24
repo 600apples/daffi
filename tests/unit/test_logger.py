@@ -1,3 +1,6 @@
+"""
+Unit tests for daffi.utils.logger and daffi.utils.colors.
+"""
 import logging
 from logging import LoggerAdapter
 
@@ -7,42 +10,31 @@ from daffi.utils.logger import get_daffi_logger, ColoredFormatter
 
 
 class MockLevelRecord:
-    levelno = None
-    levelname = None
-    msg = None
-    exc_info = None
-    exc_text = None
+    exc_info  = None
+    exc_text  = None
     stack_info = None
 
-    def __init__(self, levelno, levelname, msg=""):
-        self.levelno = levelno
+    def __init__(self, levelno: int, levelname: str, msg=""):
+        self.levelno   = levelno
         self.levelname = levelname
-        self.msg = msg
+        self.msg       = msg
 
-    def getMessage(self):
-        return self.msg
+    def getMessage(self) -> str:
+        return self.msg if isinstance(self.msg, str) else self.msg.decode()
 
 
-class TestConsoleWarningFormatter:
+class TestColoredFormatter:
     @pytest.mark.parametrize(
         "record, expected_result",
         [
-            (MockLevelRecord(logging.ERROR, "error"), f"{colors.red('error')}:"),
-            (
-                MockLevelRecord(logging.WARNING, "warning"),
-                f"{colors.yellow('warning')}:",
-            ),
-            (MockLevelRecord(logging.INFO, "info"), f"{colors.green('info')}:"),
+            (MockLevelRecord(logging.ERROR,   "error"),   f"{colors.red('error')}:"),
+            (MockLevelRecord(logging.WARNING, "warning"), f"{colors.yellow('warning')}:"),
+            (MockLevelRecord(logging.INFO,    "info"),    f"{colors.green('info')}:"),
         ],
     )
-    async def test_get_level_message(self, record, expected_result):
-        # Preparation
+    def test_get_level_message(self, record, expected_result):
         formatter = ColoredFormatter()
-
-        # Execution
-        result = formatter.get_level_message(record)
-
-        # Assertion
+        result    = formatter.get_level_message(record)
         assert result.strip() == expected_result
 
     @pytest.mark.parametrize(
@@ -58,19 +50,11 @@ class TestConsoleWarningFormatter:
             ),
         ],
     )
-    async def test_format(self, record, expected_result):
-        # Preparation
+    def test_format(self, record, expected_result):
         formatter = ColoredFormatter()
-
-        # Execution
-        result = formatter.format(record)
-
-        # Assertion
+        result    = formatter.format(record)
         assert result == expected_result
 
-    async def test_patch_logging(self):
-        # Preparation
+    def test_patch_logging(self):
         logger = get_daffi_logger(__name__, color=colors.red)
-
-        # Assertion
         assert isinstance(logger, LoggerAdapter)

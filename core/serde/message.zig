@@ -20,9 +20,10 @@ pub const UNIT_SEPARATOR_SEQ: []const u8 = &[_]u8{UNIT_SEPARATOR};
 const print = std.debug.print;
 
 pub const MessageDecoder = enum(u2) {
-    RAW,
+    OPAQUE,
     JSON,
     PICKLE,
+    MSGPACK,
 };
 
 pub const MessageFlag = enum(u4) {
@@ -86,7 +87,36 @@ pub const Header = packed struct {
     msg_parts: u7 = 1, // number of expected receivers for broadcast message. used with Router mode only. // TODO: remove this field
     endian: u1 = @intFromEnum(native_endian),
 
-    pub usingnamespace serdeFns(Header);
+    pub const size: u32 = @divExact(@bitSizeOf(@This()), 8);
+    const backed_int_type = std.meta.Int(.unsigned, size * 8);
+
+    pub fn toInt(self: @This()) backed_int_type {
+        return @as(backed_int_type, @bitCast(self));
+    }
+
+    pub fn toBytes(self: @This(), buf: []u8) void {
+        @memcpy(buf, &@as([size]u8, @bitCast(self)));
+    }
+
+    pub fn fromInt(backed_int: backed_int_type) @This() {
+        return @as(@This(), @bitCast(backed_int));
+    }
+
+    pub fn fromBytes(backed_bytes: *const [size]u8) @This() {
+        return @as(@This(), @bitCast(backed_bytes.*));
+    }
+
+    pub fn setBytes(_: @This(), comptime field_name: []const u8, v: anytype, buf: []u8) void {
+        const type_size = @sizeOf(@TypeOf(v));
+        const offset_start = @offsetOf(@This(), field_name);
+        const offset_end = offset_start + type_size;
+        @memcpy(buf[offset_start..offset_end], &@as([type_size]u8, @bitCast(v)));
+    }
+
+    pub fn setBits(_: @This(), comptime Ftype: type, comptime field_name: []const u8, v: Ftype, buf: []u8) void {
+        const bit_offset = @bitOffsetOf(@This(), field_name);
+        std.mem.writePackedIntNative(Ftype, buf, bit_offset, v);
+    }
 
     pub fn create(
         uuid: u16,
@@ -103,8 +133,8 @@ pub const Header = packed struct {
             .decoder = decoder,
             .is_bytes = is_bytes,
             .return_result = return_result,
-            .msg_len = @as(meta.FieldType(Header, .msg_len), @truncate(msg_len)),
-            .metadata_len = @as(meta.FieldType(Header, .metadata_len), @truncate(metadata_len)),
+            .msg_len = @as(@FieldType(Header, "msg_len"), @truncate(msg_len)),
+            .metadata_len = @as(@FieldType(Header, "metadata_len"), @truncate(metadata_len)),
         };
     }
 
@@ -244,7 +274,7 @@ pub const Message = struct {
         return self.data[self.metadataStartPos()..self.metadataEndPos()];
     }
 
-    pub fn getUuid(self: *Message) meta.FieldType(Header, .uuid) {
+    pub fn getUuid(self: *Message) @FieldType(Header, "uuid") {
         return self.header.uuid;
     }
 
@@ -272,13 +302,13 @@ pub const Message = struct {
         return self.header.return_result;
     }
 
-    pub fn getMsgParts(self: *Message) meta.FieldType(Header, .msg_parts) {
+    pub fn getMsgParts(self: *Message) @FieldType(Header, "msg_parts") {
         return self.header.msg_parts;
     }
 
     pub fn setData(self: *Message, data: []const u8) !void {
         const new_msg_len: usize = data.len + self.header.metadata_len;
-        if (new_msg_len > std.math.maxInt(meta.FieldType(Header, .msg_len))) return error.ExceedsMaxMessageSize;
+        if (new_msg_len > std.math.maxInt(@FieldType(Header, "msg_len"))) return error.ExceedsMaxMessageSize;
         if (self.allocator.resize(self.data, new_msg_len + serde.HEADER_SIZE)) {
             // Optimal case when we can resize existing memory. We don't need to copy data to new location.
             // header and metadata are not changed, so we don't need to copy them.
@@ -292,7 +322,7 @@ pub const Message = struct {
             // re-calculate metadata as it is pointed to wrong location
             self.metadata.initFromMetadataFromStr(self.getMetadata());
         }
-        self.setMessageLen(@as(meta.FieldType(Header, .msg_len), @truncate(new_msg_len)));
+        self.setMessageLen(@as(@FieldType(Header, "msg_len"), @truncate(new_msg_len)));
     }
 
     pub fn writeData(self: *Message, comptime fmt_format: []const u8, args: anytype) !void {
@@ -304,7 +334,7 @@ pub const Message = struct {
     pub fn writeErrorMessage(self: *Message, comptime fmt_format: []const u8, args: anytype) !void {
         // For setting errors outside of python
         try self.writeData(fmt_format, args);
-        self.setDecoder(.RAW);
+        self.setDecoder(.OPAQUE);
         self.setFlag(.ERROR);
     }
 
@@ -315,17 +345,17 @@ pub const Message = struct {
         const new_metadata_len = Metadata.calcMetadataLen(ptransmitter, preceiver, pfun_name);
         const data = self.getData();
         const new_msg_len: usize = data.len + new_metadata_len;
-        if (new_msg_len > std.math.maxInt(meta.FieldType(Header, .msg_len))) return error.ExceedsMaxMessageSize;
+        if (new_msg_len > std.math.maxInt(@FieldType(Header, "msg_len"))) return error.ExceedsMaxMessageSize;
         const new_data = try serde.concatenateSlicesAlloc(self.allocator, &[_][]const u8{ self.data[0..serde.HEADER_OFFSET_END], ptransmitter, SECTION_SEPARATOR_SEQ, preceiver, SECTION_SEPARATOR_SEQ, pfun_name, data });
         self.allocator.free(self.data);
         self.data = new_data;
-        self.setMessageLen(@as(meta.FieldType(Header, .msg_len), @truncate(new_msg_len)));
-        self.setMetadataLen(@as(meta.FieldType(Header, .metadata_len), @truncate(new_metadata_len)));
+        self.setMessageLen(@as(@FieldType(Header, "msg_len"), @truncate(new_msg_len)));
+        self.setMetadataLen(@as(@FieldType(Header, "metadata_len"), @truncate(new_metadata_len)));
         // re-calculate metadata as it is pointed to wrong location
         self.metadata.initFromMetadataFromStr(self.getMetadata());
     }
 
-    pub fn setUuid(self: *Message, uuid: meta.FieldType(Header, .uuid)) void {
+    pub fn setUuid(self: *Message, uuid: @FieldType(Header, "uuid")) void {
         self.header.uuid = uuid;
         self.header.setBits(@TypeOf(uuid), "uuid", uuid, self.data);
     }
@@ -355,19 +385,19 @@ pub const Message = struct {
         try self.setMetadata(null, null, func_name);
     }
 
-    pub fn setMessageLen(self: *Message, msg_len: meta.FieldType(Header, .msg_len)) void {
+    pub fn setMessageLen(self: *Message, msg_len: @FieldType(Header, "msg_len")) void {
         self.header.msg_len = msg_len;
         self.header.setBits(@TypeOf(msg_len), "msg_len", msg_len, self.data);
     }
 
-    pub fn setMetadataLen(self: *Message, metadata_len: meta.FieldType(Header, .metadata_len)) void {
+    pub fn setMetadataLen(self: *Message, metadata_len: @FieldType(Header, "metadata_len")) void {
         self.header.metadata_len = metadata_len;
         self.header.setBits(@TypeOf(metadata_len), "metadata_len", metadata_len, self.data);
     }
 
-    pub fn setMsgParts(self: *Message, msg_parts: meta.FieldType(Header, .msg_parts)) void {
+    pub fn setMsgParts(self: *Message, msg_parts: @FieldType(Header, "msg_parts")) void {
         self.header.msg_parts = msg_parts;
-        self.header.setBits(meta.FieldType(Header, .msg_parts), "msg_parts", self.header.msg_parts, self.data);
+        self.header.setBits(@FieldType(Header, "msg_parts"), "msg_parts", self.header.msg_parts, self.data);
     }
 
     pub fn hasReceiver(self: *Message) bool {
@@ -401,7 +431,7 @@ pub const RawMessage = struct {
         const pfun_name = func_name orelse PLACEHOLDER;
         const metadata_len = Metadata.calcMetadataLen(ptransmitter, preceiver, pfun_name);
         const msg_len = data.len + metadata_len;
-        if (msg_len > std.math.maxInt(meta.FieldType(Header, .msg_len))) return error.ExceedsMaxMessageSize;
+        if (msg_len > std.math.maxInt(@FieldType(Header, "msg_len"))) return error.ExceedsMaxMessageSize;
         const header: *const Header = &try Header.create(uuid, flag, decoder, is_bytes, return_result, msg_len, metadata_len);
         var backed_header_bytes: [serde.HEADER_SIZE]u8 = undefined;
         header.toBytes(&backed_header_bytes);
@@ -418,7 +448,7 @@ pub const RawMessage = struct {
     }
 };
 
-pub fn createHandshakeMessage(allocator: Allocator, memberdata: []serde.Handshake.MemberData, uuid: meta.FieldType(Header, .uuid), password: ?[]const u8, comptime hstype: []const u8) !*Message {
+pub fn createHandshakeMessage(allocator: Allocator, memberdata: []serde.Handshake.MemberData, uuid: @FieldType(Header, "uuid"), password: ?[]const u8, comptime hstype: []const u8) !*Message {
     // gonna be using arena allocator to free dynamically allocated memory for json related stuff
     var arena = ArenaAllocator.init(allocator);
     defer arena.deinit();
@@ -428,7 +458,7 @@ pub fn createHandshakeMessage(allocator: Allocator, memberdata: []serde.Handshak
     return try Message.fromRawMessage(allocator, &raw_message);
 }
 
-pub fn createEventMessage(allocator: Allocator, uuid: meta.FieldType(Header, .uuid), connection_name: []const u8, comptime event_type: []const u8) !*Message {
+pub fn createEventMessage(allocator: Allocator, uuid: @FieldType(Header, "uuid"), connection_name: []const u8, comptime event_type: []const u8) !*Message {
     var event = serde.Event.create(event_type, connection_name);
     const event_data = try event.toJson(allocator);
     defer allocator.free(event_data);

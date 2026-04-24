@@ -1,4 +1,5 @@
 const std = @import("std");
+const Mutex = @import("../../misc.zig").Mutex;
 
 const Allocator = std.mem.Allocator;
 
@@ -88,7 +89,7 @@ pub const Pool = struct {
     available: usize,
     buffers: []Buffer,
     allocator: Allocator,
-    mutex: std.Thread.Mutex,
+    mutex: Mutex,
 
     pub fn init(allocator: Allocator, count: usize, buffer_size: usize) !Pool {
         const buffers = try allocator.alloc(Buffer, count);

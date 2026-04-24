@@ -69,7 +69,7 @@ pub const Reader = struct {
     }
 
     pub fn deinit(self: *Reader) void {
-        if (self.fragment) |f| {
+        if (self.fragment) |*f| {
             f.deinit();
         }
 
@@ -82,7 +82,7 @@ pub const Reader = struct {
     }
 
     pub fn handled(self: *Reader) void {
-        if (self.fragment) |f| {
+        if (self.fragment) |*f| {
             f.deinit();
             self.fragment = null;
         }

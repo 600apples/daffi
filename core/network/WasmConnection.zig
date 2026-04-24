@@ -10,6 +10,7 @@ pub const op_table = OperationTable{
     .write = undefined, // wasm doesn't have net package functionality
     .accept = undefined, // wasm doesn't have net package functionality
     .close = close,
+    .destroy = destroy,
     .getAddr = undefined, // wasm doesn't have net package functionality
 };
 
@@ -25,7 +26,21 @@ pub fn init(allocator: Allocator, _: Config) !*WasmConnection {
     return self;
 }
 
-pub fn close(ctx: *anyopaque) void {
+pub fn close(_: *anyopaque) void {}
+
+pub fn destroy(ctx: *anyopaque) void {
     const self: *WasmConnection = @ptrCast(@alignCast(ctx));
     self.allocator.destroy(self);
 }
+
+/// Stub SynParser so that connection.zig can reference WebConnection.SynParser
+/// on wasm targets (where WebConnection is aliased to WasmConnection).
+pub const SynParser = struct {
+    pub fn init(_: std.mem.Allocator) !@This() {
+        return .{};
+    }
+    pub fn deinit(_: *@This()) void {}
+    pub fn tryWebSocket(_: *@This(), _: anytype) !bool {
+        return false;
+    }
+};

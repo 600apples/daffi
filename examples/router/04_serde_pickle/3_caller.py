@@ -1,0 +1,37 @@
+"""
+router/04_serde_pickle — Caller.
+
+Sends Task dataclass objects to the worker using PICKLE serialisation
+and receives TaskResult objects back.  Also demonstrates cast() to
+broadcast to all workers.
+
+Run 1_router.py and 2_worker.py first.
+"""
+from daffi import Client
+from daffi.serialization import SerdeFormat
+from models import Task, TaskResult, Priority
+
+
+if __name__ == "__main__":
+    caller = Client(app_name="task-caller", host="127.0.0.1", port=6004)
+    conn = caller.connect()
+
+    rpc = conn.rpc(timeout=5, serde=SerdeFormat.PICKLE)
+
+    tasks = [
+        Task("t-001", "hello world", Priority.HIGH),
+        Task("t-002", "foo bar baz", Priority.LOW),
+    ]
+    for task in tasks:
+        result: TaskResult = rpc.execute_task(task)
+        print(f"task {result.task_id}: worker={result.worker!r}  "
+              f"output={result.output!r}  ok={result.success}")
+
+    # cast() — broadcast to ALL workers.
+    cast = conn.cast(timeout=5, serde=SerdeFormat.PICKLE)
+    all_results = cast.execute_task(Task("t-broadcast", "broadcast payload"))
+    for worker_name, res in all_results.items():
+        print(f"[cast] {worker_name}: {res.output!r}")
+
+    caller.stop()
+    print("Done.")

@@ -1,8 +1,0 @@
-LICENSE.txt
-README.md
-setup.py
-core/core.zig
-dfcoire.egg-info/PKG-INFO
-dfcoire.egg-info/SOURCES.txt
-dfcoire.egg-info/dependency_links.txt
-dfcoire.egg-info/top_level.txt

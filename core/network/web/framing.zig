@@ -8,29 +8,32 @@ const Allocator = std.mem.Allocator;
 pub const Fragmented = struct {
     type: MessageType,
     max_size: usize,
+    allocator: Allocator,
     buf: std.ArrayList(u8),
 
     pub fn init(bp: *buffer.Provider, max_size: usize, message_type: MessageType, value: []const u8) !Fragmented {
-        var buf = std.ArrayList(u8).init(bp.allocator);
-        try buf.ensureTotalCapacity(value.len * 2);
+        const gpa = bp.allocator;
+        var buf: std.ArrayList(u8) = .empty;
+        try buf.ensureTotalCapacity(gpa, value.len * 2);
         buf.appendSliceAssumeCapacity(value);
 
         return .{
             .buf = buf,
             .max_size = max_size,
             .type = message_type,
+            .allocator = gpa,
         };
     }
 
-    pub fn deinit(self: Fragmented) void {
-        self.buf.deinit();
+    pub fn deinit(self: *Fragmented) void {
+        self.buf.deinit(self.allocator);
     }
 
     pub fn add(self: *Fragmented, value: []const u8) !void {
         if (self.buf.items.len + value.len > self.max_size) {
             return error.TooLarge;
         }
-        try self.buf.appendSlice(value);
+        try self.buf.appendSlice(self.allocator, value);
     }
 
     // Optimization so that we don't over-allocate on our last frame.
@@ -38,7 +41,7 @@ pub const Fragmented = struct {
         if (self.buf.items.len + value.len > self.max_size) {
             return error.TooLarge;
         }
-        try self.buf.ensureUnusedCapacity(value.len);
+        try self.buf.ensureUnusedCapacity(self.allocator, value.len);
         self.buf.appendSliceAssumeCapacity(value);
         return self.buf.items;
     }
@@ -102,12 +105,12 @@ pub fn frame(op_code: OpCode, comptime msg: []const u8) [frameLen(msg)]u8 {
     const len = msg.len;
     if (len <= 125) {
         framed[1] = @intCast(len);
-        std.mem.copy(u8, framed[2..], msg);
+        @memcpy(framed[2..][0..msg.len], msg);
     } else if (len < 65536) {
         framed[1] = 126;
         framed[2] = @intCast((len >> 8) & 0xFF);
         framed[3] = @intCast(len & 0xFF);
-        std.mem.copy(u8, framed[4..], msg);
+        @memcpy(framed[4..][0..msg.len], msg);
     } else {
         framed[1] = 127;
         framed[2] = @intCast((len >> 56) & 0xFF);
@@ -118,7 +121,7 @@ pub fn frame(op_code: OpCode, comptime msg: []const u8) [frameLen(msg)]u8 {
         framed[7] = @intCast((len >> 16) & 0xFF);
         framed[8] = @intCast((len >> 8) & 0xFF);
         framed[9] = @intCast(len & 0xFF);
-        std.mem.copy(u8, framed[10..], msg);
+        @memcpy(framed[10..][0..msg.len], msg);
     }
     return framed;
 }

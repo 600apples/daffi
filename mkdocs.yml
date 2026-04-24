@@ -3,93 +3,64 @@ site_url: https://600apples.github.io/daffi/
 site_dir: mkdocs_files
 extra_css:
   - stylesheets/extra.css
-extra_javascript:
-  - js/extra.js
+
 theme:
   name: material
   logo: images/logo.png
   favicon: images/logo.png
   features:
+    - navigation.tabs
+    - navigation.tabs.sticky
+    - navigation.sections
+    - navigation.top
     - toc.integrate
+    - content.code.copy
+  custom_dir: docs/overrides
   palette:
-    - scheme: default
-      toggle:
-        icon: material/brightness-7
-        name: Switch to dark mode
     - scheme: slate
       primary: black
-      accent: red
+      accent: indigo
+      toggle:
+        icon: material/brightness-7
+        name: Switch to light mode
+    - scheme: default
+      primary: black
+      accent: indigo
       toggle:
         icon: material/brightness-4
-        name: Switch to light mode
+        name: Switch to dark mode
+
 nav:
   - Overview: index.md
-  - Usage:
-    - basic example: usage/basic-example.md
-    - fetchers with function body: usage/fetchers-with-body.md
-    - additional arguments for callback instantiation: usage/callback-additional-arguments.md
-    - private methods: usage/private-methods.md
-    - aliased methods: usage/aliased-methods.md
-    - named processes: usage/named-processes.md
-    - stream from fetcher to callback: usage/stream-fetcher-to-callback.md
-    - stream from callback to fetcher: usage/stream-callback-to-fetcher.md
-    - function transfer: usage/function-transfer.md
-    - bidirectional communication: usage/bidirectional-communication.md
-    - SSL certificates: usage/ssl-certificates.md
-    - lifecycle events: usage/lifecycle-events.md
-    - asynchronous execution: usage/asynchronous-execution.md
-    - broadcasting: usage/broadcasting.md
-    - task scheduling and batch delayed execution: usage/scheduling-tasks.md
-  - Node and Controller: node-and-controller.md
-  - Global object: global-object.md
-  - Asynchronous applications: async-apps.md
-  - Execution modifiers: execution-modifiers.md
-  - Code reference:
-     - Global: code-reference/global.md
-     - callback: code-reference/callback.md
-     - fetcher: code-reference/fetcher.md
+  - Architecture: architecture.md
+  - Getting Started: getting-started.md
+  - Python API:
+    - Client → Service: usage/service.md
+    - Client → Router → Worker: usage/router.md
+    - Call Styles — rpc vs cast: usage/call-styles.md
+    - Serialization: usage/serialization.md
+    - Events: usage/events.md
+    - Unix Sockets: usage/unix-sockets.md
+    - TLS: usage/tls.md
+  - JavaScript Client: js-client.md
 
 plugins:
   - search
   - section-index
-  - with-pdf:
-      author: ""
-      cover: true
-      cover_title: ""
-      exclude_pages:
-        - code-reference/global.md
-        - code-reference/callback.md
-        - code-reference/fetcher.md
-      cover_logo: docs/images/logo-white-sm.png
-      output_path: pdf/daffi.pdf
-      back_cover: false
-      cover_subtitle: version 1.4.1
-  - mkdocstrings:
-      default_handler: python
-      handlers:
-        python:
-          options:
-            filters:
-              - "!^_" # exlude all members starting with _
-              - "^__init__$" # but always include __init__ modules and methods
-            show_signature_annotations: true
-            inherited_members: true
-            show_source: false
-            show_object_full_path: false
-            show_root_members_full_path: false
 
 markdown_extensions:
   - admonition
   - footnotes
+  - attr_list
+  - md_in_html
   - pymdownx.tabbed:
       alternate_style: true
   - pymdownx.superfences
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.inlinehilite
   - toc:
       permalink: true
   - pymdownx.emoji:
-      emoji_index: !!python/name:materialx.emoji.twemoji
-      emoji_generator: !!python/name:materialx.emoji.to_svg
-
-extra:
-  version:
-    provider: mike
+      emoji_index: !!python/name:material.extensions.emoji.twemoji
+      emoji_generator: !!python/name:material.extensions.emoji.to_svg

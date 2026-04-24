@@ -32,7 +32,11 @@ pub const os = struct {
 extern "env" fn _throwError(pointer: [*]const u8, length: u32) noreturn;
 extern "env" fn _consoleLog(pointer: [*]const u8, length: u32) void;
 extern "window" fn _sendToSocket(data_ptr: [*]const u8, data_len: u32) void;
-extern "window" fn _storeMessage(data_ptr: [*]const u8, data_len: u32, uuid: u32, is_error: bool) void;
+/// decoder mirrors MessageDecoder: 0=OPAQUE, 1=JSON, 2=PICKLE, 3=MSGPACK.
+/// The JS side uses this to choose the right deserialiser for the payload.
+/// Passing it as a 5th argument is backward-compatible: older JS handlers
+/// that only declare 4 parameters will simply ignore the extra value.
+extern "window" fn _storeMessage(data_ptr: [*]const u8, data_len: u32, uuid: u32, is_error: bool, decoder: u32) void;
 extern "window" fn _triggerEvent(data_ptr: [*]const u8, data_len: u32) void;
 
 pub fn throwError(message: []const u8) noreturn {
@@ -81,8 +85,7 @@ export fn sendMessage(data: [*:0]const u8, receiver: [*:0]const u8, func_name: [
     const decoder: MessageDecoder = @enumFromInt(serde);
     const is_bytes = switch (decoder) {
         .JSON => false,
-        .RAW => true,
-        else => unreachable,
+        .OPAQUE, .PICKLE, .MSGPACK => true,
     };
     defer {
         allocator.free(actual_data);
@@ -96,7 +99,7 @@ export fn sendMessage(data: [*:0]const u8, receiver: [*:0]const u8, func_name: [
         const members = iterator.next() orelse throwError("failed to get members\n");
         // consoleLog("failed to create message: {any} for method '{s}'.\nAvailable receivers {s}\n", .{ err, actual_func_name, available_receivers });
         var buf: [1000]u8 = undefined;
-        _ = std.fmt.bufPrint(&buf, "failed to create message: {any} for method '{s}'.\nAvailable receivers {?s}\n", .{ err, actual_func_name, std.mem.trim(u8, members, ":}") }) catch
+        _ = std.fmt.bufPrint(&buf, "failed to create message: {any} for method '{s}'.\nAvailable receivers {s}\n", .{ err, actual_func_name, std.mem.trim(u8, members, ":}") }) catch
             @panic("failed to allocate memory for error message");
         throwError(&buf);
     };
@@ -107,6 +110,15 @@ export fn sendMessage(data: [*:0]const u8, receiver: [*:0]const u8, func_name: [
     result[2] = @intFromPtr(ident.message.receiver.ptr);
     result[3] = @intFromBool(!is_bytes);
     return result.ptr;
+}
+
+/// Return a null-terminated JSON string describing all connected members and
+/// their registered methods.  Format: {"meta":{...},"members":[{"name":...,"methods":[...]},...]}
+/// The caller must pass the returned pointer to free() when done.
+export fn getAvailableMembers(conn_num: usize) [*:0]const u8 {
+    const json = Client.getAvailableMembers(allocator, conn_num) catch throwError("failed to get available members\n");
+    defer allocator.free(json);
+    return (allocator.dupeZ(u8, json) catch @panic("OOM")).ptr;
 }
 
 export fn parseAndStoreMessage(data: [*:0]const u8, len: u32, conn_num: u32) void {
@@ -122,18 +134,31 @@ export fn parseAndStoreMessage(data: [*:0]const u8, len: u32, conn_num: u32) voi
     const payload = msg.getData();
     switch (msg.getFlag()) {
         .HANDSHAKE => {
-            client_handler.onHandshake(connection, msg) catch |err| {
-                consoleLog("failed to parse and store message: {any}\n", .{err});
-                throwError("failed to parse and store message\n");
-            };
-            if (std.mem.eql(u8, msg.getTransmitter(), client_handler.app_name)) {
-                // Notify sender about handshake completion.
-                _storeMessage(payload.ptr, payload.len, uuid, false);
+            const is_own = std.mem.eql(u8, msg.getTransmitter(), client_handler.app_name);
+            if (is_own) {
+                // Own handshake response: clear + full rebuild, then resolve the JS promise.
+                client_handler.onHandshake(connection, msg) catch |err| {
+                    consoleLog("failed to handle own handshake: {any}\n", .{err});
+                    throwError("failed to handle own handshake\n");
+                };
+                _storeMessage(payload.ptr, payload.len, uuid, false, @intFromEnum(msg.getDecoder()));
+            } else {
+                // Broadcast from another worker's reconnect: add-only so a stale
+                // broadcast arriving out-of-order cannot wipe out freshly added members.
+                client_handler.addMembersFromHandshake(connection, msg) catch |err| {
+                    consoleLog("failed to merge handshake broadcast: {any}\n", .{err});
+                };
             }
         },
-        .RESPONSE => _storeMessage(payload.ptr, payload.len, uuid, false),
-        .ERROR => _storeMessage(payload.ptr, payload.len, uuid, true),
-        .EVENTS => _triggerEvent(payload.ptr, payload.len),
+        .RESPONSE => _storeMessage(payload.ptr, payload.len, uuid, false, @intFromEnum(msg.getDecoder())),
+        .ERROR => _storeMessage(payload.ptr, payload.len, uuid, true, @intFromEnum(msg.getDecoder())),
+        .EVENTS => {
+            // Update local chan_mapper before notifying JS event handlers so
+            // that any RPC triggered from within an event handler sees the
+            // correct (already-updated) member list.
+            client_handler.onEvent(connection, msg) catch {};
+            _triggerEvent(payload.ptr, payload.len);
+        },
         else => unreachable,
     }
 }
@@ -142,4 +167,10 @@ export fn initClient(data: [*:0]const u8) usize {
     defer free(data);
     const app_name = std.mem.span(data);
     return Client.init(allocator, app_name, .{}) catch throwError("failed to initialize client\n");
+}
+
+/// Release the client slot allocated by initClient.  Must be called on
+/// reconnect so that old slots do not accumulate in the 512-entry table.
+export fn stopClient(conn_num: usize) void {
+    Client.desctroyClient(conn_num) catch {};
 }
