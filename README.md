@@ -133,11 +133,15 @@ When multiple workers expose the same function, `rpc()` picks one using a
 **round-robin** strategy — each call goes to the next worker in rotation, spreading
 load evenly.  Pin to a specific worker with `receiver=` when you need affinity.
 
+> **Round-robin only applies in the Router topology** (many workers behind one Router).
+> In the Client → Service topology there is always exactly one receiver — the Service
+> itself — so omitting `receiver=` is the norm and specifying it is redundant.
+
 ```python
 result = conn.rpc(timeout=5).echo("hello")
 result = conn.rpc(timeout=5, serde=SerdeFormat.JSON).add(1, 2)
 
-# Target a specific worker by name (bypasses round-robin)
+# Router topology only: pin to a specific worker by name (bypasses round-robin)
 result = conn.rpc(timeout=5, receiver="worker-1").process("task")
 ```
 
@@ -189,12 +193,12 @@ conn.stream_nowait(serde=SerdeFormat.OPAQUE).receive_chunk(chunk)
 
 Pass `serde=SerdeFormat.X` to any call method.
 
-| Format | Import | Notes |
-|---|---|---|
-| `PICKLE` | `from daffi import SerdeFormat` | Default. Any Python object. |
-| `JSON` | same | Human-readable; requires JSON-serialisable values. |
-| `OPAQUE` | same | Raw `bytes` — zero-copy, fastest for binary data. |
-| `MSGPACK` | same | Compact binary; requires `pip install daffi[msgpack]`. |
+| Format | Import | Notes                                                                    |
+|---|---|--------------------------------------------------------------------------|
+| `PICKLE` | `from daffi import SerdeFormat` | Default. Any Python object.                                              |
+| `JSON` | same | Human-readable; requires JSON-serialisable values.                       |
+| `OPAQUE` | same | Raw `bytes` or `string` — zero-copy, fastest for binary and string data. |
+| `MSGPACK` | same | Compact binary; requires `pip install daffi[msgpack]`.                   |
 
 ```python
 from daffi import Client, SerdeFormat
@@ -221,11 +225,6 @@ def echo(payload):
 def compute(x: int, y: int) -> int:
     return x * y
 ```
-
-Callbacks with `-> None` return annotation emit a `UserWarning` at
-registration time because `rpc()` callers receive `None` — which is usually
-unintentional.
-
 ---
 
 ## Auto-reconnect
@@ -268,7 +267,7 @@ Both `Service` and `Client` support `add_event_handler`.
 ## Unix sockets
 
 Use `unix_sock_path` instead of `host`/`port` for inter-process communication
-on the same machine (lower latency, no TCP overhead).
+on the same machine.
 
 ```python
 svc = Service(unix_sock_path="/tmp/daffi.sock")
