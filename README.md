@@ -127,13 +127,17 @@ remote function by attribute access.
 conn = client.connect()
 ```
 
-### `rpc` — blocking, one worker
+### `rpc` — blocking, one worker (round-robin)
+
+When multiple workers expose the same function, `rpc()` picks one using a
+**round-robin** strategy — each call goes to the next worker in rotation, spreading
+load evenly.  Pin to a specific worker with `receiver=` when you need affinity.
 
 ```python
 result = conn.rpc(timeout=5).echo("hello")
 result = conn.rpc(timeout=5, serde=SerdeFormat.JSON).add(1, 2)
 
-# Target a specific worker by name
+# Target a specific worker by name (bypasses round-robin)
 result = conn.rpc(timeout=5, receiver="worker-1").process("task")
 ```
 
@@ -144,6 +148,10 @@ conn.rpc_nowait().notify("event happened")
 ```
 
 ### `cast` — broadcast to all workers, collect results
+
+Most useful in the **Router topology** where multiple workers expose the same
+function.  The call fans out to every matching worker simultaneously and returns
+a `{worker_name: result}` dict once all have responded.
 
 ```python
 # Returns {worker_name: result, ...}
