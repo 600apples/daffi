@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "daffi"
-version = "2.0.0"
+version = "3.0.0"
 description = "Lightweight inter-process RPC framework with a high-performance native core"
 readme = "README.md"
 license = "MIT"
