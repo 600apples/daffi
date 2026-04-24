@@ -4,6 +4,14 @@
 
 The simplest daffi topology: a **Service** hosts `@callback` functions; **Clients** call them.
 
+!!! note "Callbacks in the Service vs Router topology"
+    In this topology Clients are pure callers — they connect to the Service and issue RPC calls,
+    but do not expose their own callbacks.
+
+    If you need Clients that *also* expose `@callback` functions (workers) or peers that call
+    each other, use the [Router topology](router.md) instead.  In that model every `Client`
+    can register callbacks and call other connected clients' callbacks through the Router.
+
 ---
 
 ## Service
