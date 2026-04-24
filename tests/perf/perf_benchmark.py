@@ -55,7 +55,7 @@ def _serde_modes():
 
     MSGPACK is skipped with a notice if the optional package is absent.
     """
-    from daffi.serialization import SerdeFormat
+    from daffi._serialization import SerdeFormat
     modes = [
         (SerdeFormat.PICKLE,  "PICKLE"),
         (SerdeFormat.JSON,    "JSON"),
@@ -170,7 +170,7 @@ def bench_direct(serde: int, data: dict, label: str) -> list[float]:
     from daffi import Client
 
     # OPAQUE requires a single pre-serialised string argument.
-    from daffi.serialization import SerdeFormat
+    from daffi._serialization import SerdeFormat
     wire = json.dumps(data) if serde == SerdeFormat.OPAQUE else data
 
     port = _free_port()
@@ -207,7 +207,7 @@ def bench_direct(serde: int, data: dict, label: str) -> list[float]:
 def bench_via_router(serde: int, data: dict, label: str) -> list[float]:
     """Via Router: Client → Router → Worker, two hops."""
     from daffi import Client
-    from daffi.serialization import SerdeFormat
+    from daffi._serialization import SerdeFormat
 
     wire = json.dumps(data) if serde == SerdeFormat.OPAQUE else data
 

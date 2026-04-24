@@ -13,7 +13,7 @@ Run 1_router.py and 2_worker.py first.
 """
 import time
 from daffi import Client
-from daffi.serialization import SerdeFormat
+from daffi import SerdeFormat
 
 
 if __name__ == "__main__":

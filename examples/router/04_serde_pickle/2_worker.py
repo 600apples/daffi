@@ -7,7 +7,7 @@ Start 1_router.py first, then this, then 3_caller.py.
 """
 import os
 from daffi import Client, callback
-from daffi.serialization import SerdeFormat
+from daffi import SerdeFormat
 from models import Task, TaskResult
 
 WORKER_NAME = os.environ.get("WORKER_NAME", "task-worker-1")
@@ -25,5 +25,4 @@ if __name__ == "__main__":
     worker = Client(app_name=WORKER_NAME, host="127.0.0.1", port=6004)
     worker.connect()
     print(f"Worker {WORKER_NAME!r} connected — press Ctrl+C to stop.")
-    import signal
-    signal.pause()
+    worker.join()

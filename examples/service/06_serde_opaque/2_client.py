@@ -8,7 +8,7 @@ Run 1_service.py first.
 """
 import json
 from daffi import Client
-from daffi.serialization import SerdeFormat
+from daffi import SerdeFormat
 
 
 PAYLOAD = {

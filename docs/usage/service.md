@@ -47,8 +47,106 @@ if __name__ == "__main__":
 | `host` | `str` | TCP host to listen on. |
 | `port` | `int` | TCP port to listen on. |
 | `unix_sock_path` | `os.PathLike` | Unix socket path (mutually exclusive with `host`/`port`). |
-| `workers` | `int` | Number of threads executing incoming callbacks concurrently. Default: `1` (inline, no threads). |
+| `workers` | `int` | Concurrency level for callback execution. Default: `1` (inline). |
+| `use_processes` | `bool` | When `True`, worker slots are forked **processes** instead of threads. Bypasses the GIL — use for CPU-bound callbacks. Ignored when `workers=1`. Default: `False`. |
 | `tls` | `bool` | Enable TLS. Requires `cert_file` and `key_file`. |
+
+### Concurrent callback execution
+
+By default (`workers=1`) callbacks are executed **inline** — one at a time, in the
+poller thread.  A slow callback blocks every subsequent call until it finishes.
+
+#### Thread pool (`workers=N`, default)
+
+Set `workers=N` to process up to N callbacks in parallel using a **thread pool**
+(`use_processes=False`, the default).  Good for I/O-bound callbacks — the threads
+release the GIL while waiting on network, disk, or database, so they genuinely run
+in parallel:
+
+```python
+import time
+from daffi import Service, callback
+
+@callback
+def fetch_data(query: str) -> dict:
+    time.sleep(0.3)          # I/O-bound — sleeps while waiting for a DB / API
+    return {"result": query}
+
+# workers=1 (default): 10 concurrent callers finish in ~3 s total
+svc = Service(host="127.0.0.1", port=5000, workers=1)
+
+# workers=10: 10 concurrent callers all finish in ~0.3 s
+svc = Service(host="127.0.0.1", port=5000, workers=10)
+
+svc.start()
+svc.join()
+```
+
+#### Process pool (`workers=N, use_processes=True`)
+
+For **CPU-bound** callbacks Python's GIL serialises threads — multiple worker
+threads can't execute Python bytecode simultaneously.  Pass `use_processes=True`
+to use **forked processes** instead: each worker runs in its own interpreter with
+no shared GIL, so CPU-heavy callbacks scale across cores:
+
+```python
+import math
+from daffi import Service, callback
+
+@callback
+def heavy_compute(n: int) -> int:
+    return sum(i * i for i in range(n))   # CPU-bound — GIL would serialise threads
+
+# 4 worker processes — all four cores run callbacks in parallel
+svc = Service(
+    host="127.0.0.1",
+    port=5000,
+    workers=4,
+    use_processes=True,
+)
+svc.start()
+svc.join()
+```
+
+**How it works under the hood:** worker processes are forked *before* any native
+I/O threads are started (POSIX fork-safety).  Each process inherits the full
+`@callback` registry from the parent.  Results are sent back to the main process
+via an internal `multiprocessing.Queue` and forwarded to the caller by a lightweight
+collector thread — the native connection handle never leaves the main process.
+
+!!! note "Post-fork callback registration"
+    Callbacks registered *after* `start()` are automatically propagated to all
+    worker processes.      Internally the framework serialises the new ``@callback``
+    with ``pickle`` and puts one broadcast message per worker onto the shared work
+    queue; each worker applies the update before its next task.  FIFO ordering
+    guarantees that all workers have the new callback in their local registry
+    before any task that uses it is dequeued.
+
+    For best latency, register all callbacks before `start()` — those are
+    inherited at fork time with zero overhead.
+
+The same `workers` / `use_processes` parameters apply to a `Client` acting as a
+worker in the [Router topology](router.md):
+
+```python
+from daffi import Client, callback
+
+@callback
+def process(task: str) -> str:
+    time.sleep(0.5)
+    return f"done: {task}"
+
+client = Client(app_name="worker-1", host="127.0.0.1", port=6000, workers=8)
+client.connect()
+client.join()
+```
+
+!!! tip "Choosing the right mode"
+    | Callback type | Recommended setting |
+    |---|---|
+    | Fast / pure-Python | `workers=1` (default inline mode, zero overhead) |
+    | I/O-bound (network, disk, DB) | `workers=N, use_processes=False` (thread pool) |
+    | CPU-bound (math, compression, ML inference) | `workers=N, use_processes=True` (process pool) |
 
 ---
 
@@ -203,7 +301,7 @@ svc.start(); svc.join()
 
 ```python
 from daffi import Client
-from daffi.serialization import SerdeFormat
+from daffi import SerdeFormat
 
 def data_source():
     for i in range(5):
@@ -232,7 +330,6 @@ client.stop()
 | Example | Location |
 |---|---|
 | Basic rpc | `examples/service/01_rpc/` |
-| cast / cast_nowait | `examples/service/02_cast/` |
 | Class-based callbacks | `examples/service/03_class_callbacks/` |
 | Pickle serde | `examples/service/04_serde_pickle/` |
 | JSON serde | `examples/service/05_serde_json/` |

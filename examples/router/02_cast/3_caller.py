@@ -1,37 +1,34 @@
 """
 router/02_cast — Caller.
 
-Demonstrates cast() and cast_nowait() via a Router:
+Broadcasts to ALL connected workers and collects every response.
 
-  cast()        — fan-out to ALL workers that expose 'process'; collect results.
-  cast_nowait() — fire-and-forget fan-out; no result waited for.
+  cast()        — fan-out to all workers, wait for all responses → {name: result}
+  cast_nowait() — fire-and-forget, no results collected
 
-Tip: start 2_worker.py twice with different WORKER_NAME env vars to see
-     the dict contain two entries.
-
-Run 1_router.py and 2_worker.py first.
+Start 1_router.py and 2_worker.py (×3) first.
 """
 from daffi import Client
+from daffi._rpc_proxy import get_available_members
 
 
 if __name__ == "__main__":
     caller = Client(app_name="cast-caller", host="127.0.0.1", port=6002)
     conn = caller.connect()
 
-    # cast() — blocking; waits for every worker and returns {name: result}.
-    cast = conn.cast(timeout=5)
-    results = cast.process("task-A")
-    print(f"cast results: {results}")
+    workers = [
+        m["name"]
+        for m in get_available_members(caller._conn_num)
+        if "(this app)" not in m["name"]
+    ]
+    print(f"Connected workers: {workers}\n")
 
-    # cast to a subset of workers by name.
-    cast_subset = conn.cast(timeout=5, receiver=["worker-1"])
-    results = cast_subset.process("task-B")
-    print(f"cast (subset) results: {results}")
+    results = conn.cast(timeout=5).process("task-A")
+    for name, reply in results.items():
+        print(f"  {name}: {reply}")
 
-    # cast_nowait() — fire-and-forget; returns None immediately.
-    cast_nowait = conn.cast_nowait()
-    cast_nowait.process("task-C")
-    print("cast_nowait sent")
+    conn.cast_nowait().process("task-B")
+    print("  Sent (no reply collected)")
 
     caller.stop()
-    print("Done.")
+    print("\nDone.")

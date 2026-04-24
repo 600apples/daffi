@@ -2,6 +2,26 @@
     font-family: Verdana, Geneva, Tahoma, sans-serif !important;
 }
 
+/* ── Light-mode pastel tint ──────────────────────────────────────────────────
+   The default Material scheme uses pure white.  Override the background
+   variables with a very soft lavender-gray so the page feels warmer without
+   losing contrast on text.
+   ──────────────────────────────────────────────────────────────────────────── */
+[data-md-color-scheme="default"] {
+    --md-default-bg-color:          #e8e8f0;   /* page canvas */
+    --md-default-bg-color--light:   #edecf5;   /* hover / mild highlight */
+    --md-default-bg-color--lighter: #f2f2f8;   /* subtle inset areas */
+    --md-default-bg-color--lightest:#f7f7fb;   /* nearly white for cards */
+
+    --md-code-bg-color:             #dedeed;   /* inline & fenced code */
+
+    /* Sidebar and nav strip */
+    --md-sidebar-bg-color:          #e4e4ed;
+
+    /* Table stripe */
+    --md-typeset-table-color:       rgba(99, 99, 180, 0.07);
+}
+
 header {
 background: linear-gradient(51deg, rgb(225, 225, 242) 0%, rgba(53,53,68,1) 70%);
 }

@@ -31,12 +31,13 @@ classifiers = [
 dependencies = []
 
 [project.optional-dependencies]
-msgpack = ["msgpack>=1.0"]
+msgpack   = ["msgpack>=1.0"]
+processes = ["dill>=0.3.6"]
 
 [project.urls]
-Homepage    = "https://github.com/600apples/dafi"
-Source      = "https://github.com/600apples/dafi"
-"Bug Tracker" = "https://github.com/600apples/dafi/issues"
+Homepage    = "https://github.com/600apples/daffi"
+Source      = "https://github.com/600apples/daffi"
+"Bug Tracker" = "https://github.com/600apples/daffi/issues"
 
 [tool.setuptools.packages.find]
 include = ["daffi*"]

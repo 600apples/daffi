@@ -227,6 +227,58 @@ def compute(x: int, y: int) -> int:
 ```
 ---
 
+## Concurrent callback execution (`workers`)
+
+By default every node processes incoming callbacks **inline on a single thread**
+(`workers=1`).  Callbacks are executed one at a time — a slow callback blocks
+the next one.
+
+Pass `workers=N` (N ≥ 2) to spin up a thread pool so that up to N callbacks
+run in parallel:
+
+```python
+import time
+from daffi import Service, callback
+
+@callback
+def slow_task(n: int) -> int:
+    time.sleep(1)        # simulates I/O-bound work
+    return n * n
+
+# workers=1 (default) — three concurrent callers would each wait ~1 s
+svc = Service(host="127.0.0.1", port=5000, workers=1)
+
+# workers=4 — three concurrent callers all finish in ~1 s
+svc = Service(host="127.0.0.1", port=5000, workers=4)
+
+svc.start()
+svc.join()
+```
+
+The same parameter works on a `Client` acting as a worker in the Router topology:
+
+```python
+from daffi import Client, callback
+
+@callback
+def process(task: str) -> str:
+    time.sleep(0.5)
+    return f"done: {task}"
+
+# This single Client instance can now handle up to 8 concurrent incoming calls
+client = Client(app_name="worker-1", host="127.0.0.1", port=6000, workers=8)
+client.connect()
+client.join()
+```
+
+> **When to increase `workers`:**
+> - Callbacks do **I/O** (network calls, file reads, database queries).
+> - Callbacks do **CPU-heavy work** — prefer multiple separate worker *processes* instead
+>   (Python's GIL limits true CPU parallelism within one process).
+> - Callbacks are **fast and pure** — keep `workers=1` (no threading overhead).
+
+---
+
 ## Auto-reconnect
 
 ```python

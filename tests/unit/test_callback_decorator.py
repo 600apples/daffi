@@ -17,7 +17,7 @@ import warnings
 import pytest
 
 from daffi.registry import callback, alias, local
-from daffi.registry.executor_registry import EXECUTOR_REGISTRY, Executor
+from daffi.registry._executor_registry import EXECUTOR_REGISTRY, Executor
 from daffi.exceptions import InitializationError
 
 
@@ -137,17 +137,6 @@ class TestCallbackFunction:
             @callback
             async def my_agen():
                 yield 1
-
-    def test_warn_if_none_return_annotation(self):
-        """@callback emits UserWarning when the return annotation is None."""
-        with warnings.catch_warnings(record=True) as caught:
-            warnings.simplefilter("always")
-
-            @callback
-            def fn_none_ret() -> None:  # type: ignore[return]
-                pass
-
-        assert any(issubclass(w.category, UserWarning) for w in caught)
 
     def test_no_warn_without_annotation(self):
         """No warning when there is no return annotation."""

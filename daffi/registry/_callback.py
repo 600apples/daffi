@@ -2,7 +2,6 @@
 ``@callback`` decorator — register functions or class methods as remote executors.
 """
 
-import warnings
 from inspect import (
     iscoroutinefunction,
     isgeneratorfunction,
@@ -11,43 +10,14 @@ from inspect import (
     ismethod,
     isfunction,
     getmembers,
-    signature,
 )
 
 from daffi.exceptions import InitializationError
 from daffi.utils.misc import is_lambda_function
-from daffi.registry.executor_registry import EXECUTOR_REGISTRY
+from daffi.registry._executor_registry import EXECUTOR_REGISTRY
 
 
 __all__ = ["callback"]
-
-
-def _warn_if_no_return(name: str, func) -> None:
-    """Emit a ``UserWarning`` when a callback is annotated to return ``None``.
-
-    A callback with no return value will send ``None`` back to callers using
-    ``rpc()`` (blocking call), which is almost always a mistake.  When the
-    annotation explicitly says ``-> None`` we warn at registration time.
-
-    Functions without a return annotation are left unchecked — they may
-    intentionally return ``None`` or be used only with ``stream()``.
-
-    Handles both evaluated annotations (``ret is None``) and PEP 563 stringified
-    annotations (``from __future__ import annotations``) where the raw annotation
-    is the string ``'None'`` rather than the ``None`` singleton.
-    """
-    try:
-        ret = signature(func).return_annotation
-        if ret is None or ret == "None":
-            warnings.warn(
-                f"Callback {name!r} is annotated '-> None'. Callers using "
-                f"rpc() will always receive None. Use stream() for "
-                f"fire-and-forget calls, or fix the return type.",
-                UserWarning,
-                stacklevel=4,
-            )
-    except (TypeError, ValueError):
-        pass  # built-ins or C extensions — skip
 
 
 class callback:
@@ -110,7 +80,6 @@ class callback:
                     f"Not supported. {name!r} is an async generator (async def + yield) — "
                     f"daffi callbacks must be regular synchronous functions."
                 )
-            _warn_if_no_return(name, func)
             EXECUTOR_REGISTRY.register(name=name, func=func, cls=cls)
 
     def __call__(self, *args, **kwargs):

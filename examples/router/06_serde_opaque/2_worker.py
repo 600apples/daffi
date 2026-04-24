@@ -25,5 +25,4 @@ if __name__ == "__main__":
     worker = Client(app_name=WORKER_NAME, host="127.0.0.1", port=6006)
     worker.connect()
     print(f"Worker {WORKER_NAME!r} connected — press Ctrl+C to stop.")
-    import signal
-    signal.pause()
+    worker.join()

@@ -54,6 +54,50 @@ if __name__ == "__main__":
     Run two instances of this script in separate terminals.  
     `rpc()` will round-robin between them; `cast()` will call both.
 
+### Concurrent callbacks per worker node
+
+Each worker `Client` accepts the same `workers` and `use_processes` parameters
+as `Service` — they control how many callbacks a **single worker node** executes
+in parallel:
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `workers` | `int` | `1` | Concurrency level for callback execution within this node. |
+| `use_processes` | `bool` | `False` | When `True`, use forked **processes** instead of threads. Bypasses the GIL for CPU-bound callbacks. |
+
+**I/O-bound** callbacks (network, disk, database) — use a thread pool:
+
+```python
+# Each worker node handles up to 8 callbacks concurrently via threads.
+worker = Client(
+    app_name="io-worker",
+    host="127.0.0.1",
+    port=6001,
+    workers=8,
+)
+worker.connect()
+worker.join()
+```
+
+**CPU-bound** callbacks (heavy computation, ML inference) — use a process pool to
+bypass the GIL:
+
+```python
+# Each worker node forks 4 processes; all four cores run callbacks in parallel.
+worker = Client(
+    app_name="cpu-worker",
+    host="127.0.0.1",
+    port=6001,
+    workers=4,
+    use_processes=True,
+)
+worker.connect()
+worker.join()
+```
+
+See [Service → Concurrent callback execution](service.md#concurrent-callback-execution)
+for a detailed explanation of both modes and how to choose between them.
+
 ---
 
 ## 3. Connect a Caller

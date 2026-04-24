@@ -7,7 +7,7 @@ serialisation (the default).  The service returns the updated object.
 Run 1_service.py first.
 """
 from daffi import Client
-from daffi.serialization import SerdeFormat
+from daffi import SerdeFormat
 from models import Order, LineItem, OrderStatus
 
 

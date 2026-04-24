@@ -3,7 +3,7 @@
 daffi supports four wire formats. Pass `serde=SerdeFormat.X` to any call proxy, or use the string shorthand where supported.
 
 ```python
-from daffi.serialization import SerdeFormat
+from daffi import SerdeFormat
 ```
 
 ---
@@ -45,7 +45,7 @@ svc.start(); svc.join()
 ```python
 # 2_client.py
 from daffi import Client
-from daffi.serialization import SerdeFormat
+from daffi import SerdeFormat
 from models import Order
 
 client = Client(app_name="order-client", host="127.0.0.1", port=5004)
@@ -82,7 +82,7 @@ svc.start(); svc.join()
 ```python
 # 2_client.py
 from daffi import Client
-from daffi.serialization import SerdeFormat
+from daffi import SerdeFormat
 
 client = Client(app_name="json-client", host="127.0.0.1", port=5005)
 conn = client.connect()
@@ -118,7 +118,7 @@ svc.start(); svc.join()
 ```python
 # 2_client.py
 from daffi import Client
-from daffi.serialization import SerdeFormat
+from daffi import SerdeFormat
 
 client = Client(app_name="msgpack-client", host="127.0.0.1", port=5007)
 conn = client.connect()
@@ -154,7 +154,7 @@ svc.start(); svc.join()
 ```python
 # 2_client.py
 from daffi import Client
-from daffi.serialization import SerdeFormat
+from daffi import SerdeFormat
 
 client = Client(app_name="raw-client", host="127.0.0.1", port=5006)
 conn = client.connect()

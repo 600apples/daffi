@@ -1,10 +1,17 @@
 """
 Custom build configuration for the dfcore Zig extension.
 
+Zig auto-install
+----------------
+If ``zig`` is not found in PATH, the build script downloads the official
+Zig 0.16.0 binary for the current platform into a temporary directory and
+uses it transparently.  No manual installation is required for
+``pip install -e .`` on a clean machine.
+
 OpenSSL discovery order
 -----------------------
 1. ``OPENSSL_DIR`` environment variable
-2. macOS: ``brew --prefix openssl@3``  (falls back to @1.1 then bare openssl)
+2. macOS: arch-native Homebrew prefix (``/opt/homebrew`` or ``/usr/local``)
 3. System default paths
 
 OpenSSL linking strategy
@@ -28,9 +35,78 @@ build-lib`` so the emitted shared library has the correct architecture.
 """
 import os
 import sys
+import shutil
 import subprocess
+import platform
+import tarfile
+import tempfile
+import urllib.request
 from setuptools import setup, Extension
 from setuptools.command.build_ext import build_ext
+
+
+_ZIG_VERSION = "0.16.0"
+
+
+def _ensure_zig() -> str:
+    """Return the path to a ``zig`` executable.
+
+    Checks PATH first.  If not found, downloads the official Zig binary for
+    the current platform into ``/tmp/zig-<arch>-<os>-<version>/`` and returns
+    the path to the extracted binary.  Subsequent calls reuse the cached
+    download.
+    """
+    zig = shutil.which("zig")
+    if zig:
+        return zig
+
+    machine = platform.machine().lower()
+    arch = "aarch64" if machine in ("aarch64", "arm64") else "x86_64"
+
+    if sys.platform == "darwin":
+        os_name = "macos"
+    elif sys.platform.startswith("linux"):
+        os_name = "linux"
+    else:
+        raise RuntimeError(
+            f"Unsupported platform {sys.platform!r}. "
+            "Install Zig manually from https://ziglang.org/download/"
+        )
+
+    dir_name = f"zig-{arch}-{os_name}-{_ZIG_VERSION}"
+    zig_dir  = os.path.join(tempfile.gettempdir(), dir_name)
+    zig_exe  = os.path.join(zig_dir, "zig")
+
+    if os.path.isfile(zig_exe):
+        print(f"setup.py: reusing cached Zig at {zig_exe!r}")
+        return zig_exe
+
+    tarball  = f"{dir_name}.tar.xz"
+    url      = f"https://ziglang.org/download/{_ZIG_VERSION}/{tarball}"
+    archive  = os.path.join(tempfile.gettempdir(), tarball)
+
+    print(f"setup.py: zig not found in PATH — downloading {url!r} …")
+    try:
+        urllib.request.urlretrieve(url, archive)
+    except Exception:
+        # urllib may lack SSL on some minimal environments; fall back to curl.
+        subprocess.check_call(["curl", "-fsSL", url, "-o", archive])
+
+    print(f"setup.py: extracting {archive!r} …")
+    with tarfile.open(archive, "r:xz") as tf:
+        tf.extractall(tempfile.gettempdir())
+
+    os.remove(archive)
+
+    if not os.path.isfile(zig_exe):
+        raise RuntimeError(
+            f"Zig binary not found at {zig_exe!r} after extraction. "
+            f"Check that {url!r} is correct."
+        )
+
+    os.chmod(zig_exe, 0o755)
+    print(f"setup.py: Zig {_ZIG_VERSION} ready at {zig_exe!r}")
+    return zig_exe
 
 
 def _find_openssl():
@@ -51,11 +127,9 @@ def _find_openssl():
         )
 
     if sys.platform == "darwin":
-        import platform as _platform
-
         # /opt/homebrew  → arm64 Homebrew (Apple Silicon)
         # /usr/local     → x86_64 Homebrew (Intel / Rosetta)
-        machine = _platform.machine()
+        machine = platform.machine()
         brew_prefix = "/opt/homebrew" if machine == "arm64" else "/usr/local"
         print(f"setup.py: macOS machine={machine!r}, using Homebrew prefix {brew_prefix!r}")
 
@@ -126,7 +200,7 @@ class ZigBuilder(build_ext):
         target = _zig_target()
 
         cmd = [
-            "zig",
+            _ensure_zig(),
             "build-lib",
             "-O", mode,
             "-lc",

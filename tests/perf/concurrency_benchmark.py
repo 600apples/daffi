@@ -475,7 +475,7 @@ def run_scenario_3() -> None:
 def _wait_for_workers(port: int, n: int, timeout: float = 60) -> None:
     """Block until at least *n* members with an 'echo' method are visible."""
     from daffi import Client
-    from daffi.bindings import get_available_members
+    from daffi._bindings import get_available_members
 
     probe = Client(app_name="probe-client", host=HOST, port=port)
     conn = probe.connect()   # noqa: F841 — just need the connection open

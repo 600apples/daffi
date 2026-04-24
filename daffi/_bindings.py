@@ -5,6 +5,7 @@ All functions delegate directly to C-level calls exposed by the Zig
 ``dfcore`` shared library, providing type annotations and docstrings so
 the rest of the Python code does not call ``dfcore.*`` directly.
 """
+
 from __future__ import annotations
 
 import ctypes
@@ -13,7 +14,7 @@ from . import dfcore
 from enum import IntEnum
 from typing import Union, Tuple
 
-from daffi.serialization import SerdeFormat
+from daffi._serialization import SerdeFormat
 
 
 class MessageFlag(IntEnum):

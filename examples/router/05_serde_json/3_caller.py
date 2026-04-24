@@ -11,7 +11,7 @@ Run 1_router.py and 2_worker.py first.
 """
 import time
 from daffi import Client
-from daffi.serialization import SerdeFormat
+from daffi import SerdeFormat
 
 
 BATCH = {"values": [10, 20, 30, 40, 50]}

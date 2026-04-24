@@ -11,6 +11,7 @@ Five call styles are available on every :class:`ClientConnection`:
 * :meth:`~ClientConnection.stream`         — iterate a generator, wait for ack per chunk (backpressure)
 * :meth:`~ClientConnection.stream_nowait`  — iterate a generator, fire-and-forget per chunk (no backpressure)
 """
+
 from __future__ import annotations
 
 import json
@@ -24,10 +25,10 @@ from contextlib import contextmanager
 if TYPE_CHECKING:
     from daffi.app import Client
 
-from daffi.serialization import SerdeFormat, Serializer
+from daffi._serialization import SerdeFormat, Serializer
 from daffi.utils.misc import iterable
-from daffi.registry.executor_registry import EXECUTOR_REGISTRY
-from daffi.bindings import (
+from daffi.registry._executor_registry import EXECUTOR_REGISTRY
+from daffi._bindings import (
     send_message_from_client,
     get_message_from_client_store,
     mark_message_as_expired,
@@ -110,22 +111,42 @@ class RemoteCallError(Exception):
 
 
 @contextmanager
-def system_exception_handler(msg_template: str, errtype: type):
-    """Context manager that converts low-level ``SystemError`` from the native
-    extension into a friendlier *errtype* exception.
+def system_exception_handler(msg_template: str, errtype: type, conn_num: int = 0):
+    """Context manager that converts low-level errors from the native extension
+    into a friendlier *errtype* exception.
 
     Args:
         msg_template: A ``str.format``-style template with one ``{}`` placeholder
                       for the original error message.
         errtype:      The exception class to raise.
+        conn_num:     Optional native connection handle.  When provided and the
+                      error is ``ReceiverNotFound``, the message is enriched with
+                      the list of currently connected peers.
     """
     try:
         yield
-    except SystemError as e:
-        origin_err_name = e.__cause__.args[0]
-        raise errtype(msg_template.format(origin_err_name)).with_traceback(
-            None
-        ) from None
+    except (SystemError, ValueError) as e:
+        if isinstance(e, SystemError):
+            origin = e.__cause__.args[0] if e.__cause__ else str(e)
+        else:
+            origin = str(e)
+
+        if "ReceiverNotFound" in origin and conn_num:
+            available = [m["name"] for m in get_available_members(conn_num)]
+            peer_lines = (
+                "\n".join(f"      • {p}" for p in available)
+                if available
+                else "      (none connected)"
+            )
+            origin = (
+                "ReceiverNotFound\n\n"
+                "  The peer is either not connected to the router, or it is\n"
+                "  connected but does not have the requested @callback registered.\n"
+                f"\n"
+                f"  Connected peers:\n{peer_lines}"
+            )
+
+        raise errtype(msg_template.format(origin)).with_traceback(None) from None
 
 
 class RpcProxy:
@@ -196,7 +217,7 @@ class RpcProxy:
         data, is_bytes = Serializer.serialize(self.serde, *args, **kwargs)
         assert self._func_name is not None
         with system_exception_handler(
-            f"Unable to proceed with {self}: {{}}", TransmissionFailure
+            f"Unable to proceed with {self}: {{}}", TransmissionFailure, conn_num
         ):
             uuid, ts, found_receiver = send_message_from_client(
                 data=data,
@@ -254,7 +275,7 @@ class RpcProxy:
         for a, k in items:
             data, is_bytes = Serializer.serialize(self.serde, *a, **k)
             with system_exception_handler(
-                f"Unable to proceed with {self}: {{}}", TransmissionFailure
+                f"Unable to proceed with {self}: {{}}", TransmissionFailure, conn_num
             ):
                 uuid, ts, found_receiver = send_message_from_client(
                     data=data,
@@ -491,6 +512,7 @@ class BroadcastProxy:
             with system_exception_handler(
                 f"Unable to dispatch call_all to {receiver_name!r}: {{}}",
                 TransmissionFailure,
+                conn_num,
             ):
                 uuid, ts, found = send_message_from_client(
                     data=data,
@@ -539,6 +561,7 @@ class BroadcastProxy:
             with system_exception_handler(
                 f"Unable to dispatch cast_all to {receiver_name!r}: {{}}",
                 TransmissionFailure,
+                conn_num,
             ):
                 send_message_from_client(
                     data=data,
@@ -584,7 +607,7 @@ class _StreamBase:
         """Serialise and send one chunk; return (uuid, ts, found_receiver)."""
         data, is_bytes = Serializer.serialize(self.serde, chunk)
         with system_exception_handler(
-            f"Unable to stream to {self}: {{}}", TransmissionFailure
+            f"Unable to stream to {self}: {{}}", TransmissionFailure, conn_num
         ):
             uuid, ts, found_receiver = send_message_from_client(
                 data=data,
@@ -709,7 +732,7 @@ class ClientConnection:
     """
 
     def __init__(self, client: "Client", password: str = ""):
-        self.client   = client
+        self.client = client
         self.password = password
 
     # ------------------------------------------------------------------
@@ -996,16 +1019,17 @@ class _RetryCallProxy:
         args: tuple,
         kwargs: dict,
     ) -> None:
-        self._ar     = ar
+        self._ar = ar
         self._method = method
-        self._args   = args
+        self._args = args
         self._kwargs = kwargs
 
     def __getattr__(self, func_name: str):
         def _invoke(*call_args: Any, **call_kwargs: Any) -> Any:
-            conn  = self._ar._live_conn()
+            conn = self._ar._live_conn()
             proxy = getattr(conn, self._method)(*self._args, **self._kwargs)
             return getattr(proxy, func_name)(*call_args, **call_kwargs)
+
         return _invoke
 
 
@@ -1121,11 +1145,11 @@ class AutoReconnect:
         user threads (via :meth:`_live_conn`).  The task dispatcher is *not*
         stopped — its threads are reused for the new connection.
         """
-        client   = self.conn.client
+        client = self.conn.client
         password = self.conn.password
 
         old_num = client._conn_num
-        client._conn_num  = None
+        client._conn_num = None
         client._conn_type = None
 
         if old_num is not None:
@@ -1136,9 +1160,7 @@ class AutoReconnect:
 
         while True:
             delay = client._reconnect_delay
-            client.logger.warning(
-                f"Connection lost — reconnecting in {delay:.1f}s…"
-            )
+            client.logger.warning(f"Connection lost — reconnecting in {delay:.1f}s…")
             time.sleep(delay)
             try:
                 client._do_connect(password)
@@ -1152,9 +1174,7 @@ class AutoReconnect:
                     )
                 return
             except Exception as exc:
-                client.logger.warning(
-                    f"Reconnect failed: {exc}"
-                )
+                client.logger.warning(f"Reconnect failed: {exc}")
                 if client._conn_num is not None:
                     try:
                         dfcore.stopClient(client._conn_num)

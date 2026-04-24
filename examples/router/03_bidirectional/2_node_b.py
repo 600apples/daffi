@@ -1,32 +1,32 @@
 """
 router/03_bidirectional — Node B.
 
-Node B exposes a 'greet' callback and waits.  Node A will call it, then
-Node B calls back a function exposed by Node A.
+Registers a 'greet' callback, waits for node-a, then calls status() on it.
+Node A does the symmetric thing — each node is both a caller and a worker.
 
 Start 1_router.py first, then this, then 3_node_a.py.
 """
 import time
+
 from daffi import Client, callback
 
 
 @callback
 def greet(name: str) -> str:
-    print(f"[node-b] greet({name!r})")
+    print(f"[node-b] greet({name!r}) called")
     return f"Hello, {name}! — from node-b"
 
 
 if __name__ == "__main__":
     node = Client(app_name="node-b", host="127.0.0.1", port=6003)
     conn = node.connect()
-    print("Node B connected — press Ctrl+C to stop.")
+    print("node-b connected — waiting for node-a…")
 
-    # Wait until node-a connects and exposes its callbacks.
-    time.sleep(2)
+    conn.wait_for_members("node-a", timeout=30)
+    print("node-a is online — calling status()")
 
-    rpc_a = conn.rpc(timeout=5, receiver="node-a")
-    result = rpc_a.status()
-    print(f"[node-b] node-a status: {result!r}")
+    result = conn.rpc(timeout=5, receiver="node-a").status()
+    print(f"[node-b] node-a replied: {result!r}")
 
-    import signal
-    signal.pause()
+    time.sleep(3)
+    node.stop()

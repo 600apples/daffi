@@ -1,8 +1,8 @@
 """
 router/02_cast — Router.
 
-Start first, then run 2_worker.py (optionally multiple times for >1
-worker), then 3_caller.py.
+Start this first, then open three terminals and run 2_worker.py with
+different WORKER_NAME values (alpha, beta, gamma), then 3_caller.py.
 """
 from daffi import Router
 

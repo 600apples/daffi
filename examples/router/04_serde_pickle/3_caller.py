@@ -8,7 +8,7 @@ broadcast to all workers.
 Run 1_router.py and 2_worker.py first.
 """
 from daffi import Client
-from daffi.serialization import SerdeFormat
+from daffi import SerdeFormat
 from models import Task, TaskResult, Priority
 
 

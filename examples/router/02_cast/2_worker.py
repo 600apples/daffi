@@ -1,26 +1,28 @@
 """
 router/02_cast — Worker.
 
-Exposes a 'process' callback.  Start multiple instances of this script
-(with different app_name env vars if needed) to see cast() fan out to all.
+Run this script in 3 separate terminals:
 
-Start 1_router.py first, then one or more instances of this, then 3_caller.py.
+  Terminal 1:  python 2_worker.py
+  Terminal 2:  python 2_worker.py
+  Terminal 3:  python 2_worker.py
+
+Start 1_router.py first, then the workers, then 3_caller.py.
 """
-import os
+import random
+
 from daffi import Client, callback
 
-WORKER_NAME = os.environ.get("WORKER_NAME", "worker-1")
+TAG = random.choice(["🔵", "🟢", "🟡", "🔴", "🟣", "🟠"])
 
 
 @callback
 def process(item: str) -> str:
-    print(f"[{WORKER_NAME}] process({item!r})")
-    return f"{WORKER_NAME}: processed {item!r}"
+    return TAG
 
 
 if __name__ == "__main__":
-    worker = Client(app_name=WORKER_NAME, host="127.0.0.1", port=6002)
+    worker = Client(host="127.0.0.1", port=6002)
     worker.connect()
-    print(f"Worker {WORKER_NAME!r} connected — press Ctrl+C to stop.")
-    import signal
-    signal.pause()
+    print(f"{TAG}  worker connected — press Ctrl+C to stop.")
+    worker.join()

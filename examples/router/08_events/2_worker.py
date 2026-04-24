@@ -7,7 +7,6 @@ connected node whenever the membership changes.
 
 Start 1_router.py first, then this, then 3_caller.py.
 """
-import signal
 from daffi import Client, callback
 
 
@@ -32,4 +31,4 @@ if __name__ == "__main__":
     worker.add_event_handler(on_event)
     conn = worker.connect()
     print("Worker connected — press Ctrl+C to stop.")
-    signal.pause()
+    worker.join()

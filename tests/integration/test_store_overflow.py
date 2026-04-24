@@ -113,9 +113,9 @@ class TestStoreOverflow:
         starts (after the sleep), exactly one response is in the store.
         """
         from daffi import Client
-        from daffi.bindings import send_message_from_client, MessageFlag
-        from daffi.rpc_proxy import RpcResult
-        from daffi.serialization import Serializer, SerdeFormat
+        from daffi._bindings import send_message_from_client, MessageFlag
+        from daffi._rpc_proxy import RpcResult
+        from daffi._serialization import Serializer, SerdeFormat
 
         client = Client(app_name="overflow-cli", host=HOST, port=overflow_service)
         conn = client.connect()

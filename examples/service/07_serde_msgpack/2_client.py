@@ -10,7 +10,7 @@ Requires:  pip install 'daffi[msgpack]'
 Run 1_service.py first.
 """
 from daffi import Client
-from daffi.serialization import SerdeFormat
+from daffi import SerdeFormat
 
 
 if __name__ == "__main__":

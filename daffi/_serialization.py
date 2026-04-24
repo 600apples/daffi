@@ -1,6 +1,7 @@
 """
 Serialisation and deserialisation for the four supported wire formats.
 """
+
 import json
 import pickle
 from typing import Union, Tuple, Dict, Callable
@@ -59,7 +60,6 @@ class SerdeFormat:
     PICKLE, but supports a narrower set of types (no tuples, custom classes,
     or tracebacks).  Requires the optional ``msgpack`` package — install with
     ``pip install 'daffi[msgpack]'``."""
-
 
 
 class Serializer:
@@ -164,9 +164,7 @@ class Serializer:
             raise ValueError(f"Unknown serde format: {serde!r}")
 
     @classmethod
-    def deserialize(
-        cls, serde: SerdeFormat, data: Union[bytes, str]
-    ) -> Tuple:
+    def deserialize(cls, serde: SerdeFormat, data: Union[bytes, str]) -> Tuple:
         """Deserialise *data* using the format chosen by *serde*.
 
         Returns:
@@ -187,15 +185,15 @@ class Serializer:
 
 
 Serializer._SERIALIZE = {
-    SerdeFormat.OPAQUE:  Serializer._serialize_opaque,
-    SerdeFormat.JSON:    Serializer._serialize_json,
-    SerdeFormat.PICKLE:  Serializer._serialize_pickle,
+    SerdeFormat.OPAQUE: Serializer._serialize_opaque,
+    SerdeFormat.JSON: Serializer._serialize_json,
+    SerdeFormat.PICKLE: Serializer._serialize_pickle,
     SerdeFormat.MSGPACK: Serializer._serialize_msgpack,
 }
 
 Serializer._DESERIALIZE = {
-    SerdeFormat.OPAQUE:  Serializer._deserialize_opaque,
-    SerdeFormat.JSON:    Serializer._deserialize_json,
-    SerdeFormat.PICKLE:  Serializer._deserialize_pickle,
+    SerdeFormat.OPAQUE: Serializer._deserialize_opaque,
+    SerdeFormat.JSON: Serializer._deserialize_json,
+    SerdeFormat.PICKLE: Serializer._deserialize_pickle,
     SerdeFormat.MSGPACK: Serializer._deserialize_msgpack,
 }

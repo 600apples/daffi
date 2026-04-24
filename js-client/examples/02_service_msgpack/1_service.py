@@ -12,7 +12,7 @@ Requires: pip install 'daffi[msgpack]'
 Run this first, then open index.html in a browser (via an HTTP server).
 """
 from daffi import Service, callback
-from daffi.serialization import SerdeFormat
+from daffi import SerdeFormat
 
 
 @callback

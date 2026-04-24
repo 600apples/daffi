@@ -43,7 +43,7 @@ Worker ──┘   (bidirectional: workers can also call each other)
 
 ```python
 from daffi import Router, Client, callback
-from daffi.serialization import SerdeFormat
+from daffi import SerdeFormat
 
 # --- Router ---
 router = Router(host="127.0.0.1", port=6000)

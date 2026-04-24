@@ -8,7 +8,6 @@ for direct **Client → Service** communication.  Run the numbered files in orde
 | # | Folder | What it shows |
 |---|--------|---------------|
 | 01 | `01_rpc/` | Basic blocking RPC call |
-| 02 | `02_cast/` | `cast()` and `cast_nowait()` broadcast calls |
 | 03 | `03_class_callbacks/` | Class-based callbacks and `@local` |
 | 04 | `04_serde_pickle/` | PICKLE — Python dataclasses and Enums |
 | 05 | `05_serde_json/` | JSON — language-agnostic plain dicts |
@@ -16,6 +15,7 @@ for direct **Client → Service** communication.  Run the numbered files in orde
 | 07 | `07_serde_msgpack/` | MSGPACK — compact binary encoding |
 | 08 | `08_unix_socket/` | Unix domain socket transport |
 | 09 | `09_events/` | `add_event_handler()` — connect/disconnect events |
+| 10 | `10_stream/` | Generator streaming with `stream()` / `stream_nowait()` |
 
 ## Quick Start
 
@@ -41,7 +41,7 @@ python examples/service/01_rpc/2_client.py
 ```python
 from daffi import Service, Client, callback
 from daffi.registry import local
-from daffi.serialization import SerdeFormat
+from daffi import SerdeFormat
 
 # --- Service side ---
 @callback

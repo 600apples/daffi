@@ -64,7 +64,7 @@ def silence_subprocess() -> None:
     os.close(devnull)
     logging.disable(logging.CRITICAL)
 
-    from daffi.registry.executor_registry import EXECUTOR_REGISTRY  # noqa: PLC0415
+    from daffi.registry._executor_registry import EXECUTOR_REGISTRY  # noqa: PLC0415
     EXECUTOR_REGISTRY.subscribers.clear()
     EXECUTOR_REGISTRY.registry.clear()
 

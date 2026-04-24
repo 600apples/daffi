@@ -4,7 +4,9 @@ User-facing application classes: Router, Service, and Client.
 
 import os
 import sys
+import select
 import socket
+import threading
 import time
 from abc import ABC
 from enum import IntEnum
@@ -17,10 +19,11 @@ from daffi.utils import colors
 from daffi.utils.logger import get_daffi_logger
 from daffi.exceptions import InitializationError
 from daffi.utils.misc import string_uuid
-from daffi.rpc_proxy import RpcProxy, SerdeFormat, ClientConnection, AutoReconnect
-from daffi.signals import set_signal_handler
-from daffi.task_dispatcher import TaskDispatcher
-from daffi.registry.executor_registry import EXECUTOR_REGISTRY
+from daffi._bindings import set_client_disconnect_fd
+from daffi._rpc_proxy import RpcProxy, SerdeFormat, ClientConnection, AutoReconnect
+from daffi._signals import set_signal_handler
+from daffi._task_dispatcher import TaskDispatcher
+from daffi.registry._executor_registry import EXECUTOR_REGISTRY
 
 
 class ServerMode(IntEnum):
@@ -48,6 +51,7 @@ class Application(ABC):
         port: Optional[int] = None,
         unix_sock_path: Optional[os.PathLike] = None,
         workers: int = TaskDispatcher.DEFAULT_WORKERS,
+        use_processes: bool = False,
         tls: bool = False,
         cert_file: str = "",
         key_file: str = "",
@@ -61,11 +65,22 @@ class Application(ABC):
             port:          TCP port number.
             unix_sock_path: Path to a Unix-domain socket (mutually exclusive
                            with *host*/*port*).
-            workers:       Number of worker threads that execute incoming
-                           ``@callback`` calls concurrently.  Defaults to
-                           ``max(1, os.cpu_count() // 2)``.  Increase for
-                           I/O-heavy callbacks; ignored by :class:`Router`
-                           which never executes callbacks itself.
+            workers:       Number of concurrent workers for executing incoming
+                           ``@callback`` calls.  ``1`` (default) runs callbacks
+                           inline with zero overhead.  ``N >= 2`` spawns a pool
+                           of N-1 workers; their type is controlled by
+                           *use_processes*.  Ignored by :class:`Router` which
+                           never executes callbacks itself.
+            use_processes: When ``False`` (default) worker slots are OS
+                           **threads** — best for I/O-bound callbacks.  When
+                           ``True`` worker slots are **forked processes** that
+                           bypass the GIL — best for CPU-bound callbacks.
+                           Ignored when ``workers == 1``.
+
+                           All ``@callback`` functions must be registered
+                           *before* calling :meth:`start` / :meth:`connect`
+                           because worker processes are forked at that point and
+                           will not see callbacks added later.
             tls:           Enable TLS encryption for the TCP connection.
                            Servers require ``cert_file`` and ``key_file``.
                            Clients may optionally supply ``ca_file``.
@@ -83,6 +98,7 @@ class Application(ABC):
         self.port = port
         self.unix_sock_path = str(unix_sock_path or "")
         self.workers = workers
+        self.use_processes = use_processes
         self.tls = tls
         self.cert_file = cert_file
         self.key_file = key_file
@@ -90,6 +106,7 @@ class Application(ABC):
         self._conn_num = None
         self._conn_type = None
         self._stop_event = Event()
+        self._connection_error: Optional[Exception] = None
         self.event_handlers: List[Callable[[Dict], Any]] = []
         self._executors_subscribed: bool = False
 
@@ -193,8 +210,20 @@ class Application(ABC):
             client = Client(app_name="worker", host="127.0.0.1", port=6001)
             client.connect()
             client.join()   # blocks until Ctrl+C (SIGINT/SIGTERM → stop())
+
+        For :class:`Client` nodes the method also re-raises any connection
+        error that was not handled by the application (e.g. the server
+        disconnecting unexpectedly).  If you want to suppress the error wrap
+        the call in a ``try/except``::
+
+            try:
+                client.join()
+            except ConnectionError:
+                pass   # silent disconnect
         """
         self._stop_event.wait()
+        if self._connection_error is not None:
+            raise self._connection_error
 
     def stop(self, *args, **kwargs):
         """Stop the application. Subclasses provide the actual teardown logic."""
@@ -238,19 +267,35 @@ class ServerMixin:
         """
         if self._conn_num is not None:
             raise RuntimeError(f"{self.__class__.__name__} is already started")
+        if self.server_mode == ServerMode.SERVICE:
+            # Start the worker pool before native I/O threads are created.
+            # Threads idle harmlessly; processes must be forked while the
+            # process is still single-threaded (POSIX fork-safety).
+            if not self._task_dispatcher:
+                self._task_dispatcher = TaskDispatcher(
+                    workers=self.workers,
+                    use_processes=self.use_processes,
+                )
+            self._task_dispatcher._start_workers()
         self._conn_num = dfcore.startServer(
-            self.host, self.port, self.server_mode, password, self.app_name,
-            self.tls, self.cert_file, self.key_file,
+            self.host,
+            self.port,
+            self.server_mode,
+            password,
+            self.app_name,
+            self.tls,
+            self.cert_file,
+            self.key_file,
         )
         if self._conn_num is None:
             raise InitializationError(
                 f"Failed to start the server. connection info: {self.info}"
             )
-        self.logger.debug(f"has been started successfully. connection info: {self.info}")
+        self.logger.debug(
+            f"has been started successfully. connection info: {self.info}"
+        )
         self._register_executors()
         if self.server_mode == ServerMode.SERVICE:
-            if not self._task_dispatcher:
-                self._task_dispatcher = TaskDispatcher(workers=self.workers)
             self._task_dispatcher.start_for_connection(self)
             RpcProxy._process_service_handshake(self._conn_num)
 
@@ -364,6 +409,7 @@ class Client(Application):
         port: Optional[int] = None,
         unix_sock_path: Optional[os.PathLike] = None,
         workers: int = TaskDispatcher.DEFAULT_WORKERS,
+        use_processes: bool = False,
         tls: bool = False,
         cert_file: str = "",
         key_file: str = "",
@@ -392,6 +438,7 @@ class Client(Application):
             port=port,
             unix_sock_path=unix_sock_path,
             workers=workers,
+            use_processes=use_processes,
             tls=tls,
             cert_file=cert_file,
             key_file=key_file,
@@ -399,6 +446,11 @@ class Client(Application):
         )
         self._autoreconnect = autoreconnect
         self._reconnect_delay = max(0.5, reconnect_delay)
+        # Pipe used by the disconnect watcher thread (non-autoreconnect).
+        # write-end is handed to the native layer; closing it also wakes the
+        # watcher thread so stop() doesn't leave it blocking forever.
+        self._disc_pipe_r: Optional[int] = None
+        self._disc_pipe_w: Optional[int] = None
 
     @property
     def info(self) -> str:
@@ -408,7 +460,9 @@ class Client(Application):
             sock = "unix:///" + self.unix_sock_path.strip("unix:///")
             return f"unix socket: [ {sock!r} ]"
         else:
-            type_part = f", type: {self._conn_type!r}" if self._conn_type is not None else ""
+            type_part = (
+                f", type: {self._conn_type!r}" if self._conn_type is not None else ""
+            )
             return f"tcp: [ host {self.host!r}, port: {self.port!r}{type_part} ]"
 
     def connect(self, password: str = "") -> Union["ClientConnection", "AutoReconnect"]:
@@ -444,9 +498,26 @@ class Client(Application):
 
     def _do_connect(self, password: str) -> None:
         """Low-level connect: allocate native slot, handshake, start dispatcher."""
+        # Start the worker pool before native I/O threads are created.
+        # For threads: they idle harmlessly until work arrives.
+        # For processes: they must be forked while single-threaded (fork-safety).
+        # If the server turns out to be a Service (not a Router) the pool is
+        # stopped immediately after the handshake.
+        if self.workers > 1:
+            if self._task_dispatcher is None:
+                self._task_dispatcher = TaskDispatcher(
+                    workers=self.workers,
+                    use_processes=self.use_processes,
+                )
+            self._task_dispatcher._start_workers()
+
         self._conn_num = dfcore.startClient(
-            self.host, self.port, password, self.app_name,
-            self.tls, self.ca_file,
+            self.host,
+            self.port,
+            password,
+            self.app_name,
+            self.tls,
+            self.ca_file,
         )
         if self._conn_num is None:
             raise InitializationError(
@@ -459,9 +530,14 @@ class Client(Application):
         )
         if self._conn_type == "router":
             if self._task_dispatcher is None:
-                self._task_dispatcher = TaskDispatcher(workers=self.workers)
+                self._task_dispatcher = TaskDispatcher(
+                    workers=self.workers,
+                    use_processes=self.use_processes,
+                )
             self._task_dispatcher.start_for_connection(self)
             self._register_executors()
+            if not self._autoreconnect:
+                self._start_disconnect_watcher()
 
     def add_event_handler(self, handler: Callable[[Dict], Any]):
         """Register a callable invoked whenever a node connects or disconnects.
@@ -494,11 +570,61 @@ class Client(Application):
         """
         self.event_handlers.append(handler)
 
+    def _start_disconnect_watcher(self) -> None:
+        """Start a daemon thread that unblocks :meth:`join` when the server closes
+        the connection unexpectedly (i.e. without a user-initiated :meth:`stop`).
+
+        A pipe is created; the write-end is handed to the native layer via
+        ``setClientDisconnectFd``.  When the connection is lost the native layer
+        writes one byte to the write-end, the thread wakes, and — if :meth:`stop`
+        has not already been called — stores a :class:`ConnectionError` and sets
+        the stop event so :meth:`join` returns and re-raises the error.
+        """
+        r, w = os.pipe()
+        self._disc_pipe_r = r
+        self._disc_pipe_w = w
+        set_client_disconnect_fd(self._conn_num, w)
+
+        def _watch(stop_event: Event, client_ref) -> None:
+            try:
+                select.select([r], [], [])
+            except Exception:
+                pass
+            finally:
+                try:
+                    os.close(r)
+                except OSError:
+                    pass
+            # Only record an error if stop() was NOT the one that triggered this.
+            if not stop_event.is_set():
+                client_ref._connection_error = ConnectionError(
+                    "Server disconnected unexpectedly.\n\n"
+                    "  The router or service this client was connected to has stopped.\n"
+                    "  If you want to reconnect automatically, use:\n"
+                    "      Client(..., autoreconnect=True)"
+                )
+                stop_event.set()
+
+        t = threading.Thread(
+            target=_watch,
+            args=(self._stop_event, self),
+            name="daffi-disc-watcher",
+            daemon=True,
+        )
+        t.start()
+
     def stop(self, *_, **__):
         """Stop the client: signal the reconnect loop, join task-dispatcher
         threads, then destroy the native connection."""
         if not self._stop_event.is_set():
             self._stop_event.set()
+            # Wake the disconnect-watcher thread so it exits cleanly.
+            if self._disc_pipe_w is not None:
+                try:
+                    os.close(self._disc_pipe_w)
+                except OSError:
+                    pass
+                self._disc_pipe_w = None
             if self._task_dispatcher:
                 self._task_dispatcher.stop_for_connection(self)
             if self._conn_num is not None:
