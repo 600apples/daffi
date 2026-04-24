@@ -114,9 +114,20 @@ wheels-macos:  ## Build macOS wheels for the native host arch — run on macOS
 	$(CIBW) --platform macos .
 
 wheels-qemu:  ## Register QEMU binfmt handlers for multi-arch emulation (run once)
-	@echo "==> Registering QEMU binfmt handlers..."
-	@echo "    If this does not work, run: sudo apt-get install -y qemu-user-static"
-	docker run --rm --privileged tonistiigi/binfmt --install all
+	@echo "==> Registering QEMU binfmt handlers for aarch64 emulation..."
+	@# On Debian/Ubuntu the package-level install is the most reliable method:
+	@#   sudo apt-get install -y qemu-user-static
+	@# It writes to /proc/sys/fs/binfmt_misc directly via update-binfmts.
+	@# The Docker-only fallback below works on some setups but not all.
+	@if command -v apt-get >/dev/null 2>&1; then \
+	    echo "Debian/Ubuntu detected — running: sudo apt-get install -y qemu-user-static"; \
+	    sudo apt-get install -y qemu-user-static; \
+	else \
+	    echo "Non-Debian system — trying Docker-based binfmt registration..."; \
+	    docker run --rm --privileged tonistiigi/binfmt --install all; \
+	fi
+	@echo "Registered handlers:"
+	@ls /proc/sys/fs/binfmt_misc/ 2>/dev/null || echo "(none visible — may need a re-login)"
 
 wheels-upload:  ## Upload all wheels in $(WHEELHOUSE)/ to PyPI
 	@echo "==> Uploading $(WHEELHOUSE)/*.whl to PyPI..."
