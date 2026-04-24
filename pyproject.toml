@@ -94,6 +94,7 @@ repair-wheel-command = "delocate-wheel --require-archs {delocate_archs} -w {dest
 
 
 [tool.hatch.envs.docs]
+skip-install = true
 dependencies = [
     "mkdocs-material>=9.4",
     "mkdocs-section-index>=0.3",
@@ -103,6 +104,7 @@ dependencies = [
 DISABLE_MKDOCS_2_WARNING = "true"
 
 [tool.hatch.envs.docs.scripts]
-serve = "mkdocs serve --dev-addr 127.0.0.1:8000"
-build = "mkdocs build --strict"
-clean = "rm -rf mkdocs_files"
+serve  = "mkdocs serve --dev-addr 127.0.0.1:8000"
+build  = "mkdocs build --strict"
+deploy = "mkdocs gh-deploy --force"
+clean  = "rm -rf mkdocs_files"
