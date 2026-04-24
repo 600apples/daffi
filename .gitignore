@@ -84,3 +84,5 @@ htmlcov/
 *.bak
 *.tmp
 test_map
+/js-client/.zig-cache/
+wheelhouse/

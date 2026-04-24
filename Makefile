@@ -69,6 +69,63 @@ docs-build:  ## Build the documentation site into mkdocs_files/
 docs-clean:  ## Remove the generated docs output directory
 	hatch run docs:clean
 
+# ── Wheels ────────────────────────────────────────────────────────────────────
+# Prerequisites (install once):
+#   pipx install cibuildwheel          # wheel builder
+#   pip install twine                  # PyPI uploader
+#   Docker must be running for Linux targets.
+#
+# Linux wheels  : run inside manylinux Docker containers.
+#   x86_64  → works out of the box (native Docker).
+#   aarch64 → requires QEMU binfmt on the host first:
+#               sudo apt-get install -y qemu-user-static   # Debian/Ubuntu
+#             …or once Docker-based:
+#               make wheels-qemu
+#
+# macOS wheels  : must be executed ON a macOS machine (the binary must be
+#                 compiled for the target OS natively).  Run on both an
+#                 Apple Silicon and an Intel Mac to cover both arches, or
+#                 let CI handle macOS.
+
+WHEELHOUSE ?= wheelhouse
+# Honour a pre-installed cibuildwheel binary (pipx) or fall back to the
+# module form (pip install cibuildwheel).
+CIBW        = cibuildwheel --output-dir $(WHEELHOUSE)
+
+# Architectures to build locally.  Override on the command line to add
+# aarch64 once QEMU is set up, e.g.:  make wheels-linux LINUX_ARCHS=x86_64,aarch64
+LINUX_ARCHS ?= x86_64
+
+.PHONY: wheels wheels-linux wheels-linux-all wheels-macos wheels-qemu wheels-upload wheels-clean
+
+wheels: wheels-linux  ## Build Linux wheels for LINUX_ARCHS (default: x86_64)
+
+wheels-linux:  ## Build Linux manylinux wheels — requires Docker (see LINUX_ARCHS)
+	@echo "==> Building Linux manylinux wheels (cp310..cp313 × $(LINUX_ARCHS))..."
+	$(CIBW) --platform linux --archs $(LINUX_ARCHS) .
+
+wheels-linux-all:  ## Build Linux manylinux wheels for x86_64 AND aarch64 — needs QEMU
+	@echo "==> Building Linux manylinux wheels (cp310..cp313 × x86_64 + aarch64)..."
+	@echo "    If aarch64 fails, run: sudo apt-get install -y qemu-user-static"
+	$(CIBW) --platform linux --archs x86_64,aarch64 .
+
+wheels-macos:  ## Build macOS wheels for the native host arch — run on macOS
+	@echo "==> Building macOS wheels (native arch: $$(uname -m))..."
+	$(CIBW) --platform macos .
+
+wheels-qemu:  ## Register QEMU binfmt handlers for multi-arch emulation (run once)
+	@echo "==> Registering QEMU binfmt handlers..."
+	@echo "    If this does not work, run: sudo apt-get install -y qemu-user-static"
+	docker run --rm --privileged tonistiigi/binfmt --install all
+
+wheels-upload:  ## Upload all wheels in $(WHEELHOUSE)/ to PyPI
+	@echo "==> Uploading $(WHEELHOUSE)/*.whl to PyPI..."
+	@echo "    Set TWINE_PASSWORD=<your-token> and optionally TWINE_USERNAME=__token__"
+	TWINE_USERNAME=$${TWINE_USERNAME:-__token__} twine upload --non-interactive $(WHEELHOUSE)/*.whl
+
+wheels-clean:  ## Remove the wheelhouse/ directory
+	rm -rf $(WHEELHOUSE)
+
 # ── Build ─────────────────────────────────────────────────────────────────────
 
 .PHONY: build
