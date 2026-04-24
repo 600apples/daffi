@@ -47,8 +47,7 @@ if __name__ == "__main__":
     worker = Client(app_name="calc-worker", host="127.0.0.1", port=6001)
     worker.connect()
     print("Worker connected — press Ctrl+C to stop.")
-    import signal
-    signal.pause()   # keep alive
+    worker.join()
 ```
 
 !!! tip
@@ -113,7 +112,7 @@ def hello_from_b(msg: str) -> str:
 
 node_b = Client(app_name="node-B", host="127.0.0.1", port=6003)
 conn = node_b.connect()
-import signal; signal.pause()
+node_b.join()
 ```
 
 ---
@@ -128,7 +127,6 @@ first: if the link is down it **blocks with exponential back-off** until
 the Router comes back, then sends the request on the fresh connection.
 
 ```python
-import signal
 from daffi import Client, callback
 
 @callback
@@ -165,7 +163,7 @@ if __name__ == "__main__":
         reconnect_delay=2.0,
     )
     conn = worker.connect()  # AutoReconnect; callbacks re-registered on reconnect
-    signal.pause()
+    worker.join()
 ```
 
 When the Router restarts the worker logs the reconnect cycle:
@@ -231,7 +229,6 @@ The method polls the native ChannelsMapper every `interval` seconds (default
 `timeout` parameter raises `TimeoutError` if the deadline is exceeded:
 
 ```python
-import signal
 from daffi import Client
 
 conn = Client(app_name="caller", host="127.0.0.1", port=6001).connect()

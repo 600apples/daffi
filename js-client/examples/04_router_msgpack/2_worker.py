@@ -34,8 +34,6 @@ Try it:
   5. Restart the router: python 1_router.py
   6. Make calls from the browser again — the worker reconnects automatically.
 """
-import signal
-
 from daffi import Client, callback
 
 
@@ -74,4 +72,4 @@ if __name__ == "__main__":
     conn = worker.connect()   # returns AutoReconnect adapter
     print("Worker connected to router — press Ctrl+C to stop.")
     print("(If the router restarts, any call through 'conn' will reconnect automatically.)")
-    signal.pause()
+    worker.join()

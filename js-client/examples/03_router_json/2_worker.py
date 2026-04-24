@@ -27,5 +27,4 @@ if __name__ == "__main__":
     worker = Client(app_name="json-worker", host="127.0.0.1", port=6010)
     worker.connect()
     print("Worker connected to router — press Ctrl+C to stop.")
-    import signal
-    signal.pause()
+    worker.join()

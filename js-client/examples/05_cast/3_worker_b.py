@@ -25,5 +25,4 @@ if __name__ == "__main__":
     client = Client(app_name=NAME, host="127.0.0.1", port=6020)
     client.connect()
     print(f"'{NAME}' connected — press Ctrl+C to stop.")
-    import signal
-    signal.pause()
+    client.join()

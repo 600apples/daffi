@@ -182,6 +182,20 @@ class Application(ABC):
             self._registry_subscriber = None
         self._executors_subscribed = False
 
+    def join(self):
+        """Block the calling thread until :meth:`stop` is called (or until a
+        registered signal handler triggers it).
+
+        Works on every node type — :class:`Router`, :class:`Service`, and
+        :class:`Client` alike.  This is the idiomatic way to keep a process
+        alive without importing ``signal``::
+
+            client = Client(app_name="worker", host="127.0.0.1", port=6001)
+            client.connect()
+            client.join()   # blocks until Ctrl+C (SIGINT/SIGTERM → stop())
+        """
+        self._stop_event.wait()
+
     def stop(self, *args, **kwargs):
         """Stop the application. Subclasses provide the actual teardown logic."""
         self._unregister_executor_subscriber()
@@ -189,12 +203,12 @@ class Application(ABC):
 
 
 class ServerMixin:
-    """Mixin that adds ``start()`` / ``stop()`` / ``join()`` to server-side
-    components (:class:`Router` and :class:`Service`)."""
+    """Mixin that adds ``start()`` / ``stop()`` to server-side components
+    (:class:`Router` and :class:`Service`).
 
-    def join(self):
-        """Block the calling thread until :meth:`stop` is called."""
-        self._stop_event.wait()
+    ``join()`` is inherited from :class:`Application` and available on all
+    node types.
+    """
 
     def start(self, password: str = ""):
         """Start the server, register executors, and — for a :class:`Service` —
