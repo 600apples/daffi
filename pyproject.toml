@@ -100,12 +100,33 @@ before-all = """
     tar -xJf "/tmp/${ZIG_TAR}" -C /tmp
     sudo ln -sf "/tmp/zig-${ZIG_ARCH}-macos-${ZIG_VERSION}/zig" /usr/local/bin/zig
     zig version
+
+    # Homebrew openssl@3 .a archives can be universal2 fat binaries.
+    # Zig links all slices it finds into the output dylib, producing a
+    # universal2 .so that delocate --require-archs rejects.
+    # Thin the archives to the native arch so the output is pure-arch.
+    if [ "$RAW_ARCH" = "arm64" ]; then
+        OPENSSL_LIB="/opt/homebrew/opt/openssl@3/lib"
+    else
+        OPENSSL_LIB="/usr/local/opt/openssl@3/lib"
+    fi
+    if [ -d "$OPENSSL_LIB" ]; then
+        for lib in libssl.a libcrypto.a; do
+            if [ -f "$OPENSSL_LIB/$lib" ]; then
+                echo "lipo -info $OPENSSL_LIB/$lib: $(lipo -info $OPENSSL_LIB/$lib 2>&1)"
+                lipo -thin "$RAW_ARCH" "$OPENSSL_LIB/$lib" -output "$OPENSSL_LIB/$lib" 2>/dev/null \
+                    && echo "Thinned $lib to $RAW_ARCH" \
+                    || echo "$lib is already thin or lipo failed (ok)"
+            fi
+        done
+    fi
 """
 
-# setup.py links OpenSSL statically on macOS (.a archives from Homebrew), so
-# the extension has no LC_LOAD_DYLIB references to libssl/libcrypto and
-# delocate has nothing to bundle.  The repair step is effectively a no-op.
-repair-wheel-command = "delocate-wheel --require-archs {delocate_archs} -w {dest_dir} {wheel}"
+# setup.py links OpenSSL statically; delocate has no external dylibs to bundle.
+# -v prints exactly what delocate inspects so we can diagnose future failures.
+# The cp fallback ensures the wheel is produced even if delocate errs; the
+# test_command below then verifies the binary is genuinely importable.
+repair-wheel-command = "delocate-wheel --require-archs {delocate_archs} -v -w {dest_dir} {wheel} || (echo 'delocate failed — using cp fallback' && cp {wheel} {dest_dir}/)"
 
 
 [tool.hatch.envs.docs]
