@@ -1,0 +1,214 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>daffi — cast()</title>
+  <script src="../../daffi.js"></script>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 740px; margin: 40px auto; padding: 0 16px; background: #0f0f0f; color: #e0e0e0; }
+    h1   { color: #34d399; margin-bottom: 4px; }
+    p    { color: #94a3b8; margin-top: 0; font-size: 0.9rem; }
+    code { background: #1e1e2e; padding: 1px 6px; border-radius: 4px; font-size: 0.85em; }
+    .card { background: #1e1e2e; border-radius: 8px; padding: 16px 20px; margin-bottom: 16px; }
+    label { display: block; margin-bottom: 8px; color: #94a3b8; font-size: 0.85rem; }
+    input[type=text], input[type=number] {
+      background: #13131f; border: 1px solid #374151; border-radius: 6px;
+      color: #e0e0e0; padding: 6px 10px; margin-right: 6px;
+    }
+    button {
+      background: #059669; color: #fff; border: none; border-radius: 6px;
+      padding: 7px 16px; cursor: pointer; font-size: 0.9rem; margin-right: 6px; margin-top: 4px;
+    }
+    button:disabled { background: #374151; cursor: not-allowed; }
+    button.connect { background: #10b981; }
+    button.danger  { background: #ef4444; }
+    button.partial { background: #7c3aed; }
+
+    /* worker checkboxes */
+    .worker-checks { display: flex; gap: 14px; margin: 10px 0 14px; flex-wrap: wrap; }
+    .worker-checks label {
+      display: flex; align-items: center; gap: 6px; cursor: pointer;
+      font-size: 0.88rem; color: #c4b5fd; user-select: none; margin-bottom: 0;
+    }
+    .worker-checks input[type=checkbox] { accent-color: #7c3aed; width: 15px; height: 15px; cursor: pointer; }
+
+    /* result table */
+    table { width: 100%; border-collapse: collapse; margin-top: 10px; font-size: 0.85rem; }
+    th { text-align: left; color: #6b7280; padding: 4px 8px; border-bottom: 1px solid #374151; }
+    td { padding: 5px 8px; border-bottom: 1px solid #1f2937; font-family: monospace; }
+    td.name  { color: #60a5fa; }
+    td.value { color: #34d399; }
+    .empty   { color: #4b5563; font-style: italic; font-size: 0.82rem; padding: 8px; }
+
+    #log { background: #13131f; border-radius: 6px; padding: 12px; min-height: 80px;
+           font-family: monospace; font-size: 0.82rem; white-space: pre-wrap;
+           color: #a0aec0; overflow-y: auto; max-height: 200px; }
+    .ok  { color: #34d399; }
+    .err { color: #f87171; }
+    .inf { color: #60a5fa; }
+  </style>
+</head>
+<body>
+
+<h1>daffi — <code>cast()</code></h1>
+<p>
+  Broadcasts a call to <strong>all three workers</strong> simultaneously and collects
+  every result as <code>{ workerName: result, … }</code>.
+</p>
+<p>Start order: <code>1_router.py</code> → <code>2_worker_a.py</code> →
+  <code>3_worker_b.py</code> → <code>4_worker_c.py</code> → open this page.</p>
+
+<div class="card">
+  <label>Router WebSocket URL</label>
+  <input type="text" id="wsUrl" value="ws://127.0.0.1:6020" style="width:220px">
+  <button class="connect" id="btnConnect">Connect</button>
+  <button class="danger"  id="btnDisconnect" disabled>Disconnect</button>
+</div>
+
+<!-- cast ping() -->
+<div class="card">
+  <label><strong>cast ping()</strong> — broadcast to all workers, collect string replies</label>
+  <button id="btnPing" disabled>cast().ping()</button>
+  <div id="pingResult"><div class="empty">results will appear here</div></div>
+</div>
+
+<!-- cast square(n) -->
+<div class="card">
+  <label>
+    <strong>cast square(n)</strong> — each worker returns
+    <code>{ worker, input, result }</code>
+  </label>
+  <input type="number" id="squareN" value="5" style="width:70px">
+  <button id="btnSquare" disabled>cast().square(n)</button>
+  <div id="squareResult"><div class="empty">results will appear here</div></div>
+</div>
+
+<!-- partial cast — receiver filter -->
+<div class="card">
+  <label>
+    <strong>Partial cast</strong> — broadcast only to a chosen subset of workers
+    via <code>options.receiver</code>.  Select any combination below, then call
+    <code>ping()</code> or <code>square(n)</code>.
+  </label>
+  <div class="worker-checks">
+    <label><input type="checkbox" id="chkA" checked> worker-A</label>
+    <label><input type="checkbox" id="chkB"        > worker-B</label>
+    <label><input type="checkbox" id="chkC" checked> worker-C</label>
+  </div>
+  <input type="number" id="partialN" value="9" style="width:70px">
+  <button class="partial" id="btnPartialPing"   disabled>cast(receiver=[…]).ping()</button>
+  <button class="partial" id="btnPartialSquare" disabled>cast(receiver=[…]).square(n)</button>
+  <div id="partialResult"><div class="empty">results will appear here</div></div>
+</div>
+
+<div class="card">
+  <label>Log</label>
+  <div id="log"></div>
+</div>
+
+<script>
+  const log = (msg, cls) => {
+    const el = document.getElementById('log');
+    el.innerHTML += `<span class="${cls||''}">${msg}</span>\n`;
+    el.scrollTop = el.scrollHeight;
+  };
+
+  /* Render a {workerName: value} dict as a two-column table. */
+  function renderDict(containerId, dict) {
+    const entries = Object.entries(dict);
+    const rows = entries.map(([name, val]) => {
+      const display = typeof val === 'object' ? JSON.stringify(val) : String(val);
+      return `<tr><td class="name">${name}</td><td class="value">${display}</td></tr>`;
+    }).join('');
+    document.getElementById(containerId).innerHTML =
+      `<table><thead><tr><th>worker</th><th>result</th></tr></thead><tbody>${rows}</tbody></table>`;
+  }
+
+  let conn = null;
+
+  const setButtons = (on) => {
+    ['btnPing','btnSquare','btnPartialPing','btnPartialSquare','btnDisconnect']
+      .forEach(id => document.getElementById(id).disabled = !on);
+    document.getElementById('btnConnect').disabled = on;
+  };
+
+  /* Return the array of checked worker names, or null if all are checked. */
+  function selectedWorkers() {
+    const all = ['worker-A','worker-B','worker-C'];
+    const checked = [
+      document.getElementById('chkA').checked ? 'worker-A' : null,
+      document.getElementById('chkB').checked ? 'worker-B' : null,
+      document.getElementById('chkC').checked ? 'worker-C' : null,
+    ].filter(Boolean);
+    // If all three are ticked treat it the same as no filter.
+    return checked.length === all.length ? null : checked;
+  }
+
+  document.getElementById('btnConnect').onclick = async () => {
+    const url = document.getElementById('wsUrl').value;
+    log(`Connecting to ${url} …`, 'inf');
+    try {
+      const client = new DaffiClient('browser-cast-client', {
+        wsUrl:    url,
+        wasmPath: '../../app.wasm',
+      });
+      client.addEventHandler(e => log(`  ← event: ${e.type} [${e.member}]`, 'inf'));
+      conn = await client.connect();
+      log('Connected!', 'ok');
+      setButtons(true);
+    } catch (err) { log(`Connect failed: ${err}`, 'err'); }
+  };
+
+  document.getElementById('btnDisconnect').onclick = () => {
+    conn = null;
+    log('Disconnected.', 'inf');
+    setButtons(false);
+  };
+
+  document.getElementById('btnPing').onclick = async () => {
+    log('→ cast().ping() …', 'inf');
+    try {
+      const results = await conn.cast({ serde: 'json', timeout: 5000 }).ping();
+      renderDict('pingResult', results);
+      log(`← received replies from: ${Object.keys(results).join(', ')}`, 'ok');
+    } catch (err) { log(`Error: ${err}`, 'err'); }
+  };
+
+  document.getElementById('btnSquare').onclick = async () => {
+    const n = parseFloat(document.getElementById('squareN').value);
+    log(`→ cast().square(${n}) …`, 'inf');
+    try {
+      const results = await conn.cast({ serde: 'json', timeout: 5000 }).square(n);
+      renderDict('squareResult', results);
+      log(`← received replies from: ${Object.keys(results).join(', ')}`, 'ok');
+    } catch (err) { log(`Error: ${err}`, 'err'); }
+  };
+
+  // ── partial cast ─────────────────────────────────────────────────────────
+
+  document.getElementById('btnPartialPing').onclick = async () => {
+    const receiver = selectedWorkers();
+    const label = receiver ? `[${receiver.join(', ')}]` : 'all';
+    log(`→ cast({ receiver: ${label} }).ping() …`, 'inf');
+    try {
+      const results = await conn.cast({ serde: 'json', timeout: 5000, receiver }).ping();
+      renderDict('partialResult', results);
+      log(`← replies from: ${Object.keys(results).join(', ')}`, 'ok');
+    } catch (err) { log(`Error: ${err}`, 'err'); }
+  };
+
+  document.getElementById('btnPartialSquare').onclick = async () => {
+    const n        = parseFloat(document.getElementById('partialN').value);
+    const receiver = selectedWorkers();
+    const label    = receiver ? `[${receiver.join(', ')}]` : 'all';
+    log(`→ cast({ receiver: ${label} }).square(${n}) …`, 'inf');
+    try {
+      const results = await conn.cast({ serde: 'json', timeout: 5000, receiver }).square(n);
+      renderDict('partialResult', results);
+      log(`← replies from: ${Object.keys(results).join(', ')}`, 'ok');
+    } catch (err) { log(`Error: ${err}`, 'err'); }
+  };
+</script>
+</body>
+</html>

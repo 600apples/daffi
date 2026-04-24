@@ -1,151 +1,118 @@
-from inspect import signature, iscoroutinefunction, isgeneratorfunction
-from typing import Callable, Any, Union, Type, Optional, ClassVar
-from daffi.registry._base import BaseRegistry, logger
-from daffi.method_executors import ClassCallbackExecutor, CallbackExecutor
-from daffi.utils.func_validation import (
-    get_class_methods,
-    func_info,
-    is_class_or_static_method,
+"""
+``@callback`` decorator — register functions or class methods as remote executors.
+"""
+
+import warnings
+from inspect import (
+    iscoroutinefunction,
+    isgeneratorfunction,
+    isasyncgenfunction,
+    isclass,
+    ismethod,
+    isfunction,
+    getmembers,
+    signature,
 )
+
 from daffi.exceptions import InitializationError
 from daffi.utils.misc import is_lambda_function
-from daffi.settings import LOCAL_CALLBACK_MAPPING, WELL_KNOWN_CALLBACKS, LOCAL_CLASS_CALLBACKS
+from daffi.registry.executor_registry import EXECUTOR_REGISTRY
 
 
-__all__ = ["Callback"]
+__all__ = ["callback"]
 
 
-class Callback(BaseRegistry):
+def _warn_if_no_return(name: str, func) -> None:
+    """Emit a ``UserWarning`` when a callback is annotated to return ``None``.
+
+    A callback with no return value will send ``None`` back to callers using
+    ``rpc()`` (blocking call), which is almost always a mistake.  When the
+    annotation explicitly says ``-> None`` we warn at registration time.
+
+    Functions without a return annotation are left unchecked — they may
+    intentionally return ``None`` or be used only with ``stream()``.
+
+    Handles both evaluated annotations (``ret is None``) and PEP 563 stringified
+    annotations (``from __future__ import annotations``) where the raw annotation
+    is the string ``'None'`` rather than the ``None`` singleton.
     """
-    Remote callback group representation. All public methods of class inherited from Callbacks become remote callbacks
-    identified by they names.
-    """
-
-    # If auto_init=True then class will be implicitly instantiated.
-    auto_init: ClassVar[bool] = False
-
-    @staticmethod
-    def _init_class(cls, instance_or_type) -> Union[Type, "Callback"]:
-        """
-        Register all public methods of class as callbacks.
-        Args:
-            instance_or_type: class type or class instance. This argument depends on `auto_init` value of base class
-                if `auto_init` == True then class instance will be instantiated implicitly.
-        """
-        _updated = False
-        # Iterate over all methods of class.
-        for method in get_class_methods(cls):
-            _, method_alias = func_info(method)
-            origin_method_name = method.__name__
-
-            if origin_method_name.startswith("_") or hasattr(method, "local"):
-                # Ignore methods which starts with `_` and methods decorated with `local` decorator.
-                continue
-
-            if not hasattr(cls, method_alias):
-                # If method has alias then add this method to class initialization by alias
-                setattr(cls, method_alias, method)
-
-            # Check if method is static or classmethod.
-            # Remote callback is ready to use in 2 cases:
-            #    1. Instance of class is not instantiated (`auto_init` == False)
-            #           but method is staticmethod or classmethod. static/class methods
-            #           are not bounded to specific instance
-            #    2. Instance of class is instantiated (`auto_init` == True). In this case all public methods
-            #           become remote callbacks.
-            is_static_or_class_method = is_class_or_static_method(cls, origin_method_name)
-            if not isinstance(instance_or_type, type):
-                klass = instance_or_type
-            else:
-                klass = cls if is_static_or_class_method else None
-            cb = ClassCallbackExecutor(
-                klass=klass,
-                # Origin name is the name callback is visible for other remote processes
-                origin_name_=method_alias,
-                signature=signature(method),
-                is_async=iscoroutinefunction(method),
-                is_static=str(is_static_or_class_method) == "static",
-                is_generator=isgeneratorfunction(method),
+    try:
+        ret = signature(func).return_annotation
+        if ret is None or ret == "None":
+            warnings.warn(
+                f"Callback {name!r} is annotated '-> None'. Callers using "
+                f"rpc() will always receive None. Use stream() for "
+                f"fire-and-forget calls, or fix the return type.",
+                UserWarning,
+                stacklevel=4,
             )
-            name_in_mapping = method_alias in LOCAL_CALLBACK_MAPPING
-            LOCAL_CALLBACK_MAPPING[method_alias] = cb
-            if not name_in_mapping:
-                logger.info(
-                    f"callback {method_alias!r} <class {cls.__name__}> is registered"
-                    + ("" if klass else f" (required {cls.__name__} initialization)")
-                )
+    except (TypeError, ValueError):
+        pass  # built-ins or C extensions — skip
 
-            _updated = True
 
-        if _updated:
-            cls._update_callbacks()
+class callback:
+    """Decorator that registers a plain function *or* all public methods of a
+    class instance as remote callbacks.
 
-        return instance_or_type
+    Decorated callables are added to the global :data:`~daffi.registry.executor_registry.EXECUTOR_REGISTRY`
+    so the framework can dispatch incoming RPC requests to them.
 
-    @classmethod
-    def _init_function(cls, fn: Callable[..., Any], fn_name: Optional[str] = None) -> CallbackExecutor:
-        """Register one function as remote callback (This method is used in `callback` decorator)."""
-        if is_lambda_function(fn):
-            InitializationError("Lambdas is not supported.").fire()
+    Restrictions:
+        - Lambda functions are **not** supported.
+        - Coroutine functions (``async def``) are **not** supported.
+        - Generator functions are **not** supported.
+        - Methods whose names start with ``_`` are silently skipped.
+        - Methods decorated with :func:`~daffi.registry._local.local` are skipped.
 
-        elif isinstance(fn, type):
-            # Class wrapped
-            InitializationError(
-                "Classes are not supported."
-                " Use `Callback` base class from `daffi.registry` "
-                "package to initialize class as callback group"
-            ).fire()
+    Example::
 
-        if fn_name:
-            name = fn_name
+        from daffi import callback
+
+        @callback
+        def add(a: int, b: int) -> int:
+            return a + b
+
+        @callback
+        class MathOps:
+            def multiply(self, a: int, b: int) -> int:
+                return a * b
+    """
+
+    def __init__(self, func_or_class):
+        cls = None
+        self._func_or_class = func_or_class
+        if isclass(func_or_class):
+            # Inspect the *instance* so bound methods are discovered correctly.
+            cls = func_or_class()
+            members = getmembers(cls, predicate=lambda x: isfunction(x) or ismethod(x))
         else:
-            _, name = func_info(fn)
-        _fn = CallbackExecutor(
-            wrapped=fn,
-            origin_name_=name,
-            signature=signature(fn),
-            is_async=iscoroutinefunction(fn),
-            is_generator=isgeneratorfunction(fn),
-        )
-        LOCAL_CALLBACK_MAPPING[name] = _fn
-        if name not in WELL_KNOWN_CALLBACKS:
-            logger.info(f"callback {name!r} is registered")
+            members = [(func_or_class.__name__, func_or_class)]
 
-        cls._update_callbacks()
-        return _fn
-
-    @classmethod
-    def _update_callbacks(cls):
-        if cls._ipc and cls._ipc.is_running:
-            # Update remote callbacks if ips is running. It means callback was not registered during handshake
-            # or callback was added dynamically.
-            cls._ipc.update_callbacks()
-
-    @staticmethod
-    def _post_init(self):
-        """Initialize instance of Callback class on demand (If this class is not initialized implicitly yet)."""
-        class_name = self.__class__.__name__
-        if class_name in LOCAL_CLASS_CALLBACKS:
-            msg = f"Only one callback instance of {class_name!r} should be created."
-            if self.auto_init:
-                msg += (
-                    " auto_init is enabled for this class. "
-                    "If you want to create instance explicitly "
-                    "then you need specify `auto_init=False` class attribute for this class"
+        for name, func in members:
+            if name.startswith("_") or hasattr(func, "local"):
+                continue
+            if is_lambda_function(func):
+                raise InitializationError(
+                    f"Not supported. {name!r} is a lambda — use a named function instead."
                 )
-            InitializationError(msg).fire()
-        LOCAL_CLASS_CALLBACKS.add(class_name)
+            if iscoroutinefunction(func):
+                raise InitializationError(
+                    f"Not supported. {name!r} is a coroutine (async def) — "
+                    f"daffi callbacks must be regular synchronous functions."
+                )
+            if isgeneratorfunction(func):
+                raise InitializationError(
+                    f"Not supported. {name!r} is a generator (uses yield) — "
+                    f"daffi callbacks must be regular synchronous functions."
+                )
+            if isasyncgenfunction(func):
+                raise InitializationError(
+                    f"Not supported. {name!r} is an async generator (async def + yield) — "
+                    f"daffi callbacks must be regular synchronous functions."
+                )
+            _warn_if_no_return(name, func)
+            EXECUTOR_REGISTRY.register(name=name, func=func, cls=cls)
 
-        if not self.auto_init:
-            method_initialized = False
-            for method in get_class_methods(self.__class__):
-                module, name = func_info(method)
-                if name.startswith("_"):
-                    continue
-
-                if info := LOCAL_CALLBACK_MAPPING.get(name):
-                    method_initialized = True
-                    LOCAL_CALLBACK_MAPPING[name] = info._replace(klass=self)
-
-            if method_initialized:
-                self._update_callbacks()
+    def __call__(self, *args, **kwargs):
+        """Delegate calls to the wrapped function or class."""
+        return self._func_or_class(*args, **kwargs)

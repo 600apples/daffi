@@ -1,9 +1,0 @@
-@callback
-def callback_func_{{ callback_index }}(*args, path=None, text=None, **kwargs):
-{%- if write_to_file %}
-    try:
-        with open(path, "a") as f: f.write(text)
-    except Exception as e:
-        print(f"Error while writing: {e}")
-{% endif %}
-    return args, kwargs

@@ -1,0 +1,130 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>daffi — waitForMembers()</title>
+  <script src="../../daffi.js"></script>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 660px; margin: 40px auto; padding: 0 16px; background: #0f0f0f; color: #e0e0e0; }
+    h1   { color: #a78bfa; margin-bottom: 4px; }
+    p    { color: #94a3b8; margin-top: 0; font-size: 0.9rem; }
+    code { background: #1e1e2e; padding: 1px 6px; border-radius: 4px; font-size: 0.85em; }
+    .card { background: #1e1e2e; border-radius: 8px; padding: 16px 20px; margin-bottom: 16px; }
+    label { display: block; margin-bottom: 6px; color: #94a3b8; font-size: 0.85rem; }
+    input[type=number] { background: #13131f; border: 1px solid #374151; border-radius: 6px; color: #e0e0e0; padding: 6px 10px; width: 80px; margin-right: 6px; }
+    button { background: #7c3aed; color: #fff; border: none; border-radius: 6px; padding: 7px 16px; cursor: pointer; font-size: 0.9rem; margin-right: 6px; }
+    button:disabled { background: #374151; cursor: not-allowed; }
+    button.connect { background: #10b981; }
+    button.danger  { background: #ef4444; }
+    #log { background: #13131f; border-radius: 6px; padding: 12px; min-height: 120px;
+           font-family: monospace; font-size: 0.82rem; white-space: pre-wrap;
+           color: #a0aec0; overflow-y: auto; max-height: 300px; }
+    .ok  { color: #34d399; }
+    .err { color: #f87171; }
+    .inf { color: #60a5fa; }
+    .wait { color: #fbbf24; }
+  </style>
+</head>
+<body>
+
+<h1>daffi — <code>waitForMembers()</code></h1>
+<p>
+  Connect to the Router, then click <em>Connect &amp; Wait</em>.  The browser will block
+  in <code>waitForMembers('py-worker')</code> until the Python worker is online —
+  start it in any order.
+</p>
+<p>Start order: <code>1_router.py</code> → <code>2_worker.py</code> → open this page
+  (or open this page first — it will wait).</p>
+
+<div class="card">
+  <label>Router WebSocket URL</label>
+  <input type="text" id="wsUrl" value="ws://127.0.0.1:6030" style="width:220px">
+  <button class="connect" id="btnConnect">Connect &amp; Wait</button>
+  <button class="danger"  id="btnDisconnect" disabled>Disconnect</button>
+</div>
+
+<div class="card">
+  <label><strong>process(n)</strong> — square a number on the Python worker</label>
+  <input type="number" id="inputN" value="7" min="1" max="100">
+  <button id="btnProcess" disabled>Call process(n)</button>
+</div>
+
+<div class="card">
+  <label><strong>ping()</strong> — simple round-trip check</label>
+  <button id="btnPing" disabled>Call ping()</button>
+</div>
+
+<div class="card">
+  <label>Log</label>
+  <div id="log"></div>
+</div>
+
+<script>
+  const log = (msg, cls) => {
+    const el = document.getElementById('log');
+    el.innerHTML += `<span class="${cls || ''}">${msg}</span>\n`;
+    el.scrollTop = el.scrollHeight;
+  };
+
+  let conn = null;
+
+  document.getElementById('btnConnect').onclick = async () => {
+    const url = document.getElementById('wsUrl').value.trim();
+    document.getElementById('btnConnect').disabled = true;
+    log(`Connecting to ${url} …`, 'inf');
+    try {
+      const client = new DaffiClient('browser-wait-demo', {
+        wsUrl:    url,
+        wasmPath: '../../app.wasm',
+      });
+      client.addEventHandler(e => log(`  event: ${e.type} [${e.member}]`, 'inf'));
+      conn = await client.connect();
+      log('Connected to router!', 'ok');
+
+      // ── waitForMembers ────────────────────────────────────────────────────
+      // Block here until 'py-worker' appears in the ChannelsMapper.
+      // The browser polls every second; starts immediately so the worker can
+      // be started before OR after this page opens.
+      log('Waiting for py-worker to come online… (start 2_worker.py now if you haven\'t)', 'wait');
+      await conn.waitForMembers('py-worker');
+      log('py-worker is online — RPC calls are now safe.', 'ok');
+      // ─────────────────────────────────────────────────────────────────────
+
+      ['btnProcess', 'btnPing', 'btnDisconnect'].forEach(id =>
+        document.getElementById(id).disabled = false
+      );
+    } catch (err) {
+      log(`Error: ${err}`, 'err');
+      document.getElementById('btnConnect').disabled = false;
+    }
+  };
+
+  document.getElementById('btnDisconnect').onclick = () => {
+    conn = null;
+    log('Disconnected.', 'inf');
+    ['btnProcess', 'btnPing', 'btnDisconnect'].forEach(id =>
+      document.getElementById(id).disabled = true
+    );
+    document.getElementById('btnConnect').disabled = false;
+  };
+
+  document.getElementById('btnProcess').onclick = async () => {
+    const n = parseInt(document.getElementById('inputN').value, 10);
+    log(`→ process(${n}) …`, 'inf');
+    try {
+      const result = await conn.rpc({ serde: 'json', timeout: 5000, receiver: 'py-worker' }).process(n);
+      log(`← process(${n}) = ${JSON.stringify(result)}`, 'ok');
+    } catch (err) { log(`Error: ${err}`, 'err'); }
+  };
+
+  document.getElementById('btnPing').onclick = async () => {
+    log('→ ping() …', 'inf');
+    try {
+      const result = await conn.rpc({ serde: 'json', timeout: 5000, receiver: 'py-worker' }).ping();
+      log(`← ping() = ${JSON.stringify(result)}`, 'ok');
+    } catch (err) { log(`Error: ${err}`, 'err'); }
+  };
+</script>
+</body>
+</html>

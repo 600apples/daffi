@@ -1,0 +1,19 @@
+# Zig source files needed to build from sdist
+recursive-include core *.zig *.h
+
+# Build helpers
+include builder.py
+include setup.py
+include pyproject.toml
+include README.md
+include LICENSE
+
+# Python package
+recursive-include daffi *.py py.typed
+
+# Exclude build artefacts
+global-exclude __pycache__
+global-exclude *.pyc
+global-exclude *.pyo
+global-exclude *.so
+global-exclude *.wasm

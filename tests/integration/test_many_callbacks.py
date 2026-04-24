@@ -1,177 +1,283 @@
-import sys
+"""
+Integration tests for services with many @callback functions.
+
+A single Service registers 10 named callbacks (cb_0 … cb_9); each one
+returns its own index.  Tests exercise:
+
+  • Sequential calls to all callbacks
+  • Concurrent calls from multiple threads hitting the same connection
+  • Argument passing (echo + arithmetic)
+  • Mixed concurrent calls interleaved across all callback names
+"""
+from __future__ import annotations
+
+import multiprocessing as mp
+import threading
 import time
-import asyncio
-from datetime import datetime
-from random import choices, choice
-from subprocess import Popen
 
 import pytest
-from daffi import FG, BG, PERIOD
 
-timings = []
-remote_type = "callback_func_", "async_callback_func_"
+from conftest import HOST, TIMEOUT, wait_for_port, silence_subprocess, quiet_kill
 
-
-async def call_remote(g, _range, exec_type):
-    random_args = [1, 2, 134566, "12345", "867", ("a", "b", "c"), {"foo": "bar"}, object]
-
-    for i in range(3):
-
-        func_args = tuple(choices(random_args, k=4))
-        start = time.time()
-        future = getattr(g.call, remote_type[bool(i % 2)] + str(choice(_range)))(*func_args)
-
-        if exec_type == FG:
-            res = future & FG(timeout=20)
-            assert func_args == res[0]
-            assert {} == res[1]
-            timings.append(time.time() - start)
-
-        elif exec_type == BG:
-            future = future & BG(timeout=20)
-            res = future.get()
-
-            assert res
-
-            assert func_args == res[0]
-            assert {} == res[1]
-            timings.append(time.time() - start)
+N_CALLBACKS = 10   # must match the number defined in _proc_service_many
 
 
-async def call_remote_no_return(g, num, exec_type, path):
-    for i in range(5):
-        func_args = dict(path=str(path), text=str(i))
-        start = datetime.utcnow().timestamp()
-        future = getattr(g.call, remote_type[bool(i % 2)] + str(num))(**func_args)
+# ── subprocess: service with many named callbacks ──────────────────────────────
 
-        if exec_type == PERIOD:
-            future & PERIOD(at_time=start + 2)
-            await asyncio.sleep(3)
-        elif exec_type == BG:
-            future & BG(return_result=False)
-            await asyncio.sleep(3)
+def _proc_service_many(port: int) -> None:
+    """Start a Service that exposes cb_0 … cb_9, each returning its index."""
+    silence_subprocess()
+    from daffi import Service, callback
 
+    # Define each callback with a unique __name__ so the registry records it
+    # under the right key.  Using a factory avoids the late-binding closure trap.
+    def _make_cb(idx: int):
+        def fn():
+            return idx
+        fn.__name__     = f"cb_{idx}"
+        fn.__qualname__ = f"cb_{idx}"
+        return fn
 
-@pytest.mark.parametrize("exec_type", [BG, FG])
-@pytest.mark.skipif(sys.platform == "win32", reason="Unix sockets dont work on windows")
-async def test_many_callbacks_unix(remote_callbacks_path, exec_type, g, stop_components):
-    timings.clear()
-    g = g()
-    process_name = "test_node"
-    start_range = 1
-    end_range = 500
-    range_ = list(range(start_range, end_range))
-    executable_file = remote_callbacks_path(
-        template_name="many_callbacks.jinja2", process_name=process_name, start_range=start_range, end_range=end_range
-    )
+    registered = [callback(_make_cb(i)) for i in range(N_CALLBACKS)]  # noqa: F841
 
-    try:
-        remotes = [Popen([sys.executable, executable_file])]
-        g.wait_process(process_name)
-        await asyncio.gather(*[call_remote(g, range_, exec_type) for _ in range(500)])
-
-        max_time = max(timings)
-        assert max_time < 1
-
-    finally:
-        await stop_components(remotes, g)
+    svc = Service(app_name="many-cb-svc", host=HOST, port=port)
+    svc.start()
+    svc.join()
 
 
-@pytest.mark.parametrize("exec_type", [PERIOD, BG])
-@pytest.mark.skipif(sys.platform == "win32", reason="Unix sockets dont work on windows")
-async def test_many_callbacks_unix_no_return(remote_callbacks_path, exec_type, g, stop_components):
-    timings.clear()
-    g = g()
-    process_name = "test_node"
-    start_range = 1
-    end_range = 251
-    executable_file = remote_callbacks_path(
-        template_name="many_callbacks.jinja2",
-        process_name=process_name,
-        start_range=start_range,
-        end_range=end_range,
-        write_to_file=True,
-    )
-    path = executable_file.parent / "test_data"
-    path.mkdir()
+# ── subprocess: service with argument-taking callbacks ─────────────────────────
 
-    try:
-        remotes = [Popen([sys.executable, executable_file])]
-        g.wait_process(process_name)
+def _proc_service_args(port: int) -> None:
+    """Service with callbacks that take and transform arguments."""
+    silence_subprocess()
+    from daffi import Service, callback
 
-        await asyncio.gather(*[call_remote_no_return(g, i, exec_type, path / str(i)) for i in range(1, 251)])
-        await asyncio.sleep(5)
-        g.ipc._wait_all_bg_tasks()
+    @callback
+    def echo(payload):
+        return payload
 
-        all_files = list(path.iterdir())
-        assert len(all_files) == 250
-        for file in all_files:
-            assert set(file.read_text()) == set("01234")
-    except AssertionError:
-        raise
-    except Exception as e:
-        print(f"Exeption while execution : {type(e)}, {e}")
+    @callback
+    def multiply(a: int, b: int) -> int:
+        return a * b
 
-    finally:
-        await stop_components(remotes, g)
+    @callback
+    def concat(s1: str, s2: str) -> str:
+        return s1 + s2
+
+    @callback
+    def sum_list(items: list) -> int:
+        return sum(items)
+
+    svc = Service(app_name="args-cb-svc", host=HOST, port=port, workers=8)
+    svc.start()
+    svc.join()
 
 
-@pytest.mark.parametrize("exec_type", [BG, FG])
-async def test_many_callbacks_tcp(remote_callbacks_path, exec_type, g, stop_components):
-    timings.clear()
-    g = g(host="localhost")
-    process_name = "test_node"
-    start_range = 1
-    end_range = 500
-    range_ = list(range(start_range, end_range))
-    executable_file = remote_callbacks_path(
-        template_name="many_callbacks.jinja2",
-        process_name=process_name,
-        start_range=start_range,
-        end_range=end_range,
-        host="localhost",
-        port=g.port,
-    )
-    try:
-        remotes = [Popen([sys.executable, executable_file])]
-        g.wait_process(process_name)
-        await asyncio.gather(*[call_remote(g, range_, exec_type) for _ in range(500)])
-        max_time = max(timings)
-        assert max_time < 1
-    finally:
-        await stop_components(remotes, g)
+# ── fixtures ──────────────────────────────────────────────────────────────────
+
+@pytest.fixture
+def many_cb_service(free_port):
+    proc = mp.Process(target=_proc_service_many, args=(free_port,), daemon=True)
+    proc.start()
+    wait_for_port(free_port)
+    time.sleep(0.2)   # let all 10 callbacks register
+    yield free_port
+    quiet_kill(proc)
 
 
-@pytest.mark.parametrize("exec_type", [PERIOD, BG])
-async def test_many_callbacks_tcp_no_return(remote_callbacks_path, exec_type, g, stop_components):
-    timings.clear()
-    g = g(host="0.0.0.0")
-    process_name = "test_node"
-    start_range = 1
-    end_range = 251
-    executable_file = remote_callbacks_path(
-        template_name="many_callbacks.jinja2",
-        process_name=process_name,
-        start_range=start_range,
-        end_range=end_range,
-        write_to_file=True,
-        host="0.0.0.0",
-        port=g.port,
-    )
-    path = executable_file.parent / "test_data"
-    path.mkdir()
+@pytest.fixture
+def args_cb_service(free_port):
+    proc = mp.Process(target=_proc_service_args, args=(free_port,), daemon=True)
+    proc.start()
+    wait_for_port(free_port)
+    time.sleep(0.15)
+    yield free_port
+    quiet_kill(proc)
 
-    try:
-        remotes = [Popen([sys.executable, executable_file])]
-        g.wait_process(process_name)
 
-        await asyncio.gather(*[call_remote_no_return(g, i, exec_type, path / str(i)) for i in range(1, 251)])
-        await asyncio.sleep(5)
-        g.ipc._wait_all_bg_tasks()
+# ── tests: named callbacks ─────────────────────────────────────────────────────
 
-        all_files = list(path.iterdir())
-        assert len(all_files) == 250
-        for file in all_files:
-            assert set(file.read_text()) == set("01234")
-    finally:
-        await stop_components(remotes, g)
+class TestManyNamedCallbacks:
+    """Sequential and concurrent invocations of cb_0 … cb_N-1."""
+
+    def _connect(self, port: int, name: str):
+        from daffi import Client
+        client = Client(app_name=name, host=HOST, port=port)
+        conn   = client.connect()
+        return client, conn
+
+    def test_each_callback_sequential(self, many_cb_service):
+        """Call every callback once, verify each returns its own index."""
+        client, conn = self._connect(many_cb_service, "mc-seq")
+        proxy = conn.rpc(timeout=TIMEOUT)
+        try:
+            for i in range(N_CALLBACKS):
+                result = getattr(proxy, f"cb_{i}")()
+                assert result == i, f"cb_{i} returned {result!r}, expected {i}"
+        finally:
+            client.stop()
+
+    def test_each_callback_repeated(self, many_cb_service):
+        """Call each callback multiple times; results must be stable."""
+        client, conn = self._connect(many_cb_service, "mc-rep")
+        proxy = conn.rpc(timeout=TIMEOUT)
+        try:
+            for _ in range(5):
+                for i in range(N_CALLBACKS):
+                    assert getattr(proxy, f"cb_{i}")() == i
+        finally:
+            client.stop()
+
+    def test_concurrent_calls_same_connection(self, many_cb_service):
+        """N threads share one connection, each fires one callback per thread."""
+        client, conn = self._connect(many_cb_service, "mc-conc-single")
+        proxy  = conn.rpc(timeout=TIMEOUT)
+        errors: list[Exception] = []
+        lock   = threading.Lock()
+
+        def _call(idx: int) -> None:
+            try:
+                result = getattr(proxy, f"cb_{idx % N_CALLBACKS}")()
+                assert result == idx % N_CALLBACKS
+            except Exception as exc:
+                with lock:
+                    errors.append(exc)
+
+        n_threads = 30
+        threads = [threading.Thread(target=_call, args=(i,)) for i in range(n_threads)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=TIMEOUT)
+
+        client.stop()
+        assert not errors, f"{len(errors)} thread(s) failed: {errors[:3]}"
+
+    def test_concurrent_calls_separate_clients(self, many_cb_service):
+        """Multiple independent clients concurrently call different callbacks."""
+        results: list = [None] * N_CALLBACKS
+        errors:  list[Exception] = []
+        lock = threading.Lock()
+
+        def _task(idx: int) -> None:
+            from daffi import Client
+            client = Client(
+                app_name=f"mc-sep-{idx}", host=HOST, port=many_cb_service
+            )
+            conn = client.connect()
+            try:
+                result = getattr(conn.rpc(timeout=TIMEOUT), f"cb_{idx}")()
+                with lock:
+                    results[idx] = result
+            except Exception as exc:
+                with lock:
+                    errors.append(exc)
+            finally:
+                client.stop()
+
+        threads = [threading.Thread(target=_task, args=(i,)) for i in range(N_CALLBACKS)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=TIMEOUT)
+
+        assert not errors, f"Errors: {errors}"
+        assert results == list(range(N_CALLBACKS))
+
+    def test_interleaved_concurrent_calls(self, many_cb_service):
+        """Each of N threads fires all N callbacks; total N² calls."""
+        errors: list[Exception] = []
+        lock = threading.Lock()
+
+        def _task(thread_id: int) -> None:
+            from daffi import Client
+            client = Client(
+                app_name=f"mc-intl-{thread_id}", host=HOST, port=many_cb_service
+            )
+            conn  = client.connect()
+            proxy = conn.rpc(timeout=TIMEOUT)
+            try:
+                for i in range(N_CALLBACKS):
+                    result = getattr(proxy, f"cb_{i}")()
+                    if result != i:
+                        with lock:
+                            errors.append(AssertionError(f"cb_{i} → {result!r}"))
+            finally:
+                client.stop()
+
+        n_threads = 8
+        threads = [threading.Thread(target=_task, args=(j,)) for j in range(n_threads)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=TIMEOUT)
+
+        assert not errors, f"{len(errors)} failures: {errors[:3]}"
+
+
+# ── tests: argument-taking callbacks ──────────────────────────────────────────
+
+class TestCallbacksWithArguments:
+    """Callbacks that take arguments and perform simple transformations."""
+
+    def _proxy(self, port: int, name: str):
+        from daffi import Client
+        client = Client(app_name=name, host=HOST, port=port)
+        conn   = client.connect()
+        return client, conn.rpc(timeout=TIMEOUT)
+
+    def test_multiply(self, args_cb_service):
+        client, proxy = self._proxy(args_cb_service, "args-mul")
+        assert proxy.multiply(6, 7) == 42
+        assert proxy.multiply(0, 999) == 0
+        assert proxy.multiply(-3, 4) == -12
+        client.stop()
+
+    def test_concat(self, args_cb_service):
+        client, proxy = self._proxy(args_cb_service, "args-cat")
+        assert proxy.concat("hello ", "world") == "hello world"
+        assert proxy.concat("", "x") == "x"
+        client.stop()
+
+    def test_sum_list(self, args_cb_service):
+        client, proxy = self._proxy(args_cb_service, "args-sum")
+        assert proxy.sum_list([1, 2, 3, 4, 5]) == 15
+        assert proxy.sum_list([]) == 0
+        assert proxy.sum_list(list(range(100))) == 4950
+        client.stop()
+
+    def test_echo_various_types(self, args_cb_service):
+        client, proxy = self._proxy(args_cb_service, "args-echo")
+        for payload in [42, 3.14, "text", [1, 2], {"k": "v"}, None]:
+            assert proxy.echo(payload) == payload
+        client.stop()
+
+    def test_concurrent_mixed_callbacks(self, args_cb_service):
+        """Threads concurrently call different argument-taking callbacks."""
+        errors: list[Exception] = []
+        lock = threading.Lock()
+
+        def _task(tid: int) -> None:
+            from daffi import Client
+            client = Client(
+                app_name=f"args-conc-{tid}", host=HOST, port=args_cb_service
+            )
+            conn  = client.connect()
+            proxy = conn.rpc(timeout=TIMEOUT)
+            try:
+                assert proxy.multiply(tid, 2) == tid * 2
+                assert proxy.concat(str(tid), "!") == f"{tid}!"
+                assert proxy.sum_list(list(range(tid + 1))) == tid * (tid + 1) // 2
+            except Exception as exc:
+                with lock:
+                    errors.append(exc)
+            finally:
+                client.stop()
+
+        threads = [threading.Thread(target=_task, args=(i,)) for i in range(20)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=TIMEOUT)
+
+        assert not errors, f"Errors: {errors}"

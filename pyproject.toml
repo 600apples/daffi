@@ -1,152 +1,108 @@
 [build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "daffi"
-description = "Daffi is fast, simple and lightweight library for inter process communication"
+version = "0.1.0"
+description = "Lightweight inter-process RPC framework with a high-performance native core"
 readme = "README.md"
-requires-python = ">=3.8"
 license = "MIT"
-keywords = ["rpc", "task", "queue", "job", "async", "python", "distributed", "stream", "grpc"]
+requires-python = ">=3.10"
 authors = [
-  { name = "Volodymyr Boiko", email = "600apples@gmail.com" },
+    { name = "Volodymyr Boiko", email = "600apples@gmail.com" },
 ]
+keywords = ["rpc", "ipc", "distributed", "messaging", "networking", "websocket"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
-    "Intended Audience :: System Administrators",
-    "License :: OSI Approved :: MIT License",
-    "Operating System :: OS Independent",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.8",
-    "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
-    "Topic :: Internet",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: Implementation :: CPython",
     "Topic :: Software Development :: Libraries :: Python Modules",
-    "Topic :: Software Development :: Object Brokering",
-    "Topic :: Software Development :: Testing",
-    "Topic :: System :: Clustering",
     "Topic :: System :: Distributed Computing",
-    "Topic :: System :: Monitoring",
     "Topic :: System :: Networking",
-    "Topic :: System :: Systems Administration",
 ]
-dependencies = [
-    "anyio>=3.6.2",
-    "dill>=0.3.6",
-    "grpcio>=1.51.3",
-    "protobuf>=4.21.12",
-    "tenacity>=8.1.0",
-    "typing_extensions>=4.4.0",
-    "tblib>=1.7.0",
-    "cachetools>=5.3.0",
-    "cached-property>=1.5.2",
-    "uvloop>=0.17.0; sys.platform != 'win32'",
-    "colorama>=0.4.6; sys.platform == 'win32'"
-]
-dynamic = [
-    "version",
-]
+dependencies = []
+
+[project.optional-dependencies]
+msgpack = ["msgpack>=1.0"]
 
 [project.urls]
-Documentation = "https://600apples.github.io/dafi/"
-Source = "https://github.com/600apples/dafi"
+Homepage    = "https://github.com/600apples/dafi"
+Source      = "https://github.com/600apples/dafi"
+"Bug Tracker" = "https://github.com/600apples/dafi/issues"
 
-[tool.hatch.version]
-path = "daffi/__about__.py"
+[tool.setuptools.packages.find]
+include = ["daffi*"]
 
-[tool.hatch.envs.default.overrides]
-env.GITHUB_ACTIONS.env-vars = "COVERAGE_REPORT="
 
-[tool.hatch.envs.default]
-dependencies = [
-    "pytest",
-    "pytest-cov",
-    "pytest-asyncio==0.20.3",
-    "Jinja2==3.1.2",
-    "trio==0.22.0",
-    "grpcio-tools==1.51.1",
-    "types-protobuf==4.21.0.2",
-]
-[tool.hatch.envs.default.scripts]
-cov = "export DAFFI_DEBUG=True && pytest --cov-report=term-missing --cov-config=pyproject.toml --cov=daffi --cov-report=html --cov=tests -s -vv {args}"
-cov_git = "export DAFFI_DEBUG=True && pytest --cov=daffi --cov-report={env:COVERAGE_REPORT:term-missing} --cov-config=pyproject.toml -s -vv -x"
-no_cov = "pytest -vv {args}"
-compile = "python -m grpc_tools.protoc -I daffi/components/proto --python_out=daffi/components/proto --grpc_python_out=daffi/components/proto messager.proto"
+[tool.cibuildwheel]
+# CPython 3.10 – 3.13; skip PyPy, 32-bit, and musl (Windows handled separately)
+build  = "cp310-* cp311-* cp312-* cp313-*"
+skip   = "pp* *i686* *musllinux*"
+
+# Install the wheel after building to run a quick smoke test
+test-command = "python -c \"import daffi; print('daffi', daffi.__version__)\""
+
+# ── Linux ─────────────────────────────────────────────────────────────────────
+[tool.cibuildwheel.linux]
+archs         = ["x86_64", "aarch64"]
+# Use manylinux_2_28 (AlmaLinux 8 based) — modern enough for Zig 0.16
+manylinux-x86_64-image  = "quay.io/pypa/manylinux_2_28_x86_64"
+manylinux-aarch64-image = "quay.io/pypa/manylinux_2_28_aarch64"
+
+before-all = """
+    ARCH=$(uname -m)
+    ZIG_VERSION="0.16.0"
+    ZIG_TAR="zig-linux-${ARCH}-${ZIG_VERSION}.tar.xz"
+    curl -fL "https://ziglang.org/download/${ZIG_VERSION}/${ZIG_TAR}" \
+        | tar -xJ -C /opt
+    ln -sf "/opt/zig-linux-${ARCH}-${ZIG_VERSION}/zig" /usr/local/bin/zig
+    zig version
+"""
+
+# auditwheel repair bundles libssl/libcrypto into the wheel automatically
+repair-wheel-command = "auditwheel repair -w {dest_dir} {wheel}"
+
+# ── macOS ─────────────────────────────────────────────────────────────────────
+[tool.cibuildwheel.macos]
+archs = ["x86_64", "arm64"]
+
+before-all = """
+    brew install openssl@3 || true
+
+    # Map uname -m (arm64) to Zig's arch name (aarch64)
+    RAW_ARCH=$(uname -m)
+    if [ "$RAW_ARCH" = "arm64" ]; then ZIG_ARCH="aarch64"; else ZIG_ARCH="$RAW_ARCH"; fi
+
+    ZIG_VERSION="0.16.0"
+    ZIG_TAR="zig-macos-${ZIG_ARCH}-${ZIG_VERSION}.tar.xz"
+    curl -fL "https://ziglang.org/download/${ZIG_VERSION}/${ZIG_TAR}" \
+        | tar -xJ -C /opt
+    sudo ln -sf "/opt/zig-macos-${ZIG_ARCH}-${ZIG_VERSION}/zig" /usr/local/bin/zig
+    zig version
+"""
+
+# delocate bundles dylibs into the wheel automatically
+repair-wheel-command = "delocate-wheel --require-archs {delocate_archs} -w {dest_dir} {wheel}"
+
 
 [tool.hatch.envs.docs]
 dependencies = [
-    "mkdocs==1.4.2",
-    "mkdocs-material==8.5.9",
-    "mkdocs-section-index==0.3.4",
-    "mkdocs-with-pdf==0.9.3",
-    "mkdocstrings-python==0.8.3",
+    "mkdocs-material>=9.4",
+    "mkdocs-section-index>=0.3",
 ]
+
+[tool.hatch.envs.docs.env-vars]
+DISABLE_MKDOCS_2_WARNING = "true"
+
 [tool.hatch.envs.docs.scripts]
-build = "mkdocs build --clean --strict"
-serve = "mkdocs serve --dev-addr localhost:8000"
-deploy = "mkdocs gh-deploy --force"
-
-[tool.hatch.envs.lint]
-detached = true
-dependencies = [
-  "black>=22.6.0",
-  "mypy>=0.990",
-  "ruff>=0.0.176",
-]
-[tool.hatch.envs.lint.scripts]
-typing = "mypy --install-types --non-interactive {args:backend/src/hatchling src/hatch tests}"
-style = [
-  "ruff {args:.}",
-  "black --check --diff {args:.}",
-]
-fmt = [
-  "black {args:.}",
-  "ruff --fix {args:.}",
-  "style",
-]
-all = [
-  "style",
-  "typing",
-]
-
-[[tool.hatch.envs.test.matrix]]
-python = ["38", "39", "310", "311"]
-
-[tool.hatch.envs.coverage]
-detached = true
-dependencies = [
-  "coverage[toml]>=6.2",
-   "lxml",
-]
-
-[tool.hatch.envs.coverage.scripts]
-combine = "coverage combine {args}"
-report-xml = "coverage xml"
-report-json = "coverage json"
-report-uncovered-html = "coverage html --skip-covered --skip-empty"
-generate-summary = "python scripts/generate_coverage_summary.py"
-write-summary-report = "python scripts/write_coverage_summary_report.py"
-
-[tool.coverage.run]
-branch = true
-parallel = true
-omit = [
-  "daffi/__about__.py",
-  "daffi/components/proto/messager_pb2.py", # Generated by grpc-tools
-  "daffi/components/proto/messager_pb2_grpc.py", # Generated by grpc-tools
-  "tests/*",
-]
-
-[tool.coverage.report]
-exclude_lines = [
-  "no cov",
-  "if __name__ == .__main__.:",
-  "if TYPE_CHECKING:",
-]
-ignore_errors = true
-
-
-[tool.black]
-line-length = 120
+serve = "mkdocs serve --dev-addr 127.0.0.1:8000"
+build = "mkdocs build --strict"
+clean = "rm -rf mkdocs_files"

@@ -1,0 +1,86 @@
+/.zig-cache/
+/zig-cache/
+/zig-out/
+core/zig-cache/
+*.wasm
+*.wasm.o
+# The distributable WASM that lives next to daffi.js is intentionally tracked.
+!js-client/app.wasm
+
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.dylib
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+*.dist-info/
+
+/venv/
+/.venv/
+env/
+.env/
+
+/.lh/
+/.history/
+
+# MkDocs generated site (mkdocs build output)
+/mkdocs_files/
+
+# JetBrains (IntelliJ, PyCharm, CLion, GoLand, RustRover, etc.)
+.idea/
+*.iml
+*.iws
+*.ipr
+out/
+.idea_modules/
+
+# VS Code / Cursor / Windsurf
+.vscode/
+*.code-workspace
+.history/
+
+# Cursor agent / project state
+.cursor/
+
+# Sublime Text
+*.sublime-project
+*.sublime-workspace
+
+# Eclipse
+.project
+.classpath
+.settings/
+
+# NetBeans
+nbproject/private/
+
+# Vim / Neovim / Emacs
+*.swp
+*.swo
+*.swn
+*~
+.netrwhist
+Session.vim
+[._]*.s[a-w][a-z]
+[._]s[a-w][a-z]
+
+# JetBrains Fleet
+.fleet/
+
+.DS_Store
+Thumbs.db
+
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+*.log
+*.bak
+*.tmp
+test_map
