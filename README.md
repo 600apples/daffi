@@ -273,9 +273,11 @@ client.join()
 
 > **When to increase `workers`:**
 > - Callbacks do **I/O** (network calls, file reads, database queries).
-> - Callbacks do **CPU-heavy work** — prefer multiple separate worker *processes* instead
->   (Python's GIL limits true CPU parallelism within one process).
 > - Callbacks are **fast and pure** — keep `workers=1` (no threading overhead).
+>
+> For **CPU-bound** callbacks, Python's GIL limits true parallelism within one
+> process.  Run multiple worker nodes behind a Router instead of increasing
+> `workers` on a single node.
 
 ---
 

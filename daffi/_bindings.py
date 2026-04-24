@@ -175,6 +175,22 @@ def set_client_disconnect_fd(conn_num: int, fd: int) -> None:
     dfcore.setClientDisconnectFd(conn_num, fd)
 
 
+def set_client_response_fd(conn_num: int, fd: int) -> None:
+    """Register the eventfd / pipe write-end the native layer writes to whenever
+    a new response is inserted into the client message store.
+
+    Python's :class:`~daffi._rpc_proxy.RpcResult` waiters block on the
+    corresponding read end with a select-based deadline instead of polling the
+    store, so a slow remote call no longer burns CPU on a busy-wait loop.
+
+    Args:
+        conn_num: Native connection handle returned by :func:`~daffi.bindings.startClient`.
+        fd:       An ``os.eventfd`` (Linux) or the **write end** of an
+                  ``os.pipe()`` (macOS / fallback).
+    """
+    dfcore.setClientResponseFd(conn_num, fd)
+
+
 def set_client_wakeup_fd(conn_num: int, fd: int) -> None:
     """Register the eventfd (or pipe write-end) for a Client connection used
     as a worker in a router topology.

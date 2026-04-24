@@ -1,11 +1,10 @@
 """
-daffi workers benchmark — thread pool vs process pool, sequential & concurrent.
+daffi workers benchmark — thread-pool throughput (sequential & concurrent).
 
-Compares three execution modes side by side:
+Compares two execution modes side by side:
 
   baseline      workers=1 (inline, single-threaded)
-  threads ×4    workers=4, use_processes=False
-  processes ×4  workers=4, use_processes=True
+  threads ×4    workers=4 (thread pool)
 
 Two topologies:
   Direct     — Client → Service
@@ -52,7 +51,7 @@ CPU_N   = 500       # argument passed to cpu_work(n)
 # ── result container ──────────────────────────────────────────────────────────
 
 class BenchResult(NamedTuple):
-    mode: str        # "baseline" | "threads×4" | "processes×4"
+    mode: str        # "baseline" | "threads×4"
     topology: str    # "direct" | "router"
     callback: str    # "echo" | "cpu_work"
     serde: str       # "PICKLE" | "JSON" | "OPAQUE"
@@ -104,7 +103,7 @@ def _quiet_stop(fn, *args) -> None:
 
 # ── subprocess targets ────────────────────────────────────────────────────────
 
-def _proc_service(port: int, workers: int, use_processes: bool) -> None:
+def _proc_service(port: int, workers: int) -> None:
     _silence()
     from daffi import Service, callback
 
@@ -120,7 +119,6 @@ def _proc_service(port: int, workers: int, use_processes: bool) -> None:
         app_name="bench-svc",
         host=HOST, port=port,
         workers=workers,
-        use_processes=use_processes,
     )
     svc.start()
     svc.join()
@@ -134,7 +132,7 @@ def _proc_router(port: int) -> None:
     r.join()
 
 
-def _proc_worker(port: int, workers: int, use_processes: bool) -> None:
+def _proc_worker(port: int, workers: int) -> None:
     _silence()
     import time as _t
     from daffi import Client, callback
@@ -151,7 +149,6 @@ def _proc_worker(port: int, workers: int, use_processes: bool) -> None:
         app_name="bench-worker",
         host=HOST, port=port,
         workers=workers,
-        use_processes=use_processes,
     )
     client.connect()
     try:
@@ -237,7 +234,6 @@ def _bench(
 
 def run_direct(
     workers: int,
-    use_processes: bool,
     mode_label: str,
     serde_int: int,
     serde_name: str,
@@ -246,14 +242,13 @@ def run_direct(
     port = _free_port()
     proc = mp.Process(
         target=_proc_service,
-        args=(port, workers, use_processes),
+        args=(port, workers),
         daemon=True,
     )
     proc.start()
     try:
         _wait(port)
-        # extra settle time for process-pool fork
-        time.sleep(0.3 if use_processes else 0.15)
+        time.sleep(0.15)
         seq_cps, conc_cps = _bench(port, cb_name, serde_int, serde_name, mode_label)
     finally:
         _quiet_stop(proc.terminate)
@@ -264,7 +259,6 @@ def run_direct(
 
 def run_router(
     workers: int,
-    use_processes: bool,
     mode_label: str,
     serde_int: int,
     serde_name: str,
@@ -275,13 +269,13 @@ def run_router(
     rproc.start()
     wproc = mp.Process(
         target=_proc_worker,
-        args=(port, workers, use_processes),
+        args=(port, workers),
         daemon=True,
     )
     try:
         _wait(port)
         wproc.start()
-        time.sleep(0.5 if use_processes else 0.35)
+        time.sleep(0.35)
         seq_cps, conc_cps = _bench(port, cb_name, serde_int, serde_name, mode_label)
     finally:
         _quiet_stop(wproc.terminate)
@@ -310,9 +304,8 @@ def _serde_modes():
 
 
 WORKER_MODES = [
-    (1,  False, "baseline  "),
-    (4,  False, "threads×4 "),
-    (4,  True,  "processes×4"),
+    (1,  "baseline  "),
+    (4,  "threads×4 "),
 ]
 
 CALLBACKS = ["echo", "cpu_work"]
@@ -344,14 +337,14 @@ def main() -> None:
             callbacks = ["echo"] if serde_name == "OPAQUE" else CALLBACKS
             for cb_name in callbacks:
                 print(f"── {serde_name} / {cb_name} ───────────────────────────────")
-                for workers, use_proc, mode_label in WORKER_MODES:
+                for workers, mode_label in WORKER_MODES:
                     tag = f"{mode_label.strip()}/{serde_name}/{cb_name}"
                     print(f"  [{tag}] direct …", end="", flush=True)
-                    r_dir = run_direct(workers, use_proc, mode_label.strip(), serde_int, serde_name, cb_name)
+                    r_dir = run_direct(workers, mode_label.strip(), serde_int, serde_name, cb_name)
                     print(f" seq={r_dir.seq_cps:>7.0f} c/s  conc={r_dir.conc_cps:>7.0f} c/s", end="")
 
                     print(f"  | router …", end="", flush=True)
-                    r_rtr = run_router(workers, use_proc, mode_label.strip(), serde_int, serde_name, cb_name)
+                    r_rtr = run_router(workers, mode_label.strip(), serde_int, serde_name, cb_name)
                     print(f" seq={r_rtr.seq_cps:>7.0f} c/s  conc={r_rtr.conc_cps:>7.0f} c/s")
 
                     results.append(r_dir)
@@ -401,13 +394,11 @@ def _render_chart(results: list[BenchResult]) -> None:
         print("[chart] matplotlib not installed — skipping chart generation")
         return
 
-    from daffi._serialization import SerdeFormat
     serde_modes = _serde_modes()
     serde_labels = [s for _, s in serde_modes]
 
-    mode_labels = [m for _, _, m in WORKER_MODES]
-    mode_short = [m.strip() for m in mode_labels]
-    colours = ["#4C72B0", "#55A868", "#C44E52"]   # blue, green, red
+    mode_labels = [m for _, m in WORKER_MODES]
+    colours = ["#4C72B0", "#55A868"]   # blue, green
 
     fig, axes = plt.subplots(
         nrows=2, ncols=4,
@@ -420,7 +411,6 @@ def _render_chart(results: list[BenchResult]) -> None:
         fontsize=12,
     )
 
-    col_map = {sn: i for i, (_, sn) in enumerate(serde_modes)}
     # Fill to 4 columns even if MSGPACK is missing
     while len(serde_labels) < 4:
         serde_labels.append(None)
@@ -433,9 +423,9 @@ def _render_chart(results: list[BenchResult]) -> None:
                 continue
 
             x = np.arange(2)  # direct, router
-            width = 0.25
+            width = 0.35
 
-            for mi, (_, _, mlabel) in enumerate(WORKER_MODES):
+            for mi, (_, mlabel) in enumerate(WORKER_MODES):
                 vals = []
                 for topology in ("direct", "router"):
                     match = [
@@ -447,7 +437,7 @@ def _render_chart(results: list[BenchResult]) -> None:
                     ]
                     vals.append(match[0] if match else 0)
 
-                offset = (mi - 1) * width
+                offset = (mi - 0.5) * width
                 bars = ax.bar(
                     x + offset, vals, width,
                     label=mlabel.strip(),
@@ -479,10 +469,8 @@ def _render_chart(results: list[BenchResult]) -> None:
 
 
 if __name__ == "__main__":
-    # Use "fork" (same as the integration tests) so that:
-    # (a) subprocess targets don't need to be picklable, and
-    # (b) TaskDispatcher's internal pre-fork of worker processes works
-    #     correctly from inside a subprocess that was itself forked.
+    # Use "fork" (same as the integration tests) so that subprocess targets
+    # don't need to be picklable.
     mp.set_start_method("fork", force=True)
     try:
         main()

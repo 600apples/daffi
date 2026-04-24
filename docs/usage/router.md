@@ -56,14 +56,13 @@ if __name__ == "__main__":
 
 ### Concurrent callbacks per worker node
 
-Each worker `Client` accepts the same `workers` and `use_processes` parameters
-as `Service` — they control how many callbacks a **single worker node** executes
-in parallel:
+Each worker `Client` accepts the same `workers` parameter as `Service` — it
+controls how many callbacks a **single worker node** executes in parallel via
+a thread pool:
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `workers` | `int` | `1` | Concurrency level for callback execution within this node. |
-| `use_processes` | `bool` | `False` | When `True`, use forked **processes** instead of threads. Bypasses the GIL for CPU-bound callbacks. |
 
 **I/O-bound** callbacks (network, disk, database) — use a thread pool:
 
@@ -79,24 +78,26 @@ worker.connect()
 worker.join()
 ```
 
-**CPU-bound** callbacks (heavy computation, ML inference) — use a process pool to
-bypass the GIL:
+**CPU-bound** callbacks (heavy computation, ML inference) — Python's GIL
+limits true CPU parallelism inside a single process.  Scale out by running
+**multiple worker nodes** behind the Router (one per CPU core) rather than
+increasing `workers` on a single node:
 
 ```python
-# Each worker node forks 4 processes; all four cores run callbacks in parallel.
+# Start N instances of this process — one per core.  The Router load-balances
+# RPCs across them so all cores run callbacks in parallel.
 worker = Client(
-    app_name="cpu-worker",
+    app_name=f"cpu-worker-{os.getpid()}",
     host="127.0.0.1",
     port=6001,
-    workers=4,
-    use_processes=True,
+    workers=1,
 )
 worker.connect()
 worker.join()
 ```
 
 See [Service → Concurrent callback execution](service.md#concurrent-callback-execution)
-for a detailed explanation of both modes and how to choose between them.
+for more on choosing a `workers` value.
 
 ---
 

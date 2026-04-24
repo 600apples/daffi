@@ -16,18 +16,22 @@ Interruption mechanisms used
   SIGCONT  — resume a STOPped process (used in cleanup / resume tests).
   proc.terminate() — SIGTERM; used for clean teardown.
 
-Exception types produced by the native layer
---------------------------------------------
+Exception types produced by the native layer (and how daffi surfaces them)
+--------------------------------------------------------------------------
   TimeoutError         (builtins)          — rpc() call timed out waiting
                                              for a response from a frozen server.
-  ValueError           (builtins)          — write/read error on a dead connection
-                                             (message: "WriteError" or "ReadError").
+  TransmissionFailure  (daffi._rpc_proxy)  — wraps native-side failures on
+                                             the wire (WriteError, ReadError,
+                                             ClientNotInitialized, …).  Any
+                                             write/read error on a dead or
+                                             severed connection surfaces as
+                                             this exception.
   InitializationError  (daffi.exceptions)  — Client.connect() failed because
                                              the server is not listening.
 
 Scenarios
 ---------
-  1  Service killed → existing call raises ValueError
+  1  Service killed → existing call raises TransmissionFailure
   2  Connect to dead service → InitializationError
   3  Service frozen (SIGSTOP) → TimeoutError within RPC timeout
   4  Service frozen then resumed (SIGCONT) → call eventually succeeds
@@ -38,9 +42,10 @@ Scenarios
   9  Big message round-trip succeeds after service restart
 
 All subprocess targets are module-level functions so they pickle correctly
-under Python 3.14+'s default "forkserver" and "spawn" start methods.
-The integration conftest.py forces "fork", which is simpler and correct
-for a single-threaded-at-fork pytest runner.
+under the "spawn" start method that the integration conftest.py now enforces
+(see ``tests/integration/conftest.py`` for the rationale — fork is unsafe on
+macOS once the parent pytest process has imported the native ``daffi.dfcore``
+extension).
 """
 from __future__ import annotations
 
@@ -54,6 +59,7 @@ import pytest
 
 from conftest import HOST, TIMEOUT, wait_for_port, silence_subprocess, quiet_kill
 from daffi.exceptions import InitializationError
+from daffi._rpc_proxy import TransmissionFailure
 
 # ── constants ──────────────────────────────────────────────────────────────────
 
@@ -116,7 +122,10 @@ def _start_service(port: int, name: str = "intr-svc") -> mp.Process:
     p = mp.Process(target=_intr_service, args=(port, name), daemon=True)
     p.start()
     wait_for_port(port)
-    time.sleep(0.15)
+    # Small grace after the TCP listener opens so the child finishes daffi
+    # import + callback registration before the caller's first rpc(). 0.3 s
+    # is comfortable under spawn on macOS.
+    time.sleep(0.3)
     return p
 
 
@@ -172,13 +181,20 @@ def _sigcont(proc: mp.Process) -> None:
 
 class TestServiceKilled:
     def test_call_on_dead_connection_raises(self, free_port):
-        """After SIGKILL, rpc() on the stale connection raises ValueError."""
+        """After SIGKILL, rpc() on the stale connection raises TransmissionFailure.
+
+        The underlying native error surfaces as ``WriteError`` or
+        ``ClientNotInitialized`` depending on whether the disconnect watcher
+        has already marked the connection dead — both flow through
+        ``system_exception_handler`` and are re-raised as
+        :class:`~daffi._rpc_proxy.TransmissionFailure`.
+        """
         svc = _start_service(free_port)
         client, conn = _connect(free_port, "intr-dead-call")
         try:
             assert conn.rpc(timeout=TIMEOUT).echo("ping") == "ping"
             _sigkill(svc)
-            with pytest.raises(ValueError):
+            with pytest.raises(TransmissionFailure):
                 conn.rpc(timeout=5).echo("after kill")
         finally:
             client.stop()
@@ -384,14 +400,18 @@ class TestCastWithDeadWorker:
 class TestBigMessageInterruption:
     def test_frozen_server_rejects_big_message(self, free_port):
         """Sending an 8 MiB payload to a frozen (SIGSTOP'd) server fills the
-        kernel TCP send buffer and raises ValueError or TimeoutError."""
+        kernel TCP send buffer and raises TransmissionFailure or TimeoutError.
+
+        The native write may either time out (kernel buffer never drains
+        because the server process is SIGSTOP'd) or fail with a write error
+        once TCP gives up — both are acceptable outcomes.
+        """
         svc = _start_service(free_port, "intr-big-frozen")
         client, conn = _connect(free_port, "intr-big-caller")
         try:
-            # Warm up to confirm the connection works.
             assert conn.rpc(timeout=TIMEOUT).echo(b"tiny") == b"tiny"
             _sigstop(svc)
-            with pytest.raises((ValueError, TimeoutError)):
+            with pytest.raises((TransmissionFailure, TimeoutError)):
                 conn.rpc(timeout=3).echo(bytes(BIG_MSG_SIZE))
         finally:
             client.stop()
@@ -442,9 +462,12 @@ class TestBigMessageInterruption:
             # the kill — both are acceptable; the important invariant is no hang.
             assert not sender.is_alive(), "sender thread is still blocked — likely a hang"
             # If we got a result it means the message was fully transferred before kill.
-            # If we got an error it must be ValueError or TimeoutError.
+            # If we got an error it must be a disconnect/timeout variant.
             if error_holder:
-                assert isinstance(error_holder[0], (ValueError, TimeoutError, OSError))
+                assert isinstance(
+                    error_holder[0],
+                    (TransmissionFailure, ValueError, TimeoutError, OSError),
+                )
         finally:
             client.stop()
 

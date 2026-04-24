@@ -16,7 +16,10 @@ import time
 
 import pytest
 
-from conftest import HOST, TIMEOUT, wait_for_port, silence_subprocess, quiet_kill, proc_router
+from conftest import (
+    HOST, TIMEOUT, wait_for_port, wait_for_members,
+    silence_subprocess, quiet_kill, proc_router,
+)
 
 N_WORKERS = 5   # number of worker processes for cast tests
 
@@ -66,8 +69,8 @@ def cast_setup(free_port):
         p.start()
         worker_procs.append(p)
 
-    # Give workers time to connect and register their callbacks.
-    time.sleep(0.8)
+    expected = {f"cast-worker-{i:02d}" for i in range(N_WORKERS)}
+    wait_for_members(free_port, expected, timeout=15.0, probe_name="cast-setup-probe")
 
     yield free_port
 

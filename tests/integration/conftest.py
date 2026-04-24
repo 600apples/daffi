@@ -15,12 +15,24 @@ import time
 
 import pytest
 
-# Python 3.14+ changed the default start method on Linux from "fork" to
-# "forkserver".  Integration tests define their subprocess targets as
-# module-level functions in test files, which are not importable from the
-# forkserver's fresh interpreter.  "fork" is simpler, safe in our single-
-# threaded-at-fork test harness, and works on every POSIX platform we target.
-mp.set_start_method("fork", force=True)
+# Use "spawn" so each subprocess starts from a clean, freshly-loaded Python
+# interpreter.  This avoids two classes of macOS-specific bugs:
+#
+#   * The native ``daffi.dfcore`` extension (and its Zig-allocated mutexes,
+#     libcrypto contexts, background threads, etc.) gets imported in the
+#     pytest parent as soon as any test creates a Client / Service / Router.
+#     A forked child inherits that half-initialised native state and
+#     segfaults on first use.  With ``spawn`` the child loads dfcore fresh.
+#
+#   * Objective-C runtime fork-safety.  Anything that pulls in CoreFoundation
+#     in the parent (most stdlib HTTP, DNS, logging on macOS) aborts the
+#     child on first ObjC call unless OBJC_DISABLE_INITIALIZE_FORK_SAFETY is
+#     set.  ``spawn`` sidesteps this entirely.
+#
+# All mp.Process targets in the integration suite are module-level functions
+# (picklable) so spawn works on every platform we target — macOS, Linux, and
+# Python 3.14+ which is moving away from fork as the default.
+mp.set_start_method("spawn", force=True)
 
 # ── constants available to all test modules ────────────────────────────────────
 
@@ -42,21 +54,42 @@ def wait_for_port(port: int, timeout: float = 15.0) -> None:
     raise TimeoutError(f"Port {HOST}:{port} did not open within {timeout}s")
 
 
+def wait_for_members(
+    port: int,
+    expected: set[str],
+    *,
+    timeout: float = 15.0,
+    probe_name: str = "_fx-probe",
+) -> None:
+    """Open a throw-away Client, wait until every name in *expected* is
+    registered with the router/service on *port*, and disconnect.
+
+    Deterministic replacement for ``time.sleep(N)`` in fixtures that spawn
+    multiple worker subprocesses and need all of them registered before the
+    test body issues a cast() / rpc() call.  Critical under the ``spawn``
+    start method, where per-subprocess startup can easily exceed a second
+    on macOS.
+    """
+    from daffi import Client  # noqa: PLC0415 — import lazily so fresh spawned
+                              # children don't pull daffi in during fixture
+                              # import.
+    client = Client(app_name=probe_name, host=HOST, port=port)
+    conn = client.connect()
+    try:
+        conn.wait_for_members(*expected, timeout=timeout)
+    finally:
+        client.stop()
+
+
 def silence_subprocess() -> None:
     """Redirect stdout/stderr to /dev/null and disable Python logging.
 
     Called at the very start of every subprocess target so that Zig native
     prints and daffi logs don't pollute pytest output.
 
-    Also clears ``EXECUTOR_REGISTRY`` state inherited via ``os.fork()``.
-    When the pytest runner (parent) creates a Client or Service in a test,
-    that object appends a ``registry_subscriber`` closure to
-    ``EXECUTOR_REGISTRY.subscribers``.  A forked child inherits this list.
-    Any subsequent ``@callback`` application in the child fires those stale
-    closures, which try to call ``_process_client_handshake`` on a
-    non-existent native connection and raise ``ClientNotInitialized``.
-    Clearing both ``subscribers`` and ``registry`` at fork gives each
-    subprocess a clean slate before it registers its own callbacks.
+    Also clears ``EXECUTOR_REGISTRY`` — harmless under ``spawn`` (the child
+    starts with an empty registry anyway) but keeps behaviour identical if
+    someone switches the start method back to fork for debugging.
     """
     devnull = os.open(os.devnull, os.O_WRONLY)
     os.dup2(devnull, 1)

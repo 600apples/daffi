@@ -80,6 +80,15 @@ pub fn sendMessageFromClient(_: [*c]PyObject, args: [*c]PyObject) callconv(.c) [
         return null;
     };
     const found_receiver: []const u8 = msgident.receiver;
+    // For REQUEST flags ``found_receiver`` is a caller-owned duplicate
+    // produced by ``findReceiverForMethod`` while the appropriate mutex was
+    // still held — see the comment on that function for why a borrowed slice
+    // into chan_mapper storage was a use-after-free that surfaced as random
+    // UTF-8 decode errors under concurrency.  Other flag values never go
+    // through the resolver and must not be freed.  ``Py_BuildValue("s#")``
+    // copies the bytes into a fresh Python ``str`` so freeing after the call
+    // is safe.
+    defer if (pflag == .REQUEST) allocator.free(found_receiver);
     return Py_BuildValue("(Iks#)", msgident.uuid, @as(c_long, msgident.timestamp), found_receiver.ptr, found_receiver.len);
 }
 
@@ -174,6 +183,20 @@ pub fn setClientDisconnectFd(_: [*c]PyObject, args: [*c]PyObject) callconv(.c) [
     var fd: c_int = undefined;
     if (!(py.PyArg_ParseTuple(args, "ki", &conn_num, &fd) != 0)) return null;
     Client.setDisconnectFd(@intCast(conn_num), @intCast(fd)) catch return Py_BuildValue("");
+    return Py_BuildValue("");
+}
+
+/// Register the eventfd (or pipe write-end) that the native layer signals
+/// whenever a new response message is inserted into the client message
+/// store.  Python's RpcResult waiters block on the corresponding read end
+/// (with a select-based deadline) instead of polling the store.
+///
+/// setClientResponseFd(conn_num: int, fd: int) -> None
+pub fn setClientResponseFd(_: [*c]PyObject, args: [*c]PyObject) callconv(.c) [*c]PyObject {
+    var conn_num: c_ulong = undefined;
+    var fd: c_int = undefined;
+    if (!(py.PyArg_ParseTuple(args, "ki", &conn_num, &fd) != 0)) return null;
+    Client.setResponseFd(@intCast(conn_num), @intCast(fd)) catch return Py_BuildValue("");
     return Py_BuildValue("");
 }
 

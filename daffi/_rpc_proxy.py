@@ -15,6 +15,7 @@ Five call styles are available on every :class:`ClientConnection`:
 from __future__ import annotations
 
 import json
+import select
 import time
 import logging
 import threading
@@ -27,6 +28,7 @@ if TYPE_CHECKING:
 
 from daffi._serialization import SerdeFormat, Serializer
 from daffi.utils.misc import iterable
+from daffi._wakeup import WakeupFd
 from daffi.registry._executor_registry import EXECUTOR_REGISTRY
 from daffi._bindings import (
     send_message_from_client,
@@ -34,6 +36,7 @@ from daffi._bindings import (
     mark_message_as_expired,
     set_service_methods,
     send_handshake_from_client,
+    set_client_response_fd,
     get_available_members,
     MessageFlag,
 )
@@ -42,63 +45,91 @@ from . import dfcore
 METADATA_SEPARATOR = ","
 
 
-class BackOff:
-    """Adaptive sleep/backoff controller for tight polling loops.
+class ResponseNotifier:
+    """Per-connection wakeup fd shared by every blocking RPC waiter.
 
-    Starts at a very short sleep interval and gradually increases it during
-    idle periods to reduce CPU usage, up to a configurable maximum.  Call
-    :meth:`tick` on every loop iteration; call :meth:`reset` to snap back to
-    a shorter interval when there is suddenly work to do.
+    Each :class:`~daffi.app.Client` connection owns exactly one notifier.
+    The notifier hands the write-side of an eventfd / pipe to the Zig layer
+    via :func:`set_client_response_fd`; Zig writes a single ``u64(1)`` to
+    it whenever a new response is inserted into ``ClientMessageStore``.
 
-    The counter for each stage is computed as ``round(1 / sleep)`` so that
-    every stage occupies roughly **1 second** of wall time, regardless of the
-    sleep duration.
-
-    Args:
-        step:    Amount (in seconds) to add to the sleep interval each time
-                 the internal counter expires.
-        max_:    Maximum sleep duration (seconds).
-        initial: Starting sleep duration.  Defaults to *step*.
-
-    Example::
-
-        backoff = BackOff(step=0.0001, max_=0.2, initial=0.2)
-        while running:
-            if got_work():
-                backoff.reset(0.0001)   # snap back to fast polling
-            time.sleep(backoff.tick())
+    Each :meth:`RpcResult.result` call
+    blocks **directly** in ``select.select`` on :attr:`read_fd`, with the
+    remaining timeout passed straight through.  When several waiters share
+    the fd they all wake (``select`` is level-triggered), each tries to
+    drain (the read end is non-blocking so the racer that lost just sees
+    ``EAGAIN``), and each re-checks the store for its own uuid.  Whoever
+    finds their response returns; the others go straight back to
+    ``select`` for the next signal.
     """
 
-    __slots__ = ("sleep", "_step", "_max", "_counter")
+    _instances: "dict[int, ResponseNotifier]" = {}
+    _instances_lock = threading.Lock()
 
-    def __init__(self, step: float, max_: float, initial: float = None):
-        self._step = step
-        self._max = max_
-        self.sleep: float = initial if initial is not None else step
-        self._counter: int = round(1 / self.sleep) if self.sleep > 0 else 1
+    def __init__(self, conn_num: int) -> None:
+        self._conn_num = conn_num
+        self._wakeup = WakeupFd()
+        set_client_response_fd(conn_num, self._wakeup.write_fd)
 
-    def tick(self) -> float:
-        """Advance one backoff step and return the current sleep duration."""
-        sleep = self.sleep
-        if sleep < self._max:
-            counter = self._counter - 1
-            if counter == 0:
-                sleep += self._step
-                if sleep >= self._max:
-                    sleep = self._max
-                counter = round(1 / sleep)
-            self.sleep = sleep
-            self._counter = counter
-        return sleep
 
-    def reset(self, sleep: float) -> None:
-        """Reset the sleep interval to *sleep* (e.g. after receiving work).
+    @classmethod
+    def register(cls, conn_num: int) -> "ResponseNotifier":
+        """Create and register a notifier for *conn_num*.
 
-        The internal counter is recalculated from the new sleep value so the
-        hold duration stays consistent with the rest of the stages.
+        If a stale notifier already exists for the same handle (e.g. after
+        an unclean reconnect) it is closed first so the fresh one owns
+        the slot.
         """
-        self.sleep = sleep
-        self._counter = round(1 / sleep) if sleep > 0 else 1
+        with cls._instances_lock:
+            old = cls._instances.pop(conn_num, None)
+        if old is not None:
+            old.close()
+        notifier = cls(conn_num)
+        with cls._instances_lock:
+            cls._instances[conn_num] = notifier
+        return notifier
+
+    @classmethod
+    def unregister(cls, conn_num: int) -> None:
+        """Close and forget the notifier registered for *conn_num*, if any."""
+        with cls._instances_lock:
+            n = cls._instances.pop(conn_num, None)
+        if n is not None:
+            n.close()
+
+    @classmethod
+    def for_conn(cls, conn_num: int) -> "Optional[ResponseNotifier]":
+        """Return the notifier for *conn_num*, or ``None`` if not registered."""
+        with cls._instances_lock:
+            return cls._instances.get(conn_num)
+
+    def close(self) -> None:
+        """Release both ends of the wakeup fd.
+
+        Any waiter currently blocked in ``select.select`` will get
+        ``OSError: Bad file descriptor`` and bail out of its sleep — the
+        next loop iteration in :meth:`RpcResult.result` falls back to
+        the short fixed-interval polling path so a teardown in the
+        middle of an in-flight call still terminates cleanly.
+        """
+        try:
+            self._wakeup.close()
+        except Exception:
+            pass
+
+    @property
+    def read_fd(self) -> int:
+        """File descriptor that callers should pass to ``select.select``."""
+        return self._wakeup.read_fd
+
+    def drain(self) -> None:
+        """Best-effort drain of pending notifications.
+
+        Safe to call from multiple threads; the underlying ``os.read`` is
+        non-blocking (see :class:`~daffi.utils.wakeup.WakeupFd`) so a
+        racer that lost the drain just observes ``EAGAIN``.
+        """
+        self._wakeup.drain()
 
 
 class TransmissionFailure(Exception):
@@ -366,36 +397,90 @@ class RpcResult:
         self.receivers = receivers
         self.proxy = proxy
 
+    # Cap on a single ``select.select`` wait so a silent peer disconnect is
+    # detected via the liveness re-check below within at most this many
+    # seconds.  Only applied when ``self.receivers`` is non-empty — for an
+    # untargeted RPC there is nothing to liveness-check against.
+    _LIVENESS_INTERVAL = 1.0
+
+    # Fallback poll interval for environments where no ResponseNotifier is
+    # registered (unit tests that exercise the bindings without going
+    # through ``Client.connect``).  Kept short so the fallback behaves
+    # similarly to the previous adaptive backoff at its tight end.
+    _FALLBACK_POLL_INTERVAL = 0.001
+
     def result(self) -> Tuple[bytes, int, int]:
         """Block until the response arrives and return ``(data, flag, serde)``.
+
+        Each iteration:
+
+        1. Look up the response in the client message store.  Always done
+           first — in ``cast()`` all sub-calls share roughly the same
+           ``send_ts``, so a peer's response may already be sitting in the
+           store from an earlier waiter.  Skipping this just because the
+           deadline elapsed would raise a spurious ``TimeoutError``.
+        2. Re-evaluate the deadline; raise ``TimeoutError`` if expired.
+        3. Block in ``select.select`` on the connection's response wakeup
+           fd, with the remaining time (or 1 s liveness cap) used directly
+           as the ``select`` timeout.  Any thread that wakes drains the fd
+           best-effort — the read end is non-blocking, so concurrent
+           waiters racing to drain just see ``EAGAIN`` instead of hanging.
 
         Raises:
             RemoteCallError: If the remote returned an error payload.
             TransmissionFailure: If an expected receiver disconnected mid-call.
             TimeoutError: If *timeout* seconds elapse with no response.
         """
-        timeout_cond = self._timeout_cond_fn()
-        backoff = BackOff(step=0.0001, max_=1, initial=0.000001)
-        counter = 0
-        while timeout_cond():
+        notifier = ResponseNotifier.for_conn(self.conn_num)
+        wait_fds = [notifier.read_fd] if notifier is not None else []
+        deadline = (self.send_ts + self.timeout) if self.timeout > 0 else None
+
+        while True:
             if res := get_message_from_client_store(self.uuid, self.conn_num):
-                if len(res) == 1:
-                    raise RemoteCallError(f"Unexpected response: {res[0]}")
-                data, flag, serde = res
-                if flag == MessageFlag.ERROR:
-                    (error_tuple,), _ = Serializer.deserialize(serde, data)
-                    err_name, err_module, err_msg, tb = error_tuple
-                    restored_exc = type(
-                        err_name, (RemoteCallError,), {"__module__": err_module}
+                return self._unpack_response(res)
+
+            if deadline is not None:
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    mark_message_as_expired(self.uuid, self.conn_num)
+                    raise TimeoutError(
+                        f"Timeout reached for rpc call with uuid: {self.uuid}."
                     )
-                    if tb:
-                        raise restored_exc(err_msg).with_traceback(tb)
-                    else:
-                        raise restored_exc(err_msg)
-                return data, flag, serde
-            time.sleep(backoff.tick())
-            counter = (counter + 1) % 1000
-            if counter == 0 and self.receivers:
+            else:
+                remaining = None
+
+            # Cap each wait at the liveness interval when we have a known
+            # receiver set, so a silent peer disconnect surfaces within
+            # ~1 s instead of waiting the full call deadline.
+            if remaining is None:
+                wait_chunk = self._LIVENESS_INTERVAL if self.receivers else None
+            elif self.receivers:
+                wait_chunk = min(remaining, self._LIVENESS_INTERVAL)
+            else:
+                wait_chunk = remaining
+
+            if wait_fds:
+                try:
+                    readable, _, _ = select.select(wait_fds, [], [], wait_chunk)
+                except (OSError, ValueError):
+                    # fd was closed (notifier teardown during stop) — fall
+                    # back to a brief sleep and let the next iteration
+                    # re-evaluate everything.
+                    time.sleep(self._FALLBACK_POLL_INTERVAL)
+                    readable = ()
+                if readable:
+                    notifier.drain()
+            else:
+                # No notifier registered (e.g. RpcResult exercised outside
+                # of Client.connect).  Sleep the smaller of the remaining
+                # deadline and the fallback interval.
+                time.sleep(
+                    self._FALLBACK_POLL_INTERVAL
+                    if wait_chunk is None
+                    else min(wait_chunk, self._FALLBACK_POLL_INTERVAL)
+                )
+
+            if self.receivers:
                 if missing_receivers := self.receivers - {
                     m["name"] for m in get_available_members(self.conn_num)
                 }:
@@ -404,18 +489,30 @@ class RpcResult:
                         f" unexpectedly disconnected, causing an interruption in the awaiting result of {self.proxy}."
                         f" All receivers: {self.receivers}"
                     )
-        else:
-            mark_message_as_expired(self.uuid, self.conn_num)
-            raise TimeoutError(f"Timeout reached for rpc call with uuid: {self.uuid}.")
 
-    def _timeout_cond_fn(self):
-        """Return a zero-argument predicate that is ``True`` while the deadline
-        has not been reached (or always-``True`` when *timeout* is zero)."""
-        if self.timeout <= 0:
-            return lambda: True
-        else:
-            timeout = self.send_ts + self.timeout
-            return lambda: timeout > time.time()
+    def _unpack_response(
+        self, res: Tuple
+    ) -> Tuple[bytes, int, int]:
+        """Decode a ``get_message_from_client_store`` tuple into a result.
+
+        Mirrors the original inline logic from ``result()``: a 1-tuple is an
+        unexpected error from the native layer, an ``ERROR`` flag carries a
+        pickled remote exception, and a normal RESPONSE is returned as-is.
+        """
+        if len(res) == 1:
+            raise RemoteCallError(f"Unexpected response: {res[0]}")
+        data, flag, serde = res
+        if flag == MessageFlag.ERROR:
+            (error_tuple,), _ = Serializer.deserialize(serde, data)
+            err_name, err_module, err_msg, tb = error_tuple
+            restored_exc = type(
+                err_name, (RemoteCallError,), {"__module__": err_module}
+            )
+            if tb:
+                raise restored_exc(err_msg).with_traceback(tb)
+            else:
+                raise restored_exc(err_msg)
+        return data, flag, serde
 
 
 class BroadcastProxy:
@@ -1153,6 +1250,10 @@ class AutoReconnect:
         client._conn_type = None
 
         if old_num is not None:
+            # Detach the response-notifier thread from the dying connection
+            # *before* freeing the native slot.  ``_do_connect`` will create
+            # a fresh notifier for the new conn_num.
+            ResponseNotifier.unregister(old_num)
             try:
                 dfcore.stopClient(old_num)
             except Exception:
@@ -1176,6 +1277,10 @@ class AutoReconnect:
             except Exception as exc:
                 client.logger.warning(f"Reconnect failed: {exc}")
                 if client._conn_num is not None:
+                    # The half-initialised connection may have a notifier
+                    # registered by _do_connect — unregister it before we
+                    # free the native slot to avoid a leak.
+                    ResponseNotifier.unregister(client._conn_num)
                     try:
                         dfcore.stopClient(client._conn_num)
                     except Exception:

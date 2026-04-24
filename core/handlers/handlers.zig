@@ -394,14 +394,38 @@ pub const ClientHandler = struct {
         };
     }
 
+    /// Resolve the target peer for *method* and return a newly-allocated,
+    /// caller-owned copy of that peer's connection_name.
+    ///
+    /// Why a copy?  Callers propagate the returned slice through several
+    /// layers (``msgpool.sendMessage``, the ``MessageIdentifier`` return
+    /// chain, and finally ``Py_BuildValue("...s#...")`` at the CFFI boundary)
+    /// *after* the resolution step releases its locks.  If we returned a
+    /// borrowed view into ``chan_mapper``'s storage, a concurrent handshake
+    /// or "disconnected" event on the reader thread could free the underlying
+    /// Channel before the caller is done — a classic use-after-free.  When
+    /// the freed bytes happened to be reused by another allocation the bug
+    /// surfaced as a random ``UnicodeDecodeError`` out of ``s#`` (or a
+    /// ``TransmissionFailure`` wrapping it) in ``test_concurrent_mixed_callbacks``.
+    ///
+    /// Duplication happens while the appropriate mutex is still held:
+    ///   * explicit receiver: ``chan_mapper.findReceiverDupe`` locks the
+    ///     ``ChannelsMapper`` mutex across lookup + dupe.
+    ///   * round-robin: ``self.mutex`` is held across the ``allChannels()``
+    ///     walk *and* the dupe of the selected entry.
+    ///
+    /// Caller must free the returned slice with ``self.allocator`` — see the
+    /// ``defer`` in ``core/cffi/client.zig:sendMessageFromClient``.
     pub fn findReceiverForMethod(self: *Self, method: []const u8, receiver: ?[]const u8) ![]const u8 {
         if (receiver) |rec| {
             if (mem.eql(u8, rec, self.app_name)) return error.ReceiverNotFound;
-            var chan = self.chan_mapper.getChannel(rec) catch {
-                debugPrint("No channel for receiver: {s}\n", .{rec});
-                return error.ReceiverNotFound;
+            return self.chan_mapper.findReceiverDupe(self.allocator, rec, method) catch |err| switch (err) {
+                error.ChannelNotFound => {
+                    debugPrint("No channel for receiver: {s}\n", .{rec});
+                    return error.ReceiverNotFound;
+                },
+                else => return err,
             };
-            if (chan.containsMethod(method)) return chan.connection_name;
         } else {
             var found_channels = std.array_list.Managed(ChannelsMapperT.Channel).init(self.allocator);
             self.mutex.lock();
@@ -414,7 +438,9 @@ pub const ClientHandler = struct {
                 if (mem.eql(u8, c.connection_name, self.app_name)) continue;
                 if (c.containsMethod(method)) try found_channels.append(c.*);
             }
-            if (self.chan_iterator.next(found_channels.items)) |*c| return c.connection_name;
+            if (self.chan_iterator.next(found_channels.items)) |*c| {
+                return try self.allocator.dupe(u8, c.connection_name);
+            }
         }
         return error.ReceiverNotFound;
     }

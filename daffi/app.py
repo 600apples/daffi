@@ -20,7 +20,13 @@ from daffi.utils.logger import get_daffi_logger
 from daffi.exceptions import InitializationError
 from daffi.utils.misc import string_uuid
 from daffi._bindings import set_client_disconnect_fd
-from daffi._rpc_proxy import RpcProxy, SerdeFormat, ClientConnection, AutoReconnect
+from daffi._rpc_proxy import (
+    RpcProxy,
+    SerdeFormat,
+    ClientConnection,
+    AutoReconnect,
+    ResponseNotifier,
+)
 from daffi._signals import set_signal_handler
 from daffi._task_dispatcher import TaskDispatcher
 from daffi.registry._executor_registry import EXECUTOR_REGISTRY
@@ -51,7 +57,6 @@ class Application(ABC):
         port: Optional[int] = None,
         unix_sock_path: Optional[os.PathLike] = None,
         workers: int = TaskDispatcher.DEFAULT_WORKERS,
-        use_processes: bool = False,
         tls: bool = False,
         cert_file: str = "",
         key_file: str = "",
@@ -65,22 +70,12 @@ class Application(ABC):
             port:          TCP port number.
             unix_sock_path: Path to a Unix-domain socket (mutually exclusive
                            with *host*/*port*).
-            workers:       Number of concurrent workers for executing incoming
-                           ``@callback`` calls.  ``1`` (default) runs callbacks
-                           inline with zero overhead.  ``N >= 2`` spawns a pool
-                           of N-1 workers; their type is controlled by
-                           *use_processes*.  Ignored by :class:`Router` which
-                           never executes callbacks itself.
-            use_processes: When ``False`` (default) worker slots are OS
-                           **threads** — best for I/O-bound callbacks.  When
-                           ``True`` worker slots are **forked processes** that
-                           bypass the GIL — best for CPU-bound callbacks.
-                           Ignored when ``workers == 1``.
-
-                           All ``@callback`` functions must be registered
-                           *before* calling :meth:`start` / :meth:`connect`
-                           because worker processes are forked at that point and
-                           will not see callbacks added later.
+            workers:       Number of concurrent worker **threads** for executing
+                           incoming ``@callback`` calls.  ``1`` (default) runs
+                           callbacks inline with zero overhead.  ``N >= 2``
+                           spawns a pool of N-1 threads.  Ignored by
+                           :class:`Router` which never executes callbacks
+                           itself.
             tls:           Enable TLS encryption for the TCP connection.
                            Servers require ``cert_file`` and ``key_file``.
                            Clients may optionally supply ``ca_file``.
@@ -98,7 +93,6 @@ class Application(ABC):
         self.port = port
         self.unix_sock_path = str(unix_sock_path or "")
         self.workers = workers
-        self.use_processes = use_processes
         self.tls = tls
         self.cert_file = cert_file
         self.key_file = key_file
@@ -268,14 +262,10 @@ class ServerMixin:
         if self._conn_num is not None:
             raise RuntimeError(f"{self.__class__.__name__} is already started")
         if self.server_mode == ServerMode.SERVICE:
-            # Start the worker pool before native I/O threads are created.
-            # Threads idle harmlessly; processes must be forked while the
-            # process is still single-threaded (POSIX fork-safety).
+            # Start the worker-thread pool before native I/O threads are
+            # created.  Threads idle harmlessly until work arrives.
             if not self._task_dispatcher:
-                self._task_dispatcher = TaskDispatcher(
-                    workers=self.workers,
-                    use_processes=self.use_processes,
-                )
+                self._task_dispatcher = TaskDispatcher(workers=self.workers)
             self._task_dispatcher._start_workers()
         self._conn_num = dfcore.startServer(
             self.host,
@@ -409,7 +399,6 @@ class Client(Application):
         port: Optional[int] = None,
         unix_sock_path: Optional[os.PathLike] = None,
         workers: int = TaskDispatcher.DEFAULT_WORKERS,
-        use_processes: bool = False,
         tls: bool = False,
         cert_file: str = "",
         key_file: str = "",
@@ -438,7 +427,6 @@ class Client(Application):
             port=port,
             unix_sock_path=unix_sock_path,
             workers=workers,
-            use_processes=use_processes,
             tls=tls,
             cert_file=cert_file,
             key_file=key_file,
@@ -498,17 +486,11 @@ class Client(Application):
 
     def _do_connect(self, password: str) -> None:
         """Low-level connect: allocate native slot, handshake, start dispatcher."""
-        # Start the worker pool before native I/O threads are created.
-        # For threads: they idle harmlessly until work arrives.
-        # For processes: they must be forked while single-threaded (fork-safety).
-        # If the server turns out to be a Service (not a Router) the pool is
-        # stopped immediately after the handshake.
+        # Start the worker-thread pool before native I/O threads are created.
+        # Threads idle harmlessly until work arrives.
         if self.workers > 1:
             if self._task_dispatcher is None:
-                self._task_dispatcher = TaskDispatcher(
-                    workers=self.workers,
-                    use_processes=self.use_processes,
-                )
+                self._task_dispatcher = TaskDispatcher(workers=self.workers)
             self._task_dispatcher._start_workers()
 
         self._conn_num = dfcore.startClient(
@@ -523,6 +505,11 @@ class Client(Application):
             raise InitializationError(
                 f"Failed to connect to the server. connection info: {self.info}"
             )
+        # Register the response notifier *before* the handshake so the
+        # handshake's own RpcResult also benefits from event-driven wakeups
+        # rather than polling.  ``register`` clears any stale notifier left
+        # over from a previous (e.g. failed) connect on the same handle.
+        ResponseNotifier.register(self._conn_num)
         handshake = RpcProxy._process_client_handshake(self._conn_num)
         self._conn_type = handshake["meta"]["type"]
         self.logger.debug(
@@ -530,10 +517,7 @@ class Client(Application):
         )
         if self._conn_type == "router":
             if self._task_dispatcher is None:
-                self._task_dispatcher = TaskDispatcher(
-                    workers=self.workers,
-                    use_processes=self.use_processes,
-                )
+                self._task_dispatcher = TaskDispatcher(workers=self.workers)
             self._task_dispatcher.start_for_connection(self)
             self._register_executors()
             if not self._autoreconnect:
@@ -628,5 +612,10 @@ class Client(Application):
             if self._task_dispatcher:
                 self._task_dispatcher.stop_for_connection(self)
             if self._conn_num is not None:
+                # Tear the notifier thread down before freeing the native
+                # slot — its select on the wakeup fd does not hold a
+                # reference to conn_num, but we want the thread to exit
+                # cleanly so it doesn't observe a freed Zig-side fd.
+                ResponseNotifier.unregister(self._conn_num)
                 dfcore.stopClient(self._conn_num)
                 self._conn_num = None

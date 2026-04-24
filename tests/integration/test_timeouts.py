@@ -30,7 +30,7 @@ import pytest
 
 from conftest import (
     HOST, TIMEOUT,
-    wait_for_port, silence_subprocess, quiet_kill,
+    wait_for_port, wait_for_members, silence_subprocess, quiet_kill,
     proc_router,
 )
 
@@ -190,7 +190,14 @@ def cast_mixed(free_port):
     slow_p.start()
     worker_procs.append(slow_p)
 
-    time.sleep(0.6)
+    # Deterministic wait: poll the router membership until every worker has
+    # registered its callbacks.  Under spawn a fixed sleep is flaky because
+    # subprocess startup times depend on system load from the rest of the
+    # suite; wait_for_members removes the guesswork.
+    expected = {f"timeout-fast-worker-{i:02d}" for i in range(N_WORKERS - 1)}
+    expected.add(f"timeout-slow-worker-{N_WORKERS - 1:02d}")
+    wait_for_members(free_port, expected, timeout=15.0, probe_name="to-cast-mixed-probe")
+
     yield free_port, slow_p  # expose slow proc so tests can name it
 
     for p in worker_procs:
@@ -209,7 +216,8 @@ def cast_all_slow(free_port):
         target=_proc_all_slow_workers, args=(free_port, N_WORKERS), daemon=True
     )
     wproc.start()
-    time.sleep(0.6)
+    expected = {f"timeout-allslow-{i:02d}" for i in range(N_WORKERS)}
+    wait_for_members(free_port, expected, timeout=15.0, probe_name="to-cast-allslow-probe")
     yield free_port
 
     quiet_kill(wproc)

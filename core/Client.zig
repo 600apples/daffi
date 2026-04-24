@@ -208,6 +208,10 @@ const ClientEntry = struct {
         self.client_handler.tasks_queue.wakeup_fd = fd;
     }
 
+    pub fn setResponseFdClientEntry(self: *ClientEntry, fd: i32) void {
+        self.client_handler.msg_store.wakeup_fd = fd;
+    }
+
     pub fn setDisconnectFdClientEntry(self: *ClientEntry, fd: i32) void {
         self.client_handler.tasks_queue.disconnect_fd = fd;
     }
@@ -313,6 +317,15 @@ pub fn getAvailableMembers(allocator: Allocator, conn_num: usize) ![]const u8 {
 pub fn setWakeupFd(conn_num: usize, fd: i32) !void {
     var entry = try ClientEntry.get(conn_num);
     entry.setWakeupFdClientEntry(fd);
+}
+
+/// Register the eventfd (or pipe write-end) that the native layer signals
+/// whenever a new response is inserted into the client message store.
+/// Used by every Client connection so blocking RPC waiters
+/// (``RpcResult.result``) don't have to poll the store.
+pub fn setResponseFd(conn_num: usize, fd: i32) !void {
+    var entry = try ClientEntry.get(conn_num);
+    entry.setResponseFdClientEntry(fd);
 }
 
 /// Register the pipe write-end that the native layer writes to once when the

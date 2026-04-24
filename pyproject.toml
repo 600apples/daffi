@@ -31,8 +31,7 @@ classifiers = [
 dependencies = []
 
 [project.optional-dependencies]
-msgpack   = ["msgpack>=1.0"]
-processes = ["dill>=0.3.6"]
+msgpack = ["msgpack>=1.0"]
 
 [project.urls]
 Homepage    = "https://github.com/600apples/daffi"

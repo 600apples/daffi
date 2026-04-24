@@ -224,6 +224,19 @@ const client_methods = [_]PyMethodDef{
             \\can react without a polling thread.
         ,
     },
+    .{
+        .ml_name  = "setClientResponseFd",
+        .ml_meth  = cffi.setClientResponseFd,
+        .ml_flags = 1,
+        .ml_doc   =
+            \\setClientResponseFd(conn_num, fd)
+            \\
+            \\Register an eventfd or pipe write-end that the native layer signals
+            \\whenever a new response is inserted into the client message store.
+            \\Python's RpcResult waiters block on the corresponding read end with
+            \\a select-based deadline instead of polling the store.
+        ,
+    },
 };
 
 // ── Combined method table ─────────────────────────────────────────────────────

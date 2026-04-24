@@ -101,6 +101,28 @@ pub fn ChannelsMapper(comptime ConnectionT: type) type {
             return self.channels.get(chan_uuid) orelse error.ChannelNotFound;
         }
 
+        /// Look up *chan_uuid*, verify it exposes *method*, and return an owned
+        /// duplicate of its connection_name.  Holding the mutex across both the
+        /// lookup and the dupe is essential — the returned slice is propagated
+        /// all the way up through the message pipeline (and into
+        /// ``Py_BuildValue("s#")`` for CFFI), and freeing the Channel
+        /// concurrently would otherwise yield a classic use-after-free
+        /// (surfacing as a random UTF-8 decode error when the freed bytes get
+        /// reused by another allocation before ``s#`` reads them).  Caller owns
+        /// the returned slice and must free it with *dupe_allocator*.
+        pub fn findReceiverDupe(
+            self: *Self,
+            dupe_allocator: Allocator,
+            chan_uuid: Uuid,
+            method: []const u8,
+        ) ![]const u8 {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            const chan = self.channels.getPtr(chan_uuid) orelse return error.ChannelNotFound;
+            if (!chan.containsMethod(method)) return error.ChannelNotFound;
+            return try dupe_allocator.dupe(u8, chan.connection_name);
+        }
+
         pub fn getOrCreateChannel(self: *Self, conn: *ConnectionT, chan_uuid: Uuid) !*Channel {
             self.mutex.lock();
             defer self.mutex.unlock();
