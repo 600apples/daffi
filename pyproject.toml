@@ -58,6 +58,10 @@ manylinux-x86_64-image  = "quay.io/pypa/manylinux_2_28_x86_64"
 manylinux-aarch64-image = "quay.io/pypa/manylinux_2_28_aarch64"
 
 before-all = """
+    # xz is required by tar -J (xz decompression) and is absent from minimal
+    # manylinux images; install it silently before attempting the Zig download.
+    yum install -y xz 2>/dev/null || dnf install -y xz 2>/dev/null || true
+
     ARCH=$(uname -m)
     ZIG_VERSION="0.16.0"
     ZIG_TAR="zig-linux-${ARCH}-${ZIG_VERSION}.tar.xz"
@@ -75,7 +79,8 @@ repair-wheel-command = "auditwheel repair -w {dest_dir} {wheel}"
 archs = ["x86_64", "arm64"]
 
 before-all = """
-    brew install openssl@3 || true
+    # xz is needed by BSD tar's -J flag; openssl@3 for the native extension.
+    brew install xz openssl@3 || true
 
     # Map uname -m (arm64) to Zig's arch name (aarch64)
     RAW_ARCH=$(uname -m)
@@ -84,8 +89,8 @@ before-all = """
     ZIG_VERSION="0.16.0"
     ZIG_TAR="zig-macos-${ZIG_ARCH}-${ZIG_VERSION}.tar.xz"
     curl -fL "https://ziglang.org/download/${ZIG_VERSION}/${ZIG_TAR}" \
-        | tar -xJ -C /opt
-    sudo ln -sf "/opt/zig-macos-${ZIG_ARCH}-${ZIG_VERSION}/zig" /usr/local/bin/zig
+        | tar -xJ -C /tmp
+    sudo ln -sf "/tmp/zig-macos-${ZIG_ARCH}-${ZIG_VERSION}/zig" /usr/local/bin/zig
     zig version
 """
 
