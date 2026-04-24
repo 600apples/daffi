@@ -20,12 +20,12 @@ The Python side sees the browser as a regular daffi Client — no special config
 
 ## Loading from CDN
 
-Both files are hosted on [jsDelivr](https://www.jsdelivr.com/) automatically from the GitHub repository.  
-Replace `TAG` with a git tag or commit hash:
+`daffi.js` is hosted on [jsDelivr](https://www.jsdelivr.com/) automatically from the GitHub repository.  
+`app.wasm` is fetched automatically from the same CDN release — **you do not need to host or specify it yourself.**
 
 ```html
-<!-- daffi.js client library -->
-<script src="https://cdn.jsdelivr.net/gh/600apples/daffi@TAG/js-client/daffi.js"></script>
+<!-- daffi.js client library (pinned to release 2.0.0) -->
+<script src="https://cdn.jsdelivr.net/gh/600apples/daffi@2.0.0/js-client/daffi.js"></script>
 
 <!-- Optional: msgpack-lite (only needed for serde: "msgpack") -->
 <script src="https://unpkg.com/msgpack-lite/dist/msgpack.min.js"></script>
@@ -48,10 +48,12 @@ const client = new DaffiClient(options);
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `name` | `string` | `"hostname-0x<random>"` | Unique name for this browser client. When omitted, a name is generated automatically from `location.hostname` + a random 32-bit hex suffix. |
-| `options.wsUrl` | `string` | `"ws://127.0.0.1:5000"` | WebSocket URL of the Python backend. |
-| `options.wasmPath` | `string` | `"./app.wasm"` | URL path to `app.wasm`. |
+| `options.wsUrl` | `string` | **required** | WebSocket URL of the Python backend. No default — must always be provided explicitly (e.g. `"ws://127.0.0.1:5000"`). |
 | `options.autoreconnect` | `boolean` | `false` | Reconnect automatically when the server drops the link. |
 | `options.reconnectDelay` | `number` (ms) | `2000` | Base delay before the first retry. Doubles after each failure, capped at 60 s. |
+
+!!! note
+    `app.wasm` is loaded automatically from the CDN release that matches the `daffi.js` version — there is no `wasmPath` option.
 
 ### `client.connect()` → `Promise<Connection>`
 
@@ -207,7 +209,6 @@ compiled once and reused — only the WebSocket is replaced on each attempt.
 ```javascript
 const client = new DaffiClient("browser-caller", {
     wsUrl:          "ws://127.0.0.1:6001",
-    wasmPath:       "./app.wasm",
     autoreconnect:  true,   // reconnect automatically after disconnect
     reconnectDelay: 2000,   // first retry after 2 s; then 4 s, 8 s … (max 60 s)
 });
@@ -269,15 +270,17 @@ const conn = await client.connect("secret");
 <head>
   <meta charset="UTF-8">
   <title>daffi demo</title>
-  <script src="https://cdn.jsdelivr.net/gh/600apples/daffi@TAG/js-client/daffi.js"></script>
+  <!-- app.wasm is fetched automatically from the same CDN release -->
+  <script src="https://cdn.jsdelivr.net/gh/600apples/daffi@2.0.0/js-client/daffi.js"></script>
 </head>
 <body>
 <script>
 (async () => {
+  // wsUrl is required — there is no default
   const client = new DaffiClient("browser-client", {
-    wsUrl:    "ws://127.0.0.1:5000",
+    wsUrl: "ws://127.0.0.1:5000",
   });
-    
+
   const conn = await client.connect();
 
   const result = await conn.rpc({ timeout: 5000 }).add(3, 4);

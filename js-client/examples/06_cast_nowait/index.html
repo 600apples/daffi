@@ -158,8 +158,7 @@
     log(`Connecting to ${url} …`, 'inf');
     try {
       const client = new DaffiClient('browser-cast-nw-client', {
-        wsUrl:    url,
-        wasmPath: '../../app.wasm',
+        wsUrl: url,
       });
       client.addEventHandler(e => log(`  ← event: ${e.type} [${e.member}]`, 'dim'));
       conn = await client.connect();

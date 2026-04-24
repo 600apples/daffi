@@ -4,32 +4,21 @@
  * DaffiClient — browser WebSocket + WASM client for daffi.
  *
  * ─────────────────────────────────────────────────────────────────────────────
- * DISTRIBUTION — using daffi.js from a CDN
+ * DISTRIBUTION — loading daffi.js from the CDN
  * ─────────────────────────────────────────────────────────────────────────────
- * daffi.js ships together with app.wasm in the js-client/ folder of the
- * repository.  Both files are required; daffi.js loads app.wasm at runtime
- * via WebAssembly.compileStreaming() and the server must serve it with the
- * correct MIME type (application/wasm).
+ * Load daffi.js from jsDelivr.  app.wasm is fetched automatically from the
+ * same CDN release — you do NOT need to host or specify it yourself.
  *
- * The simplest way to consume them without hosting your own copy is via the
- * jsDelivr CDN, which serves any public GitHub file automatically:
+ *   <!-- Load the JS client (pin to a specific release tag) -->
+ *   <script src="https://cdn.jsdelivr.net/gh/600apples/daffi@2.0.0/js-client/daffi.js"></script>
  *
- *   <!-- 1. Load the JS client (replace TAG with a git tag or commit hash) -->
- *   <script src="https://cdn.jsdelivr.net/gh/600apples/daffi@TAG/js-client/daffi.js"></script>
- *
- *   <!-- 2. (optional) msgpack-lite — only needed for serde: "msgpack" -->
+ *   <!-- (optional) msgpack-lite — only needed for serde: "msgpack" -->
  *   <script src="https://unpkg.com/msgpack-lite/dist/msgpack.min.js"></script>
  *
  *   <script>
- *     const client = new DaffiClient("my-app", {
- *       wsUrl:    "ws://127.0.0.1:5000",
- *       // Point wasmPath at the same CDN release so the browser can fetch it:
- *       wasmPath: "https://cdn.jsdelivr.net/gh/600apples/daffi@TAG/js-client/app.wasm",
- *     });
+ *     // wsUrl is REQUIRED — there is no default.
+ *     const client = new DaffiClient("my-app", { wsUrl: "ws://127.0.0.1:5000" });
  *   </script>
- *
- * For local development both files can live in the same directory.  The
- * default wasmPath ("./app.wasm") then resolves relative to the HTML page.
  *
  * ─────────────────────────────────────────────────────────────────────────────
  * QUICK START
@@ -62,12 +51,9 @@
  *                                (e.g. "localhost-0x3f9a12bc"), mirroring the
  *                                auto-naming behaviour of the Python client.
  *
- *   options.wsUrl     string   — WebSocket URL of the daffi Service or Router.
- *                                Default: "ws://127.0.0.1:5000"
- *
- *   options.wasmPath  string   — Absolute URL path to app.wasm served by your
- *                                HTTP server.
- *                                Default: "/zig-out/lib/app.wasm"
+ *   options.wsUrl     string   — REQUIRED. WebSocket URL of the daffi Service
+ *                                or Router.  No default — must always be set
+ *                                explicitly (e.g. "ws://127.0.0.1:5000").
  *
  *   options.autoreconnect  boolean — When true, automatically reconnect to the
  *                                    server after a disconnect.  The first retry
@@ -169,13 +155,20 @@ function _generateClientName() {
     return `${host}-0x${rand.toString(16).padStart(8, '0')}`;
 }
 
+// CDN URL for the WASM binary — pinned to the release tag, not user-configurable.
+const _WASM_URL = 'https://cdn.jsdelivr.net/gh/600apples/daffi@2.0.0/js-client/app.wasm';
+
 function DaffiClient(name, options) {
     // Allow DaffiClient(options) — name omitted entirely.
     if (name !== null && typeof name === 'object') { options = name; name = undefined; }
     options = options || {};
+    if (!options.wsUrl) throw new Error(
+        '[daffi] options.wsUrl is required — there is no default. ' +
+        'Pass the WebSocket URL explicitly, e.g. { wsUrl: "ws://127.0.0.1:5000" }.'
+    );
     this.name           = name || _generateClientName();
-    this.wsUrl          = options.wsUrl          || 'ws://127.0.0.1:5000';
-    this.wasmPath       = options.wasmPath       || './app.wasm';
+    this.wsUrl          = options.wsUrl;
+    this.wasmPath       = _WASM_URL;
     this.autoreconnect  = options.autoreconnect  || false;
     this.reconnectDelay = options.reconnectDelay != null ? options.reconnectDelay : 2000;
     this.pendingMessages = {};

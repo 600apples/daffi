@@ -74,8 +74,7 @@
     log(`Connecting to ${url} …`, 'inf');
     try {
       const client = new DaffiClient('browser-json-client', {
-        wsUrl:    url,
-        wasmPath: '../../app.wasm',
+        wsUrl: url,
       });
       client.addEventHandler(e => log(`event: ${e.member} → ${e.type}`, 'inf'));
       conn = await client.connect();

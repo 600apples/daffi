@@ -83,7 +83,6 @@
     try {
       client = new DaffiClient('browser-mp-caller', {
         wsUrl:          url,
-        wasmPath:       '../../app.wasm',
         autoreconnect:  true,   // reconnect automatically when the router restarts
         reconnectDelay: 2000,   // first retry after 2 s; then 4 s, 8 s … up to 60 s
       });
