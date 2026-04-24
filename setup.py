@@ -34,7 +34,15 @@ from setuptools.command.build_ext import build_ext
 
 
 def _find_openssl():
-    """Return ``(include_dir, lib_dir)`` for OpenSSL, or ``(None, None)``."""
+    """Return ``(include_dir, lib_dir)`` for OpenSSL, or ``(None, None)``.
+
+    On macOS the arch-native Homebrew prefix is resolved directly via
+    ``platform.machine()`` rather than via ``brew --prefix``.  cibuildwheel
+    prepends ``/usr/local/bin`` to PATH during the Python build step, which
+    causes ``brew`` to resolve to the *x86_64* Homebrew even on arm64 runners,
+    returning the wrong-arch ``.a`` archives and producing a binary that fails
+    ``delocate-wheel --require-archs arm64``.  Bypassing ``brew`` avoids this.
+    """
     openssl_dir = os.environ.get("OPENSSL_DIR")
     if openssl_dir:
         return (
@@ -43,12 +51,31 @@ def _find_openssl():
         )
 
     if sys.platform == "darwin":
+        import platform as _platform
+
+        # /opt/homebrew  → arm64 Homebrew (Apple Silicon)
+        # /usr/local     → x86_64 Homebrew (Intel / Rosetta)
+        machine = _platform.machine()
+        brew_prefix = "/opt/homebrew" if machine == "arm64" else "/usr/local"
+        print(f"setup.py: macOS machine={machine!r}, using Homebrew prefix {brew_prefix!r}")
+
+        for pkg in ("openssl@3", "openssl@1.1", "openssl"):
+            candidate = os.path.join(brew_prefix, "opt", pkg)
+            if os.path.isdir(candidate):
+                print(f"setup.py: found OpenSSL at {candidate!r}")
+                return (
+                    os.path.join(candidate, "include"),
+                    os.path.join(candidate, "lib"),
+                )
+
+        # Fallback: try the brew command (e.g. non-standard installations).
         for pkg in ("openssl@3", "openssl@1.1", "openssl"):
             try:
                 prefix = subprocess.check_output(
                     ["brew", "--prefix", pkg], stderr=subprocess.DEVNULL
                 ).decode().strip()
                 if prefix and os.path.isdir(prefix):
+                    print(f"setup.py: OpenSSL via brew at {prefix!r}")
                     return (
                         os.path.join(prefix, "include"),
                         os.path.join(prefix, "lib"),
