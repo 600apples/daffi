@@ -18,9 +18,15 @@ throughput up to **~1.2 GiB/s** for large binary payloads.
 
 | Class | Role |
 |---|---|
-| `Service` | Exposes `@callback`-decorated functions to remote callers. Listens on a TCP port. |
-| `Router` | Routes calls between `Client`s and `Service`s. Needed only for the three-tier layout. |
-| `Client` | Connects to a `Router` or `Service` and issues calls. |
+| `Service` | Listens on a TCP port. Exposes `@callback` functions; Clients call them. |
+| `Router` | Pure message forwarder. Needed for the multi-worker layout. Has no callbacks of its own. |
+| `Client` | Connects to a `Router` or `Service`. Can issue calls **and/or** expose its own `@callback` functions. |
+
+> **Both `Service` and `Client` can expose `@callback` functions.**
+> The topology determines the role:
+> - **Client → Service**: only the `Service` exposes callbacks; Clients are pure callers.
+> - **Client → Router → Worker**: any `Client` can expose callbacks (acting as a worker),
+>   issue calls (acting as a caller), or do both at the same time — all through the Router.
 
 ---
 
@@ -82,7 +88,6 @@ router.join()
 
 `worker.py`:
 ```python
-import time
 from daffi import Client, callback
 
 @callback
@@ -91,12 +96,7 @@ def process(task: str) -> str:
 
 client = Client(app_name="worker-1", host="127.0.0.1", port=6000)
 client.connect()
-
-try:
-    while True:
-        time.sleep(1)
-except KeyboardInterrupt:
-    client.stop()
+client.join()   # block until Ctrl+C / SIGTERM
 ```
 
 `caller.py`:
