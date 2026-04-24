@@ -63,13 +63,13 @@ before-all = """
 
     ARCH=$(uname -m)
     ZIG_VERSION="0.16.0"
-    ZIG_TAR="zig-linux-${ARCH}-${ZIG_VERSION}.tar.xz"
+    ZIG_TAR="zig-${ARCH}-linux-${ZIG_VERSION}.tar.xz"
     ZIG_URL="https://ziglang.org/download/${ZIG_VERSION}/${ZIG_TAR}"
 
     echo "Downloading Zig ${ZIG_VERSION} for ${ARCH} ..."
     curl -fL "${ZIG_URL}" -o "/tmp/${ZIG_TAR}"
     tar -xJf "/tmp/${ZIG_TAR}" -C /opt
-    ln -sf "/opt/zig-linux-${ARCH}-${ZIG_VERSION}/zig" /usr/local/bin/zig
+    ln -sf "/opt/zig-${ARCH}-linux-${ZIG_VERSION}/zig" /usr/local/bin/zig
     zig version
 """
 
@@ -89,13 +89,13 @@ before-all = """
     if [ "$RAW_ARCH" = "arm64" ]; then ZIG_ARCH="aarch64"; else ZIG_ARCH="$RAW_ARCH"; fi
 
     ZIG_VERSION="0.16.0"
-    ZIG_TAR="zig-macos-${ZIG_ARCH}-${ZIG_VERSION}.tar.xz"
+    ZIG_TAR="zig-${ZIG_ARCH}-macos-${ZIG_VERSION}.tar.xz"
     ZIG_URL="https://ziglang.org/download/${ZIG_VERSION}/${ZIG_TAR}"
 
     echo "Downloading Zig ${ZIG_VERSION} for ${ZIG_ARCH} ..."
     curl -fL "${ZIG_URL}" -o "/tmp/${ZIG_TAR}"
     tar -xJf "/tmp/${ZIG_TAR}" -C /tmp
-    sudo ln -sf "/tmp/zig-macos-${ZIG_ARCH}-${ZIG_VERSION}/zig" /usr/local/bin/zig
+    sudo ln -sf "/tmp/zig-${ZIG_ARCH}-macos-${ZIG_VERSION}/zig" /usr/local/bin/zig
     zig version
 """
 

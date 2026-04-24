@@ -38,15 +38,17 @@ jobs:
           RAW_ARCH=$(uname -m)
           if [ "$RAW_ARCH" = "arm64" ]; then ZIG_ARCH="aarch64"; else ZIG_ARCH="$RAW_ARCH"; fi
           brew install xz || true
-          curl -fL "https://ziglang.org/download/${ZIG_VERSION}/zig-macos-${ZIG_ARCH}-${ZIG_VERSION}.tar.xz" \
-            | tar -xJ -C /tmp
-          sudo ln -sf "/tmp/zig-macos-${ZIG_ARCH}-${ZIG_VERSION}/zig" /usr/local/bin/zig
+          curl -fL "https://ziglang.org/download/${ZIG_VERSION}/zig-${ZIG_ARCH}-macos-${ZIG_VERSION}.tar.xz" \
+            -o "/tmp/zig.tar.xz"
+          tar -xJf "/tmp/zig.tar.xz" -C /tmp
+          sudo ln -sf "/tmp/zig-${ZIG_ARCH}-macos-${ZIG_VERSION}/zig" /usr/local/bin/zig
         else
           ARCH=$(uname -m)
           sudo apt-get install -y xz-utils 2>/dev/null || true
-          curl -fL "https://ziglang.org/download/${ZIG_VERSION}/zig-linux-${ARCH}-${ZIG_VERSION}.tar.xz" \
-            | tar -xJ -C /tmp
-          sudo ln -sf "/tmp/zig-linux-${ARCH}-${ZIG_VERSION}/zig" /usr/local/bin/zig
+          curl -fL "https://ziglang.org/download/${ZIG_VERSION}/zig-${ARCH}-linux-${ZIG_VERSION}.tar.xz" \
+            -o "/tmp/zig.tar.xz"
+          tar -xJf "/tmp/zig.tar.xz" -C /tmp
+          sudo ln -sf "/tmp/zig-${ARCH}-linux-${ZIG_VERSION}/zig" /usr/local/bin/zig
         fi
         zig version
 
