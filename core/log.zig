@@ -75,49 +75,52 @@ pub fn logFn(
     comptime format: []const u8,
     args: anytype,
 ) void {
-    if (comptime misc.is_wasm) return;
+    // On wasm32-freestanding std.Io.Threaded / std.posix are unavailable.
+    // Wrap the entire native body in a comptime branch so Zig does not even
+    // attempt to type-check std.Io.Writer on that target.
+    if (comptime !misc.is_wasm) {
+        // Runtime gate — one atomic load; returns immediately when silent.
+        if (levelNum(level) < g_level.load(.acquire)) return;
 
-    // Runtime gate — one atomic load; returns immediately when silent.
-    if (levelNum(level) < g_level.load(.acquire)) return;
+        // ── build the full log line into a stack buffer ───────────────────────
+        var buf: [2048]u8 = undefined;
+        var w = std.Io.Writer.fixed(&buf);
 
-    // ── build the full log line into a stack buffer ───────────────────────
-    var buf: [2048]u8 = undefined;
-    var w = std.Io.Writer.fixed(&buf);
+        // Level label padded to 9 characters: "DEBUG:   " / "WARNING: " etc.
+        w.writeAll(comptime levelLabel(level)) catch return;
+        w.writeByte(':')                       catch return;
+        w.writeAll(comptime levelPad(level))   catch return;
 
-    // Level label padded to 9 characters: "DEBUG:   " / "WARNING: " etc.
-    w.writeAll(comptime levelLabel(level)) catch return;
-    w.writeByte(':')                       catch return;
-    w.writeAll(comptime levelPad(level))   catch return;
+        // UTC timestamp  YYYY-MM-DD HH:MM:SS
+        {
+            var ts: std.c.timespec = undefined;
+            _ = std.c.clock_gettime(.REALTIME, &ts);
+            const secs: u64 = @intCast(ts.sec);
+            const es = epoch.EpochSeconds{ .secs = secs };
+            const ed = es.getEpochDay();
+            const ds = es.getDaySeconds();
+            const yd = ed.calculateYearDay();
+            const md = yd.calculateMonthDay();
+            w.print(" {d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2}", .{
+                yd.year,
+                md.month.numeric(),
+                md.day_index + 1,
+                ds.getHoursIntoDay(),
+                ds.getMinutesIntoHour(),
+                ds.getSecondsIntoMinute(),
+            }) catch return;
+        }
 
-    // UTC timestamp  YYYY-MM-DD HH:MM:SS
-    {
-        var ts: std.c.timespec = undefined;
-        _ = std.c.clock_gettime(.REALTIME, &ts);
-        const secs: u64 = @intCast(ts.sec);
-        const es = epoch.EpochSeconds{ .secs = secs };
-        const ed = es.getEpochDay();
-        const ds = es.getDaySeconds();
-        const yd = ed.calculateYearDay();
-        const md = yd.calculateMonthDay();
-        w.print(" {d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2}", .{
-            yd.year,
-            md.month.numeric(),
-            md.day_index + 1,
-            ds.getHoursIntoDay(),
-            ds.getMinutesIntoHour(),
-            ds.getSecondsIntoMinute(),
-        }) catch return;
+        // Scope column  " | native[scope] | "
+        w.print(" | native[{s}] | ", .{comptime @tagName(scope)}) catch return;
+
+        // User message
+        w.print(format ++ "\n", args) catch {
+            w.writeAll("<message truncated>\n") catch {};
+        };
+
+        // Single write(2) call — atomic for writes up to PIPE_BUF (≥512 B)
+        const written = std.Io.Writer.buffered(&w);
+        _ = write(2, written.ptr, written.len);
     }
-
-    // Scope column  " | native[scope] | "
-    w.print(" | native[{s}] | ", .{comptime @tagName(scope)}) catch return;
-
-    // User message
-    w.print(format ++ "\n", args) catch {
-        w.writeAll("<message truncated>\n") catch {};
-    };
-
-    // Single write(2) call — atomic for writes up to PIPE_BUF (≥512 B)
-    const written = std.Io.Writer.buffered(&w);
-    _ = write(2, written.ptr, written.len);
 }

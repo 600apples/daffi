@@ -5,6 +5,20 @@ const ArenaAllocator = std.heap.ArenaAllocator;
 const allocator = std.heap.wasm_allocator;
 const MessageDecoder = @import("serde.zig").MessageDecoder;
 
+// Override std.log so that std.log.* calls anywhere in the wasm compilation
+// unit resolve to this no-op instead of defaultLog, which pulls in
+// std.Io.Threaded / std.posix — unavailable on wasm32-freestanding.
+pub const std_options: std.Options = .{
+    .logFn = wasmLogFn,
+};
+
+fn wasmLogFn(
+    comptime _: std.log.Level,
+    comptime _: @EnumLiteral(),
+    comptime _: []const u8,
+    _: anytype,
+) void {}
+
 pub const os = struct {
     pub const system = struct {
         pub const fd_t = u8;
@@ -135,7 +149,9 @@ export fn parseAndStoreMessage(data: [*:0]const u8, len: u32, conn_num: u32) voi
             const is_own = std.mem.eql(u8, msg.getTransmitter(), client_handler.app_name);
             if (is_own) {
                 // Own handshake response: clear + full rebuild, then resolve the JS promise.
-                client_handler.onHandshake(connection, msg) catch |err| {
+                // wasm owns the message (defer deinit above), so consumed is a dummy.
+                var consumed = false;
+                client_handler.onHandshake(connection, msg, &consumed) catch |err| {
                     consoleLog("failed to handle own handshake: {any}\n", .{err});
                     throwError("failed to handle own handshake\n");
                 };
@@ -154,7 +170,9 @@ export fn parseAndStoreMessage(data: [*:0]const u8, len: u32, conn_num: u32) voi
             // Update local chan_mapper before notifying JS event handlers so
             // that any RPC triggered from within an event handler sees the
             // correct (already-updated) member list.
-            client_handler.onEvent(connection, msg) catch {};
+            // wasm owns the message (defer deinit above), so consumed is a dummy.
+            var consumed = false;
+            client_handler.onEvent(connection, msg, &consumed) catch {};
             _triggerEvent(payload.ptr, payload.len);
         },
         else => unreachable,

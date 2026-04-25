@@ -157,8 +157,15 @@ function _generateClientName() {
     return `${host}-0x${rand.toString(16).padStart(8, '0')}`;
 }
 
-// CDN URL for the WASM binary — pinned to the release tag, not user-configurable.
-const _WASM_URL = 'https://cdn.jsdelivr.net/gh/600apples/daffi@2.0.0/js-client/app.wasm';
+// Resolve app.wasm relative to wherever daffi.js was loaded from.
+// This works for local dev servers and CDN alike: if daffi.js was fetched
+// from  https://cdn.../daffi.js  then app.wasm is  https://cdn.../app.wasm.
+// Falls back to the same directory as the HTML page when currentScript is
+// unavailable (e.g. loaded as an ES module via import()).
+const _WASM_URL = (() => {
+    const s = document.currentScript;
+    return (s && s.src) ? new URL('app.wasm', s.src).href : './app.wasm';
+})();
 
 function DaffiClient(name, options) {
     // Allow DaffiClient(options) — name omitted entirely.
