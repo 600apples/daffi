@@ -1,5 +1,9 @@
 """
 Colored logger factory for daffi components.
+
+To enable native Zig log output call :func:`sync_native_log_level` (or
+call ``dfcore.setLogLevel(n)`` directly) **before** constructing any
+Application.  The native layer is silent by default (level 4 = off).
 """
 
 import sys
@@ -9,6 +13,42 @@ from typing import Callable
 from daffi.utils import colors
 
 logging.basicConfig(level=logging.INFO)
+
+
+def _python_level_to_native(python_level: int) -> int:
+    """Convert a Python logging level integer to the Zig native level.
+
+    Python levels:   DEBUG=10  INFO=20  WARNING=30  ERROR=40
+    Zig native:      0=debug   1=info   2=warning   3=error  4=off
+    """
+    if python_level <= logging.DEBUG:
+        return 0
+    elif python_level <= logging.INFO:
+        return 1
+    elif python_level <= logging.WARNING:
+        return 2
+    elif python_level <= logging.ERROR:
+        return 3
+    return 4  # off
+
+
+def sync_native_log_level(python_level: int | None = None) -> None:
+    """Push the current (or supplied) Python log level to the native layer.
+
+    Safe to call at any time; silently does nothing if *dfcore* is not yet
+    importable (e.g. during wheel build / docs generation).
+
+    Args:
+        python_level: explicit Python level integer.  When *None* (default)
+                      the effective level of the root logger is used.
+    """
+    if python_level is None:
+        python_level = logging.getLogger().getEffectiveLevel()
+    try:
+        from daffi import dfcore  # local import to avoid circular imports
+        dfcore.setLogLevel(_python_level_to_native(python_level))
+    except Exception:
+        pass
 
 
 class DaffiLoggerAdapter(logging.LoggerAdapter):

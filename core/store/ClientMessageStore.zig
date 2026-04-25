@@ -38,24 +38,19 @@ inline fn signalWakeup(self: *ClientMessageStore) void {
 /// Store a response message.
 /// Returns error.StoreFull when another message already occupies the slot
 /// (hash collision from having >= buf_size simultaneous in-flight RPCs).
-///
-/// On success the registered ``wakeup_fd`` (if any) is signalled so the
-/// Python ``RpcResult`` waiters can return without polling.  Signalling
-/// happens *after* the slot is published under the store mutex so any
-/// waiter awakened by the signal is guaranteed to observe the message.
 pub fn insert(self: *ClientMessageStore, msg: *Message) !void {
-    {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        const uuid = msg.getUuid();
-        const hash = @rem(uuid, buf_size);
-        if (self.buf[hash] != null) return error.StoreFull;
-        self.buf[hash] = msg;
-    }
-    // Signal *after* releasing the store mutex.  The slot is already
-    // published, so waiters that wake up will find the message.  Doing
-    // this outside the lock keeps the critical section short and avoids
-    // any chance of holding the store mutex across a syscall.
+    self.mutex.lock();
+    defer self.mutex.unlock();
+    const uuid = msg.getUuid();
+    const hash = @rem(uuid, buf_size);
+    if (self.buf[hash] != null) return error.StoreFull;
+    self.buf[hash] = msg;
+}
+
+/// Explicitly notify Python ``RpcResult`` waiters that a new response may
+/// be available.  Called by ``ClientHandler.wakeupFn`` *after* the
+/// dispatcher has finished inspecting ``message.metadata.durable``.
+pub fn triggerWakeup(self: *ClientMessageStore) void {
     self.signalWakeup();
 }
 

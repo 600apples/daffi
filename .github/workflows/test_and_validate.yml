@@ -56,7 +56,7 @@ jobs:
         zig version
 
     - name: Install package
-      run: pip install -e ".[msgpack]"
+      run: pip install -e ".[tests]"
 
     - name: Run tests
       run: python -m pytest tests/ -x -q

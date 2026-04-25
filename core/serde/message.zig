@@ -149,7 +149,6 @@ const Metadata = struct {
     transmitter: ?[]const u8 = null,
     receiver: ?[]const u8 = null,
     func_name: ?[]const u8 = null,
-    durable: bool = false,
 
     pub fn initFromMetadataFromStr(self: *Metadata, metadata_str: []const u8) void {
         // metadata_str is in format: transmitter|receiver|func_name
@@ -215,19 +214,10 @@ pub const Message = struct {
     }
 
     pub fn deinit(self: *Message) void {
-        if (self.metadata.durable) return;
         self.allocator.free(self.data);
         self.allocator.destroy(self);
     }
 
-    pub fn setDurable(self: *Message) void {
-        self.metadata.durable = true;
-    }
-
-    pub fn undurableAndDeinit(self: *Message) void {
-        self.metadata.durable = false;
-        self.deinit();
-    }
 
     fn msgEndPos(self: *Message) usize {
         // Message length including all parts (header, metadata and data)
@@ -448,11 +438,11 @@ pub const RawMessage = struct {
     }
 };
 
-pub fn createHandshakeMessage(allocator: Allocator, memberdata: []serde.Handshake.MemberData, uuid: @FieldType(Header, "uuid"), password: ?[]const u8, comptime hstype: []const u8) !*Message {
+pub fn createHandshakeMessage(allocator: Allocator, memberdata: []serde.Handshake.MemberData, uuid: @FieldType(Header, "uuid"), comptime hstype: []const u8) !*Message {
     // gonna be using arena allocator to free dynamically allocated memory for json related stuff
     var arena = ArenaAllocator.init(allocator);
     defer arena.deinit();
-    var handshake = try serde.Handshake.create(arena.allocator(), memberdata, password, hstype);
+    var handshake = try serde.Handshake.create(arena.allocator(), memberdata, hstype);
     const handshake_data = try handshake.toJson(arena.allocator());
     var raw_message = try RawMessage.create(allocator, handshake_data, uuid, .HANDSHAKE, .JSON, false, false, null, null, null);
     return try Message.fromRawMessage(allocator, &raw_message);

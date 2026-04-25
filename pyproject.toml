@@ -32,6 +32,10 @@ dependencies = []
 
 [project.optional-dependencies]
 msgpack = ["msgpack>=1.0"]
+tests = [
+    "pytest>=7.0",
+    "msgpack>=1.0",
+]
 
 [project.urls]
 Homepage    = "https://github.com/600apples/daffi"

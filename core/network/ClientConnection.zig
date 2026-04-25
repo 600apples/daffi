@@ -37,7 +37,6 @@ pub const Config = struct {
     /// PEM file path for a CA bundle used to verify the server certificate.
     /// Empty string disables peer verification.
     ca_file: []const u8 = "",
-    password: []const u8 = "",
 };
 
 const zero_timeout = std.mem.toBytes(posix.timeval{ .tv_sec = 0, .tv_usec = 0 });

@@ -14,11 +14,17 @@ from __future__ import annotations
 
 import multiprocessing as mp
 import threading
-import time
 
 import pytest
 
-from conftest import HOST, TIMEOUT, wait_for_port, silence_subprocess, quiet_kill
+from conftest import (
+    HOST,
+    TIMEOUT,
+    wait_for_port,
+    wait_for_members,
+    silence_subprocess,
+    quiet_kill,
+)
 
 N_THREADS         = 50    # concurrent callers per scenario
 CALLS_PER_THREAD  = 20    # sequential calls inside each thread
@@ -83,7 +89,9 @@ def conc_service(free_port):
     proc = mp.Process(target=_proc_service, args=(free_port,), daemon=True)
     proc.start()
     wait_for_port(free_port)
-    time.sleep(0.15)
+    # Deterministic — replaces a fixed sleep that occasionally raced
+    # registration on slower CI runners.
+    wait_for_members(free_port, {"conc-service"}, probe_name="_conc-svc-probe")
     yield free_port
     quiet_kill(proc)
 
@@ -95,7 +103,10 @@ def conc_router(free_port):
     wait_for_port(free_port)
     wproc = mp.Process(target=_proc_worker, args=(free_port,), daemon=True)
     wproc.start()
-    time.sleep(0.4)
+    # Block until the router actually has the worker registered — without this
+    # the test occasionally fires its first echo() before conc-worker has
+    # finished its handshake, surfacing as ReceiverNotFound.
+    wait_for_members(free_port, {"conc-worker"}, probe_name="_conc-rtr-probe")
     yield free_port
     quiet_kill(wproc)
     quiet_kill(rproc)

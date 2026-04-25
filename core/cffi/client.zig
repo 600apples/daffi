@@ -21,19 +21,17 @@ const allocator = std.heap.c_allocator;
 pub fn startClient(_: [*c]PyObject, args: [*c]PyObject) callconv(.c) [*c]PyObject {
     var host: [*:0]u8 = undefined;
     var port: c_long = undefined;
-    var password: [*:0]u8 = undefined;
     var app_name: [*:0]u8 = undefined;
     var tls_enabled: c_int = 0;
     var ca_file: [*:0]u8 = undefined;
-    if (!(py.PyArg_ParseTuple(args, "slssps", &host, &port, &password, &app_name, &tls_enabled, &ca_file) != 0)) return Py_BuildValue("");
+    if (!(py.PyArg_ParseTuple(args, "slsps", &host, &port, &app_name, &tls_enabled, &ca_file) != 0)) return Py_BuildValue("");
     const pport: u16 = @intCast(port);
     const phost = std.mem.span(host);
-    const ppassword = std.mem.span(password);
     const papp_name = std.mem.span(app_name);
     const ptls = tls_enabled != 0;
     const pca_file = std.mem.span(ca_file);
     const conn_num = Client.init(allocator, papp_name, .{
-        .host = phost, .port = pport, .password = ppassword,
+        .host = phost, .port = pport,
         .tls = ptls, .ca_file = pca_file,
     }) catch return Py_BuildValue("");
     return Py_BuildValue("k", @as(c_ulong, conn_num));
@@ -95,16 +93,14 @@ pub fn sendMessageFromClient(_: [*c]PyObject, args: [*c]PyObject) callconv(.c) [
 /// Send the initial client handshake advertising exported method names.
 /// Returns (uuid, timestamp, found_receiver).  Raises ValueError on failure.
 pub fn sendHandshakeFromClient(_: [*c]PyObject, args: [*c]PyObject) callconv(.c) [*c]PyObject {
-    var password: [*:0]u8 = undefined;
     var methods: [*:0]u8 = undefined;
     var conn_num: usize = undefined;
-    if (!(py.PyArg_ParseTuple(args, "ssk", &password, &methods, &conn_num) != 0)) {
+    if (!(py.PyArg_ParseTuple(args, "sk", &methods, &conn_num) != 0)) {
         PyErr_SetString(py.PyExc_ValueError, "unable to parse provided arguments");
         return null;
     }
-    const ppassword = std.mem.span(password);
     const pmethods = std.mem.span(methods);
-    const msgident = Client.sendHandshake(conn_num, ppassword, pmethods) catch |err| {
+    const msgident = Client.sendHandshake(conn_num, pmethods) catch |err| {
         PyErr_SetString(py.PyExc_ValueError, @errorName(err));
         return null;
     };
@@ -122,7 +118,7 @@ pub fn getMessageFromClientStore(_: [*c]PyObject, args: [*c]PyObject) callconv(.
         const err_name = @errorName(err)[0..];
         return Py_BuildValue("(s#)", err_name.ptr, err_name.len);
     }) orelse return Py_BuildValue("");
-    defer msg.undurableAndDeinit();
+    defer msg.deinit();
     const data: []const u8 = msg.getData();
     const flag: c_ushort = @intFromEnum(msg.getFlag());
     const decoder: c_ushort = @intFromEnum(msg.getDecoder());
@@ -146,7 +142,7 @@ pub fn getMessageForClientWorker(_: [*c]PyObject, args: [*c]PyObject) callconv(.
     var conn_num: usize = undefined;
     if (!(py.PyArg_ParseTuple(args, "k", &conn_num) != 0)) return Py_BuildValue("");
     var msg = (Client.getMessageForClientWorker(conn_num) catch return Py_BuildValue("")) orelse return Py_BuildValue("");
-    defer msg.undurableAndDeinit();
+    defer msg.deinit();
     const uuid: c_uint = @as(c_uint, msg.getUuid());
     const data: []const u8 = msg.getData();
     const flag: c_ushort = @intFromEnum(msg.getFlag());
@@ -197,6 +193,21 @@ pub fn setClientResponseFd(_: [*c]PyObject, args: [*c]PyObject) callconv(.c) [*c
     var fd: c_int = undefined;
     if (!(py.PyArg_ParseTuple(args, "ki", &conn_num, &fd) != 0)) return null;
     Client.setResponseFd(@intCast(conn_num), @intCast(fd)) catch return Py_BuildValue("");
+    return Py_BuildValue("");
+}
+
+/// Set the native Zig log level at runtime.
+///
+/// level values: 0=DEBUG  1=INFO  2=WARNING  3=ERROR  4=OFF (default, silent)
+///
+/// setLogLevel(level: int) -> None
+pub fn setLogLevel(_: [*c]PyObject, args: [*c]PyObject) callconv(.c) [*c]PyObject {
+    var level: c_int = 4;
+    if (!(py.PyArg_ParseTuple(args, "i", &level) != 0)) return Py_BuildValue("");
+    const clamped: u32 = @intCast(@max(0, @min(4, level)));
+    @import("../log.zig").setLevel(clamped);
+    // Emit a confirmation log so callers can see the level took effect.
+    std.log.scoped(.dfcore).info("native log level set to {d}", .{clamped});
     return Py_BuildValue("");
 }
 

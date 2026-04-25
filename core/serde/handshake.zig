@@ -40,8 +40,10 @@ pub const Handshake = struct {
     };
 
     const Meta = struct {
-        password: []const u8,
         type: []const u8,
+        // Set by the server on a rejection reply (e.g. duplicate app_name).
+        // ``error`` is a Zig keyword → @"…" identifier syntax.
+        @"error": ?[]const u8 = null,
     };
 
     pub fn fromJson(allocator: Allocator, data: []const u8) !json.Parsed(Handshake) {
@@ -52,7 +54,7 @@ pub const Handshake = struct {
         return try std.json.Stringify.valueAlloc(allocator, self, .{});
     }
 
-    pub fn create(allocator: Allocator, memberdata: []const MemberData, password: ?[]const u8, connection_type: ?[]const u8) !Handshake {
+    pub fn create(allocator: Allocator, memberdata: []const MemberData, connection_type: ?[]const u8) !Handshake {
         var members = try allocator.alloc(Member, memberdata.len);
         var methods: ?[][]const u8 = undefined;
         for (memberdata, 0..) |md, mem_idx| {
@@ -66,6 +68,20 @@ pub const Handshake = struct {
             }
             members[mem_idx] = .{ .name = md.name, .methods = methods };
         }
-        return .{ .meta = .{ .password = password orelse PLACEHOLDER, .type = connection_type orelse PLACEHOLDER }, .members = members };
+        return .{ .meta = .{ .type = connection_type orelse PLACEHOLDER }, .members = members };
+    }
+
+    /// Build a *rejection* handshake reply: empty member list, ``meta.error``
+    /// set to *reason*.  The connecting peer parses the same JSON and
+    /// inspects ``meta.error`` to detect that the handshake was refused.
+    pub fn createRejection(allocator: Allocator, connection_type: []const u8, reason: []const u8) !Handshake {
+        const members = try allocator.alloc(Member, 0);
+        return .{
+            .meta = .{
+                .type = connection_type,
+                .@"error" = reason,
+            },
+            .members = members,
+        };
     }
 };

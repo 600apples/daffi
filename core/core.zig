@@ -6,6 +6,15 @@
 //! role without scrolling through one giant flat list.
 
 const std = @import("std");
+
+/// Keep all log levels compiled in; the runtime gate in log.logFn filters
+/// by the Python-controlled g_level atomic.  Users call dfcore.setLogLevel()
+/// to enable native debug output at runtime without a recompile.
+pub const std_options: std.Options = .{
+    .log_level = .debug,
+    .logFn    = @import("log.zig").logFn,
+};
+
 const py = @import("python.zig").c;
 const PyObject = py.PyObject;
 const PyMethodDef = py.PyMethodDef;
@@ -22,7 +31,7 @@ const server_methods = [_]PyMethodDef{
         .ml_meth  = cffi.startServer,
         .ml_flags = 1,
         .ml_doc   =
-            \\startServer(host, port, mode, password, app_name, tls, cert_file, key_file) -> int | None
+            \\startServer(host, port, mode, app_name, tls, cert_file, key_file) -> int | None
             \\
             \\Bind to host:port and start the server dispatcher thread.
             \\Returns a conn_num handle, or None on failure.
@@ -118,7 +127,7 @@ const client_methods = [_]PyMethodDef{
         .ml_meth  = cffi.startClient,
         .ml_flags = 1,
         .ml_doc   =
-            \\startClient(host, port, password, app_name, tls, ca_file) -> int | None
+            \\startClient(host, port, app_name, tls, ca_file) -> int | None
             \\
             \\Open a TCP connection and return a conn_num handle, or None on failure.
             \\
@@ -153,7 +162,7 @@ const client_methods = [_]PyMethodDef{
         .ml_meth  = cffi.sendHandshakeFromClient,
         .ml_flags = 1,
         .ml_doc   =
-            \\sendHandshakeFromClient(password, methods, conn_num)
+            \\sendHandshakeFromClient(methods, conn_num)
             \\    -> (uuid, timestamp, found_receiver)
             \\
             \\Send the initial client handshake.
@@ -239,8 +248,31 @@ const client_methods = [_]PyMethodDef{
     },
 };
 
+// ── Logging / utility methods ─────────────────────────────────────────────────
+const util_methods = [_]PyMethodDef{
+    .{
+        .ml_name  = "setLogLevel",
+        .ml_meth  = cffi.setLogLevel,
+        .ml_flags = 1,
+        .ml_doc   =
+            \\setLogLevel(level: int) -> None
+            \\
+            \\Set the native Zig log level at runtime:
+            \\  0 → DEBUG    (most verbose)
+            \\  1 → INFO
+            \\  2 → WARNING
+            \\  3 → ERROR
+            \\  4 → OFF      (default — silent)
+            \\
+            \\Typically called with the numeric equivalent of the Python
+            \\root-logger level so that native log messages appear iff the
+            \\Python logger would also emit them.
+        ,
+    },
+};
+
 // ── Combined method table ─────────────────────────────────────────────────────
-var methods = server_methods ++ client_methods ++ [_]PyMethodDef{
+var methods = server_methods ++ client_methods ++ util_methods ++ [_]PyMethodDef{
     .{ .ml_name = null, .ml_meth = null, .ml_flags = 0, .ml_doc = null },
 };
 

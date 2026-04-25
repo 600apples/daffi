@@ -13,6 +13,7 @@ const MessageHandler = handlers.MessageHandler;
 const Message = serde.Message;
 const MessageFlag = serde.MessageFlag;
 const MessagePool = serde.MessagePool;
+const log = std.log.scoped(.server);
 const MessageDecoder = serde.MessageDecoder;
 
 /// Replacement for std.BoundedArray (removed in Zig 0.16).
@@ -144,14 +145,26 @@ pub fn messageDispatcher(allocator: Allocator, app_name: []const u8, config: Ser
     const server_entry = ServerEntry{ .connection = conn, .msgpool = msgpool, .server_handler = server_handler };
     serverEntries.?.set(conn_num, server_entry);
     serverReady[conn_num].store(true, .release);
+    log.debug("{s}[{s}] listening on {s}:{d} conn_num={d}", .{
+        @tagName(config.mode),
+        app_name,
+        config.host orelse "0.0.0.0",
+        config.port,
+        conn_num,
+    });
     // Conection normally should be closed by destroyConnection method.
     // msgpool.deinit should happen after connection is closed.
-    defer msgpool.deinit();
+    defer {
+        log.debug("{s}[{s}] accept-loop exited conn_num={d}", .{ @tagName(config.mode), app_name, conn_num });
+        msgpool.deinit();
+    }
     while (!conn.suspended) {
         if (conn.accept()) |client_conn| {
             // Pass handler BY VALUE so std.Thread.spawn copies it into the thread's
             // own argument storage.  Taking &server_handler.X.handler() would capture
             // the address of a temporary that is destroyed before the new thread runs.
+            if (client_conn.peer_addr) |addr|
+                log.debug("{s}[{s}] accepted connection from {f}", .{ @tagName(config.mode), app_name, @import("network/connection.zig").fmtNetAddr(addr) });
             var th = if (client_conn.is_websocket)
                 switch (config.mode) {
                     .Service => try std.Thread.spawn(.{}, serverWsLoop, .{ client_conn, msgpool, server_handler.Service.handler() }),
@@ -163,56 +176,50 @@ pub fn messageDispatcher(allocator: Allocator, app_name: []const u8, config: Ser
             };
             th.detach();
         } else |err| {
-            std.debug.print("failed to accept connection {}\n", .{err});
+            log.warn("failed to accept connection: {}", .{err});
         }
     }
 }
 
 fn serverLoop(conn: *ServerHandler.ConnectionT, msgpool: *MessagePool, msg_handler: anytype) !void {
+    if (conn.peer_addr) |addr|
+        log.debug("serverLoop started for {f}", .{@import("network/connection.zig").fmtNetAddr(addr)});
     defer {
-        if (comptime @import("builtin").mode == .Debug)
-            if (conn.peer_addr) |addr|
-                std.debug.print("connection closed from {f}\n", .{@import("network/connection.zig").fmtNetAddr(addr)});
+        if (conn.peer_addr) |addr|
+            log.debug("serverLoop exiting for {f}", .{@import("network/connection.zig").fmtNetAddr(addr)});
         conn.destroy();
     }
     while (msgpool.receiveMessage(conn)) |message| {
         // OWNERSHIP PROTOCOL
         // ------------------
-        // handle() may call onRequest() which:
-        //   1. Sets message.metadata.durable = true
-        //   2. Pushes the message into the TasksQueue
+        // handle() transfers ownership via the `consumed` out-parameter:
+        // if consumed=true the handler (e.g. onRequest) owns the message and
+        // will free it later (via deinit()); we must not free it here.
         //
-        // Previously, TasksQueue.pushMessageToQueue() immediately wrote to the
-        // eventfd, which could wake the Python poller *before* this thread
-        // reached the old `defer message.deinit()`.  The poller would then call
-        // undurableAndDeinit() — setting durable=false and freeing the message —
-        // while this thread still had a live pointer to it, causing a use-after-
-        // free when the defer later read `metadata.durable` from freed memory.
-        //
-        // Fix: pushMessageToQueue() no longer signals the wakeup.  We check
-        // `metadata.durable` here (safe: no Python thread is awake yet), free
-        // the message if this thread still owns it, and THEN call triggerWakeup()
-        // so the Python poller can safely take ownership of queued messages.
-        msg_handler.handle(conn, message) catch |err| {
-            // handle() failed before (or during) ownership transfer.  The
-            // message was never successfully pushed, so we own it and must free.
-            // Force-clear durable in case setDurable() was called before the
-            // failing pushMessageToQueue().
-            message.metadata.durable = false;
-            message.deinit();
+
+        var consumed = false;
+        msg_handler.handle(conn, message, &consumed) catch |err| {
+            // handle() failed before (or during) ownership transfer.
+            // If not consumed, this thread still owns the message and must free it.
+            if (!consumed) message.deinit();
             // Still flush any wakeup that a prior successful push may have
             // set before the error occurred.
             msg_handler.triggerWakeup();
             try msg_handler.handleErr(conn, err);
             return;
         };
-        // handle() succeeded.  No Python thread has been notified yet.
-        // Safe to inspect (and possibly act on) message.metadata.durable.
-        if (!message.metadata.durable) message.deinit();
+        // handle() succeeded.  consumed tells us who owns the message.
+        // Do NOT read message fields when consumed==true — Python may have
+        // already freed it.
+        if (!consumed) message.deinit();
         // NOW wake the Python poller.  From this point the Python side may
-        // dequeue and free any durable messages.
+        // dequeue and free any consumed messages.
         msg_handler.triggerWakeup();
-    } else |err| try msg_handler.handleErr(conn, err);
+    } else |err| {
+        if (conn.peer_addr) |addr|
+            log.warn("serverLoop recv error from {f}: {}", .{ @import("network/connection.zig").fmtNetAddr(addr), err });
+        try msg_handler.handleErr(conn, err);
+    }
     try msg_handler.handleDisconnect(conn);
     // Wake the Python poller so it can pick up the "disconnected" event message
     // that handleDisconnect() pushed onto the task queue.
@@ -221,23 +228,22 @@ fn serverLoop(conn: *ServerHandler.ConnectionT, msgpool: *MessagePool, msg_handl
 
 fn serverWsLoop(conn: *ServerHandler.ConnectionT, msgpool: *MessagePool, msg_handler: anytype) !void {
     defer {
-        if (comptime @import("builtin").mode == .Debug)
-            if (conn.peer_addr) |addr|
-                std.debug.print("connection closed from {f}\n", .{@import("network/connection.zig").fmtNetAddr(addr)});
+        if (conn.peer_addr) |addr|
+            log.debug("ws connection closed from {f}", .{@import("network/connection.zig").fmtNetAddr(addr)});
         conn.destroy();
     }
     while (msgpool.receiveWsMessage(conn)) |maybe_message| {
         var message = maybe_message orelse break;
         // Apply the same ownership protocol as serverLoop (see detailed comment
         // there).  WebSocket messages follow identical lifetime rules.
-        msg_handler.handle(conn, message) catch |err| {
-            message.metadata.durable = false;
-            message.deinit();
+        var consumed = false;
+        msg_handler.handle(conn, message, &consumed) catch |err| {
+            if (!consumed) message.deinit();
             msg_handler.triggerWakeup();
             try msg_handler.handleErr(conn, err);
             return;
         };
-        if (!message.metadata.durable) message.deinit();
+        if (!consumed) message.deinit();
         msg_handler.triggerWakeup();
     } else |err| try msg_handler.handleErr(conn, err);
     try msg_handler.handleDisconnect(conn);

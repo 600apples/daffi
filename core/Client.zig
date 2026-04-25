@@ -22,7 +22,7 @@ const PLACEHOLDER = serde.PLACEHOLDER;
 const Allocator = std.mem.Allocator;
 const ArenaAllocator = std.heap.ArenaAllocator;
 const misc = @import("misc.zig");
-const print = misc.print;
+const log = std.log.scoped(.client);
 const is_wasm = misc.is_wasm;
 
 const Client = @This();
@@ -84,10 +84,30 @@ const ClientEntry = struct {
 
     /// Close the connection and free all associated resources.
     ///
-    /// For native targets: closes the socket (which unblocks the dispatcher's
-    /// recv via shutdown), waits for the dispatcher's defer block to finish
-    /// freeing connection/msgpool and set disconnected=true, then frees the
-    /// ClientEntry struct itself.
+    /// For native targets this is a two-phase shutdown that eliminates the race
+    /// between the Zig dispatcher thread freeing shared resources and Python
+    /// worker threads that are still inside sendMessageClientEntry / msgpool:
+    ///
+    ///   Phase 1 — signal & wait
+    ///     If the dispatcher is still running (disconnected == false), close the
+    ///     connection socket so the dispatcher's receiveMessage returns with EOF.
+    ///     Then spin until the dispatcher has set disconnected = true.  At that
+    ///     point the dispatcher has exited its receive loop and will never touch
+    ///     connection or msgpool again.
+    ///
+    ///   Phase 2 — free resources
+    ///     destroy() is always called by Python *after* stop_for_connection()
+    ///     has joined all task-dispatcher worker threads.  So by the time we
+    ///     arrive here, no Python thread is executing inside sendMessageClientEntry
+    ///     either.  It is therefore safe to free connection and msgpool.
+    ///
+    ///   Why not free in the dispatcher's defer?
+    ///     When the router crashes the disconnect watcher wakes first (from
+    ///     triggerDisconnect), schedules client.stop() which joins the 100 Python
+    ///     worker threads, and then calls stopClient/destroy().  If the dispatcher
+    ///     freed msgpool in its defer immediately after triggerDisconnect(), those
+    ///     100 workers could still be in the middle of msgpool.sendMessage → SIGABRT
+    ///     (from the Zig assert in destroyChannelLocked) or SIGSEGV.
     ///
     /// For WASM: no dispatcher thread exists, so resources are freed directly.
     pub fn destroy(self: *ClientEntry) void {
@@ -98,41 +118,62 @@ const ClientEntry = struct {
             self.alloc.destroy(self);
             return;
         }
+        // Phase 1 — wait for the dispatcher thread to exit its receive loop.
         if (!self.disconnected.load(.acquire)) {
+            log.debug("[{s}] destroy phase-1: closing connection, waiting for dispatcher", .{self.client_handler.app_name});
             self.connection.close();
+            var spins: usize = 0;
             while (!self.disconnected.load(.acquire)) {
                 const ts = std.c.timespec{ .sec = 0, .nsec = 1_000_000 };
                 _ = std.c.nanosleep(&ts, null);
+                spins += 1;
+                if (spins % 500 == 0)
+                    log.warn("[{s}] destroy phase-1: still waiting for dispatcher after ~{d}ms", .{ self.client_handler.app_name, spins });
             }
+            log.debug("[{s}] destroy phase-1: dispatcher exited after ~{d}ms", .{ self.client_handler.app_name, spins });
+        } else {
+            log.debug("[{s}] destroy phase-1: dispatcher already exited (disconnected=true)", .{self.client_handler.app_name});
         }
+        // Phase 2 — safe to free: dispatcher is done, Python workers are joined.
+        log.debug("[{s}] destroy phase-2: freeing connection + msgpool", .{self.client_handler.app_name});
+        self.connection.destroy();
+        self.msgpool.deinit();
         self.client_handler.deinit();
         self.alloc.destroy(self);
     }
 
     fn messageDispatcherClientEntry(self: *ClientEntry) !void {
+        // Only set the flag — connection and msgpool are freed by destroy()
+        // after Python has joined all worker threads (see destroy() doc above).
+        log.debug("[{s}] dispatcher started", .{self.client_handler.app_name});
         defer {
-            self.connection.destroy();
-            self.msgpool.deinit();
+            log.debug("[{s}] dispatcher exiting — setting disconnected=true", .{self.client_handler.app_name});
             self.disconnected.store(true, .release);
         }
         var msg_handler = self.client_handler.handler();
-        while (self.msgpool.receiveMessage(self.connection)) |message| {
-            try msg_handler.handle(self.connection, message);
-            // Notify the Python task dispatcher that a new task-queue message
-            // may be waiting.
+        while (true) {
+            const message = self.msgpool.receiveMessage(self.connection) catch |err| {
+                if (!self.connection.suspended) {
+                    log.warn("[{s}] connection lost: {}", .{ self.client_handler.app_name, err });
+                } else {
+                    log.debug("[{s}] connection closed intentionally", .{self.client_handler.app_name});
+                }
+                try msg_handler.handleErr(self.connection, err);
+                break;
+            };
+            // `consumed` is set to true by the handler when it transfers ownership
+            // of the message to a store/queue.  After handle() returns we must NOT
+            // read any field of `message` when consumed==true — Python may have
+            // already popped and freed the message (use-after-free).
+            var consumed = false;
+            try msg_handler.handle(self.connection, message, &consumed);
+            if (!consumed) message.deinit();
             msg_handler.triggerWakeup();
-        } else |err| {
-            // Suppress the log when the disconnect was intentional: close()
-            // sets suspended = true before shutting down the socket, so by
-            // the time we land here with an EOF the flag is already set.
-            if (!self.connection.suspended) {
-                print("exit client connection with error: {}\n", .{err});
-            }
-            try msg_handler.handleErr(self.connection, err);
         }
         // Notify Python that this connection is dead so AutoReconnect can
         // react immediately without polling.  Must happen before the defer
         // frees resources so wakeup/disconnect fds are still valid.
+        log.debug("[{s}] triggering disconnect fd", .{self.client_handler.app_name});
         self.client_handler.tasks_queue.triggerDisconnect();
         try msg_handler.handleDisconnect(self.connection);
     }
@@ -166,9 +207,9 @@ const ClientEntry = struct {
         }
     }
 
-    pub fn createHandshakeClientEntry(self: *ClientEntry, allocator: Allocator, password: []const u8, methods: []const u8) !MessageAndDataIndentifier {
+    pub fn createHandshakeClientEntry(self: *ClientEntry, allocator: Allocator, methods: []const u8) !MessageAndDataIndentifier {
         try self.client_handler.setClientMethods(methods);
-        var handshake = try Handshake.create(allocator, &[_]Handshake.MemberData{.{ .name = self.client_handler.app_name, .methods = methods }}, password, "client");
+        var handshake = try Handshake.create(allocator, &[_]Handshake.MemberData{.{ .name = self.client_handler.app_name, .methods = methods }}, "client");
         const data = try handshake.toJson(allocator);
         const uuid = self.generateUUID();
         const msg = try self.msgpool.createMessage(allocator, data, uuid, .HANDSHAKE, .JSON, false, true, self.client_handler.app_name, PLACEHOLDER, PLACEHOLDER);
@@ -176,12 +217,12 @@ const ClientEntry = struct {
         return .{ .message = .{ .receiver = PLACEHOLDER, .uuid = uuid, .timestamp = ts }, .data = msg };
     }
 
-    pub fn sendHandshakeClientEntry(self: *ClientEntry, password: []const u8, methods: []const u8) !MessageIdentifier {
+    pub fn sendHandshakeClientEntry(self: *ClientEntry, methods: []const u8) !MessageIdentifier {
         var arena = ArenaAllocator.init(std.heap.c_allocator);
         defer arena.deinit();
         const allocator = arena.allocator();
         try self.client_handler.setClientMethods(methods);
-        var handshake = try Handshake.create(allocator, &[_]Handshake.MemberData{.{ .name = self.client_handler.app_name, .methods = methods }}, password, "client");
+        var handshake = try Handshake.create(allocator, &[_]Handshake.MemberData{.{ .name = self.client_handler.app_name, .methods = methods }}, "client");
         const data = try handshake.toJson(allocator);
         const uuid = self.generateUUID();
         try self.msgpool.sendMessage(self.connection, data, uuid, .HANDSHAKE, .JSON, false, true, self.client_handler.app_name, PLACEHOLDER, PLACEHOLDER);
@@ -217,21 +258,21 @@ const ClientEntry = struct {
     }
 
     pub fn getAvailableMembersClientEntry(self: *ClientEntry, allocator: Allocator) ![]const u8 {
-        const chan_count = self.client_handler.chan_mapper.ChannelsCount();
+        self.client_handler.mutex.lock();
+        defer self.client_handler.mutex.unlock();
+        const all_chans = self.client_handler.chan_mapper.allChannels();
         // Always return allocator-owned memory so the CFFI caller can safely
         // call allocator.free() on the result.  The arena used for building the
         // JSON is local to this function and is freed before we return, so we
         // must copy the final JSON string into the caller's allocator first.
-        if (chan_count == 0) return allocator.dupe(u8, PLACEHOLDER);
+        if (all_chans.len == 0) return allocator.dupe(u8, PLACEHOLDER);
         var arena = ArenaAllocator.init(allocator);
         defer arena.deinit();
-        const this_name = try std.fmt.allocPrint(arena.allocator(), "{s} (this app)", .{self.client_handler.app_name});
-        var memberdata = try arena.allocator().alloc(Handshake.MemberData, chan_count);
-        for (self.client_handler.chan_mapper.allChannels(), 0..) |*c, idx| {
-            const name = if (std.mem.eql(u8, c.connection_name, self.client_handler.app_name)) this_name else c.connection_name;
-            memberdata[idx] = .{ .name = name, .methods = try c.joinedMethods(arena.allocator(), serde.UNIT_SEPARATOR) };
+        var memberdata = try arena.allocator().alloc(Handshake.MemberData, all_chans.len);
+        for (all_chans, 0..) |*c, idx| {
+            memberdata[idx] = .{ .name = c.connection_name, .methods = try c.joinedMethods(arena.allocator(), serde.UNIT_SEPARATOR) };
         }
-        var handshake = try Handshake.create(arena.allocator(), memberdata, null, null);
+        var handshake = try Handshake.create(arena.allocator(), memberdata, null);
         // Copy into the caller's allocator BEFORE defer arena.deinit() fires.
         return try allocator.dupe(u8, try handshake.toJson(arena.allocator()));
     }
@@ -261,6 +302,7 @@ pub fn init(allocator: std.mem.Allocator, app_name: []const u8, config: ClientCo
     // The heap address of the ClientEntry is the connection number: unbounded,
     // unique, and O(1) to resolve — just @ptrFromInt(conn_num).
     const conn_num: usize = @intFromPtr(cl_entry);
+    log.debug("[{s}] client init  conn_num=0x{x}", .{ app_name, conn_num });
     if (!is_wasm) _ = try std.Thread.spawn(.{}, messageDispatcher, .{conn_num});
     return conn_num;
 }
@@ -268,7 +310,9 @@ pub fn init(allocator: std.mem.Allocator, app_name: []const u8, config: ClientCo
 pub fn desctroyClient(conn_num: usize) !void {
     if (conn_num == 0) return error.ClientNotInitialized;
     const entry: *ClientEntry = @ptrFromInt(conn_num);
+    log.debug("[{s}] stopClient called  conn_num=0x{x}", .{ entry.client_handler.app_name, conn_num });
     entry.destroy();
+    log.debug("stopClient complete  conn_num=0x{x}", .{conn_num});
 }
 
 pub fn createMessage(allocator: Allocator, data: []const u8, uuid: u16, flag: MessageFlag, decoder: MessageDecoder, is_bytes: bool, return_result: bool, receiver: []const u8, func_name: []const u8, conn_num: usize) !MessageAndDataIndentifier {
@@ -281,14 +325,14 @@ pub fn sendMessage(data: []const u8, uuid: u16, flag: MessageFlag, decoder: Mess
     return entry.sendMessageClientEntry(data, uuid, flag, decoder, is_bytes, return_result, receiver, func_name);
 }
 
-pub fn createHandshake(allocator: Allocator, password: []const u8, methods: []const u8, conn_num: usize) !MessageAndDataIndentifier {
+pub fn createHandshake(allocator: Allocator, methods: []const u8, conn_num: usize) !MessageAndDataIndentifier {
     var entry = try ClientEntry.get(conn_num);
-    return try entry.createHandshakeClientEntry(allocator, password, methods);
+    return try entry.createHandshakeClientEntry(allocator, methods);
 }
 
-pub fn sendHandshake(conn_num: usize, password: []const u8, methods: []const u8) !MessageIdentifier {
+pub fn sendHandshake(conn_num: usize, methods: []const u8) !MessageIdentifier {
     var entry = try ClientEntry.get(conn_num);
-    return try entry.sendHandshakeClientEntry(password, methods);
+    return try entry.sendHandshakeClientEntry(methods);
 }
 
 pub fn getMessageByUuid(uuid: u16, conn_num: usize) !?*Message {

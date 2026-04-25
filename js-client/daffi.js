@@ -27,7 +27,7 @@
  *   const client = new DaffiClient("my-app", { wsUrl: "ws://127.0.0.1:5000" });
  *   // Auto-generated name ("localhost-0x3f9a12bc"):
  *   const client = new DaffiClient({ wsUrl: "ws://127.0.0.1:5000" });
- *   const conn   = await client.connect();          // optional password string
+ *   const conn   = await client.connect();
  *
  *   // Call a remote function and get the result
  *   const sum = await conn.rpc({ timeout: 5000 }).add(3, 4);
@@ -64,9 +64,11 @@
  *   options.reconnectDelay number (ms) — Base reconnect delay.  Default: 2000.
  *
  * ─────────────────────────────────────────────────────────────────────────────
- * client.connect(password?) → Promise<Connection>
+ * client.connect() → Promise<Connection>
  * ─────────────────────────────────────────────────────────────────────────────
- *   password  string (optional) — Server password, if configured.
+ *   Connect to the server and perform the handshake.  Use ``wss://`` in
+ *   ``wsUrl`` (and run the Python backend with ``tls=True``) to encrypt and
+ *   authenticate the channel — no application-level secret is required.
  *
  * ─────────────────────────────────────────────────────────────────────────────
  * client.addEventHandler(fn)
@@ -313,7 +315,7 @@ function DaffiClient(name, options) {
         };
     };
 
-    const _scheduleReconnect = (password) => {
+    const _scheduleReconnect = () => {
         if (_intentionalClose || !self.autoreconnect) return;
         // Guard against double-scheduling: both socket.onclose and the open-
         // timeout promise rejection can fire for the same failed attempt.
@@ -324,12 +326,12 @@ function DaffiClient(name, options) {
         console.log(`[daffi] connection lost — reconnecting in ${(delay / 1000).toFixed(1)} s…`);
         setTimeout(() => {
             if (_intentionalClose) { _reconnecting = false; return; }
-            _connectSocket(password)
+            _connectSocket()
                 .then(() => { _reconnecting = false; })
                 .catch((err) => {
                     console.warn(`[daffi] reconnect failed: ${err}`);
                     _reconnecting = false;
-                    _scheduleReconnect(password);
+                    _scheduleReconnect();
                 });
         }, delay);
     };
@@ -532,7 +534,7 @@ function DaffiClient(name, options) {
                         const members = conn._members();
                         const targets = members.filter(m => {
                             if (!m.methods) return false;
-                            if (m.name.endsWith('(this app)')) return false;
+                            if (m.name === self.name) return false;
                             if (!m.methods.includes(prop)) return false;
                             if (filter) return filter.some(f => m.name.startsWith(f));
                             return true;
@@ -570,7 +572,7 @@ function DaffiClient(name, options) {
                         const members = conn._members();
                         const targets = members.filter(m => {
                             if (!m.methods) return false;
-                            if (m.name.endsWith('(this app)')) return false;
+                            if (m.name === self.name) return false;
                             if (!m.methods.includes(prop)) return false;
                             if (filter) return filter.some(f => m.name.startsWith(f));
                             return true;
@@ -590,10 +592,6 @@ function DaffiClient(name, options) {
          * in the ChannelsMapper.  Use this to synchronise a multi-worker
          * scenario before issuing RPC calls that require specific peers to be
          * online.
-         *
-         * The " (this app)" suffix added by the native layer to the current
-         * client's own entry is stripped before comparison, so it is safe to
-         * pass the current client's own name if needed.
          *
          * @param {string|string[]} members     Peer name or array of peer names to wait for.
          * @param {object}          [options]
@@ -621,9 +619,7 @@ function DaffiClient(name, options) {
             const needed   = new Set(members);
 
             while (true) {
-                const current = new Set(
-                    this._members().map(m => m.name.replace(/ \(this app\)$/, ''))
-                );
+                const current = new Set(this._members().map(m => m.name));
                 if ([...needed].every(n => current.has(n))) return;
                 if (deadline !== null && Date.now() >= deadline) {
                     const missing = [...needed].filter(n => !current.has(n));
@@ -636,7 +632,7 @@ function DaffiClient(name, options) {
         }
     }
 
-    const _connectSocket = async (password) => {
+    const _connectSocket = async () => {
         await _initWasm();
 
         const { initClient, sendHandshake } = _wasmExports;
@@ -659,7 +655,7 @@ function DaffiClient(name, options) {
                 }
             }
             self.closed = true;
-            _scheduleReconnect(password);
+            _scheduleReconnect();
         };
 
         // Wait for the socket to open (up to 4 s).
@@ -679,7 +675,7 @@ function DaffiClient(name, options) {
         }
         const connNum = initClient(_encodeStringZ(self.name));
         self.connNum  = connNum;
-        const hsUuid  = sendHandshake(_encodeStringZ(password), connNum);
+        const hsUuid  = sendHandshake(connNum);
         const hsResult = await new Handler('', null, 1, true)
             ._waitWithTimeout(hsUuid, 5000, '');
         console.log(`[daffi] "${self.name}" connected. type: ${hsResult.meta.type}`);
@@ -690,9 +686,8 @@ function DaffiClient(name, options) {
     // ── Public API ────────────────────────────────────────────────────────────
 
     /** Connect to the server and return a Connection. */
-    this.connect = async (password) => {
-        password = password || '';
-        return _connectSocket(password);
+    this.connect = async () => {
+        return _connectSocket();
     };
 
     /** Gracefully close the connection (will not auto-reconnect). */

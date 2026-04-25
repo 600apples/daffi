@@ -195,7 +195,7 @@ class ZigBuilder(build_ext):
         out_dir = os.path.dirname(self.get_ext_fullpath(ext.name))
         os.makedirs(out_dir, exist_ok=True)
 
-        mode = "Debug" if self.debug else "ReleaseFast"
+        mode = "Debug" if self.debug else os.environ.get("ZIG_OPT", "ReleaseSafe")
         openssl_include, openssl_lib = _find_openssl()
         target = _zig_target()
 

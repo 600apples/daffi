@@ -40,12 +40,11 @@ pub fn startServer(_: [*c]PyObject, args: [*c]PyObject) callconv(.c) [*c]PyObjec
     var host: [*:0]u8 = undefined;
     var port: c_long = undefined;
     var mode: c_short = undefined;
-    var password: [*:0]u8 = undefined;
     var app_name: [*:0]u8 = undefined;
     var tls_enabled: c_int = 0;
     var cert_file: [*:0]u8 = undefined;
     var key_file: [*:0]u8 = undefined;
-    if (!(py.PyArg_ParseTuple(args, "slpsspss", &host, &port, &mode, &password, &app_name, &tls_enabled, &cert_file, &key_file) != 0)) return Py_BuildValue("");
+    if (!(py.PyArg_ParseTuple(args, "slpspss", &host, &port, &mode, &app_name, &tls_enabled, &cert_file, &key_file) != 0)) return Py_BuildValue("");
     const pmode: HandlerMode = switch (mode) {
         0 => .Router,
         1 => .Service,
@@ -53,7 +52,6 @@ pub fn startServer(_: [*c]PyObject, args: [*c]PyObject) callconv(.c) [*c]PyObjec
     };
     const pport: u16 = @intCast(port);
     const phost = std.mem.span(host);
-    const ppassword = std.mem.span(password);
     const papp_name = std.mem.span(app_name);
     const ptls = tls_enabled != 0;
     const pcert_file = std.mem.span(cert_file);
@@ -63,7 +61,7 @@ pub fn startServer(_: [*c]PyObject, args: [*c]PyObject) callconv(.c) [*c]PyObjec
     }
     const conn_num: usize = @rem(serverHandlerThreads.?.len, 256);
     const cfg = @import("../network/ServerConnection.zig").Config{
-        .host = phost, .port = pport, .mode = pmode, .password = ppassword,
+        .host = phost, .port = pport, .mode = pmode,
         .tls = ptls, .cert_file = pcert_file, .key_file = pkey_file,
     };
     const handler_thread = std.Thread.spawn(.{}, Server.messageDispatcher, .{ allocator, papp_name, cfg, conn_num }) catch return Py_BuildValue("");
@@ -157,7 +155,7 @@ pub fn getMessageForServerWorker(_: [*c]PyObject, args: [*c]PyObject) callconv(.
     // Never set a Python exception here; the caller polls in a tight loop and treats
     // None as "nothing to process yet".
     var msg = (Server.getMessageForServerWorker(conn_num) catch return Py_BuildValue("")) orelse return Py_BuildValue("");
-    defer msg.undurableAndDeinit();
+    defer msg.deinit();
     const uuid: c_uint = @as(c_uint, msg.getUuid());
     const data: []const u8 = msg.getData();
     const flag: c_ushort = @intFromEnum(msg.getFlag());

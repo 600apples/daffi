@@ -11,6 +11,7 @@ pub const setServiceMethods         = @import("cffi/server.zig").setServiceMetho
 pub const setWakeupFd               = @import("cffi/server.zig").setWakeupFd;
 
 // --- client functions ---
+pub const setLogLevel               = @import("cffi/client.zig").setLogLevel;
 pub const startClient               = @import("cffi/client.zig").startClient;
 pub const stopClient                = @import("cffi/client.zig").stopClient;
 pub const sendMessageFromClient     = @import("cffi/client.zig").sendMessageFromClient;

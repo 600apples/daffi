@@ -7,7 +7,7 @@ import sys
 import select
 import socket
 import threading
-import time
+
 from abc import ABC
 from enum import IntEnum
 from threading import Event
@@ -100,7 +100,18 @@ class Application(ABC):
         self._conn_num = None
         self._conn_type = None
         self._stop_event = Event()
+        # Serialises calls to ``stop()`` so concurrent callers (e.g. the
+        # user thread + the disconnect watcher) cannot race on native
+        # teardown — without it both threads could read ``_conn_num`` as
+        # non-None and both call ``dfcore.stopClient`` (double-free).
+        self._stop_lock = threading.Lock()
         self._connection_error: Optional[Exception] = None
+        # True only while a thread is parked in :meth:`join` waiting on
+        # ``_stop_event``.  Used by the disconnect watcher to decide whether
+        # an unexpected disconnect can be surfaced via ``join`` (which will
+        # re-raise ``_connection_error``) or whether it must be raised
+        # directly from the watcher thread to avoid being silently swallowed.
+        self._joining: bool = False
         self.event_handlers: List[Callable[[Dict], Any]] = []
         self._executors_subscribed: bool = False
 
@@ -215,7 +226,15 @@ class Application(ABC):
             except ConnectionError:
                 pass   # silent disconnect
         """
-        self._stop_event.wait()
+        self._joining = True
+        try:
+            self._stop_event.wait()
+        finally:
+            self._joining = False
+        # ``_stop_event`` is flipped only at the *end* of ``stop()``, so by
+        # the time ``wait()`` returns the client (or server) is guaranteed
+        # to be fully torn down — we can safely re-raise without doing any
+        # additional cleanup ourselves.
         if self._connection_error is not None:
             raise self._connection_error
 
@@ -233,31 +252,25 @@ class ServerMixin:
     node types.
     """
 
-    def start(self, password: str = ""):
+    def start(self):
         """Start the server, register executors, and — for a :class:`Service` —
         launch the task dispatcher and perform the initial handshake.
 
-        Args:
-            password: Optional shared secret used to restrict access.  When
-                      set, every client must pass the identical value to
-                      :meth:`~daffi.app.Client.connect`; the handshake is
-                      rejected and the connection is dropped if the passwords
-                      do not match.  Leaving it empty (the default) disables
-                      authentication and accepts any client.
+        Connection-level protection (encryption + peer authentication) is
+        delegated to TLS — pass ``tls=True`` together with ``cert_file`` /
+        ``key_file`` (server) and ``ca_file`` (client) on the constructor.
 
         Raises:
             RuntimeError: If the server is already started.
             InitializationError: If the native layer fails to bind.
 
-        Example — password-protected router::
+        Example::
 
-            # server side
             router = Router(host="127.0.0.1", port=6000)
-            router.start(password="s3cr3t")
+            router.start()
 
-            # client side — must supply the same password
             client = Client(host="127.0.0.1", port=6000)
-            conn = client.connect(password="s3cr3t")
+            conn = client.connect()
         """
         if self._conn_num is not None:
             raise RuntimeError(f"{self.__class__.__name__} is already started")
@@ -271,7 +284,6 @@ class ServerMixin:
             self.host,
             self.port,
             self.server_mode,
-            password,
             self.app_name,
             self.tls,
             self.cert_file,
@@ -453,7 +465,7 @@ class Client(Application):
             )
             return f"tcp: [ host {self.host!r}, port: {self.port!r}{type_part} ]"
 
-    def connect(self, password: str = "") -> Union["ClientConnection", "AutoReconnect"]:
+    def connect(self) -> Union["ClientConnection", "AutoReconnect"]:
         """Connect to the server, perform the handshake, and return a connection handle.
 
         Returns a :class:`~daffi.rpc_proxy.ClientConnection` normally.
@@ -462,10 +474,9 @@ class Client(Application):
         identical, but each call transparently reconnects on connection loss before
         executing.
 
-        Args:
-            password: Must match the password the server was started with.
-                      Pass an empty string (the default) when the server was
-                      started without a password.
+        Connection-level protection (encryption + peer authentication) is
+        delegated to TLS — pass ``tls=True`` together with ``ca_file`` on the
+        constructor to authenticate the server's certificate.
 
         Returns:
             A :class:`~daffi.rpc_proxy.ClientConnection` (normal) or
@@ -477,14 +488,13 @@ class Client(Application):
         """
         if self._conn_num is not None:
             raise RuntimeError("Client is already connected")
-        self._do_connect(password)
-        time.sleep(0.005)  # flush the log
-        conn = ClientConnection(self, password)
+        self._do_connect()
+        conn = ClientConnection(self)
         if self._autoreconnect:
             conn = AutoReconnect(conn)
         return conn
 
-    def _do_connect(self, password: str) -> None:
+    def _do_connect(self) -> None:
         """Low-level connect: allocate native slot, handshake, start dispatcher."""
         # Start the worker-thread pool before native I/O threads are created.
         # Threads idle harmlessly until work arrives.
@@ -496,7 +506,6 @@ class Client(Application):
         self._conn_num = dfcore.startClient(
             self.host,
             self.port,
-            password,
             self.app_name,
             self.tls,
             self.ca_file,
@@ -510,7 +519,18 @@ class Client(Application):
         # rather than polling.  ``register`` clears any stale notifier left
         # over from a previous (e.g. failed) connect on the same handle.
         ResponseNotifier.register(self._conn_num)
-        handshake = RpcProxy._process_client_handshake(self._conn_num)
+        try:
+            handshake = RpcProxy._process_client_handshake(self._conn_num)
+        except Exception:
+            # Tear the native slot down so the caller can retry connect()
+            # without hitting the "already connected" guard.
+            ResponseNotifier.unregister(self._conn_num)
+            try:
+                dfcore.stopClient(self._conn_num)
+            except Exception:
+                pass
+            self._conn_num = None
+            raise
         self._conn_type = handshake["meta"]["type"]
         self.logger.debug(
             f"has been connected successfully. connection info: {self.info}"
@@ -555,14 +575,36 @@ class Client(Application):
         self.event_handlers.append(handler)
 
     def _start_disconnect_watcher(self) -> None:
-        """Start a daemon thread that unblocks :meth:`join` when the server closes
-        the connection unexpectedly (i.e. without a user-initiated :meth:`stop`).
+        """Start a daemon thread that surfaces unexpected server-side disconnects.
 
         A pipe is created; the write-end is handed to the native layer via
-        ``setClientDisconnectFd``.  When the connection is lost the native layer
-        writes one byte to the write-end, the thread wakes, and — if :meth:`stop`
-        has not already been called — stores a :class:`ConnectionError` and sets
-        the stop event so :meth:`join` returns and re-raises the error.
+        ``setClientDisconnectFd``.  When the connection is lost the native
+        layer writes one byte to the write-end and the watcher thread wakes.
+
+        An unexpected disconnect is **not recoverable in-place** — the native
+        connection slot, task dispatcher, and response notifier must all be
+        torn down so the user is forced to call :meth:`connect` again to
+        obtain a fresh connection.  The watcher therefore always invokes
+        :meth:`stop` (which is lock-serialised and idempotent) regardless of
+        whether the application thread is currently parked in :meth:`join`;
+        the only thing that depends on that flag is *how* the
+        :class:`ConnectionError` is delivered:
+
+        * **Inside ``join``** (``self._joining is True``): ``stop`` flips
+          ``_stop_event`` as its very last step, which wakes the parked
+          thread; :meth:`join` then re-raises ``_connection_error`` in the
+          application's own context against a fully-torn-down client.
+
+        * **Outside ``join``**: nobody is blocked, so the watcher
+          additionally re-raises the error from its own thread.  Python's
+          default ``threading.excepthook`` prints the traceback to stderr,
+          ensuring the disconnect is not silently swallowed.  The error is
+          also left on ``_connection_error`` so any *later* :meth:`join`
+          call still observes (and re-raises) it.
+
+        A user-initiated ``stop()`` that ran *before* the watcher fires sets
+        ``_stop_event`` and short-circuits everything — there is nothing to
+        report.
         """
         r, w = os.pipe()
         self._disc_pipe_r = r
@@ -570,8 +612,19 @@ class Client(Application):
         set_client_disconnect_fd(self._conn_num, w)
 
         def _watch(stop_event: Event, client_ref) -> None:
+            # Two ways out of the select: the native layer wrote one signal
+            # byte to ``w`` (real disconnect), or ``stop()`` closed ``w``
+            # which makes the read side go EOF (user-initiated teardown).
+            # Reading after the select disambiguates them — without that
+            # we'd race ``stop_event.set()`` and could spuriously raise
+            # ``ConnectionError`` on a clean shutdown.
+            data = b""
             try:
                 select.select([r], [], [])
+                try:
+                    data = os.read(r, 1)
+                except OSError:
+                    data = b""
             except Exception:
                 pass
             finally:
@@ -579,15 +632,42 @@ class Client(Application):
                     os.close(r)
                 except OSError:
                     pass
-            # Only record an error if stop() was NOT the one that triggered this.
-            if not stop_event.is_set():
-                client_ref._connection_error = ConnectionError(
-                    "Server disconnected unexpectedly.\n\n"
-                    "  The router or service this client was connected to has stopped.\n"
-                    "  If you want to reconnect automatically, use:\n"
-                    "      Client(..., autoreconnect=True)"
-                )
-                stop_event.set()
+
+            # No data → EOF, i.e. ``stop()`` closed the write end.  Or a
+            # concurrent ``stop()`` already finished.  Either way: nothing
+            # to surface.
+            if not data or stop_event.is_set():
+                return
+
+            err = ConnectionError(
+                "Server disconnected unexpectedly.\n\n"
+                "  The router or service this client was connected to has stopped.\n"
+                "  If you want to reconnect automatically, use:\n"
+                "      Client(..., autoreconnect=True)"
+            )
+            # Record the error first so any join() — current or future —
+            # observes it once ``stop`` flips ``_stop_event``.
+            client_ref._connection_error = err
+
+            # Snapshot the flag *before* stop() runs: stop() flips
+            # ``_stop_event`` as its last act, which wakes any parked
+            # ``join`` and lets it clear ``_joining`` in its ``finally``.
+            was_joining = client_ref._joining
+
+            # Always tear down — the connection is dead; the user must call
+            # ``connect()`` again.  ``stop`` is lock-serialised and flips
+            # ``_stop_event`` only at the end, so a parked ``join`` sees a
+            # fully torn-down client when it finally wakes.
+            try:
+                client_ref.stop()
+            except Exception:
+                pass
+
+            if not was_joining:
+                # Nobody is blocked in ``join`` — surface the error from this
+                # thread so the default ``threading.excepthook`` prints it
+                # instead of leaving it silently buried on the client object.
+                raise err
 
         t = threading.Thread(
             target=_watch,
@@ -599,9 +679,21 @@ class Client(Application):
 
     def stop(self, *_, **__):
         """Stop the client: signal the reconnect loop, join task-dispatcher
-        threads, then destroy the native connection."""
-        if not self._stop_event.is_set():
-            self._stop_event.set()
+        threads, then destroy the native connection.
+
+        Idempotent and safe to call from multiple threads.  Two invariants:
+
+        * The full teardown is serialised by ``_stop_lock`` so concurrent
+          callers (e.g. user thread + disconnect watcher) cannot both call
+          ``dfcore.stopClient`` on the same handle (double-free).
+
+        * ``_stop_event`` is flipped **last**, after every resource has been
+          released.  Anyone parked in ``_stop_event.wait()`` (notably
+          :meth:`Application.join`) is therefore guaranteed to observe a
+          fully-stopped client — no half-torn-down race window where
+          ``_conn_num`` is still set.
+        """
+        with self._stop_lock:
             # Wake the disconnect-watcher thread so it exits cleanly.
             if self._disc_pipe_w is not None:
                 try:
@@ -619,3 +711,4 @@ class Client(Application):
                 ResponseNotifier.unregister(self._conn_num)
                 dfcore.stopClient(self._conn_num)
                 self._conn_num = None
+            self._stop_event.set()

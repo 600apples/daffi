@@ -230,13 +230,20 @@ auto-reconnect loop.
 
 ---
 
-## Password-protected connections
+## Securing the connection
 
-If the Python backend requires a password, pass it as a string to `connect()`:
+Authentication and confidentiality are delegated to TLS — there is no
+application-level password. Run the Python backend with `tls=True`
+(plus `cert_file` / `key_file`) and connect from the browser using a
+`wss://` URL:
 
 ```javascript
-const conn = await client.connect("secret");
+const client = new DaffiClient("my-app", { wsUrl: "wss://example.com:5000" });
+const conn   = await client.connect();
 ```
+
+The browser will refuse the upgrade unless the server presents a
+certificate that chains to a CA the browser already trusts.
 
 ---
 

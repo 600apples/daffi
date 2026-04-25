@@ -28,9 +28,8 @@ workers=N (thread pool)
 """
 
 import json
-import select
+import selectors
 import sys
-import time
 from queue import Queue
 from threading import Thread, Event
 from typing import Any
@@ -143,9 +142,6 @@ class TaskDispatcher:
 
     DEFAULT_WORKERS = 1  # inline execution — fastest for typical callbacks
 
-    # Fallback poll interval (seconds) for connections without an eventfd.
-    _POLL_INTERVAL = 0.001  # 1 ms
-
     def __init__(
         self,
         workers: int = DEFAULT_WORKERS,
@@ -169,6 +165,8 @@ class TaskDispatcher:
         self._workers: list = []
         # Poller thread — always a Thread; None until first start_for_connection.
         self._poller: "Thread | None" = None
+
+        self._stop_wakeup: WakeupFd = WakeupFd()
 
         # conn_num → _WakeupFd
         self._wakeup: dict[int, WakeupFd] = {}
@@ -197,12 +195,29 @@ class TaskDispatcher:
             self._workers.append(t)
 
     def stop_for_connection(self, connection) -> None:
-        """Deregister *connection* and, if no connections remain, stop all workers."""
+        """Deregister *connection* and, if no connections remain, stop all workers.
+
+        **Ordering guarantee**: the poller thread is joined *before* any
+        wakeup/disconnect fds are closed.  Closing an fd while the poller is
+        blocked in ``select.select`` on that same fd is undefined behaviour
+        on macOS (the fd number may be reused by the OS, causing select to
+        report activity on the wrong resource, or worse, a SIGSEGV when
+        kqueue's internal state is corrupted).
+
+        The poller uses ``select.select(timeout=None)`` (infinite wait) and
+        is woken via ``_stop_wakeup`` rather than via a fixed poll interval.
+        This means idle poller threads block without ever acquiring the GIL.
+        """
         self.connections.discard(connection)
         conn_num = getattr(connection, "_conn_num", None)
-        self._deregister_fds(conn_num)
         if not self.connections:
+            # Signal the poller to exit.  Order matters:
+            # 1. set stop_event so the loop condition is True after wakeup.
+            # 2. write to _stop_wakeup so select.select(None) returns.
+            # 3. join the poller (it will exit cleanly after seeing stop_event).
+            # 4. close _stop_wakeup fd — safe because the poller has exited.
             self.stop_event.set()
+            self._stop_wakeup.signal()
             # Send one sentinel per worker so each exits its loop cleanly.
             for _ in self._workers:
                 try:
@@ -213,6 +228,12 @@ class TaskDispatcher:
                 w.join(timeout=3)
             if self._poller is not None:
                 self._poller.join()
+            self._stop_wakeup.close()
+        # Deregister (and close) fds only after the poller has exited for the
+        # last-connection case, or immediately for the non-last case (the
+        # poller will see a ValueError on the next select call, catch it, and
+        # rebuild all_fds without the now-closed fd).
+        self._deregister_fds(conn_num)
 
     def _deregister_fds(self, conn_num) -> None:
         """Remove wakeup and disconnect fds for *conn_num* without stopping threads.
@@ -287,21 +308,64 @@ class TaskDispatcher:
 
         Disconnect fds are also monitored here.  When one fires the registered
         callback is invoked directly in this thread.
+
+        I/O multiplexing strategy
+        -------------------------
+        The poller uses ``selectors.DefaultSelector`` (kqueue on macOS, epoll
+        on Linux) with ``timeout=None`` (infinite wait).  This has two
+        advantages over ``select.select``:
+
+        1. **No fd-number limit.** ``select.select`` silently misbehaves or
+           raises ``ValueError`` when any fd number ≥ 1024 (macOS / POSIX
+           ``FD_SETSIZE``).  With N router-connected clients each holding 7-9
+           fds this threshold is reached around N = 110-140.  kqueue and epoll
+           have no such limitation.
+
+        2. **Zero idle GIL pressure.** A fixed poll interval (e.g. 1 ms)
+           forces every idle poller to wake up, acquire the GIL, find nothing
+           to do, and sleep again — with N clients this creates N spurious GIL
+           acquisitions per millisecond, starving the main thread.  With
+           ``timeout=None`` idle threads stay fully asleep.
+
+        The poller rebuilds the selector on every iteration.  This is
+        efficient because an iteration only runs when a real event occurs
+        (a task arrives, a disconnect fires, or shutdown is requested);
+        idle threads never execute the loop body.  The cost of one
+        kqueue/epoll open + a handful of kevent/epoll_ctl registrations
+        per event is negligible.
+
+        Shutdown is signalled by writing to ``_stop_wakeup`` which causes
+        the selector to return; the loop then checks ``stop_event.is_set()``.
         """
         inline = self.workers == 1
+        stop_rfd = self._stop_wakeup.read_fd
 
         while not self.stop_event.is_set():
             wakeup_fds = list(self._fd_to_conn.keys())
             disc_fds = list(self._disc_by_rfd.keys())
-            all_fds = wakeup_fds + disc_fds
-            if all_fds:
-                try:
-                    readable, _, _ = select.select(all_fds, [], [], self._POLL_INTERVAL)
-                except (ValueError, OSError):
-                    readable = []
-            else:
-                time.sleep(self._POLL_INTERVAL)
-                readable = []
+            all_fds = [stop_rfd] + wakeup_fds + disc_fds
+
+            # Build a fresh selector with the current fd set.  We rebuild it
+            # on every iteration rather than maintaining it incrementally so
+            # that closed fds (after _deregister_fds) are never selected on.
+            readable: set = set()
+            sel = selectors.DefaultSelector()
+            try:
+                for fd in all_fds:
+                    try:
+                        sel.register(fd, selectors.EVENT_READ)
+                    except (ValueError, OSError):
+                        pass
+                events = sel.select(timeout=None)
+                readable = {key.fd for key, _ in events}
+            except OSError:
+                pass
+            finally:
+                sel.close()
+
+            # Stop signal: exit the loop immediately without processing tasks.
+            if stop_rfd in readable:
+                break
 
             # --- Handle disconnect notifications first ---
             for rfd in readable:
@@ -348,8 +412,7 @@ class TaskDispatcher:
                     ) = task
 
                     if flag == MessageFlag.EVENTS:
-                        # Event notifications carry conn-bound handlers and must
-                        # always run here — they cannot be offloaded to workers.
+                        # Event notifications carry conn-bound handlers
                         payload = json.loads(data)
                         for handler in conn.event_handlers:
                             handler(payload)

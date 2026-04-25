@@ -21,7 +21,10 @@ pub fn MessageHandler(comptime T: type) type {
         const Self = @This();
 
         pub const HandlersMapping = [meta.fields(MessageFlag).len]HandlerEntryFn;
-        const HandlerEntryFn = *const fn (ctx: *T, conn: *T.ParentConnT, message: *Message) anyerror!void;
+        /// consumed: set to true by a handler that has transferred ownership of
+        /// the message into a store or queue.  The caller must NOT touch the
+        /// message after handle() returns when consumed == true.
+        const HandlerEntryFn = *const fn (ctx: *T, conn: *T.ParentConnT, message: *Message, consumed: *bool) anyerror!void;
 
         pub fn createMapping(smapping: enums.EnumFieldStruct(MessageFlag, HandlerEntryFn, notSupported)) HandlersMapping {
             const fields = meta.fields(MessageFlag);
@@ -32,9 +35,13 @@ pub fn MessageHandler(comptime T: type) type {
             return mapping;
         }
 
-        pub fn handle(self: Self, conn: *T.ParentConnT, message: *Message) !void {
+        /// Dispatch message to the registered handler.
+        /// `consumed` is set to true by the handler if ownership of the message
+        /// was transferred to a store or queue; the caller must not free the
+        /// message in that case (Python will call deinit() later).
+        pub fn handle(self: Self, conn: *T.ParentConnT, message: *Message, consumed: *bool) !void {
             switch (message.getFlag()) {
-                inline else => |fl| try self.handlers_mapping[@intFromEnum(fl)](self.ptr, conn, message),
+                inline else => |fl| try self.handlers_mapping[@intFromEnum(fl)](self.ptr, conn, message, consumed),
             }
         }
 
@@ -53,7 +60,7 @@ pub fn MessageHandler(comptime T: type) type {
             self.wakeup_fn(self.ptr);
         }
 
-        fn notSupported(_: *T, _: *T.ParentConnT, message: *Message) !void {
+        fn notSupported(_: *T, _: *T.ParentConnT, message: *Message, _: *bool) !void {
             std.debug.print("message flag {any} not supported\n", .{message.getFlag()});
             return error.FlagNotSupported;
         }

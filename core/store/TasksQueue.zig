@@ -71,7 +71,7 @@ pub fn deinit(self: *TasksQueue) void {
     defer self.mutex.unlock();
     while (self.queue.popFirst()) |raw_node| {
         const msg_node: *MessageNode = @fieldParentPtr("node", raw_node);
-        msg_node.data.undurableAndDeinit();
+        msg_node.data.deinit();
         self.allocator.destroy(msg_node);
     }
 }

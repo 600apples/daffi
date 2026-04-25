@@ -38,7 +38,6 @@ pub const Config = struct {
     /// PEM file containing the server private key (required when tls = true).
     key_file: []const u8 = "",
     mode: HandlerMode,
-    password: []const u8,
 };
 
 pub fn init(allocator: Allocator, config: Config) !*ServerConnection {

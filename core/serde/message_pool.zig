@@ -92,11 +92,6 @@ pub const MessagePool = struct {
         _ = try writer.write(&fulfillment);
     }
 
-    pub fn tryAuthenticate(_: *Self, buf: []u8, password: []const u8) !void {
-        if (std.mem.eql(u8, password, "")) return;
-        return if (std.mem.startsWith(u8, buf, password)) {} else error.PasswordMismatch;
-    }
-
     pub fn receiveMessage(self: *Self, reader: anytype) !*Message {
         var header_buf: [serde.HEADER_SIZE]u8 = undefined;
         try mustRead(reader, &header_buf);

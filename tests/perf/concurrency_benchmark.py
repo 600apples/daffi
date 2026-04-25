@@ -3,17 +3,26 @@ daffi concurrency benchmark — many clients hitting one service/router simultan
 
 Scenarios
 ---------
-1. N_CLIENTS clients → 1 Service (direct)
+1. N_CLIENTS clients → 1 Service (direct, SERVICE_WORKERS threads)
    All clients connect concurrently then simultaneously fire CALLS_PER_CLIENT
    rpc() calls each.
 
-2. N_CLIENTS clients → 1 Router → 1 Worker
+2. N_CLIENTS clients → 1 Router → 1 Worker (1 thread)
    Same load, but routed through an intermediate Router (one extra hop).
 
 3. N_CALLERS callers → 1 Router → N_WORKERS Workers  (cast broadcast)
    Each caller issues CASTS_PER_CALLER cast() calls that fan out to all workers.
-   N_WORKERS is kept modest (30) because each worker is a separate OS process;
+   N_WORKERS is kept modest (50) because each worker is a separate OS process;
    200+ processes saturate the system before the Python GIL becomes the limit.
+
+4. N_CLIENTS clients → 1 Router → 1 Worker (HEAVY_WORKERS threads)
+   Same topology as scenario 2 but the single worker process runs a large
+   thread pool.  Measures how call throughput scales with handler concurrency
+   when routing is in the mix.
+
+5. N_CLIENTS clients → 1 Service (HEAVY_WORKERS workers)
+   Same topology as scenario 1 but with a much larger thread pool.  Direct
+   apples-to-apples comparison against scenario 4 (service vs router hop).
 
 Measurement
 -----------
@@ -42,9 +51,17 @@ from typing import Optional
 N_CLIENTS        = 200   # scenario 1 & 2 — concurrent callers
 CALLS_PER_CLIENT = 1_000 # rpc() calls per client
 
-N_WORKERS        = 50    # scenario 3 — concurrent workers
+N_WORKERS        = 50    # scenario 3 — concurrent workers (separate processes)
 N_CALLERS        = 3     # scenario 3 — callers issuing casts
 CASTS_PER_CALLER = 100   # cast() calls per caller
+
+HEAVY_WORKERS    = 200   # scenario 4 & 5 — handler threads inside one worker/service
+
+LEAK_CALLERS      = 100  # scenario 6 — concurrent callers for leak/resource test
+LEAK_WORKERS      = 100  # scenario 6 — worker thread pool size (must be ≥ LEAK_CALLERS)
+LEAK_DURATION     = 720  # scenario 6 — total run time in seconds (12 min default)
+LEAK_INTERVAL     = 30   # scenario 6 — RSS sampling interval in seconds
+LEAK_CALL_DELAY_S = 0.01 # scenario 6 — min sleep between calls per caller (10 ms)
 
 WARMUP_CALLS  = 3        # warm-up calls per client before measurement
 TIMEOUT       = 60       # per-call timeout (seconds) — generous for heavy load
@@ -137,6 +154,42 @@ def _proc_worker(port: int, worker_id: int) -> None:
         pass
     finally:
         client.stop()
+
+
+def _proc_heavy_worker(port: int, n_threads: int) -> None:
+    """Single worker process with a large thread-pool (scenario 4)."""
+    _silence_subprocess()
+    from daffi import Client, callback
+
+    @callback
+    def echo(payload):
+        return payload
+
+    client = Client(app_name="heavy-worker", host=HOST, port=port, workers=n_threads)
+    client.connect()
+    try:
+        while True:
+            time.sleep(1)
+    except (KeyboardInterrupt, SystemExit):
+        pass
+    finally:
+        client.stop()
+
+
+def _proc_heavy_service(port: int, n_threads: int) -> None:
+    """Single Service with a large thread-pool (scenario 5)."""
+    _silence_subprocess()
+    from daffi import Service, callback
+
+    @callback
+    def echo(payload):
+        return payload
+
+    svc = Service(app_name="heavy-service", host=HOST, port=port, workers=n_threads)
+    svc.start()
+    svc.join()
+
+
 
 # ── stats helper ──────────────────────────────────────────────────────────────
 
@@ -472,6 +525,347 @@ def run_scenario_3() -> None:
         _quiet_kill(router_proc)
 
 
+def run_scenario_4() -> None:
+    """N_CLIENTS clients → Router → 1 Worker with HEAVY_WORKERS threads."""
+    label = (
+        f"Scenario 4 — {N_CLIENTS} clients → Router → 1 Worker ({HEAVY_WORKERS} threads)"
+    )
+    print(f"\n{'='*70}")
+    print(f"  {label}")
+    print(f"  {CALLS_PER_CLIENT} rpc() calls per client  (total: {N_CLIENTS * CALLS_PER_CLIENT:,})")
+    print(f"  (compare: scenario 2 uses 1 worker thread — this shows thread-pool scaling)")
+    print(f"{'='*70}")
+
+    port        = _free_port()
+    router_proc = mp.Process(target=_proc_router, args=(port,), daemon=True)
+    worker_proc = mp.Process(
+        target=_proc_heavy_worker, args=(port, HEAVY_WORKERS), daemon=True
+    )
+    router_proc.start()
+    try:
+        _wait_for_port(port)
+        worker_proc.start()
+        print("  Waiting for heavy-worker to register…", end="", flush=True)
+        _wait_for_workers(port, 1, timeout=30)
+        print(" done")
+        _run_rpc_scenario(label, port, N_CLIENTS, CALLS_PER_CLIENT)
+    finally:
+        _quiet_kill(worker_proc)
+        _quiet_kill(router_proc)
+
+
+def run_scenario_5() -> None:
+    """N_CLIENTS clients → Service with HEAVY_WORKERS workers."""
+    label = (
+        f"Scenario 5 — {N_CLIENTS} clients → Service ({HEAVY_WORKERS} workers)"
+    )
+    print(f"\n{'='*70}")
+    print(f"  {label}")
+    print(f"  {CALLS_PER_CLIENT} rpc() calls per client  (total: {N_CLIENTS * CALLS_PER_CLIENT:,})")
+    print(f"  (compare: scenario 1 uses {SERVICE_WORKERS} workers — this shows thread-pool scaling)")
+    print(f"{'='*70}")
+
+    port     = _free_port()
+    svc_proc = mp.Process(
+        target=_proc_heavy_service, args=(port, HEAVY_WORKERS), daemon=True
+    )
+    svc_proc.start()
+    try:
+        _wait_for_port(port)
+        time.sleep(0.5)   # let the service register its callbacks
+        _run_rpc_scenario(label, port, N_CLIENTS, CALLS_PER_CLIENT)
+    finally:
+        _quiet_kill(svc_proc)
+
+
+def _sample_rss_kb(pid: int) -> Optional[int]:
+    """Return RSS in KiB for *pid*, or None if the process is gone / unavailable."""
+    try:
+        if sys.platform == "darwin":
+            import subprocess as _sp
+            out = _sp.check_output(
+                ["ps", "-o", "rss=", "-p", str(pid)],
+                stderr=_sp.DEVNULL,
+            )
+            return int(out.strip())
+        else:
+            with open(f"/proc/{pid}/status") as f:
+                for line in f:
+                    if line.startswith("VmRSS:"):
+                        return int(line.split()[1])
+    except Exception:
+        return None
+    return None
+
+
+def _proc_leak_loader(port: int, n_callers: int, duration_s: float,
+                      q: "mp.Queue") -> None:
+    """Continuous RPC load for the leak/resource scenario (scenario 6).
+
+    Connects *n_callers* independent clients and runs each in its own thread,
+    firing ``echo`` calls as fast as possible for *duration_s* seconds.
+    Aggregated call counts and error counts are sent back through *q*.
+    """
+    import threading, time, os, logging
+    devnull = os.open(os.devnull, os.O_WRONLY)
+    os.dup2(devnull, 2)
+    os.close(devnull)
+    logging.disable(logging.CRITICAL)
+
+    from daffi import Client
+
+    connected: list[tuple] = []
+    for i in range(n_callers):
+        try:
+            client = Client(app_name=f"leak-{i:03d}", host=HOST, port=port)
+            conn = client.connect()
+            connected.append((client, conn))
+        except Exception as exc:
+            if i < 5:
+                print(f"  [!] leak caller {i} connect failed: {exc}")
+
+    if not connected:
+        q.put({"calls": 0, "errors": 0, "n_connected": 0})
+        return
+
+    # Brief warmup before measurement starts.
+    rpc0 = connected[0][1].rpc(timeout=TIMEOUT)
+    for _ in range(WARMUP_CALLS):
+        try:
+            rpc0.echo(PAYLOAD)
+        except Exception:
+            pass
+
+    total_calls  = [0]
+    total_errors = [0]
+    lock         = threading.Lock()
+    stop_event   = threading.Event()
+
+    def _run(client, conn):
+        rpc = conn.rpc(timeout=TIMEOUT)
+        lc = le = 0
+        while not stop_event.is_set():
+            try:
+                rpc.echo(PAYLOAD)
+                lc += 1
+                # Throttle so the worker never gets more than LEAK_WORKERS concurrent
+                # in-flight requests — prevents TCP-buffer overflow and write-timeout
+                # disconnects while still producing sustained, realistic load.
+                time.sleep(LEAK_CALL_DELAY_S)
+            except Exception:
+                le += 1
+                time.sleep(0.1)  # longer back-off on error
+        with lock:
+            total_calls[0]  += lc
+            total_errors[0] += le
+        try:
+            client.stop()
+        except Exception:
+            pass
+
+    threads = [
+        threading.Thread(target=_run, args=(cl, conn), daemon=True)
+        for cl, conn in connected
+    ]
+    for t in threads:
+        t.start()
+
+    time.sleep(duration_s)
+    stop_event.set()
+    for t in threads:
+        t.join(timeout=TIMEOUT + 30)
+
+    q.put({
+        "calls":       total_calls[0],
+        "errors":      total_errors[0],
+        "n_connected": len(connected),
+    })
+
+
+def run_scenario_leak(
+    n_callers: int = LEAK_CALLERS,
+    duration_s: float = LEAK_DURATION,
+    sample_interval_s: float = LEAK_INTERVAL,
+) -> None:
+    """Scenario 6 — long-running resource / memory-leak detection.
+
+    Topology:  n_callers callers → Router → 1 Worker (LEAK_WORKERS threads).
+
+    Runs for *duration_s* seconds (default 12 min) while sampling the RSS
+    (resident set size) of the router, worker and loader processes every
+    *sample_interval_s* seconds.  At the end, prints:
+
+    * A time-series table of RSS values (MB).
+    * A per-process summary: initial, final, peak RSS and growth rate.
+    * A warning if any process grows faster than 1 MB/min.
+
+    Run standalone::
+
+        python3 tests/perf/concurrency_benchmark.py --leak
+    """
+    label = (
+        f"Scenario 6 — {n_callers} callers → Router → Worker ({LEAK_WORKERS} threads)"
+        f"  [{duration_s / 60:.0f} min]"
+    )
+    max_calls_per_s = int(n_callers / LEAK_CALL_DELAY_S)
+    print(f"\n{'='*70}")
+    print(f"  {label}")
+    print(f"  duration: {duration_s:.0f} s   sample every: {sample_interval_s:.0f} s")
+    print(f"  throttle: {LEAK_CALL_DELAY_S*1000:.0f} ms/call per caller"
+          f"  (≤{max_calls_per_s:,} calls/s total)")
+    print(f"{'='*70}", flush=True)
+
+    port        = _free_port()
+    router_proc = mp.Process(target=_proc_router, args=(port,), daemon=True)
+    worker_proc = mp.Process(
+        target=_proc_heavy_worker, args=(port, LEAK_WORKERS), daemon=True
+    )
+    router_proc.start()
+    try:
+        _wait_for_port(port)
+        worker_proc.start()
+        print("  Waiting for worker to register…", end="", flush=True)
+        _wait_for_workers(port, 1, timeout=30)
+        print(" done")
+
+        q: mp.Queue = mp.Queue()
+        load_proc = mp.Process(
+            target=_proc_leak_loader,
+            args=(port, n_callers, duration_s, q),
+            daemon=True,
+        )
+        load_proc.start()
+
+        # Allow callers to establish connections before first sample.
+        time.sleep(5)
+
+        pids = {
+            "router": router_proc.pid,
+            "worker": worker_proc.pid,
+            "loader": load_proc.pid,
+        }
+        # samples[name] = list of (elapsed_s, rss_kb)
+        samples: dict[str, list] = {name: [] for name in pids}
+
+        col = 10
+        header = f"  {'Time':>8}  {'router MB':>{col}}  {'worker MB':>{col}}  {'loader MB':>{col}}"
+        sep    = f"  {'-'*8}  {'-'*col}  {'-'*col}  {'-'*col}"
+        print(f"\n{header}")
+        print(sep, flush=True)
+
+        t0          = time.monotonic()
+        next_sample = t0
+
+        while True:
+            now     = time.monotonic()
+            elapsed = now - t0
+
+            if now >= next_sample:
+                row_parts = []
+                proc_map = {
+                    "router": router_proc,
+                    "worker": worker_proc,
+                    "loader": load_proc,
+                }
+                for name, pid in pids.items():
+                    proc = proc_map[name]
+                    if proc.is_alive():
+                        rss = _sample_rss_kb(pid)
+                    else:
+                        rss = None   # process exited — don't record 0-KB zombie
+                    if rss is not None:
+                        samples[name].append((elapsed, rss))
+                        row_parts.append(f"{rss / 1024:>{col}.1f}")
+                    else:
+                        row_parts.append(f"{'dead' if not proc.is_alive() else '—':>{col}}")
+                print(f"  {elapsed:>7.0f}s  {'  '.join(row_parts)}", flush=True)
+                next_sample += sample_interval_s
+
+            # Stop once the loader finishes (it exits after duration_s).
+            if not load_proc.is_alive():
+                break
+            if elapsed >= duration_s + 30:
+                break
+
+            sleep_for = max(0.5, next_sample - time.monotonic())
+            time.sleep(min(sleep_for, 2.0))
+
+        print(sep)
+
+        # Report any unexpected subprocess exits.
+        for name, proc in [("router", router_proc), ("worker", worker_proc)]:
+            if not proc.is_alive():
+                print(f"  [!] {name} process exited early (code={proc.exitcode})")
+
+        # Collect final stats from the loader.
+        load_proc.join(timeout=TIMEOUT + 30)
+        stats: dict = {}
+        try:
+            stats = q.get(timeout=5)
+        except Exception:
+            pass
+
+        calls      = stats.get("calls", 0)
+        errors     = stats.get("errors", 0)
+        n_conn     = stats.get("n_connected", 0)
+        calls_per_s = calls / duration_s if duration_s > 0 else 0
+
+        print(f"\n  ── Throughput")
+        print(f"     connected callers : {n_conn}")
+        print(f"     total calls       : {calls:,}")
+        print(f"     errors            : {errors:,}")
+        print(f"     avg throughput    : {calls_per_s:,.1f} calls/s")
+
+        print(f"\n  ── Memory (RSS) growth analysis")
+        # Skip the first 2 samples to avoid startup / GC warm-up noise.
+        # For a 12-min run with 30 s intervals that's 24 samples, so we still
+        # have 22 data points for the trend — plenty for reliable detection.
+        SKIP = 2
+        leak_suspect = False
+        for name, pts in samples.items():
+            if not pts:
+                print(f"     {name:<8}: no samples")
+                continue
+            first_mb = pts[0][1]  / 1024
+            last_mb  = pts[-1][1] / 1024
+            peak_mb  = max(p[1] for p in pts) / 1024
+
+            # Use linear regression on post-warmup samples for the rate.
+            trend_pts = pts[SKIP:] if len(pts) > SKIP + 1 else pts
+            if len(trend_pts) >= 2:
+                xs = [p[0] / 60 for p in trend_pts]   # minutes
+                ys = [p[1] / 1024 for p in trend_pts]  # MB
+                n  = len(xs)
+                xm = sum(xs) / n
+                ym = sum(ys) / n
+                num = sum((x - xm) * (y - ym) for x, y in zip(xs, ys))
+                den = sum((x - xm) ** 2 for x in xs)
+                rate = num / den if den > 0 else 0.0
+            else:
+                rate = 0.0
+
+            warn = " ⚠  possible leak!" if rate > 1.0 else ""
+            if rate > 1.0:
+                leak_suspect = True
+            print(
+                f"     {name:<8}: start={first_mb:6.1f} MB  end={last_mb:6.1f} MB"
+                f"  peak={peak_mb:6.1f} MB"
+                f"  trend={rate:+.3f} MB/min{warn}"
+            )
+
+        if not leak_suspect:
+            print("\n  ✓  No significant memory growth detected.")
+        else:
+            print("\n  ⚠  One or more processes show sustained memory growth.")
+
+        if load_proc.exitcode not in (0, None):
+            print(f"  [!] loader subprocess exited with code {load_proc.exitcode}")
+
+    finally:
+        _quiet_kill(worker_proc)
+        _quiet_kill(router_proc)
+
+
 def _wait_for_workers(port: int, n: int, timeout: float = 60) -> None:
     """Block until at least *n* members with an 'echo' method are visible."""
     from daffi import Client
@@ -487,7 +881,7 @@ def _wait_for_workers(port: int, n: int, timeout: float = 60) -> None:
         ready = sum(
             1 for m in members
             if "echo" in (m.get("methods") or [])
-            and not (m.get("name", "")).endswith("(this app)")
+            and m.get("name", "") != probe.app_name
         )
         if ready >= n:
             probe.stop()
@@ -501,10 +895,49 @@ def _wait_for_workers(port: int, n: int, timeout: float = 60) -> None:
 
 # ── main ──────────────────────────────────────────────────────────────────────
 
-def main() -> None:
+def main(argv: Optional[list] = None) -> None:
+    """Entry point.
+
+    Flags
+    -----
+    --leak          Run the standard scenarios *and* the leak test (scenario 6).
+    --leak-only     Skip the throughput scenarios, run *only* the leak test.
+    --duration N    Override LEAK_DURATION to N seconds (default: 720).
+    --interval N    Override LEAK_INTERVAL to N seconds (default: 30).
+    --callers N     Override LEAK_CALLERS to N (default: 100).
+    """
+    global LEAK_DURATION, LEAK_INTERVAL, LEAK_CALLERS
+
+    import argparse
+    parser = argparse.ArgumentParser(
+        description="daffi concurrency / resource benchmark",
+        add_help=False,
+    )
+    parser.add_argument("--leak",       action="store_true",
+                        help="also run the long-running resource leak scenario")
+    parser.add_argument("--leak-only",  action="store_true",
+                        help="run only the leak scenario, skip throughput tests")
+    parser.add_argument("--duration",   type=float, default=None, metavar="S",
+                        help="leak test duration in seconds (default: 720)")
+    parser.add_argument("--interval",   type=float, default=None, metavar="S",
+                        help="RSS sampling interval in seconds (default: 30)")
+    parser.add_argument("--callers",    type=int,   default=None, metavar="N",
+                        help="number of concurrent callers in leak test (default: 100)")
+    args, _ = parser.parse_known_args(argv)
+
+    if args.duration is not None:
+        LEAK_DURATION = args.duration
+    if args.interval is not None:
+        LEAK_INTERVAL = args.interval
+    if args.callers is not None:
+        LEAK_CALLERS = args.callers
+
+    run_leak = args.leak or args.leak_only
+    run_throughput = not args.leak_only
+
     logging.disable(logging.CRITICAL)
 
-    # Redirect stderr so async native teardown prints don't corrupt output.
+    # Redirect stderr so async native teardown noise doesn't corrupt output.
     devnull = os.open(os.devnull, os.O_WRONLY)
     saved_stderr = os.dup(2)
     os.dup2(devnull, 2)
@@ -514,14 +947,32 @@ def main() -> None:
         print("\ndaffi concurrency benchmark")
         print(f"host: {HOST}")
         print(f"payload: {PAYLOAD}")
-        print(f"scenarios:")
-        print(f"  1. {N_CLIENTS} clients → Service (workers={SERVICE_WORKERS}),  {CALLS_PER_CLIENT} calls each")
-        print(f"  2. {N_CLIENTS} clients → Router → 1 Worker,  {CALLS_PER_CLIENT} calls each")
-        print(f"  3. {N_CALLERS} callers → Router → {N_WORKERS} Workers,  {CASTS_PER_CALLER} casts each")
 
-        run_scenario_1()
-        run_scenario_2()
-        run_scenario_3()
+        if run_throughput:
+            print(f"scenarios:")
+            print(f"  1. {N_CLIENTS} clients → Service (workers={SERVICE_WORKERS}),  {CALLS_PER_CLIENT} calls each")
+            print(f"  2. {N_CLIENTS} clients → Router → 1 Worker,  {CALLS_PER_CLIENT} calls each")
+            print(f"  3. {N_CALLERS} callers → Router → {N_WORKERS} Workers,  {CASTS_PER_CALLER} casts each")
+            print(f"  4. {N_CLIENTS} clients → Router → 1 Worker ({HEAVY_WORKERS} threads),  {CALLS_PER_CLIENT} calls each")
+            print(f"  5. {N_CLIENTS} clients → Service ({HEAVY_WORKERS} workers),  {CALLS_PER_CLIENT} calls each")
+
+            run_scenario_1()
+            run_scenario_2()
+            run_scenario_3()
+            run_scenario_4()
+            run_scenario_5()
+
+            print("\n── Throughput scenarios done ────────────────────────\n")
+
+        if run_leak:
+            print(f"leak scenario:")
+            print(f"  6. {LEAK_CALLERS} callers → Router → Worker ({LEAK_WORKERS} threads)")
+            print(f"     duration={LEAK_DURATION:.0f}s  sample_interval={LEAK_INTERVAL:.0f}s")
+            run_scenario_leak(
+                n_callers=LEAK_CALLERS,
+                duration_s=LEAK_DURATION,
+                sample_interval_s=LEAK_INTERVAL,
+            )
 
         print("\n── Done ─────────────────────────────────────────────\n")
     finally:
@@ -532,7 +983,7 @@ def main() -> None:
 if __name__ == "__main__":
     mp.set_start_method("spawn", force=True)
     try:
-        main()
+        main(sys.argv[1:])
     except KeyboardInterrupt:
         print("\nInterrupted.", file=sys.stderr)
         sys.exit(1)

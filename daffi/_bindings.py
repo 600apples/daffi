@@ -72,19 +72,18 @@ def send_message_from_client(
 
 
 def send_handshake_from_client(
-    password: str, methods: str, conn_num: int
+    methods: str, conn_num: int
 ) -> Tuple[int, int, str]:
     """Send the initial client handshake carrying the node's exported method list.
 
     Args:
-        password: Shared secret (may be empty).
         methods:  Comma-separated list of callback names this client exposes.
         conn_num: Native connection handle.
 
     Returns:
         A ``(uuid, timestamp, found_receiver)`` tuple for the handshake message.
     """
-    return dfcore.sendHandshakeFromClient(password, methods, conn_num)
+    return dfcore.sendHandshakeFromClient(methods, conn_num)
 
 
 def get_available_members(conn_num: int) -> list:

@@ -66,14 +66,12 @@ export fn free(pointer: [*:0]const u8) void {
     allocator.free(std.mem.span(pointer));
 }
 
-export fn sendHandshake(password: [*:0]const u8, conn_num: usize) u32 {
+export fn sendHandshake(conn_num: usize) u32 {
     var arena = ArenaAllocator.init(allocator);
     defer arena.deinit();
     const arena_allocator = arena.allocator();
-    const actual_password: []const u8 = std.mem.span(password);
-    defer allocator.free(actual_password);
     const methods = ""; // Empty for now. Maybe in the future we will have some methods to be executed in browser.
-    const ident = Client.createHandshake(arena_allocator, actual_password, methods, conn_num) catch throwError("failed to create message\n");
+    const ident = Client.createHandshake(arena_allocator, methods, conn_num) catch throwError("failed to create message\n");
     _sendToSocket(ident.data.ptr, ident.data.len);
     return ident.message.uuid;
 }

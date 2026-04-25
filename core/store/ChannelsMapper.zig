@@ -2,6 +2,7 @@ const std = @import("std");
 const network = @import("../network.zig");
 const Allocator = std.mem.Allocator;
 const Mutex = @import("../misc.zig").Mutex;
+const log = std.log.scoped(.store);
 
 pub fn ChannelsMapper(comptime ConnectionT: type) type {
     return struct {
@@ -101,6 +102,15 @@ pub fn ChannelsMapper(comptime ConnectionT: type) type {
             return self.channels.get(chan_uuid) orelse error.ChannelNotFound;
         }
 
+        /// Lock-protected ``contains`` query.  Used by the server-side
+        /// handshake handlers to detect duplicate ``app_name`` registrations
+        /// before mutating the map.
+        pub fn hasChannel(self: *Self, chan_uuid: Uuid) bool {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            return self.channels.contains(chan_uuid);
+        }
+
         /// Look up *chan_uuid*, verify it exposes *method*, and return an owned
         /// duplicate of its connection_name.  Holding the mutex across both the
         /// lookup and the dupe is essential — the returned slice is propagated
@@ -131,10 +141,12 @@ pub fn ChannelsMapper(comptime ConnectionT: type) type {
             const chan = result.value_ptr;
             if (!result.found_existing) {
                 chan.* = try Channel.init(self.allocator, conn, chan_uuid_dup);
+                log.debug("channel created: {s}  total={d}", .{ chan_uuid, self.channels.count() });
             } else {
                 // just update connection. It might be different if client reconnected.
                 chan.conn = conn;
                 self.allocator.free(chan_uuid_dup);
+                log.debug("channel updated (conn ptr): {s}  total={d}", .{ chan_uuid, self.channels.count() });
             }
             return chan;
         }
@@ -189,16 +201,23 @@ pub fn ChannelsMapper(comptime ConnectionT: type) type {
         ///      slot, invalidating the chan pointer)
         ///   3. free the connection_name string (no longer needed as map key)
         fn destroyChannelLocked(self: *Self, chan: *Channel) void {
+            const conn_name = chan.connection_name;
+            log.debug("channel destroy: {s}  remaining={d}", .{ conn_name, self.channels.count() - 1 });
             chan.methods.deinit();
             self.allocator.destroy(chan.methods);
-            const conn_name = chan.connection_name;
-            std.debug.assert(self.channels.swapRemove(conn_name));
+            if (!self.channels.swapRemove(conn_name)) {
+                // This should never happen — it means the channel was already
+                // removed (double-free).  Log and skip the free to avoid UB.
+                log.err("channel double-destroy detected for: {s}  map_count={d}", .{ conn_name, self.channels.count() });
+                return;
+            }
             self.allocator.free(conn_name);
         }
 
         pub fn clearAllChannels(self: *Self) void {
             self.mutex.lock();
             defer self.mutex.unlock();
+            log.debug("clearAllChannels: removing {d} channels", .{self.channels.count()});
             for (self.channels.values()) |*chan| {
                 chan.methods.deinit();
                 self.allocator.destroy(chan.methods);

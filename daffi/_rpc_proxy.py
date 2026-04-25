@@ -27,6 +27,7 @@ if TYPE_CHECKING:
     from daffi.app import Client
 
 from daffi._serialization import SerdeFormat, Serializer
+from daffi.exceptions import InitializationError
 from daffi.utils.misc import iterable
 from daffi._wakeup import WakeupFd
 from daffi.registry._executor_registry import EXECUTOR_REGISTRY
@@ -343,13 +344,16 @@ class RpcProxy:
         Raises:
             TransmissionFailure: If the handshake times out or the native layer
                                  raises a ``SystemError``.
+            InitializationError: If the server *rejected* the handshake — the
+                                 only such case today is a duplicate
+                                 ``app_name`` colliding with an existing,
+                                 still-live peer.
         """
         with system_exception_handler(
             "unable to establish handshake: {}", TransmissionFailure
         ):
             data = METADATA_SEPARATOR.join([name for name, _ in EXECUTOR_REGISTRY])
             uuid, ts, found_receiver = send_handshake_from_client(
-                password="",
                 methods=data,
                 conn_num=conn_num,
             )
@@ -362,9 +366,16 @@ class RpcProxy:
                     receivers=None,
                     proxy=None,
                 ).result()
-                return json.loads(data)
+                payload = json.loads(data)
             except TimeoutError:
                 raise TransmissionFailure("Handshake failed due to timeout.")
+            # ``meta.error`` is the server's policy-rejection signal
+            # (currently: duplicate app_name).  Surface it on the same flag
+            # the success path uses — no separate ERROR-flagged response.
+            err = (payload.get("meta") or {}).get("error")
+            if err:
+                raise InitializationError(f"Handshake rejected by server: {err}")
+            return payload
 
     @classmethod
     def _process_service_handshake(cls, conn_num: int) -> None:
@@ -470,6 +481,10 @@ class RpcResult:
                     readable = ()
                 if readable:
                     notifier.drain()
+                    # The wakeup means a response was just inserted into the
+                    # store — skip the liveness check and let the next loop
+                    # iteration return it.
+                    continue
             else:
                 # No notifier registered (e.g. RpcResult exercised outside
                 # of Client.connect).  Sleep the smaller of the remaining
@@ -480,6 +495,10 @@ class RpcResult:
                     else min(wait_chunk, self._FALLBACK_POLL_INTERVAL)
                 )
 
+            # Only reach here on a ``select`` timeout (or fallback sleep) —
+            # a genuine "no message yet" event.  This is when a silent peer
+            # disconnect could have happened, so verify the expected
+            # receivers are still in the local channel mapper.
             if self.receivers:
                 if missing_receivers := self.receivers - {
                     m["name"] for m in get_available_members(self.conn_num)
@@ -494,10 +513,6 @@ class RpcResult:
         self, res: Tuple
     ) -> Tuple[bytes, int, int]:
         """Decode a ``get_message_from_client_store`` tuple into a result.
-
-        Mirrors the original inline logic from ``result()``: a 1-tuple is an
-        unexpected error from the native layer, an ``ERROR`` flag carries a
-        pickled remote exception, and a normal RESPONSE is returned as-is.
         """
         if len(res) == 1:
             raise RemoteCallError(f"Unexpected response: {res[0]}")
@@ -575,11 +590,13 @@ class BroadcastProxy:
         """
         if self._explicit_receivers is not None:
             return self._explicit_receivers
+        self_name = self.conn.client.app_name
         result = []
         for m in get_available_members(conn_num):
             name: str = m.get("name", "")
-            # Skip the self-reference inserted by the native layer.
-            if name.endswith(" (this app)"):
+            # Skip ourselves — a client connected to a router receives its own
+            # entry back in the member list and must not broadcast to itself.
+            if name == self_name:
                 continue
             methods = m.get("methods") or []
             if self._func_name in methods:
@@ -828,9 +845,8 @@ class ClientConnection:
         conn.stream_nowait(serde=SerdeFormat.OPAQUE).receive_chunk(data_source())
     """
 
-    def __init__(self, client: "Client", password: str = ""):
+    def __init__(self, client: "Client"):
         self.client = client
-        self.password = password
 
     # ------------------------------------------------------------------
     # Primary API
@@ -1052,10 +1068,6 @@ class ClientConnection:
         this to synchronise a multi-worker environment before issuing RPC calls
         that require specific peers to be online.
 
-        Member names are compared without the ``" (this app)"`` suffix that the
-        native layer appends to the current client's own entry, so you can
-        safely pass the current app's own name if needed.
-
         Args:
             *members: One or more peer names to wait for.
             timeout:  Maximum seconds to wait.  ``None`` (default) waits
@@ -1082,7 +1094,7 @@ class ClientConnection:
         start = time.monotonic()
         while True:
             raw = get_available_members(self.client._conn_num)
-            current = {m["name"].removesuffix(" (this app)") for m in raw}
+            current = {m["name"] for m in raw}
             if needed.issubset(current):
                 return
             if timeout is not None and (time.monotonic() - start) >= timeout:
@@ -1103,7 +1115,7 @@ class _RetryCallProxy:
     Usage (transparent — users call the same API as with a plain
     :class:`ClientConnection`)::
 
-        conn = AutoReconnect(client, password)
+        conn = AutoReconnect(client)
         result = conn.rpc(timeout=5).add(1, 2)   # retries on connection loss
     """
 
@@ -1137,7 +1149,7 @@ class AutoReconnect:
 
     .. code-block:: python
 
-        conn = ClientConnection(client, password)
+        conn = ClientConnection(client)
         if client._autoreconnect:
             conn = AutoReconnect(conn)
 
@@ -1243,7 +1255,6 @@ class AutoReconnect:
         stopped — its threads are reused for the new connection.
         """
         client = self.conn.client
-        password = self.conn.password
 
         old_num = client._conn_num
         client._conn_num = None
@@ -1264,7 +1275,7 @@ class AutoReconnect:
             client.logger.warning(f"Connection lost — reconnecting in {delay:.1f}s…")
             time.sleep(delay)
             try:
-                client._do_connect(password)
+                client._do_connect()
                 client.logger.debug("Reconnected successfully.")
                 # Re-register the disconnect fd for the fresh connection so
                 # future drops are also caught without a polling thread.

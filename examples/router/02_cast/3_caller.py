@@ -19,7 +19,7 @@ if __name__ == "__main__":
     workers = [
         m["name"]
         for m in get_available_members(caller._conn_num)
-        if "(this app)" not in m["name"]
+        if m["name"] != caller.app_name
     ]
     print(f"Connected workers: {workers}\n")
 
