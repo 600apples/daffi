@@ -66,15 +66,19 @@ pub fn startServer(_: [*c]PyObject, args: [*c]PyObject) callconv(.c) [*c]PyObjec
     };
     const handler_thread = std.Thread.spawn(.{}, Server.messageDispatcher, .{ allocator, papp_name, cfg, conn_num }) catch return Py_BuildValue("");
     serverHandlerThreads.?.append(handler_thread) catch return Py_BuildValue("");
-    // Block until the dispatcher thread has finished initialisation (including
-    // TLS context creation) and written its ServerEntry.  Without this barrier
-    // Python's setServiceMethods() call immediately after startServer() would
-    // race against the Zig thread and silently fail.
+    // Block until the dispatcher thread has either finished initialisation
+    // (serverReady = true) or failed (serverFailed = true).
     // 100 µs × 100 000 = 10 s maximum wait.
     const sleep_ts = std.c.timespec{ .sec = 0, .nsec = 100_000 };
     var wait_iters: usize = 0;
-    while (!Server.isReady(conn_num) and wait_iters < 100_000) : (wait_iters += 1) {
+    while (!Server.isReady(conn_num) and !Server.hasFailed(conn_num) and wait_iters < 100_000) : (wait_iters += 1) {
         _ = std.c.nanosleep(&sleep_ts, null);
+    }
+    // Signal failure to Python by raising ValueError("ConnectionRefused")
+    // so system_exception_handler can catch and enrich the message.
+    if (Server.hasFailed(conn_num)) {
+        PyErr_SetString(py.PyExc_ValueError, "ConnectionRefused");
+        return null;
     }
     return Py_BuildValue("k", @as(c_ulong, conn_num));
 }

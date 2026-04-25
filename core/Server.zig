@@ -50,6 +50,19 @@ var serverReady: [256]std.atomic.Value(bool) = blk: {
     break :blk arr;
 };
 
+/// Set to true when the dispatcher thread fails during initialisation.
+/// Checked by startServer() so it can return None to Python instead of
+/// silently handing back a conn_num that will never be usable.
+var serverFailed: [256]std.atomic.Value(bool) = blk: {
+    var arr: [256]std.atomic.Value(bool) = undefined;
+    for (&arr) |*v| v.* = std.atomic.Value(bool).init(false);
+    break :blk arr;
+};
+
+pub fn hasFailed(conn_num: usize) bool {
+    return serverFailed[conn_num].load(.acquire);
+}
+
 fn setSignalHandler() !void {
     const internal_handler = struct {
         fn internal_handler(_: posix.SIG) callconv(.c) void {
@@ -132,7 +145,17 @@ pub fn setWakeupFd(conn_num: usize, fd: i32) void {
     }
 }
 
-pub fn messageDispatcher(allocator: Allocator, app_name: []const u8, config: ServerConnection.Config, conn_num: usize) !void {
+pub fn messageDispatcher(allocator: Allocator, app_name: []const u8, config: ServerConnection.Config, conn_num: usize) void {
+    messageDispatcherImpl(allocator, app_name, config, conn_num) catch |err| {
+        // Signal failure so startServer() returns None to Python.
+        // Suppress the raw `error: X` line on stderr — Python will raise a
+        // descriptive InitializationError instead.
+        log.err("{s}[{s}] failed to start: {}", .{ @tagName(config.mode), app_name, err });
+        serverFailed[conn_num].store(true, .release);
+    };
+}
+
+fn messageDispatcherImpl(allocator: Allocator, app_name: []const u8, config: ServerConnection.Config, conn_num: usize) !void {
     // Entry point for server. It creates connection and message pool and starts server loop.
     try setSignalHandler();
     var msgpool: *MessagePool = try MessagePool.init(allocator);

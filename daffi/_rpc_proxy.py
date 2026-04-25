@@ -72,6 +72,7 @@ class ResponseNotifier:
         self._wakeup = WakeupFd()
         set_client_response_fd(conn_num, self._wakeup.write_fd)
 
+
     @classmethod
     def register(cls, conn_num: int) -> "ResponseNotifier":
         """Create and register a notifier for *conn_num*.
@@ -142,7 +143,12 @@ class RemoteCallError(Exception):
 
 
 @contextmanager
-def system_exception_handler(msg_template: str, errtype: type, conn_num: int = 0):
+def system_exception_handler(
+    msg_template: str,
+    errtype: type,
+    conn_num: int = 0,
+    conn_info: tuple = (),
+):
     """Context manager that converts low-level errors from the native extension
     into a friendlier *errtype* exception.
 
@@ -153,6 +159,8 @@ def system_exception_handler(msg_template: str, errtype: type, conn_num: int = 0
         conn_num:     Optional native connection handle.  When provided and the
                       error is ``ReceiverNotFound``, the message is enriched with
                       the list of currently connected peers.
+        conn_info:    Optional ``(host, port, unix_sock_path)`` tuple used to
+                      enrich ``ConnectionRefused`` errors with address details.
     """
     try:
         yield
@@ -175,6 +183,39 @@ def system_exception_handler(msg_template: str, errtype: type, conn_num: int = 0
                 "  connected but does not have the requested @callback registered.\n"
                 f"\n"
                 f"  Connected peers:\n{peer_lines}"
+            )
+
+        elif "ConnectionRefused" in origin and conn_info:
+            import socket as _socket
+            host, port, unix_sock_path = conn_info
+            if unix_sock_path:
+                addr = f"unix://{unix_sock_path}"
+                hint = (
+                    f"\n  Check that the socket path is writable and not already in use.\n"
+                    f"  Remove a stale socket with:  rm -f {unix_sock_path}"
+                )
+            else:
+                addr = f"{host}:{port}"
+                in_use = False
+                if host and port:
+                    try:
+                        with _socket.create_connection((host, port), timeout=0.5):
+                            in_use = True
+                    except OSError:
+                        pass
+                if in_use:
+                    hint = (
+                        f"\n  Port {port} on {host} is already occupied by another process.\n"
+                        f"  Find it with:  lsof -i :{port}  or  ss -tlnp | grep {port}"
+                    )
+                else:
+                    hint = (
+                        f"\n  The server could not bind to {addr}.\n"
+                        f"  Verify the address is reachable and the port is not blocked."
+                    )
+            origin = (
+                f"ConnectionRefused\n\n"
+                f"  Failed to start the server on {addr}.{hint}"
             )
 
         raise errtype(msg_template.format(origin)).with_traceback(None) from None
@@ -482,7 +523,11 @@ class RpcResult:
                     notifier.drain()
                     # The wakeup means a response was just inserted into the
                     # store — skip the liveness check and let the next loop
-                    # iteration return it.
+                    # iteration return it.  This is the hot path for every
+                    # successful RPC: avoiding the ``get_available_members``
+                    # call here saves a Zig-side mutex acquisition + JSON
+                    # build + Python json.loads per call (the dominant cost
+                    # under high concurrency).
                     continue
             else:
                 # No notifier registered (e.g. RpcResult exercised outside
@@ -508,8 +553,15 @@ class RpcResult:
                         f" All receivers: {self.receivers}"
                     )
 
-    def _unpack_response(self, res: Tuple) -> Tuple[bytes, int, int]:
-        """Decode a ``get_message_from_client_store`` tuple into a result."""
+    def _unpack_response(
+        self, res: Tuple
+    ) -> Tuple[bytes, int, int]:
+        """Decode a ``get_message_from_client_store`` tuple into a result.
+
+        Mirrors the original inline logic from ``result()``: a 1-tuple is an
+        unexpected error from the native layer, an ``ERROR`` flag carries a
+        pickled remote exception, and a normal RESPONSE is returned as-is.
+        """
         if len(res) == 1:
             raise RemoteCallError(f"Unexpected response: {res[0]}")
         data, flag, serde = res

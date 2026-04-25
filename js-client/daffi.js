@@ -157,15 +157,73 @@ function _generateClientName() {
     return `${host}-0x${rand.toString(16).padStart(8, '0')}`;
 }
 
-// Resolve app.wasm relative to wherever daffi.js was loaded from.
-// This works for local dev servers and CDN alike: if daffi.js was fetched
-// from  https://cdn.../daffi.js  then app.wasm is  https://cdn.../app.wasm.
-// Falls back to the same directory as the HTML page when currentScript is
-// unavailable (e.g. loaded as an ES module via import()).
-const _WASM_URL = (() => {
+// Build an ordered list of candidate URLs to probe for app.wasm.
+//
+// CDN loads (jsdelivr / unpkg / cdnjs):
+//   Only one candidate — app.wasm next to daffi.js on the CDN.
+//
+// Local dev (any other origin):
+//   1. Script-relative  — same directory as daffi.js  (best case)
+//   2. Page-relative climb — walk up to 5 parent dirs from the HTML page.
+//      This handles JetBrains / VS Code "open in browser" workflows where
+//      the HTML sits inside examples/01_.../ but app.wasm is in js-client/.
+const _CDN_RE = /^https?:\/\/(?:cdn\.jsdelivr\.net|unpkg\.com|cdnjs\.cloudflare\.com)\//;
+
+const _WASM_CANDIDATES = (() => {
     const s = document.currentScript;
-    return (s && s.src) ? new URL('app.wasm', s.src).href : './app.wasm';
+    const scriptSrc = s && s.src;
+
+    // CDN: single canonical URL
+    if (scriptSrc && _CDN_RE.test(scriptSrc))
+        return [ new URL('app.wasm', scriptSrc).href ];
+
+    const seen = new Set();
+    const list = [];
+    const add  = u => { if (!seen.has(u)) { seen.add(u); list.push(u); } };
+
+    // 1. Script-relative (most reliable for proper dev servers)
+    if (scriptSrc) add(new URL('app.wasm', scriptSrc).href);
+
+    // 2. Walk up from the current page URL
+    let base = new URL('.', location.href);
+    for (let i = 0; i < 6; i++) {
+        add(new URL('app.wasm', base).href);
+        const up = new URL('..', base);
+        if (up.href === base.href) break;
+        base = up;
+    }
+
+    return list;
 })();
+
+// _loadWasm() returns a compiled WebAssembly.Module.
+// It probes _WASM_CANDIDATES in order, skipping URLs that return a
+// non-OK status or an empty body (some IDE servers do this for .wasm).
+async function _loadWasm() {
+    const errors = [];
+    for (const url of _WASM_CANDIDATES) {
+        try {
+            // compileStreaming is fastest; it needs Content-Type: application/wasm.
+            // If it fails (wrong MIME type or IDE quirk) fall through to arrayBuffer.
+            let buf = null;
+            try {
+                const m = await WebAssembly.compileStreaming(fetch(url));
+                return m;   // success
+            } catch (_) { /* try arrayBuffer below */ }
+
+            const r = await fetch(url, { cache: 'no-store' });
+            if (!r.ok) { errors.push(`${url} → HTTP ${r.status}`); continue; }
+            buf = await r.arrayBuffer();
+            if (!buf.byteLength) { errors.push(`${url} → empty body`); continue; }
+            return await WebAssembly.compile(buf);  // success
+        } catch (e) {
+            errors.push(`${url} → ${e.message}`);
+        }
+    }
+    throw new TypeError(
+        `app.wasm could not be loaded. Tried:\n  ${errors.join('\n  ')}\n` +
+        `Tip: run  python3 js-client/serve.py  from the project root.`);
+}
 
 function DaffiClient(name, options) {
     // Allow DaffiClient(options) — name omitted entirely.
@@ -177,7 +235,7 @@ function DaffiClient(name, options) {
     );
     this.name           = name || _generateClientName();
     this.wsUrl          = options.wsUrl;
-    this.wasmPath       = _WASM_URL;
+    this.wasmPath       = _WASM_CANDIDATES[0];  // informational; actual load probes all candidates
     this.autoreconnect  = options.autoreconnect  || false;
     this.reconnectDelay = options.reconnectDelay != null ? options.reconnectDelay : 2000;
     this.pendingMessages = {};
@@ -217,7 +275,7 @@ function DaffiClient(name, options) {
     const _initWasm = async () => {
         if (_wasmExports) return; // already done
 
-        if (!_module) _module = await WebAssembly.compileStreaming(fetch(self.wasmPath));
+        if (!_module) _module = await _loadWasm();
 
         const INITIAL_PAGES = 256; // 16 MB
         _memory = new WebAssembly.Memory({ initial: INITIAL_PAGES, maximum: 65536 });
@@ -665,13 +723,45 @@ function DaffiClient(name, options) {
             _scheduleReconnect();
         };
 
-        // Wait for the socket to open (up to 4 s).
+        // Wait for the socket to open.  Reject immediately on error or early
+        // close rather than polling so errors surface straight away.
+        // The previously-registered onclose (reconnect logic) is captured and
+        // restored in BOTH the success and failure paths so it is never lost.
+        const _savedOnClose = _socket.onclose;
         await new Promise((resolve, reject) => {
-            let attempts = 0;
-            const iv = setInterval(() => {
-                if (attempts++ > 20) { clearInterval(iv); reject(new Error('WebSocket open timeout')); }
-                else if (_socket.readyState === WebSocket.OPEN) { clearInterval(iv); resolve(); }
-            }, 200);
+            const timer = setTimeout(() => {
+                _socket.onclose = _savedOnClose;
+                reject(new Error(
+                    `WebSocket open timeout (8 s) — is the daffi server running at ${self.wsUrl}?`));
+            }, 8000);
+
+            _socket.onopen = () => {
+                clearTimeout(timer);
+                _socket.onopen  = null;
+                _socket.onerror = null;
+                _socket.onclose = _savedOnClose;  // restore before resolving
+                resolve();
+            };
+
+            _socket.onerror = () => {
+                clearTimeout(timer);
+                _socket.onopen  = null;
+                _socket.onerror = null;
+                _socket.onclose = _savedOnClose;
+                reject(new Error(
+                    `WebSocket connection failed for ${self.wsUrl} — ` +
+                    `verify the daffi server is running and reachable`));
+            };
+
+            _socket.onclose = (ev) => {
+                clearTimeout(timer);
+                _socket.onopen  = null;
+                _socket.onerror = null;
+                _socket.onclose = _savedOnClose;
+                reject(new Error(
+                    `WebSocket closed before open (code ${ev.code}) — ` +
+                    `target: ${self.wsUrl}`));
+            };
         });
 
         self.closed = false;

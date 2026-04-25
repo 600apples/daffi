@@ -255,7 +255,9 @@ pub const SynParser = struct {
     handshake_pool: *HandshakePool,
 
     pub fn init(allocator: Allocator) !SynParser {
-        const handshake_pool = try HandshakePool.init(allocator, 1, 512, 10);
+        // 8 KiB is enough for any real browser upgrade request.
+        // Chrome sends Sec-Fetch-* headers that push the total well past 512 B.
+        const handshake_pool = try HandshakePool.init(allocator, 1, 8192, 10);
         return .{
             .handshake_pool = handshake_pool,
         };

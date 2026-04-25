@@ -26,6 +26,7 @@ from daffi._rpc_proxy import (
     ClientConnection,
     AutoReconnect,
     ResponseNotifier,
+    system_exception_handler,
 )
 from daffi._signals import set_signal_handler
 from daffi._task_dispatcher import TaskDispatcher, EventType
@@ -339,18 +340,19 @@ class ServerMixin:
             if not self._task_dispatcher:
                 self._task_dispatcher = TaskDispatcher(workers=self.workers)
             self._task_dispatcher._start_workers()
-        self._conn_num = dfcore.startServer(
-            self.host,
-            self.port,
-            self.server_mode,
-            self.app_name,
-            self.tls,
-            self.cert_file,
-            self.key_file,
-        )
-        if self._conn_num is None:
-            raise InitializationError(
-                f"Failed to start the server. connection info: {self.info}"
+        with system_exception_handler(
+            "{}",
+            InitializationError,
+            conn_info=(self.host, self.port, self.unix_sock_path),
+        ):
+            self._conn_num = dfcore.startServer(
+                self.host,
+                self.port,
+                self.server_mode,
+                self.app_name,
+                self.tls,
+                self.cert_file,
+                self.key_file,
             )
         self.logger.debug(
             f"has been started successfully. connection info: {self.info}"
