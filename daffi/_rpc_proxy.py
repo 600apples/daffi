@@ -72,7 +72,6 @@ class ResponseNotifier:
         self._wakeup = WakeupFd()
         set_client_response_fd(conn_num, self._wakeup.write_fd)
 
-
     @classmethod
     def register(cls, conn_num: int) -> "ResponseNotifier":
         """Create and register a notifier for *conn_num*.
@@ -509,11 +508,8 @@ class RpcResult:
                         f" All receivers: {self.receivers}"
                     )
 
-    def _unpack_response(
-        self, res: Tuple
-    ) -> Tuple[bytes, int, int]:
-        """Decode a ``get_message_from_client_store`` tuple into a result.
-        """
+    def _unpack_response(self, res: Tuple) -> Tuple[bytes, int, int]:
+        """Decode a ``get_message_from_client_store`` tuple into a result."""
         if len(res) == 1:
             raise RemoteCallError(f"Unexpected response: {res[0]}")
         data, flag, serde = res

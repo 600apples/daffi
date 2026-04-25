@@ -193,7 +193,7 @@ def direct_service(free_port):
     )
     proc.start()
     wait_for_port(free_port)
-    time.sleep(0.15)   # let callbacks register
+    wait_for_members(free_port, {"integ-service"})
     yield free_port
     quiet_kill(proc)
 
@@ -209,7 +209,7 @@ def router_with_worker(free_port):
         target=proc_worker, args=(free_port, "integ-worker"), daemon=True
     )
     wproc.start()
-    time.sleep(0.4)   # let worker connect and register callbacks
+    wait_for_members(free_port, {"integ-worker"})
     yield free_port
     quiet_kill(wproc)
     quiet_kill(rproc)

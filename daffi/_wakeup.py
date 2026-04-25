@@ -56,7 +56,10 @@ class WakeupFd:
         """Write one notification unit so the fd becomes readable."""
         try:
             # eventfd: write uint64(1) as 8 little-endian bytes; pipe: 1 byte.
-            os.write(self.write_fd, b"\x01\x00\x00\x00\x00\x00\x00\x00" if self._is_eventfd else b"\x01")
+            os.write(
+                self.write_fd,
+                b"\x01\x00\x00\x00\x00\x00\x00\x00" if self._is_eventfd else b"\x01",
+            )
         except OSError:
             pass
 

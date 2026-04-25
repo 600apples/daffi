@@ -46,6 +46,7 @@ def sync_native_log_level(python_level: int | None = None) -> None:
         python_level = logging.getLogger().getEffectiveLevel()
     try:
         from daffi import dfcore  # local import to avoid circular imports
+
         dfcore.setLogLevel(_python_level_to_native(python_level))
     except Exception:
         pass

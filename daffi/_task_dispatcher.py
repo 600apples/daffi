@@ -59,6 +59,13 @@ except ImportError:
     pass
 
 
+class EventType(str):
+    """String constants for the two peer-lifecycle event types emitted by daffi."""
+
+    CONNECTED    = "connected"
+    DISCONNECTED = "disconnected"
+
+
 _SENDERS = (send_message_from_client, send_message_from_service)
 
 
@@ -89,7 +96,12 @@ def _invoke_callback(
         # worker thread, leaving the caller to time out instead of getting
         # the remote error message.
         include_tb = _tblib_installed and serde == SerdeFormat.PICKLE
-        result = (err_type.__name__, err_type.__module__, str(err_obj), tb if include_tb else None)
+        result = (
+            err_type.__name__,
+            err_type.__module__,
+            str(err_obj),
+            tb if include_tb else None,
+        )
         return result, MessageFlag.ERROR, serde
 
 
@@ -412,10 +424,7 @@ class TaskDispatcher:
                     ) = task
 
                     if flag == MessageFlag.EVENTS:
-                        # Event notifications carry conn-bound handlers
-                        payload = json.loads(data)
-                        for handler in conn.event_handlers:
-                            handler(payload)
+                        self._dispatch_event(conn, json.loads(data))
                     elif inline:
                         _execute_task(
                             uuid,
@@ -440,6 +449,31 @@ class TaskDispatcher:
                                 bool(conn.server_mode),
                             )
                         )
+
+    @staticmethod
+    def _dispatch_event(conn, payload: dict) -> None:
+        """Route an EVENTS payload to the typed handlers registered on *conn*.
+
+        Called inline on the poller thread (never enqueued) so that handlers
+        always execute in arrival order and have immediate access to the
+        connection object.
+
+        Routing rules
+        -------------
+        * ``EventType.CONNECTED``    → :attr:`_on_member_added_handlers`   (receives member name)
+        * ``EventType.DISCONNECTED`` → :attr:`_on_member_removed_handlers` (receives member name)
+
+        Both handler lists are iterated in registration order.
+        """
+        event_type: str = payload["type"]
+        member: str = payload["member"]
+
+        if event_type == EventType.CONNECTED:
+            for handler in conn._on_member_added_handlers:
+                handler(member)
+        elif event_type == EventType.DISCONNECTED:
+            for handler in conn._on_member_removed_handlers:
+                handler(member)
 
     def _worker_loop(self) -> None:
         """Thread-pool worker body.

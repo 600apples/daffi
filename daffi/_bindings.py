@@ -71,9 +71,7 @@ def send_message_from_client(
     )
 
 
-def send_handshake_from_client(
-    methods: str, conn_num: int
-) -> Tuple[int, int, str]:
+def send_handshake_from_client(methods: str, conn_num: int) -> Tuple[int, int, str]:
     """Send the initial client handshake carrying the node's exported method list.
 
     Args:

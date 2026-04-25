@@ -28,7 +28,7 @@ from daffi._rpc_proxy import (
     ResponseNotifier,
 )
 from daffi._signals import set_signal_handler
-from daffi._task_dispatcher import TaskDispatcher
+from daffi._task_dispatcher import TaskDispatcher, EventType
 from daffi.registry._executor_registry import EXECUTOR_REGISTRY
 
 
@@ -39,12 +39,71 @@ class ServerMode(IntEnum):
     SERVICE = 1
 
 
-class Application(ABC):
+class EventsMixin:
+    """Typed event-handler registration for :class:`Service` and :class:`Client`.
+
+    Provides two decorator / callable registration methods:
+
+    * :meth:`on_member_added`   — fires when a peer joins (``"connected"``).
+    * :meth:`on_member_removed` — fires when a peer leaves (``"disconnected"``).
+
+    Both can be used as plain method calls **or** as decorators::
+
+        client = Client(app_name="watcher", host="127.0.0.1", port=6000)
+
+        @client.on_member_added
+        def handle_join(member: str) -> None:
+            print(f"{member} joined")
+
+        @client.on_member_removed
+        def handle_leave(member: str) -> None:
+            print(f"{member} left")
+
+        conn = client.connect()
+    """
+
+    def __init_events__(self) -> None:
+        self._on_member_added_handlers:   List[Callable[[str], Any]] = []
+        self._on_member_removed_handlers: List[Callable[[str], Any]] = []
+
+    def on_member_added(self, handler: Callable[[str], Any]) -> Callable[[str], Any]:
+        """Register *handler* to be called whenever a peer joins the network.
+
+        The handler receives the peer's ``app_name`` as its sole argument.
+        Can be used as a decorator or as a plain method call.
+
+        Args:
+            handler: ``Callable[[str], Any]`` — receives the joining peer's name.
+
+        Returns:
+            The *handler* unchanged (so the method can be used as a decorator).
+        """
+        self._on_member_added_handlers.append(handler)
+        return handler
+
+    def on_member_removed(self, handler: Callable[[str], Any]) -> Callable[[str], Any]:
+        """Register *handler* to be called whenever a peer leaves the network.
+
+        The handler receives the peer's ``app_name`` as its sole argument.
+        Can be used as a decorator or as a plain method call.
+
+        Args:
+            handler: ``Callable[[str], Any]`` — receives the departing peer's name.
+
+        Returns:
+            The *handler* unchanged (so the method can be used as a decorator).
+        """
+        self._on_member_removed_handlers.append(handler)
+        return handler
+
+
+class Application(EventsMixin, ABC):
     """Abstract base shared by :class:`Router`, :class:`Service`, and
     :class:`Client`.
 
     Handles common initialisation: name generation, logger setup, signal
     handler registration, and transport selection (TCP vs Unix socket).
+    Inherits typed event-handler registration from :class:`EventsMixin`.
     """
 
     server_mode: ServerMode = None
@@ -112,7 +171,7 @@ class Application(ABC):
         # re-raise ``_connection_error``) or whether it must be raised
         # directly from the watcher thread to avoid being silently swallowed.
         self._joining: bool = False
-        self.event_handlers: List[Callable[[Dict], Any]] = []
+        self.__init_events__()
         self._executors_subscribed: bool = False
 
         if self.app_name is None:
@@ -347,36 +406,6 @@ class Service(Application, ServerMixin):
 
     server_mode = ServerMode.SERVICE
 
-    def add_event_handler(self, handler: Callable[[Dict], Any]):
-        """Register a callable invoked whenever a node connects or disconnects.
-
-        The framework emits an EVENTS message each time a client or service
-        joins or leaves the network.  The handler is called on the task-worker
-        thread with a single ``dict`` argument whose keys are always:
-
-        * ``"type"`` — ``"connected"`` or ``"disconnected"``
-        * ``"member"`` — the ``app_name`` of the node that changed state
-
-        Multiple handlers can be registered; they are called in registration
-        order.
-
-        Args:
-            handler: Callable that accepts one ``dict`` argument.
-
-        Example::
-
-            def on_event(event: dict):
-                if event["type"] == "connected":
-                    print(f"{event['member']} joined")
-                elif event["type"] == "disconnected":
-                    print(f"{event['member']} left")
-
-            svc = Service(host="127.0.0.1", port=5000)
-            svc.add_event_handler(on_event)
-            svc.start()
-        """
-        self.event_handlers.append(handler)
-
 
 class Client(Application):
     """A client that connects to a :class:`Router` or :class:`Service` and
@@ -542,37 +571,6 @@ class Client(Application):
             self._register_executors()
             if not self._autoreconnect:
                 self._start_disconnect_watcher()
-
-    def add_event_handler(self, handler: Callable[[Dict], Any]):
-        """Register a callable invoked whenever a node connects or disconnects.
-
-        The framework emits an EVENTS message each time a service or other
-        client joins or leaves the network.  The handler is called on the
-        task-worker thread with a single ``dict`` argument whose keys are
-        always:
-
-        * ``"type"`` — ``"connected"`` or ``"disconnected"``
-        * ``"member"`` — the ``app_name`` of the node that changed state
-
-        Multiple handlers can be registered; they are called in registration
-        order.
-
-        Args:
-            handler: Callable that accepts one ``dict`` argument.
-
-        Example::
-
-            def on_event(event: dict):
-                if event["type"] == "connected":
-                    print(f"{event['member']} joined")
-                elif event["type"] == "disconnected":
-                    print(f"{event['member']} left")
-
-            client = Client(app_name="watcher", host="127.0.0.1", port=6000)
-            client.add_event_handler(on_event)
-            conn = client.connect()
-        """
-        self.event_handlers.append(handler)
 
     def _start_disconnect_watcher(self) -> None:
         """Start a daemon thread that surfaces unexpected server-side disconnects.

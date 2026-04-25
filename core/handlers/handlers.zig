@@ -202,6 +202,15 @@ pub fn ServerHandler(comptime HandlerConnectionT: ConnectionType) type {
 
             fn onRequest(self: *Self, _: *ParentConnT, message: *Message, consumed: *bool) !void {
                 // Push message to the task queue for processing by service workers.
+                // NOTE: the handler-level mutex is intentionally NOT taken here.
+                // ``tasks_queue.pushMessageToQueue`` has its own internal mutex,
+                // so the queue is already thread-safe.  Taking ``self.mutex``
+                // here serialised all concurrent client reader threads through
+                // one lock on every single incoming RPC, making throughput
+                // proportional to 1/N instead of workers/N under high concurrency.
+                //
+                // Set consumed BEFORE pushing so the caller never reads message
+                // fields after the push (Python may free the message immediately).
                 consumed.* = true;
                 try self.tasks_queue.pushMessageToQueue(message);
             }
@@ -218,7 +227,7 @@ pub fn ServerHandler(comptime HandlerConnectionT: ConnectionType) type {
                     return;
                 };
                 const connection_name = try allocator.dupe(u8, chan.connection_name); // for event
-                log_service.debug("client disconnected: {s}  peers_remaining={d}", .{
+                log_service.info("client disconnected: {s}  peers_remaining={d}", .{
                     connection_name,
                     self.chan_mapper.channels.count() - 1,
                 });
@@ -239,6 +248,9 @@ pub fn ServerHandler(comptime HandlerConnectionT: ConnectionType) type {
                     else => log_service.warn("failed to receive message: {}", .{err}),
                 }
             }
+
+            // error_handler / disconnection_handler keep their original signatures
+            // (they are not part of handlers_mapping and don't receive *bool).
         };
 
         const RouterHandler = struct {
@@ -344,29 +356,28 @@ pub fn ServerHandler(comptime HandlerConnectionT: ConnectionType) type {
                 // Send the full member list only to the NEW client (transmitter ==
                 // its own app_name, so onHandshake inserts into the message store and
                 // the Python side unblocks from _process_client_handshake).
-                log_router.debug("client connected: {s}  total_peers={d}", .{ connection_name, all_chans.len });
+                log_router.info("client connected: {s}  total_peers={d}", .{ connection_name, all_chans.len });
                 try self.sendToConnection(Message, conn, message);
 
-                // Broadcast a compact 1-member HANDSHAKE to existing clients —
-                // BUT ONLY if the new client has at least one registered method.
+                // Notify existing clients about the new peer.
                 //
-                // Rationale: peers with no methods are pure callers; nothing in
-                // the network can route an RPC *to* them, so existing peers gain
-                // no routing capability by learning about them.  Skipping the
-                // broadcast reduces connection-phase traffic from O(N²) sends to
-                // O(N × W) where W = number of workers (typically ≪ N).
+                // Two messages are sent (always in this order so chan_mapper is
+                // up-to-date before the Python @on_event handler fires):
                 //
-                // For the very common "many callers + few workers" topology
-                // (e.g. 200 callers + 1 worker) this drops total connection-phase
-                // sends from ~20 000 to ~200, cutting wall time from >50 s to <2 s.
+                //   1. Mini-HANDSHAKE  — only when the new client has ≥1 method.
+                //      The add-only branch in ClientHandler.onHandshake updates
+                //      the receiving client's chan_mapper (enables routing to the
+                //      new peer).  Pure callers (no methods) are skipped here
+                //      because nothing in the network ever routes an RPC *to*
+                //      them, so the routing map gains nothing from them.
                 //
-                // Existing clients still learn about new *workers* (has methods)
-                // via the mini-HANDSHAKE so ``wait_for_members`` and method-based
-                // routing both work correctly.
-                //
-                // Note: no separate "connected" EVENT is sent — the mini-HANDSHAKE
-                // is the only notification.  ``ClientHandler.onEvent("connected")``
-                // is a deliberate no-op that avoids O(N²) Python GIL wakeups.
+                //   2. "connected" EVENT — sent unconditionally to ALL existing
+                //      clients, regardless of whether the new peer has methods.
+                //      This is the signal that drives @on_event("connected")
+                //      Python handlers (e.g. a monitoring router that discovers
+                //      workers as they join).  The EVENT arrives after the
+                //      mini-HANDSHAKE (TCP order), so by the time Python wakes
+                //      up the chan_mapper is already updated.
                 const new_chan = self.chan_mapper.channels.getPtr(connection_name) orelse unreachable;
                 if (new_chan.methods.hash_map.count() > 0) {
                     const new_member_methods = try new_chan.joinedMethods(allocator, serde.UNIT_SEPARATOR);
@@ -379,10 +390,37 @@ pub fn ServerHandler(comptime HandlerConnectionT: ConnectionType) type {
                             try self.sendToConnection(Message, c.conn, mini_broadcast);
                     }
                 }
+
+                // Always send a "connected" EVENT so @on_event("connected")
+                // handlers fire for every joining peer (with or without methods).
+                var connected_event = try serde.createEventMessage(self.allocator, 0, connection_name, "connected");
+                defer connected_event.deinit();
+                for (self.chan_mapper.channels.values()) |c| {
+                    if (!std.mem.eql(u8, connection_name, c.connection_name))
+                        try self.sendToConnection(Message, c.conn, connected_event);
+                }
             }
 
             fn onRequest(self: *Self, _: *ParentConnT, message: *Message, _: *bool) !void {
                 log_router.debug("onRequest func={s} receiver={s}", .{ message.getFuncName(), message.getReceiver() });
+                // Hold self.mutex for the ENTIRE lookup + send.
+                //
+                // Rationale: after findChannel() returns a Channel copy with
+                // c.conn, the mutex must still be held when sendToConnection()
+                // runs.  Without it, the race is:
+                //
+                //   1. onRequest releases mutex, extracts c.conn.
+                //   2. Client disconnects: diconnectionHandler (mutex) removes
+                //      the channel; serverLoop defer calls conn.destroy().
+                //   3. onRequest calls sendToConnection(c.conn, ...) on freed
+                //      memory → SIGSEGV.
+                //
+                // Holding the mutex prevents step 2 from completing its
+                // conn.destroy() before step 3 finishes: diconnectionHandler
+                // waits for the mutex, so conn lives at least as long as the
+                // send.  The conn.wlock (inner lock) serialises concurrent
+                // writes within sendToConnection — no new deadlock is introduced
+                // because no callee of onRequest holds the RouterHandler.mutex.
                 self.mutex.lock();
                 defer self.mutex.unlock();
                 if (self.findChannel(message.getFuncName(), message.getReceiver())) |c|
@@ -414,7 +452,7 @@ pub fn ServerHandler(comptime HandlerConnectionT: ConnectionType) type {
                     return;
                 };
                 const connection_name = try allocator.dupe(u8, chan.connection_name);
-                log_router.debug("client disconnected: {s}  peers_remaining={d}", .{
+                log_router.info("client disconnected: {s}  peers_remaining={d}", .{
                     connection_name,
                     self.chan_mapper.channels.count() - 1,
                 });
@@ -455,6 +493,11 @@ pub fn ServerHandler(comptime HandlerConnectionT: ConnectionType) type {
         };
     };
 }
+
+// error_handler / disconnection_handler keep their original signatures — they
+// are stored in separate function-pointer fields (not in handlers_mapping) and
+// are called with their own wrappers (handleErr / handleDisconnect), so they
+// do not need the consumed: *bool parameter.
 
 // Client handlers
 
@@ -504,14 +547,10 @@ pub const ClientHandler = struct {
             .ptr = @constCast(self),
             // EVENTS are routed to onEvent (not onRequest) so that:
             // * "disconnected" events update the Zig chan_mapper inline (via
-            //   destroyChannelByName) and are then pushed to the task queue for
-            //   Python @on_event handlers.
-            // * "connected" events are handled as a no-op — the chan_mapper is
-            //   already updated by the mini-HANDSHAKE broadcast — so no task-queue
-            //   push is made and no GIL wakeup is triggered.
-            // This avoids O(N²) spurious Python task-dispatcher wakeups during the
-            // connection phase (previously, EVENTS → onRequest pushed every event to
-            // the task queue, causing N² GIL acquisitions for N router-connected peers).
+            //   destroyChannelByName) before the message is pushed to the task
+            //   queue for Python @on_event handlers.
+            // * "connected" and all other events are pushed to the task queue so
+            //   Python @on_event handlers are notified.
             .handlers_mapping = MessageHandlerT.createMapping(.{ .HANDSHAKE = onHandshake, .REQUEST = onRequest, .EVENTS = onEvent, .RESPONSE = onResponse, .ERROR = onResponse }),
             .error_handler = errorHandler,
             .disconnection_handler = diconnectionHandler,
@@ -606,6 +645,17 @@ pub const ClientHandler = struct {
     ///   members are added, existing ones are updated in-place — without calling
     ///   ``clearAllChannels``.  Peers that left are handled separately by the
     ///   "disconnected" EVENT message (see ``onEvent``).
+    ///
+    ///   Skipping ``clearAllChannels`` is critical for performance: with N
+    ///   clients connected, every new connection triggers N broadcast HANDSHAKE
+    ///   messages arriving simultaneously at N existing clients.  If each
+    ///   client calls ``clearAllChannels`` (freeing N entries) and then rebuilds
+    ///   (allocating N new entries), the global C allocator is hit with O(N²)
+    ///   concurrent alloc/free operations whose internal mutex serialises them,
+    ///   causing each subsequent connection to take proportionally longer
+    ///   (client 196 → 3.4 s).  The add-only path avoids all per-entry allocs
+    ///   for already-known members, reducing pressure to O(N) total for the new
+    ///   entry only.
     pub fn onHandshake(self: *Self, conn: *ParentConnT, message: *Message, consumed: *bool) !void {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -619,7 +669,7 @@ pub const ClientHandler = struct {
                 return;
             };
             defer client_hs.deinit();
-            log_client.debug("[{s}] own handshake received  members={d}", .{ self.app_name, client_hs.value.members.len });
+            log_client.info("[{s}] own handshake received  members={d}", .{ self.app_name, client_hs.value.members.len });
             self.chan_mapper.clearAllChannels();
             for (client_hs.value.members) |mb| {
                 var chan = try self.chan_mapper.getOrCreateChannel(conn, mb.name);
@@ -627,7 +677,10 @@ pub const ClientHandler = struct {
                     for (methods) |mt| try chan.addMethod(mt);
                 }
             }
-
+            // Transfer ownership to the message store; mark consumed so the
+            // caller (dispatcher) does NOT free the message.
+            // Set consumed BEFORE insert so it is always accurate even if the
+            // dispatcher resumes before insert() returns.
             consumed.* = true;
             try self.msg_store.insert(message);
         } else {
@@ -675,23 +728,14 @@ pub const ClientHandler = struct {
 
     /// Handle an EVENTS message received from the router.
     ///
-    /// Three cases:
+    /// **"connected"**: pushed to the task queue so Python ``on_member_added``
+    ///   handlers fire.  The mini-HANDSHAKE broadcast (sent just before this EVENT
+    ///   over the same TCP connection) already updated chan_mapper via the add-only
+    ///   branch in ``onHandshake``, so routing is ready by the time Python wakes up.
     ///
     /// **"disconnected"**: removes the departed member from the Zig chan_mapper
     ///   immediately (so routing stops hitting the dead peer) and then pushes
-    ///   the event to the task queue so Python ``@on_event`` handlers are
-    ///   notified.
-    ///
-    /// **"connected"**: no-op.  The mini-HANDSHAKE broadcast already added the
-    ///   new member to the chan_mapper via the add-only branch in ``onHandshake``.
-    ///   Skipping the task-queue push avoids an O(N²) cascade of Python GIL
-    ///   wakeups during the connection phase (N existing clients × N events = N²
-    ///   acquisitions that serialise through the GIL for N router-connected peers).
-    ///   Since ``message.metadata.durable`` remains false, the caller
-    ///   (``messageDispatcherClientEntry``) frees the message and skips
-    ///   ``triggerWakeup()``.
-    ///
-    /// **Custom / other events**: pushed to the task queue so Python handlers
+    ///   the event to the task queue so Python ``on_member_removed`` handlers
     ///   are notified.
     pub fn onEvent(self: *Self, _: *ParentConnT, message: *Message, consumed: *bool) !void {
         var arena = ArenaAllocator.init(self.allocator);
@@ -700,18 +744,11 @@ pub const ClientHandler = struct {
 
         log_client.debug("[{s}] event: type={s} member={s}", .{ self.app_name, event.value.type, event.value.member });
 
-        if (std.mem.eql(u8, event.value.type, "connected")) {
-            // No-op: chan_mapper already updated by the mini-HANDSHAKE.
-            // Do NOT push to task queue — the message stays non-durable and is
-            // freed by the caller without triggering a GIL wakeup.
-            return;
-        }
-
         if (std.mem.eql(u8, event.value.type, "disconnected")) {
             // Must hold client_handler.mutex while mutating chan_mapper so we
             // don't race with findReceiverForMethod / getAvailableMembersClientEntry
             // which iterate allChannels() under the same lock.
-            log_client.debug("[{s}] peer departed: {s}  peers_remaining={d}", .{
+            log_client.info("[{s}] peer departed: {s}  peers_remaining={d}", .{
                 self.app_name,
                 event.value.member,
                 if (self.chan_mapper.channels.count() > 0) self.chan_mapper.channels.count() - 1 else 0,
@@ -721,8 +758,8 @@ pub const ClientHandler = struct {
             self.mutex.unlock();
         }
 
-        // Push to task queue (for "disconnected" + custom events) so Python
-        // @on_event handlers are called by the task dispatcher.
+        // Push to task queue so Python on_member_added / on_member_removed
+        // handlers are called by the task dispatcher.
         // Mark consumed BEFORE push — same race-safety rule as onRequest.
         consumed.* = true;
         try self.tasks_queue.pushMessageToQueue(message);
