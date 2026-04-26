@@ -171,12 +171,19 @@ def system_exception_handler(
             origin = str(e)
 
         if "ReceiverNotFound" in origin and conn_num:
-            available = [m["name"] for m in get_available_members(conn_num)]
-            peer_lines = (
-                "\n".join(f"      • {p}" for p in available)
-                if available
-                else "      (none connected)"
-            )
+            available = get_available_members(conn_num)
+            if available:
+                peer_parts = []
+                for m in available:
+                    methods = m.get("methods") or []
+                    if methods:
+                        cb_list = ", ".join(methods)
+                        peer_parts.append(f"      • {m['name']}\n          callbacks: [{cb_list}]")
+                    else:
+                        peer_parts.append(f"      • {m['name']}\n          callbacks: (none)")
+                peer_lines = "\n".join(peer_parts)
+            else:
+                peer_lines = "      (none connected)"
             origin = (
                 "ReceiverNotFound\n\n"
                 "  The peer is either not connected to the router, or it is\n"
