@@ -134,11 +134,11 @@ pub fn isReady(conn_num: usize) bool {
 /// signal whenever a message is pushed onto the Service task queue for
 /// conn_num.  Must be called after startServer() returns and before any
 /// client can send messages (i.e. before the handshake advertises methods).
-pub fn setWakeupFd(conn_num: usize, fd: i32) void {
+pub fn setServiceRequestFd(conn_num: usize, fd: i32) void {
     if (serverEntries) |*entries| {
         if (entries.buffer[conn_num]) |*entry| {
             switch (entry.server_handler.*) {
-                .Service => |*s| s.tasks_queue.wakeup_fd = fd,
+                .Service => |*s| s.tasks_queue.request_fd = fd,
                 .Router => {}, // routers have no task queue
             }
         }

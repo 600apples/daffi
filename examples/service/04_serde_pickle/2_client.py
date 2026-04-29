@@ -25,7 +25,7 @@ if __name__ == "__main__":
     print(f"Sending order: {order.order_id}  total=${order.grand_total:.2f}  "
           f"status={order.status.value}")
 
-    client = Client(app_name="order-client", host="127.0.0.1", port=5004)
+    client = Client(app_name="order-client", host="0.0.0.0", port=5004)
     conn = client.connect()
 
     rpc = conn.rpc(timeout=5, serde=SerdeFormat.PICKLE)

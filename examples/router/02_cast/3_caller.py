@@ -13,7 +13,7 @@ from daffi._rpc_proxy import get_available_members
 
 
 if __name__ == "__main__":
-    caller = Client(app_name="cast-caller", host="127.0.0.1", port=6002)
+    caller = Client(app_name="cast-caller", host="0.0.0.0", port=6002)
     conn = caller.connect()
 
     workers = [

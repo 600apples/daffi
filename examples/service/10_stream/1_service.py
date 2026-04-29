@@ -19,7 +19,7 @@ def receive_chunk(data: bytes) -> None:
 
 
 if __name__ == "__main__":
-    svc = Service(app_name="stream-service", host="127.0.0.1", port=5010)
+    svc = Service(app_name="stream-service", host="0.0.0.0", port=5010)
     svc.start()
-    print("Service running on 127.0.0.1:5010 — press Ctrl+C to stop.")
+    print("Service running on 0.0.0.0:5010 — press Ctrl+C to stop.")
     svc.join()

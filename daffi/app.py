@@ -17,9 +17,9 @@ from . import dfcore
 
 from daffi.utils import colors
 from daffi.utils.logger import get_daffi_logger
-from daffi.exceptions import InitializationError
+from daffi.exceptions import InitializationError, Disconnected, Evicted, DisconnectReason
 from daffi.utils.misc import string_uuid
-from daffi._bindings import set_client_disconnect_fd
+from daffi._bindings import set_client_lifecycle_fd
 from daffi._rpc_proxy import (
     RpcProxy,
     SerdeFormat,
@@ -96,6 +96,7 @@ class EventsMixin:
         """
         self._on_member_removed_handlers.append(handler)
         return handler
+
 
 
 class Application(EventsMixin, ABC):
@@ -283,7 +284,7 @@ class Application(EventsMixin, ABC):
 
             try:
                 client.join()
-            except ConnectionError:
+            except Disconnected:
                 pass   # silent disconnect
         """
         self._joining = True
@@ -477,11 +478,16 @@ class Client(Application):
         )
         self._autoreconnect = autoreconnect
         self._reconnect_delay = max(0.5, reconnect_delay)
-        # Pipe used by the disconnect watcher thread (non-autoreconnect).
-        # write-end is handed to the native layer; closing it also wakes the
-        # watcher thread so stop() doesn't leave it blocking forever.
-        self._disc_pipe_r: Optional[int] = None
-        self._disc_pipe_w: Optional[int] = None
+        # Single pipe used by the lifecycle watcher thread (always started).
+        # The native layer writes one DisconnectReason byte to the write-end:
+        #   DisconnectReason.DISCONNECTED → Disconnected
+        #   DisconnectReason.EVICTED      → Evicted
+        # Closing the write-end from stop() makes the read-end go EOF, which
+        # the watcher interprets as a clean shutdown (no error surfaced).
+        self._lifecycle_pipe_w: Optional[int] = None
+        # Set by AutoReconnect.__init__; called by the watcher on normal
+        # disconnect when autoreconnect=True.  None for non-autoreconnect.
+        self._reconnect_hook: Optional[Any] = None
 
     @property
     def info(self) -> str:
@@ -566,113 +572,114 @@ class Client(Application):
         self.logger.debug(
             f"has been connected successfully. connection info: {self.info}"
         )
-        if self._conn_type == "router":
-            if self._task_dispatcher is None:
-                self._task_dispatcher = TaskDispatcher(workers=self.workers)
-            self._task_dispatcher.start_for_connection(self)
-            self._register_executors()
-            if not self._autoreconnect:
-                self._start_disconnect_watcher()
+        if self._task_dispatcher is None:
+            self._task_dispatcher = TaskDispatcher(workers=self.workers)
+        self._task_dispatcher.start_for_connection(self)
+        self._register_executors()
+        self._start_disconnect_watcher()
 
     def _start_disconnect_watcher(self) -> None:
-        """Start a daemon thread that surfaces unexpected server-side disconnects.
+        """Start a daemon thread that handles all connection lifecycle events.
 
-        A pipe is created; the write-end is handed to the native layer via
-        ``setClientDisconnectFd``.  When the connection is lost the native
-        layer writes one byte to the write-end and the watcher thread wakes.
+        Always started — regardless of whether ``autoreconnect`` is enabled.
+        This is the single, central place that reacts to the native layer
+        signalling that the connection has ended.
 
-        An unexpected disconnect is **not recoverable in-place** — the native
-        connection slot, task dispatcher, and response notifier must all be
-        torn down so the user is forced to call :meth:`connect` again to
-        obtain a fresh connection.  The watcher therefore always invokes
-        :meth:`stop` (which is lock-serialised and idempotent) regardless of
-        whether the application thread is currently parked in :meth:`join`;
-        the only thing that depends on that flag is *how* the
-        :class:`ConnectionError` is delivered:
+        A plain ``os.pipe()`` is created; the write-end is handed to the
+        native layer via ``setClientLifecycleFd``.  When the connection ends
+        the native layer writes exactly **one reason byte**:
 
-        * **Inside ``join``** (``self._joining is True``): ``stop`` flips
-          ``_stop_event`` as its very last step, which wakes the parked
-          thread; :meth:`join` then re-raises ``_connection_error`` in the
-          application's own context against a fully-torn-down client.
+        * ``DisconnectReason.DISCONNECTED`` → :class:`~daffi.exceptions.Disconnected`
+        * ``DisconnectReason.EVICTED``      → :class:`~daffi.exceptions.Evicted`
 
-        * **Outside ``join``**: nobody is blocked, so the watcher
-          additionally re-raises the error from its own thread.  Python's
-          default ``threading.excepthook`` prints the traceback to stderr,
-          ensuring the disconnect is not silently swallowed.  The error is
-          also left on ``_connection_error`` so any *later* :meth:`join`
-          call still observes (and re-raises) it.
+        On any lifecycle event the watcher **immediately wakes every in-flight
+        RPC waiter** by calling :meth:`ResponseNotifier.signal_lifecycle_error`
+        before taking any further action.  This means pending
+        :meth:`RpcResult.result` calls raise the appropriate error within
+        microseconds of the connection drop rather than waiting for the next
+        liveness-check timeout.
 
-        A user-initiated ``stop()`` that ran *before* the watcher fires sets
-        ``_stop_event`` and short-circuits everything — there is nothing to
-        report.
+        After waking in-flight calls the watcher branches:
+
+        * **Normal disconnect + autoreconnect=True**: calls
+          :attr:`_reconnect_hook` (set by :class:`AutoReconnect`) which
+          performs the retry loop in this thread.  A new watcher is started
+          for the fresh connection inside :meth:`_do_connect`.
+
+        * **Eviction** (regardless of autoreconnect) or **normal disconnect
+          with autoreconnect=False**: tears down the client and delivers the
+          error — either via :attr:`_connection_error` for a parked
+          :meth:`join`, or by re-raising from this thread otherwise.
+
+        A user-initiated :meth:`stop` closes the write-end, causing an EOF
+        read of zero bytes which the watcher treats as a clean shutdown.
         """
         r, w = os.pipe()
-        self._disc_pipe_r = r
-        self._disc_pipe_w = w
-        set_client_disconnect_fd(self._conn_num, w)
+        self._lifecycle_pipe_w = w
+        conn_num_at_start = self._conn_num
+        set_client_lifecycle_fd(conn_num_at_start, w)
 
-        def _watch(stop_event: Event, client_ref) -> None:
-            # Two ways out of the select: the native layer wrote one signal
-            # byte to ``w`` (real disconnect), or ``stop()`` closed ``w``
-            # which makes the read side go EOF (user-initiated teardown).
-            # Reading after the select disambiguates them — without that
-            # we'd race ``stop_event.set()`` and could spuriously raise
-            # ``ConnectionError`` on a clean shutdown.
-            data = b""
+        def _watch(stop_event: Event, client_ref, lifecycle_r: int, conn_num: int) -> None:
+            reason = b""
             try:
-                select.select([r], [], [])
+                select.select([lifecycle_r], [], [])
                 try:
-                    data = os.read(r, 1)
+                    reason = os.read(lifecycle_r, 1)
                 except OSError:
-                    data = b""
+                    reason = b""
             except Exception:
                 pass
             finally:
                 try:
-                    os.close(r)
+                    os.close(lifecycle_r)
                 except OSError:
                     pass
 
-            # No data → EOF, i.e. ``stop()`` closed the write end.  Or a
-            # concurrent ``stop()`` already finished.  Either way: nothing
-            # to surface.
-            if not data or stop_event.is_set():
+            # EOF (empty read) means stop() closed the write-end — clean
+            # shutdown, nothing to surface.  Same if stop() already finished.
+            if not reason or stop_event.is_set():
                 return
 
-            err = ConnectionError(
-                "Server disconnected unexpectedly.\n\n"
-                "  The router or service this client was connected to has stopped.\n"
-                "  If you want to reconnect automatically, use:\n"
-                "      Client(..., autoreconnect=True)"
-            )
-            # Record the error first so any join() — current or future —
-            # observes it once ``stop`` flips ``_stop_event``.
+            if reason == DisconnectReason.EVICTED:
+                err = Evicted(
+                    f"This client (app_name={client_ref.app_name!r}) was evicted — "
+                    "a new connection with the same app_name took over its slot."
+                )
+            else:
+                err = Disconnected(
+                    "Server disconnected unexpectedly.\n\n"
+                    "  The router or service this client was connected to has stopped.\n"
+                    "  If you want to reconnect automatically, use:\n"
+                    "      Client(..., autoreconnect=True)"
+                )
+
+            # Wake every in-flight RpcResult.result() waiter immediately so
+            # they raise the appropriate error instead of polling until their
+            # individual timeouts expire.
+            ResponseNotifier.signal_lifecycle_error(conn_num, err)
+
+            # For normal disconnects with autoreconnect=True: hand off to the
+            # reconnect hook and return — _do_connect inside the hook will
+            # start a fresh watcher for the new connection.
+            reconnect_hook = client_ref._reconnect_hook
+            if reconnect_hook is not None and reason != DisconnectReason.EVICTED:
+                reconnect_hook(conn_num)
+                return
+
+            # Non-recoverable path: record the error, tear down, and surface.
             client_ref._connection_error = err
-
-            # Snapshot the flag *before* stop() runs: stop() flips
-            # ``_stop_event`` as its last act, which wakes any parked
-            # ``join`` and lets it clear ``_joining`` in its ``finally``.
             was_joining = client_ref._joining
-
-            # Always tear down — the connection is dead; the user must call
-            # ``connect()`` again.  ``stop`` is lock-serialised and flips
-            # ``_stop_event`` only at the end, so a parked ``join`` sees a
-            # fully torn-down client when it finally wakes.
             try:
                 client_ref.stop()
             except Exception:
                 pass
-
             if not was_joining:
-                # Nobody is blocked in ``join`` — surface the error from this
-                # thread so the default ``threading.excepthook`` prints it
-                # instead of leaving it silently buried on the client object.
                 raise err
 
         t = threading.Thread(
             target=_watch,
-            args=(self._stop_event, self),
-            name="daffi-disc-watcher",
+            args=(self._stop_event, self, r, conn_num_at_start),
+            name="daffi-lifecycle-watcher",
             daemon=True,
         )
         t.start()
@@ -695,12 +702,14 @@ class Client(Application):
         """
         with self._stop_lock:
             # Wake the disconnect-watcher thread so it exits cleanly.
-            if self._disc_pipe_w is not None:
+            # Closing the lifecycle pipe write-end makes the read-end go EOF,
+            # which the watcher interprets as a clean (user-initiated) stop.
+            if self._lifecycle_pipe_w is not None:
                 try:
-                    os.close(self._disc_pipe_w)
+                    os.close(self._lifecycle_pipe_w)
                 except OSError:
                     pass
-                self._disc_pipe_w = None
+                self._lifecycle_pipe_w = None
             if self._task_dispatcher:
                 self._task_dispatcher.stop_for_connection(self)
             if self._conn_num is not None:

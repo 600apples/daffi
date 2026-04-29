@@ -18,7 +18,7 @@ def status() -> str:
 
 
 if __name__ == "__main__":
-    node = Client(app_name="node-a", host="127.0.0.1", port=6003)
+    node = Client(app_name="node-a", host="0.0.0.0", port=6003)
     conn = node.connect()
     print("node-a connected — waiting for node-b…")
 

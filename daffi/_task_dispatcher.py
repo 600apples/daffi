@@ -41,9 +41,7 @@ from daffi._wakeup import WakeupFd
 from daffi._bindings import (
     send_message_from_client,
     send_message_from_service,
-    set_wakeup_fd,
-    set_client_wakeup_fd,
-    set_client_disconnect_fd,
+    set_request_fd,
     MessageFlag,
 )
 
@@ -60,10 +58,11 @@ except ImportError:
 
 
 class EventType(str):
-    """String constants for the two peer-lifecycle event types emitted by daffi."""
+    """String constants for peer-lifecycle event types emitted by daffi."""
 
-    CONNECTED    = "connected"
+    CONNECTED = "connected"
     DISCONNECTED = "disconnected"
+    EVICTED = "evicted"
 
 
 _SENDERS = (send_message_from_client, send_message_from_service)
@@ -180,12 +179,10 @@ class TaskDispatcher:
 
         self._stop_wakeup: WakeupFd = WakeupFd()
 
-        # conn_num → _WakeupFd
+        # conn_num → WakeupFd  (for incoming-task notifications)
         self._wakeup: dict[int, WakeupFd] = {}
         # read_fd → connection object
         self._fd_to_conn: dict[int, Any] = {}
-        # read_fd → (conn_num, callback, _WakeupFd) for disconnect notifications
-        self._disc_by_rfd: dict[int, tuple] = {}
 
     def _start_workers(self) -> None:
         """Start the worker-thread pool.
@@ -248,9 +245,11 @@ class TaskDispatcher:
         self._deregister_fds(conn_num)
 
     def _deregister_fds(self, conn_num) -> None:
-        """Remove wakeup and disconnect fds for *conn_num* without stopping threads.
+        """Remove the wakeup fd for *conn_num* without stopping threads.
 
-        Safe to call from the poller thread during reconnect.
+        Safe to call from any thread during reconnect.  The lifecycle pipe
+        is managed separately by the watcher thread in
+        :meth:`~daffi.app.Client._start_disconnect_watcher`.
         """
         if conn_num is None:
             return
@@ -258,28 +257,6 @@ class TaskDispatcher:
             wakeup = self._wakeup.pop(conn_num)
             self._fd_to_conn.pop(wakeup.read_fd, None)
             wakeup.close()
-        # Remove any pending disconnect fd for this conn_num.
-        to_remove = [
-            rfd for rfd, (cn, _, _) in self._disc_by_rfd.items() if cn == conn_num
-        ]
-        for rfd in to_remove:
-            _, _, disc = self._disc_by_rfd.pop(rfd)
-            disc.close()
-
-    def register_disconnect(self, conn_num: int, callback) -> None:
-        """Register an event-driven disconnect notification for *conn_num*.
-
-        Creates a pipe whose write end is handed to the native layer.  When the
-        connection drops the native layer writes to it; the poller thread wakes
-        from ``select.select``, drains the fd, and calls *callback(conn_num)*.
-
-        *callback* is invoked **from the poller thread** and may block (e.g.
-        during a reconnect retry loop) — that is intentional: the connection is
-        dead anyway so stalling the poller is acceptable.
-        """
-        disc = WakeupFd()
-        self._disc_by_rfd[disc.read_fd] = (conn_num, callback, disc)
-        set_client_disconnect_fd(conn_num, disc.write_fd)
 
     def start_for_connection(self, connection) -> None:
         """Register *connection* and start background workers if not already running."""
@@ -291,9 +268,9 @@ class TaskDispatcher:
         self._wakeup[conn_num] = wakeup
         self._fd_to_conn[wakeup.read_fd] = connection
         if bool(connection.server_mode):
-            set_wakeup_fd(conn_num, wakeup.write_fd)
+            set_request_fd(conn_num, wakeup.write_fd, server_mode=True)
         else:
-            set_client_wakeup_fd(conn_num, wakeup.write_fd)
+            set_request_fd(conn_num, wakeup.write_fd, server_mode=False)
 
         if self._poller is None:
             # Workers may already be running (pre-started by _start_workers()
@@ -317,9 +294,6 @@ class TaskDispatcher:
         * ``workers  > 1``: tasks go into ``self.queue``.  EVENTS messages are
           always run inline because their handlers hold a reference to the
           ``conn`` object.
-
-        Disconnect fds are also monitored here.  When one fires the registered
-        callback is invoked directly in this thread.
 
         I/O multiplexing strategy
         -------------------------
@@ -354,8 +328,7 @@ class TaskDispatcher:
 
         while not self.stop_event.is_set():
             wakeup_fds = list(self._fd_to_conn.keys())
-            disc_fds = list(self._disc_by_rfd.keys())
-            all_fds = [stop_rfd] + wakeup_fds + disc_fds
+            all_fds = [stop_rfd] + wakeup_fds
 
             # Build a fresh selector with the current fd set.  We rebuild it
             # on every iteration rather than maintaining it incrementally so
@@ -379,19 +352,7 @@ class TaskDispatcher:
             if stop_rfd in readable:
                 break
 
-            # --- Handle disconnect notifications first ---
-            for rfd in readable:
-                if rfd not in self._disc_by_rfd:
-                    continue
-                conn_num, callback, disc = self._disc_by_rfd.pop(rfd)
-                disc.drain()
-                disc.close()
-                try:
-                    callback(conn_num)
-                except Exception:
-                    pass
-
-            # --- Handle normal wakeup notifications ---
+            # --- Handle wakeup notifications ---
             notified: set = set()
             for rfd in readable:
                 conn = self._fd_to_conn.get(rfd)
@@ -460,10 +421,12 @@ class TaskDispatcher:
 
         Routing rules
         -------------
-        * ``EventType.CONNECTED``    → :attr:`_on_member_added_handlers`   (receives member name)
-        * ``EventType.DISCONNECTED`` → :attr:`_on_member_removed_handlers` (receives member name)
+        * ``EventType.CONNECTED``               → :attr:`_on_member_added_handlers`
+        * ``EventType.DISCONNECTED`` / EVICTED  → :attr:`_on_member_removed_handlers`
 
         Both handler lists are iterated in registration order.
+        Eviction is treated as a departure so ``on_member_removed`` fires for
+        both clean disconnects and last-connection-wins evictions.
         """
         event_type: str = payload["type"]
         member: str = payload["member"]
@@ -471,7 +434,7 @@ class TaskDispatcher:
         if event_type == EventType.CONNECTED:
             for handler in conn._on_member_added_handlers:
                 handler(member)
-        elif event_type == EventType.DISCONNECTED:
+        elif event_type in (EventType.DISCONNECTED, EventType.EVICTED):
             for handler in conn._on_member_removed_handlers:
                 handler(member)
 

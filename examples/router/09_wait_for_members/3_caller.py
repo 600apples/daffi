@@ -13,7 +13,7 @@ order — the caller will wait automatically.
 from daffi import Client
 
 if __name__ == "__main__":
-    caller = Client(app_name="calc-caller", host="127.0.0.1", port=6009)
+    caller = Client(app_name="calc-caller", host="0.0.0.0", port=6009)
     conn = caller.connect()
 
     print("Connected to router.  Waiting for 'calc-worker' to come online…")

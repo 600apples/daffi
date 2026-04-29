@@ -16,7 +16,7 @@ def add(a: int, b: int) -> int:
 
 
 if __name__ == "__main__":
-    svc = Service(app_name="calc-service", host="127.0.0.1", port=5001)
+    svc = Service(app_name="calc-service", host="0.0.0.0", port=5001)
     svc.start()
-    print("Service running on 127.0.0.1:5001 — press Ctrl+C to stop.")
+    print("Service running on 0.0.0.0:5001 — press Ctrl+C to stop.")
     svc.join()

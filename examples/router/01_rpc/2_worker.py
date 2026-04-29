@@ -16,7 +16,7 @@ def multiply(a: int, b: int) -> int:
 
 
 if __name__ == "__main__":
-    worker = Client(app_name="calc-worker", host="127.0.0.1", port=6001)
+    worker = Client(app_name="calc-worker", host="0.0.0.0", port=6001)
     worker.connect()
     print("Worker connected to router — press Ctrl+C to stop.")
     worker.join()

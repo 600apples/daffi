@@ -17,7 +17,7 @@ from daffi import SerdeFormat
 
 
 if __name__ == "__main__":
-    caller = Client(app_name="mp-caller", host="127.0.0.1", port=6007)
+    caller = Client(app_name="mp-caller", host="0.0.0.0", port=6007)
     conn = caller.connect()
 
     record = {"id": 1, "name": "widget", "value": 42}

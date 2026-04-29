@@ -23,7 +23,7 @@ def transform(record: dict) -> dict:
 
 
 if __name__ == "__main__":
-    svc = Service(app_name="msgpack-service", host="127.0.0.1", port=5007)
+    svc = Service(app_name="msgpack-service", host="0.0.0.0", port=5007)
     svc.start()
-    print("Service running on 127.0.0.1:5007 — press Ctrl+C to stop.")
+    print("Service running on 0.0.0.0:5007 — press Ctrl+C to stop.")
     svc.join()

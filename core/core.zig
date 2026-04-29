@@ -103,15 +103,15 @@ const server_methods = [_]PyMethodDef{
         ,
     },
     .{
-        .ml_name  = "setWakeupFd",
-        .ml_meth  = cffi.setWakeupFd,
+        .ml_name  = "setServiceRequestFd",
+        .ml_meth  = cffi.setServiceRequestFd,
         .ml_flags = 1,
         .ml_doc   =
-            \\setWakeupFd(conn_num, fd)
+            \\setServiceRequestFd(conn_num, fd)
             \\
-            \\Register an eventfd or pipe write-end that the native layer will signal
-            \\whenever a message is pushed onto the Service task queue.
-            \\Call once after startServer() returns and before the handshake.
+            \\Register the fd signalled by the native layer when an incoming request
+            \\is pushed onto the Service task queue.  The TaskDispatcher poller
+            \\blocks on this fd — no busy-wait or fixed-interval polling.
         ,
     },
 };
@@ -209,36 +209,37 @@ const client_methods = [_]PyMethodDef{
         ,
     },
     .{
-        .ml_name  = "setClientWakeupFd",
-        .ml_meth  = cffi.setClientWakeupFd,
+        .ml_name  = "setClientRequestFd",
+        .ml_meth  = cffi.setClientRequestFd,
         .ml_flags = 1,
         .ml_doc   =
-            \\setClientWakeupFd(conn_num, fd)
+            \\setClientRequestFd(conn_num, fd)
             \\
-            \\Register an eventfd or pipe write-end for a Client connection acting as a
-            \\worker in a router topology.
-            \\Called once after startClient() returns so the Python task dispatcher is
-            \\notified immediately instead of relying on the 1 ms fallback poll.
+            \\Register the fd signalled by the native layer when an incoming request
+            \\is pushed onto a Client task queue (worker in a router topology).
+            \\The TaskDispatcher poller blocks on this fd — no busy-wait.
         ,
     },
     .{
-        .ml_name  = "setClientDisconnectFd",
-        .ml_meth  = cffi.setClientDisconnectFd,
+        .ml_name  = "setLifecycleFd",
+        .ml_meth  = cffi.setLifecycleFd,
         .ml_flags = 1,
         .ml_doc   =
-            \\setClientDisconnectFd(conn_num, fd)
+            \\setLifecycleFd(conn_num, fd)
             \\
-            \\Register the pipe write-end written to once by the native layer when the
-            \\client connection is lost.  Python selects on the read end so AutoReconnect
-            \\can react without a polling thread.
+            \\Register the single pipe write-end for the non-autoreconnect disconnect
+            \\watcher.  One byte is written to it when the connection ends:
+            \\  'd' -> normal disconnect  (Python raises ConnectionError)
+            \\  'e' -> client evicted     (Python raises EvictedError)
+            \\Using one fd avoids a select() on multiple pipes in the watcher thread.
         ,
     },
     .{
-        .ml_name  = "setClientResponseFd",
-        .ml_meth  = cffi.setClientResponseFd,
+        .ml_name  = "setResponseFd",
+        .ml_meth  = cffi.setResponseFd,
         .ml_flags = 1,
         .ml_doc   =
-            \\setClientResponseFd(conn_num, fd)
+            \\setResponseFd(conn_num, fd)
             \\
             \\Register an eventfd or pipe write-end that the native layer signals
             \\whenever a new response is inserted into the client message store.

@@ -17,7 +17,7 @@ if __name__ == "__main__":
         status = event["type"]     # "connected" or "disconnected"
         print(f"[client] event: {name!r} → {status}")
 
-    client = Client(app_name="event-client", host="127.0.0.1", port=5009)
+    client = Client(app_name="event-client", host="0.0.0.0", port=5009)
     client.add_event_handler(on_event)
 
     conn = client.connect()

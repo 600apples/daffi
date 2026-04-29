@@ -21,7 +21,7 @@ CART = {
 }
 
 if __name__ == "__main__":
-    client = Client(app_name="json-client", host="127.0.0.1", port=5005)
+    client = Client(app_name="json-client", host="0.0.0.0", port=5005)
     conn = client.connect()
 
     rpc = conn.rpc(timeout=5, serde=SerdeFormat.JSON)

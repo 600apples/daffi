@@ -11,7 +11,7 @@ from daffi import Client
 
 
 if __name__ == "__main__":
-    caller = Client(app_name="calc-caller", host="127.0.0.1", port=6001)
+    caller = Client(app_name="calc-caller", host="0.0.0.0", port=6001)
     conn = caller.connect()
 
     rpc = conn.rpc(timeout=5)

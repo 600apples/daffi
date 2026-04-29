@@ -22,7 +22,7 @@ def handle_raw(payload: bytes) -> bytes:
 
 
 if __name__ == "__main__":
-    worker = Client(app_name=WORKER_NAME, host="127.0.0.1", port=6006)
+    worker = Client(app_name=WORKER_NAME, host="0.0.0.0", port=6006)
     worker.connect()
     print(f"Worker {WORKER_NAME!r} connected — press Ctrl+C to stop.")
     worker.join()

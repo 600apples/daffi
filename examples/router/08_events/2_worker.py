@@ -27,7 +27,7 @@ if __name__ == "__main__":
             online_nodes.discard(name)
             print(f"[worker] ✦ {name!r} left    — online: {sorted(online_nodes)}")
 
-    worker = Client(app_name="event-worker", host="127.0.0.1", port=6008)
+    worker = Client(app_name="event-worker", host="0.0.0.0", port=6008)
     worker.add_event_handler(on_event)
     conn = worker.connect()
     print("Worker connected — press Ctrl+C to stop.")

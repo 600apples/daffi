@@ -245,16 +245,16 @@ const ClientEntry = struct {
         return self.client_handler.tasks_queue.getMessageFromQueue();
     }
 
-    pub fn setWakeupFdClientEntry(self: *ClientEntry, fd: i32) void {
-        self.client_handler.tasks_queue.wakeup_fd = fd;
+    pub fn setRequestFdClientEntry(self: *ClientEntry, fd: i32) void {
+        self.client_handler.tasks_queue.request_fd = fd;
     }
 
     pub fn setResponseFdClientEntry(self: *ClientEntry, fd: i32) void {
-        self.client_handler.msg_store.wakeup_fd = fd;
+        self.client_handler.msg_store.response_fd = fd;
     }
 
-    pub fn setDisconnectFdClientEntry(self: *ClientEntry, fd: i32) void {
-        self.client_handler.tasks_queue.disconnect_fd = fd;
+    pub fn setLifecycleFdClientEntry(self: *ClientEntry, fd: i32) void {
+        self.client_handler.tasks_queue.lifecycle_fd = fd;
     }
 
     pub fn getAvailableMembersClientEntry(self: *ClientEntry, allocator: Allocator) ![]const u8 {
@@ -358,9 +358,9 @@ pub fn getAvailableMembers(allocator: Allocator, conn_num: usize) ![]const u8 {
 /// Register the eventfd (or pipe write-end) that the native layer signals
 /// whenever a new task-queue message is available for conn_num.
 /// Used by client connections acting as workers in a router topology.
-pub fn setWakeupFd(conn_num: usize, fd: i32) !void {
+pub fn setRequestFd(conn_num: usize, fd: i32) !void {
     var entry = try ClientEntry.get(conn_num);
-    entry.setWakeupFdClientEntry(fd);
+    entry.setRequestFdClientEntry(fd);
 }
 
 /// Register the eventfd (or pipe write-end) that the native layer signals
@@ -375,9 +375,9 @@ pub fn setResponseFd(conn_num: usize, fd: i32) !void {
 /// Register the pipe write-end that the native layer writes to once when the
 /// connection is lost (EOF / error).  Python's task dispatcher selects on the
 /// read end so AutoReconnect can react without a polling thread.
-pub fn setDisconnectFd(conn_num: usize, fd: i32) !void {
+pub fn setLifecycleFd(conn_num: usize, fd: i32) !void {
     var entry = try ClientEntry.get(conn_num);
-    entry.setDisconnectFdClientEntry(fd);
+    entry.setLifecycleFdClientEntry(fd);
 }
 
 pub fn getClientEntry(conn_num: usize) !*ClientEntry {

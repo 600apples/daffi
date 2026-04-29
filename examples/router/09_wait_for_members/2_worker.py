@@ -21,7 +21,7 @@ def process(value: int) -> dict:
 
 
 if __name__ == "__main__":
-    worker = Client(app_name="calc-worker", host="127.0.0.1", port=6009)
+    worker = Client(app_name="calc-worker", host="0.0.0.0", port=6009)
     worker.connect()
     print("Worker connected — press Ctrl+C to stop.")
     worker.join()

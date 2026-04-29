@@ -22,7 +22,7 @@ if __name__ == "__main__":
     # Serialise to bytes before sending — OPAQUE does not do this for you.
     raw = json.dumps(PAYLOAD).encode("utf-8")
 
-    client = Client(app_name="opaque-client", host="127.0.0.1", port=5006)
+    client = Client(app_name="opaque-client", host="0.0.0.0", port=5006)
     conn = client.connect()
 
     rpc = conn.rpc(timeout=5, serde=SerdeFormat.OPAQUE)

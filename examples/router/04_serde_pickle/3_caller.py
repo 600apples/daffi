@@ -13,7 +13,7 @@ from models import Task, TaskResult, Priority
 
 
 if __name__ == "__main__":
-    caller = Client(app_name="task-caller", host="127.0.0.1", port=6004)
+    caller = Client(app_name="task-caller", host="0.0.0.0", port=6004)
     conn = caller.connect()
 
     rpc = conn.rpc(timeout=5, serde=SerdeFormat.PICKLE)

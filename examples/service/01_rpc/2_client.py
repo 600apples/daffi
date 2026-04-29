@@ -10,7 +10,7 @@ from daffi import Client
 
 
 if __name__ == "__main__":
-    client = Client(app_name="calc-client", host="127.0.0.1", port=5001)
+    client = Client(app_name="calc-client", host="0.0.0.0", port=5001)
     conn = client.connect()
 
     rpc = conn.rpc(timeout=5)

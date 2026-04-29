@@ -17,7 +17,7 @@ from daffi import SerdeFormat
 BATCH = {"values": [10, 20, 30, 40, 50]}
 
 if __name__ == "__main__":
-    caller = Client(app_name="json-caller", host="127.0.0.1", port=6005)
+    caller = Client(app_name="json-caller", host="0.0.0.0", port=6005)
     conn = caller.connect()
 
     # rpc — blocking call to one worker.

@@ -12,6 +12,24 @@ const c = @cImport({
     @cInclude("string.h");
 });
 
+// ── fcntl — declared manually to avoid glibc bits/fcntl2.h ──────────────────
+const F_GETFL: c_int = 3;
+const F_SETFL: c_int = 4;
+/// O_NONBLOCK: 0x800 on Linux/x86-64 and most Linux arches; 0x4 on Darwin.
+const O_NONBLOCK: c_int = switch (@import("builtin").os.tag) {
+    .macos, .ios, .watchos, .tvos, .visionos => 0x0004,
+    else => 0x0800,
+};
+extern "c" fn fcntl(fd: c_int, cmd: c_int, ...) c_int;
+
+const POLLOUT: c_short = 4;
+const PollFd = extern struct {
+    fd:      c_int,
+    events:  c_short,
+    revents: c_short,
+};
+extern "c" fn poll(fds: [*]PollFd, nfds: c_uint, timeout: c_int) c_int;
+
 const std = @import("std");
 const posix = std.posix;
 const Allocator = std.mem.Allocator;
@@ -100,6 +118,10 @@ pub const Stream = struct {
 };
 
 
+/// Maximum time (ms) to wait for a TCP connect() to complete.
+/// Overrides the kernel's default retransmission timeout (~75 s on Linux).
+const CONNECT_TIMEOUT_MS: c_int = 15_000;
+
 pub fn tcpConnectToHost(_: Allocator, host: []const u8, port: u16) !Stream {
     var port_buf: [8]u8 = undefined;
     const port_str = std.fmt.bufPrintZ(&port_buf, "{d}", .{port}) catch return error.BadPort;
@@ -121,10 +143,44 @@ pub fn tcpConnectToHost(_: Allocator, host: []const u8, port: u16) !Stream {
     while (it) |rp| : (it = rp.ai_next) {
         const fd = c.socket(rp.ai_family, rp.ai_socktype, rp.ai_protocol);
         if (fd < 0) continue;
-        if (c.connect(fd, rp.ai_addr, rp.ai_addrlen) == 0) {
+
+        // Switch to non-blocking so connect() returns immediately instead of
+        // blocking for the kernel's full retransmission timeout (~75 s).
+        const orig_flags = fcntl(fd, F_GETFL, @as(c_int, 0));
+        _ = fcntl(fd, F_SETFL, orig_flags | O_NONBLOCK);
+
+        const rc = c.connect(fd, rp.ai_addr, rp.ai_addrlen);
+        if (rc == 0) {
+            // Rare fast path: connected synchronously (e.g. loopback).
+            _ = fcntl(fd, F_SETFL, orig_flags);
             return Stream{ .handle = fd };
         }
-        _ = c.close(fd);
+
+        // For non-blocking sockets, EINPROGRESS means "in progress" — use
+        // poll() to wait up to CONNECT_TIMEOUT_MS for the result.
+        // Any other errno (ECONNREFUSED, ENETUNREACH, …) causes poll() to
+        // return immediately with POLLERR, so SO_ERROR will be non-zero and
+        // we fall through to the failure path below without extra errno checks.
+        var pfd = PollFd{ .fd = fd, .events = POLLOUT, .revents = 0 };
+        const nready = poll(@as([*]PollFd, @ptrCast(&pfd)), 1, CONNECT_TIMEOUT_MS);
+        if (nready <= 0) {
+            // 0 = timeout, -1 = poll error.
+            _ = c.close(fd);
+            continue;
+        }
+
+        // Check the async connect outcome.
+        var so_err: c_int = 0;
+        var so_len: c.socklen_t = @sizeOf(c_int);
+        _ = c.getsockopt(fd, c.SOL_SOCKET, c.SO_ERROR, &so_err, &so_len);
+        if (so_err != 0) {
+            _ = c.close(fd);
+            continue;
+        }
+
+        // Restore blocking mode for normal send/recv I/O.
+        _ = fcntl(fd, F_SETFL, orig_flags);
+        return Stream{ .handle = fd };
     }
     return error.ConnectionRefused;
 }

@@ -30,7 +30,7 @@ def data_source():
         yield chunk
 
 if __name__ == "__main__":
-    client = Client(app_name="stream-client", host="127.0.0.1", port=5010)
+    client = Client(app_name="stream-client", host="0.0.0.0", port=5010)
     conn = client.connect()
 
     print("\n── stream() — blocking, backpressure ──")

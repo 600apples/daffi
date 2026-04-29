@@ -8,7 +8,7 @@ pub const detachServer              = @import("cffi/server.zig").detachServer;
 pub const sendMessageFromServer     = @import("cffi/server.zig").sendMessageFromServer;
 pub const getMessageForServerWorker = @import("cffi/server.zig").getMessageForServerWorker;
 pub const setServiceMethods         = @import("cffi/server.zig").setServiceMethods;
-pub const setWakeupFd               = @import("cffi/server.zig").setWakeupFd;
+pub const setServiceRequestFd               = @import("cffi/server.zig").setServiceRequestFd;
 
 // --- client functions ---
 pub const setLogLevel               = @import("cffi/client.zig").setLogLevel;
@@ -20,6 +20,6 @@ pub const getAvailableMembers       = @import("cffi/client.zig").getAvailableMem
 pub const getMessageFromClientStore = @import("cffi/client.zig").getMessageFromClientStore;
 pub const setTimeoutError           = @import("cffi/client.zig").setTimeoutError;
 pub const getMessageForClientWorker = @import("cffi/client.zig").getMessageForClientWorker;
-pub const setClientWakeupFd         = @import("cffi/client.zig").setClientWakeupFd;
-pub const setClientDisconnectFd     = @import("cffi/client.zig").setClientDisconnectFd;
-pub const setClientResponseFd       = @import("cffi/client.zig").setClientResponseFd;
+pub const setClientRequestFd         = @import("cffi/client.zig").setClientRequestFd;
+pub const setLifecycleFd      = @import("cffi/client.zig").setLifecycleFd;
+pub const setResponseFd       = @import("cffi/client.zig").setResponseFd;

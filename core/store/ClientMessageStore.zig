@@ -18,21 +18,21 @@ allocator: Allocator,
 /// Set once by Python via dfcore.setClientResponseFd() before any
 /// responses can arrive; -1 means no wakeup is registered (e.g. WASM).
 /// Plain i32 so this struct compiles on every target (including wasm32).
-wakeup_fd: i32 = -1,
+response_fd: i32 = -1,
 
 /// POSIX write(2) from libc.  Declared here because std.posix.write was
 /// removed in Zig 0.16; the extern works on any POSIX target (Linux, macOS)
 /// as long as we link -lc, which we always do for the Python extension.
 extern fn write(fd: c_int, buf: [*]const u8, count: usize) isize;
 
-/// Write a single uint64(1) to wakeup_fd.  Non-blocking: if the fd is full
+/// Write a single uint64(1) to response_fd.  Non-blocking: if the fd is full
 /// or invalid we drop the signal silently (Python's select() will pick up
 /// the next signal anyway).  No-op on freestanding targets (wasm32).
 inline fn signalWakeup(self: *ClientMessageStore) void {
     if (comptime @import("builtin").target.os.tag == .freestanding) return;
-    if (self.wakeup_fd < 0) return;
+    if (self.response_fd < 0) return;
     const val: u64 = 1;
-    _ = write(@intCast(self.wakeup_fd), @as([*]const u8, @ptrCast(&val)), @sizeOf(u64));
+    _ = write(@intCast(self.response_fd), @as([*]const u8, @ptrCast(&val)), @sizeOf(u64));
 }
 
 /// Store a response message.

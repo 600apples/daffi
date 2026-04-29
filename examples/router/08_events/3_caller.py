@@ -17,7 +17,7 @@ if __name__ == "__main__":
         status = event["type"]
         print(f"[caller] event: {name!r} → {status}")
 
-    caller = Client(app_name="event-caller", host="127.0.0.1", port=6008)
+    caller = Client(app_name="event-caller", host="0.0.0.0", port=6008)
     caller.add_event_handler(on_event)
     conn = caller.connect()
 

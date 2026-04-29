@@ -155,30 +155,33 @@ pub fn getMessageForClientWorker(_: [*c]PyObject, args: [*c]PyObject) callconv(.
     return Py_BuildValue(template, uuid, data.ptr, data.len, flag, decoder, transmitter.ptr, transmitter.len, receiver.ptr, receiver.len, func_name.ptr, func_name.len, return_result);
 }
 
-/// Register the eventfd (or pipe write-end) that the native layer signals
-/// whenever a new task-queue message is available for the client at conn_num.
-/// Used by client connections that act as workers in a router topology.
+/// Register the fd the native layer signals whenever an incoming request
+/// (a call to one of this Client's @callback functions) is pushed onto
+/// the task queue.  The TaskDispatcher poller blocks on this fd so it
+/// wakes only when real work arrives — no busy-wait or fixed-interval polling.
 ///
-/// setClientWakeupFd(conn_num: int, fd: int) -> None
-pub fn setClientWakeupFd(_: [*c]PyObject, args: [*c]PyObject) callconv(.c) [*c]PyObject {
+/// setClientRequestFd(conn_num: int, fd: int) -> None
+pub fn setClientRequestFd(_: [*c]PyObject, args: [*c]PyObject) callconv(.c) [*c]PyObject {
     var conn_num: c_ulong = undefined;
     var fd: c_int = undefined;
     if (!(py.PyArg_ParseTuple(args, "ki", &conn_num, &fd) != 0)) return null;
-    Client.setWakeupFd(@intCast(conn_num), @intCast(fd)) catch return Py_BuildValue("");
+    Client.setRequestFd(@intCast(conn_num), @intCast(fd)) catch return Py_BuildValue("");
     return Py_BuildValue("");
 }
 
-/// Register the pipe write-end that the native layer writes to once when the
-/// connection is lost (EOF / network error).  The Python task dispatcher
-/// selects on the corresponding read end so AutoReconnect can react
-/// immediately without a dedicated polling thread.
+/// Register the single pipe write-end used by the non-autoreconnect
+/// disconnect watcher.  The native layer writes one byte to it to signal
+/// why the connection ended:
+///   'D' (0x64) — normal disconnect  → Python raises ConnectionError
+///   'E' (0x65) — client evicted     → Python raises EvictedError
+/// Having a single fd eliminates the need for select() on multiple pipes.
 ///
-/// setClientDisconnectFd(conn_num: int, fd: int) -> None
-pub fn setClientDisconnectFd(_: [*c]PyObject, args: [*c]PyObject) callconv(.c) [*c]PyObject {
+/// setLifecycleFd(conn_num: int, fd: int) -> None
+pub fn setLifecycleFd(_: [*c]PyObject, args: [*c]PyObject) callconv(.c) [*c]PyObject {
     var conn_num: c_ulong = undefined;
     var fd: c_int = undefined;
     if (!(py.PyArg_ParseTuple(args, "ki", &conn_num, &fd) != 0)) return null;
-    Client.setDisconnectFd(@intCast(conn_num), @intCast(fd)) catch return Py_BuildValue("");
+    Client.setLifecycleFd(@intCast(conn_num), @intCast(fd)) catch return Py_BuildValue("");
     return Py_BuildValue("");
 }
 
@@ -187,8 +190,8 @@ pub fn setClientDisconnectFd(_: [*c]PyObject, args: [*c]PyObject) callconv(.c) [
 /// store.  Python's RpcResult waiters block on the corresponding read end
 /// (with a select-based deadline) instead of polling the store.
 ///
-/// setClientResponseFd(conn_num: int, fd: int) -> None
-pub fn setClientResponseFd(_: [*c]PyObject, args: [*c]PyObject) callconv(.c) [*c]PyObject {
+/// setResponseFd(conn_num: int, fd: int) -> None
+pub fn setResponseFd(_: [*c]PyObject, args: [*c]PyObject) callconv(.c) [*c]PyObject {
     var conn_num: c_ulong = undefined;
     var fd: c_int = undefined;
     if (!(py.PyArg_ParseTuple(args, "ki", &conn_num, &fd) != 0)) return null;

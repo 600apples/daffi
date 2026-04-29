@@ -12,7 +12,7 @@ from daffi import SerdeFormat
 
 
 if __name__ == "__main__":
-    caller = Client(app_name="opaque-caller", host="127.0.0.1", port=6006)
+    caller = Client(app_name="opaque-caller", host="0.0.0.0", port=6006)
     conn = caller.connect()
 
     rpc = conn.rpc(timeout=5, serde=SerdeFormat.OPAQUE)

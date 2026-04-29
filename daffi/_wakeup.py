@@ -22,7 +22,7 @@ _HAS_EVENTFD = hasattr(os, "eventfd")
 
 
 class WakeupFd:
-    """Cross-thread / cross-language wakeup primitive.
+    """Cross-thread wakeup primitive.
 
     Use one instance per logical notification channel (one per connection,
     or one per response store).  The native layer takes :attr:`write_fd`,

@@ -183,6 +183,24 @@ pub fn ChannelsMapper(comptime ConnectionT: type) type {
             self.destroyChannelLocked(chan);
         }
 
+        /// Atomically find and remove the channel for *name*, returning its
+        /// connection pointer so the caller can close the underlying socket.
+        /// Returns null if no channel with that name exists.
+        ///
+        /// Used by ``onHandshake`` to evict a stale/zombie slot before
+        /// registering a reconnecting peer (last-connection-wins semantics).
+        /// The caller must close the returned connection AFTER releasing any
+        /// handler-level mutex that the socket's reader thread may need when
+        /// it wakes up and calls ``diconnectionHandler``.
+        pub fn evictChannel(self: *Self, name: Uuid) ?*ConnectionT {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            const chan = self.channels.getPtr(name) orelse return null;
+            const conn = chan.conn;
+            self.destroyChannelLocked(chan);
+            return conn;
+        }
+
         /// Remove a channel by name (used when a "disconnected" event arrives).
         /// Safe to call if the name is not present.
         pub fn destroyChannelByName(self: *Self, name: []const u8) void {

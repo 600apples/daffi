@@ -20,7 +20,7 @@ def process_order(order: Order) -> Order:
 
 
 if __name__ == "__main__":
-    svc = Service(app_name="order-service", host="127.0.0.1", port=5004)
+    svc = Service(app_name="order-service", host="0.0.0.0", port=5004)
     svc.start()
-    print("Service running on 127.0.0.1:5004 — press Ctrl+C to stop.")
+    print("Service running on 0.0.0.0:5004 — press Ctrl+C to stop.")
     svc.join()

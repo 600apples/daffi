@@ -149,61 +149,65 @@ def mark_message_as_expired(uuid: int, conn_num: int) -> None:
     dfcore.setTimeoutError(uuid, conn_num)
 
 
-def set_wakeup_fd(conn_num: int, fd: int) -> None:
-    """Register the eventfd (or pipe write-end) that the native layer writes to
-    whenever a new message is pushed onto the Service task queue for *conn_num*.
+def set_request_fd(conn_num: int, fd: int, *, server_mode: bool) -> None:
+    """Register the fd the native layer signals whenever an **incoming request**
+    (a call to one of this connection's ``@callback`` functions) is pushed onto
+    the task queue for *conn_num*.
 
-    Call once immediately after :func:`~daffi.bindings.startServer` returns and
-    before the handshake advertises the service's methods to clients.
+    The :class:`~daffi._task_dispatcher.TaskDispatcher` poller blocks on this
+    fd so it wakes only when real work arrives — no busy-wait or fixed-interval
+    polling.
+
+    Works for both Service and Client connections — *server_mode* selects the
+    correct native entry point, since the two connection types are managed by
+    separate pools in the native layer.
 
     Args:
-        conn_num: Native connection handle returned by ``dfcore.startServer``.
-        fd:       An ``os.eventfd`` fd (Linux) or the **write end** of an
-                  ``os.pipe()`` (macOS / fallback).
+        conn_num:    Native connection handle.
+        fd:          An ``os.eventfd`` (Linux) or the **write end** of an
+                     ``os.pipe()`` (macOS / fallback).
+        server_mode: ``True`` for Service connections, ``False`` for Client.
+
+    See also:
+        :func:`set_response_fd` — signals that a *response* to an outgoing call arrived.
     """
-    dfcore.setWakeupFd(conn_num, fd)
+    if server_mode:
+        dfcore.setServiceRequestFd(conn_num, fd)
+    else:
+        dfcore.setClientRequestFd(conn_num, fd)
 
 
-def set_client_disconnect_fd(conn_num: int, fd: int) -> None:
-    """Register the pipe write-end written to once by the native layer when the
-    client connection is lost.  Python selects on the corresponding read end so
-    AutoReconnect can react without a polling thread.
+def set_lifecycle_fd(conn_num: int, fd: int) -> None:
+    """Register the lifecycle pipe write-end for the connection watcher thread.
+
+    The native layer writes exactly one byte to signal why the connection ended:
+
+    * ``b'd'`` — normal disconnect  → Python raises :class:`ConnectionError`
+    * ``b'e'`` — client evicted     → Python raises :class:`~daffi.exceptions.Evicted`
+
+    Closing the write-end (on user-initiated :meth:`~daffi.app.Client.stop`)
+    produces an EOF read, which the watcher treats as a clean shutdown.
     """
-    dfcore.setClientDisconnectFd(conn_num, fd)
+    dfcore.setLifecycleFd(conn_num, fd)
 
 
-def set_client_response_fd(conn_num: int, fd: int) -> None:
-    """Register the eventfd / pipe write-end the native layer writes to whenever
-    a new response is inserted into the client message store.
+def set_response_fd(conn_num: int, fd: int) -> None:
+    """Register the fd the native layer signals whenever a **response** to an
+    outgoing RPC call is inserted into the client message store.
 
-    Python's :class:`~daffi._rpc_proxy.RpcResult` waiters block on the
-    corresponding read end with a select-based deadline instead of polling the
-    store, so a slow remote call no longer burns CPU on a busy-wait loop.
+    :class:`~daffi._rpc_proxy.RpcResult` waiters block on this fd so they
+    wake as soon as their result is ready — no busy-wait or fixed-interval
+    polling.
 
     Args:
         conn_num: Native connection handle returned by :func:`~daffi.bindings.startClient`.
         fd:       An ``os.eventfd`` (Linux) or the **write end** of an
                   ``os.pipe()`` (macOS / fallback).
+
+    See also:
+        :func:`set_request_fd` — signals that an *incoming* request arrived.
     """
-    dfcore.setClientResponseFd(conn_num, fd)
-
-
-def set_client_wakeup_fd(conn_num: int, fd: int) -> None:
-    """Register the eventfd (or pipe write-end) for a Client connection used
-    as a worker in a router topology.
-
-    The native layer writes to *fd* whenever a new task arrives on the
-    client's task queue, allowing the Python poller to block on
-    ``select.select`` rather than sleeping for 1 ms between polls.
-
-    Call once immediately after :func:`~daffi.bindings.startClient` returns.
-
-    Args:
-        conn_num: Native connection handle returned by ``dfcore.startClient``.
-        fd:       An ``os.eventfd`` fd (Linux) or the **write end** of an
-                  ``os.pipe()`` (macOS / fallback).
-    """
-    dfcore.setClientWakeupFd(conn_num, fd)
+    dfcore.setResponseFd(conn_num, fd)
 
 
 def set_service_methods(methods: str, conn_num: int) -> None:

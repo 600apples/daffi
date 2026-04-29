@@ -22,7 +22,7 @@ def echo_raw(payload: bytes) -> bytes:
 
 
 if __name__ == "__main__":
-    svc = Service(app_name="opaque-service", host="127.0.0.1", port=5006)
+    svc = Service(app_name="opaque-service", host="0.0.0.0", port=5006)
     svc.start()
-    print("Service running on 127.0.0.1:5006 — press Ctrl+C to stop.")
+    print("Service running on 0.0.0.0:5006 — press Ctrl+C to stop.")
     svc.join()

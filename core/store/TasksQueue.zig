@@ -16,14 +16,17 @@ allocator: Allocator,
 queue: std.DoublyLinkedList,
 mutex: Mutex = .{},
 /// File descriptor to signal when a message is pushed.
-/// Set once by Python via dfcore.setWakeupFd() before any messages can
+/// Set once by Python via dfcore.setRequestFd() before any messages can
 /// arrive; -1 means no wakeup is registered.
 /// Plain i32 so this struct compiles on every target (including wasm32).
-wakeup_fd: i32 = -1,
-/// File descriptor written to once when the connection is lost.
-/// Python's task dispatcher selects on this fd to detect disconnects
-/// without polling.  -1 means not registered.
-disconnect_fd: i32 = -1,
+request_fd: i32 = -1,
+/// Single pipe write-end shared by both the AutoReconnect path and the
+/// non-autoreconnect disconnect watcher.  Written once with a single-byte
+/// reason code so Python knows both *that* the connection ended and *why*:
+///   'd'  — normal disconnect  → ConnectionError / reconnect
+///   'e'  — this client was evicted → Evicted / stop
+/// -1 means not registered.
+lifecycle_fd: i32 = -1,
 
 pub fn init(allocator: std.mem.Allocator) !TasksQueue {
     return .{ .allocator = allocator, .queue = .{} };
@@ -34,14 +37,14 @@ pub fn init(allocator: std.mem.Allocator) !TasksQueue {
 /// as long as we link -lc, which we always do for the Python extension.
 extern fn write(fd: c_int, buf: [*]const u8, count: usize) isize;
 
-/// Write a single uint64(1) to wakeup_fd (eventfd or pipe write-end).
+/// Write a single uint64(1) to request_fd (eventfd or pipe write-end).
 /// Non-blocking: if the fd is full or invalid we drop the signal silently.
 /// No-op on targets without POSIX (e.g. wasm32-freestanding).
 inline fn signalWakeup(self: *TasksQueue) void {
     if (comptime @import("builtin").target.os.tag == .freestanding) return;
-    if (self.wakeup_fd < 0) return;
+    if (self.request_fd < 0) return;
     const val: u64 = 1;
-    _ = write(@intCast(self.wakeup_fd), @as([*]const u8, @ptrCast(&val)), @sizeOf(u64));
+    _ = write(@intCast(self.request_fd), @as([*]const u8, @ptrCast(&val)), @sizeOf(u64));
 }
 
 /// Explicitly notify the Python poller that one or more messages are ready.
@@ -57,13 +60,25 @@ pub fn triggerWakeup(self: *TasksQueue) void {
 }
 
 /// Signal Python that this connection has been lost.
-/// Writes a single uint64(1) to disconnect_fd (eventfd or pipe write-end).
+/// Writes the single byte 'd' to lifecycle_fd.
 /// Called once from messageDispatcherClientEntry after the connection drops.
 pub fn triggerDisconnect(self: *TasksQueue) void {
     if (comptime @import("builtin").target.os.tag == .freestanding) return;
-    if (self.disconnect_fd < 0) return;
-    const val: u64 = 1;
-    _ = write(@intCast(self.disconnect_fd), @as([*]const u8, @ptrCast(&val)), @sizeOf(u64));
+    if (self.lifecycle_fd < 0) return;
+    const reason: u8 = 'd';
+    _ = write(@intCast(self.lifecycle_fd), @as([*]const u8, @ptrCast(&reason)), 1);
+}
+
+/// Signal Python that THIS client has been evicted by its router/service.
+/// Writes the single byte 'e' to lifecycle_fd so the watcher thread raises
+/// EvictedError instead of the generic ConnectionError.
+/// Called from ClientHandler.onEvent when the received "evicted" event
+/// names this client itself as the evicted member.
+pub fn triggerEviction(self: *TasksQueue) void {
+    if (comptime @import("builtin").target.os.tag == .freestanding) return;
+    if (self.lifecycle_fd < 0) return;
+    const reason: u8 = 'e';
+    _ = write(@intCast(self.lifecycle_fd), @as([*]const u8, @ptrCast(&reason)), 1);
 }
 
 pub fn deinit(self: *TasksQueue) void {

@@ -183,15 +183,16 @@ pub fn setServiceMethods(_: [*c]PyObject, args: [*c]PyObject) callconv(.c) [*c]P
     return Py_BuildValue("");
 }
 
-/// Register the eventfd (or pipe write-end) that the native layer signals
-/// whenever a new message is pushed onto the Service task queue.
-/// Call once after startServer() returns, before the handshake.
+/// Register the fd the native layer signals whenever an incoming request
+/// (a call to one of this Service's @callback functions) is pushed onto
+/// the task queue.  The TaskDispatcher poller blocks on this fd so it
+/// wakes only when real work arrives — no busy-wait or fixed-interval polling.
 ///
-/// setWakeupFd(conn_num: int, fd: int) -> None
-pub fn setWakeupFd(_: [*c]PyObject, args: [*c]PyObject) callconv(.c) [*c]PyObject {
+/// setServiceRequestFd(conn_num: int, fd: int) -> None
+pub fn setServiceRequestFd(_: [*c]PyObject, args: [*c]PyObject) callconv(.c) [*c]PyObject {
     var conn_num: c_ulong = undefined;
     var fd: c_int = undefined;
     if (!(py.PyArg_ParseTuple(args, "ki", &conn_num, &fd) != 0)) return null;
-    Server.setWakeupFd(@intCast(conn_num), @intCast(fd));
+    Server.setServiceRequestFd(@intCast(conn_num), @intCast(fd));
     return Py_BuildValue("");
 }

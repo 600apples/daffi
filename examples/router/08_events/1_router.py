@@ -7,7 +7,7 @@ from daffi import Router
 
 
 if __name__ == "__main__":
-    router = Router(host="127.0.0.1", port=6008)
+    router = Router(host="0.0.0.0", port=6008)
     router.start()
-    print("Router running on 127.0.0.1:6008 — press Ctrl+C to stop.")
+    print("Router running on 0.0.0.0:6008 — press Ctrl+C to stop.")
     router.join()

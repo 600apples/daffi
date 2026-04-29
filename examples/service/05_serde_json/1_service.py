@@ -19,7 +19,7 @@ def summarise(data: dict) -> dict:
 
 
 if __name__ == "__main__":
-    svc = Service(app_name="json-service", host="127.0.0.1", port=5005)
+    svc = Service(app_name="json-service", host="0.0.0.0", port=5005)
     svc.start()
-    print("Service running on 127.0.0.1:5005 — press Ctrl+C to stop.")
+    print("Service running on 0.0.0.0:5005 — press Ctrl+C to stop.")
     svc.join()

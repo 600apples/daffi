@@ -18,7 +18,7 @@ def greet(name: str) -> str:
 
 
 if __name__ == "__main__":
-    node = Client(app_name="node-b", host="127.0.0.1", port=6003)
+    node = Client(app_name="node-b", host="0.0.0.0", port=6003)
     conn = node.connect()
     print("node-b connected — waiting for node-a…")
 

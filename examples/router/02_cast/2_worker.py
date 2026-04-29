@@ -22,7 +22,7 @@ def process(item: str) -> str:
 
 
 if __name__ == "__main__":
-    worker = Client(host="127.0.0.1", port=6002)
+    worker = Client(host="0.0.0.0", port=6002)
     worker.connect()
     print(f"{TAG}  worker connected — press Ctrl+C to stop.")
     worker.join()
