@@ -4,8 +4,7 @@ Integration tests for connection interruption scenarios.
 What is tested
 --------------
 Each test deliberately disrupts the server-side process and verifies that
-the client reacts correctly — no infinite hangs, correct exception type, and
-(where applicable) transparent recovery through autoreconnect.
+the client reacts correctly — no infinite hangs and the correct exception type.
 
 Interruption mechanisms used
 ----------------------------
@@ -35,11 +34,10 @@ Scenarios
   2  Connect to dead service → InitializationError
   3  Service frozen (SIGSTOP) → TimeoutError within RPC timeout
   4  Service frozen then resumed (SIGCONT) → call eventually succeeds
-  5  Service killed then restarted → autoreconnect client recovers
-  6  Router killed then restarted → worker + caller both recover
-  7  One worker killed → cast() to remaining workers still succeeds
-  8  Big message (8 MiB) + frozen server → fails (ValueError/TimeoutError)
-  9  Big message round-trip succeeds after service restart
+  5  One worker killed → cast() to remaining workers still succeeds
+  6  Big message (8 MiB) + frozen server → fails (ValueError/TimeoutError)
+  7  Big message round-trip succeeds after service restart
+  8  Disconnected raised immediately despite a huge RPC timeout
 
 All subprocess targets are module-level functions so they pickle correctly
 under the "spawn" start method that the integration conftest.py now enforces
@@ -57,15 +55,13 @@ import time
 
 import pytest
 
-from conftest import HOST, TIMEOUT, wait_for_port, silence_subprocess, quiet_kill
-from daffi.exceptions import InitializationError
-from daffi._rpc_proxy import TransmissionFailure
+from conftest import HOST, TIMEOUT, wait_for_port, wait_for_members, silence_subprocess, quiet_kill
+from daffi.exceptions import Disconnected, InitializationError, RemoteCallError, TransmissionFailure
 
 # ── constants ──────────────────────────────────────────────────────────────────
 
 BIG_MSG_SIZE = 8 * 1024 * 1024    # 8 MiB — large enough to stress the buffer
 N_CAST_WORKERS = 4                 # workers for cast / partial-result tests
-RECONNECT_DELAY = 0.5              # base reconnect delay for autoreconnect tests
 
 
 # ── subprocess targets (module-level so they are picklable) ───────────────────
@@ -83,6 +79,23 @@ def _intr_service(port: int, name: str = "intr-svc") -> None:
     svc.join()
 
 
+def _intr_slow_service(port: int, name: str = "intr-slow-svc") -> None:
+    """Service whose only callback sleeps 60 s before replying — lets tests
+    reliably kill it while a call is in-flight."""
+    silence_subprocess()
+    import time as _t
+    from daffi import Service, callback
+
+    @callback
+    def slow_echo(payload):
+        _t.sleep(60)
+        return payload
+
+    svc = Service(app_name=name, host=HOST, port=port)
+    svc.start()
+    svc.join()
+
+
 def _intr_router(port: int, name: str = "intr-router") -> None:
     silence_subprocess()
     from daffi import Router
@@ -92,8 +105,7 @@ def _intr_router(port: int, name: str = "intr-router") -> None:
     r.join()
 
 
-def _intr_worker(port: int, name: str, autoreconnect: bool = False,
-                 reconnect_delay: float = 0.5) -> None:
+def _intr_worker(port: int, name: str) -> None:
     silence_subprocess()
     import time as _t
     from daffi import Client, callback
@@ -102,10 +114,7 @@ def _intr_worker(port: int, name: str, autoreconnect: bool = False,
     def echo(payload):
         return payload
 
-    client = Client(
-        app_name=name, host=HOST, port=port,
-        autoreconnect=autoreconnect, reconnect_delay=reconnect_delay,
-    )
+    client = Client(app_name=name, host=HOST, port=port)
     client.connect()
     try:
         while True:
@@ -117,6 +126,14 @@ def _intr_worker(port: int, name: str, autoreconnect: bool = False,
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
+
+def _start_slow_service(port: int, name: str = "intr-slow-svc") -> mp.Process:
+    p = mp.Process(target=_intr_slow_service, args=(port, name), daemon=True)
+    p.start()
+    wait_for_port(port)
+    time.sleep(0.3)
+    return p
+
 
 def _start_service(port: int, name: str = "intr-svc") -> mp.Process:
     p = mp.Process(target=_intr_service, args=(port, name), daemon=True)
@@ -136,22 +153,16 @@ def _start_router(port: int, name: str = "intr-router") -> mp.Process:
     return p
 
 
-def _start_worker(port: int, name: str, autoreconnect: bool = False,
-                  delay: float = RECONNECT_DELAY) -> mp.Process:
-    p = mp.Process(
-        target=_intr_worker, args=(port, name, autoreconnect, delay), daemon=True
-    )
+def _start_worker(port: int, name: str) -> mp.Process:
+    p = mp.Process(target=_intr_worker, args=(port, name), daemon=True)
     p.start()
     return p
 
 
-def _connect(port: int, name: str, autoreconnect: bool = False):
+def _connect(port: int, name: str):
     """Return (client, conn) connected to *port*."""
     from daffi import Client
-    client = Client(
-        app_name=name, host=HOST, port=port,
-        autoreconnect=autoreconnect, reconnect_delay=RECONNECT_DELAY,
-    )
+    client = Client(app_name=name, host=HOST, port=port)
     conn = client.connect()
     return client, conn
 
@@ -262,82 +273,7 @@ class TestServiceFrozen:
             quiet_kill(svc)
 
 
-# ── Scenario 3: autoreconnect after service restart ───────────────────────────
-
-class TestAutoreconnectService:
-    def test_reconnects_after_service_restart(self, free_port):
-        """Client with autoreconnect=True recovers transparently when the service
-        is killed and restarted on the same port."""
-        svc = _start_service(free_port, "intr-svc-ar")
-        client, conn = _connect(free_port, "intr-caller-ar", autoreconnect=True)
-        assert conn.rpc(timeout=TIMEOUT).echo("before") == "before"
-
-        _sigkill(svc, wait=0.5)
-
-        # Restart the service on the same port.
-        svc2 = _start_service(free_port, "intr-svc-ar-2")
-        try:
-            result = conn.rpc(timeout=20).echo("after restart")
-            assert result == "after restart"
-        finally:
-            client.stop()
-            quiet_kill(svc2)
-
-    def test_multiple_calls_survive_restart(self, free_port):
-        """Multiple sequential calls all succeed even though the service was
-        restarted between some of them."""
-        svc = _start_service(free_port, "intr-svc-multi")
-        client, conn = _connect(free_port, "intr-multi", autoreconnect=True)
-
-        for i in range(3):
-            assert conn.rpc(timeout=TIMEOUT).echo(i) == i
-
-        _sigkill(svc, wait=0.5)
-        svc2 = _start_service(free_port, "intr-svc-multi-2")
-        try:
-            for i in range(3, 6):
-                assert conn.rpc(timeout=20).echo(i) == i
-        finally:
-            client.stop()
-            quiet_kill(svc2)
-
-
-# ── Scenario 4: router restart ────────────────────────────────────────────────
-
-class TestRouterRestart:
-    def test_worker_and_caller_recover_after_router_restart(self, free_port):
-        """Both a connected worker and a fresh caller can communicate through
-        a router that was killed and restarted."""
-        rproc = _start_router(free_port, "intr-router-rr")
-        # Worker with autoreconnect — it will reconnect when the router comes back.
-        wproc = _start_worker(
-            free_port, "intr-worker-rr", autoreconnect=True, delay=0.5
-        )
-        time.sleep(0.5)   # let worker register its callbacks
-
-        client, conn = _connect(free_port, "intr-caller-rr")
-        assert conn.rpc(timeout=TIMEOUT).echo("before router kill") == "before router kill"
-        client.stop()   # stop the plain caller
-
-        # Kill router.
-        _sigkill(rproc, wait=0.5)
-
-        # Restart router on same port.
-        rproc2 = _start_router(free_port, "intr-router-rr-2")
-        time.sleep(1.5)   # let the worker auto-reconnect and re-register
-
-        # A brand-new caller connects to the fresh router.
-        client2, conn2 = _connect(free_port, "intr-caller-rr-2")
-        try:
-            result = conn2.rpc(timeout=20).echo("after router restart")
-            assert result == "after router restart"
-        finally:
-            client2.stop()
-            quiet_kill(wproc)
-            quiet_kill(rproc2)
-
-
-# ── Scenario 5: worker killed during cast ─────────────────────────────────────
+# ── Scenario 3: worker killed during cast ─────────────────────────────────────
 
 class TestCastWithDeadWorker:
     def test_cast_succeeds_after_one_worker_dies(self, free_port):
@@ -418,20 +354,22 @@ class TestBigMessageInterruption:
             _sigkill(svc)   # SIGKILL on stopped process; avoids poller race
 
     def test_big_message_succeeds_after_service_restart(self, free_port):
-        """After the service is restarted, an 8 MiB echo round-trip succeeds
-        with an autoreconnect client."""
+        """After the service is restarted, a fresh client can send an 8 MiB
+        echo round-trip successfully."""
         svc = _start_service(free_port, "intr-big-restart")
-        client, conn = _connect(free_port, "intr-big-restart-caller", autoreconnect=True)
+        client, conn = _connect(free_port, "intr-big-restart-caller")
         payload = bytes(BIG_MSG_SIZE)
         assert conn.rpc(timeout=TIMEOUT).echo(payload) == payload
+        client.stop()
 
         _sigkill(svc, wait=0.5)
         svc2 = _start_service(free_port, "intr-big-restart-2")
+        client2, conn2 = _connect(free_port, "intr-big-restart-caller-2")
         try:
-            result = conn.rpc(timeout=60).echo(payload)
+            result = conn2.rpc(timeout=60).echo(payload)
             assert result == payload
         finally:
-            client.stop()
+            client2.stop()
             quiet_kill(svc2)
 
     def test_big_message_concurrent_interruption(self, free_port):
@@ -472,22 +410,74 @@ class TestBigMessageInterruption:
             client.stop()
 
 
-# ── Scenario 7: rapid successive restarts ────────────────────────────────────
+# ── Scenario 6: Disconnected raised immediately despite huge timeout ──────────
 
-class TestRapidRestarts:
-    def test_autoreconnect_survives_three_restarts(self, free_port):
-        """An autoreconnect client remains functional across three sequential
-        service restarts, verifying the reconnect loop is reusable."""
-        svc = _start_service(free_port, "intr-rapid-0")
-        client, conn = _connect(free_port, "intr-rapid-caller", autoreconnect=True)
+# Maximum wall-clock seconds the client should take to raise after a disconnect.
+# Must be much smaller than the BIG_TIMEOUT used in the calls below.
+_MAX_DISCONNECT_LATENCY = 5.0
+BIG_TIMEOUT = 300
+
+
+class TestDisconnectedWithBigTimeout:
+    """Verify that a lost connection surfaces as Disconnected immediately —
+    not after the (intentionally huge) RPC timeout expires."""
+
+    def test_disconnect_before_call_raises_immediately(self, free_port):
+        """Kill the service, then call rpc(timeout=300).
+        Disconnected (or TransmissionFailure on a dead socket) must be raised
+        within a few seconds, not after the 300 s timeout."""
+        svc = _start_service(free_port, "intr-disc-before")
+        client, conn = _connect(free_port, "intr-disc-before-caller")
         try:
-            assert conn.rpc(timeout=TIMEOUT).echo(0) == 0
+            assert conn.rpc(timeout=TIMEOUT).echo("warm") == "warm"
+            _sigkill(svc, wait=0.5)   # disconnect propagates before next call
 
-            for restart_idx in range(1, 4):
-                _sigkill(svc, wait=0.3)
-                svc = _start_service(free_port, f"intr-rapid-{restart_idx}")
-                result = conn.rpc(timeout=20).echo(restart_idx)
-                assert result == restart_idx
+            t0 = time.monotonic()
+            with pytest.raises((Disconnected, TransmissionFailure)):
+                conn.rpc(timeout=BIG_TIMEOUT).echo("after disconnect")
+            elapsed = time.monotonic() - t0
+
+            assert elapsed < _MAX_DISCONNECT_LATENCY, (
+                f"raised after {elapsed:.1f}s — expected <{_MAX_DISCONNECT_LATENCY}s, "
+                f"not after the full {BIG_TIMEOUT}s timeout"
+            )
+        finally:
+            client.stop()
+            quiet_kill(svc)
+
+    def test_disconnect_during_call_raises_immediately(self, free_port):
+        """Kill the service while rpc(timeout=300) is blocked waiting for a
+        slow callback.  Disconnected must propagate within a few seconds."""
+        svc = _start_slow_service(free_port, "intr-disc-during")
+        client, conn = _connect(free_port, "intr-disc-during-caller")
+
+        error_holder: list = []
+        elapsed_holder: list = []
+
+        def _call():
+            t0 = time.monotonic()
+            try:
+                conn.rpc(timeout=BIG_TIMEOUT).slow_echo("payload")
+            except Exception as exc:
+                error_holder.append(exc)
+            elapsed_holder.append(time.monotonic() - t0)
+
+        t = threading.Thread(target=_call, daemon=True)
+        t.start()
+        time.sleep(0.3)           # let the request reach the service
+        _sigkill(svc, wait=0.0)   # disconnect while call is in-flight
+
+        t.join(timeout=10)
+
+        try:
+            assert not t.is_alive(), "caller thread is still blocked — likely a hang"
+            assert error_holder, "no exception raised — expected Disconnected"
+            assert isinstance(error_holder[0], (Disconnected, TransmissionFailure, RemoteCallError)), (
+                f"unexpected exception type: {type(error_holder[0])}"
+            )
+            assert elapsed_holder[0] < _MAX_DISCONNECT_LATENCY, (
+                f"raised after {elapsed_holder[0]:.1f}s — expected <{_MAX_DISCONNECT_LATENCY}s"
+            )
         finally:
             client.stop()
             quiet_kill(svc)

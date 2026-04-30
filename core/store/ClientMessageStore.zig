@@ -43,7 +43,9 @@ pub fn insert(self: *ClientMessageStore, msg: *Message) !void {
     defer self.mutex.unlock();
     const uuid = msg.getUuid();
     const hash = @rem(uuid, buf_size);
-    if (self.buf[hash] != null) return error.StoreFull;
+    if (self.buf[hash] != null) {
+        return error.StoreFull;
+    }
     self.buf[hash] = msg;
 }
 

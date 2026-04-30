@@ -20,7 +20,7 @@ What this file pins down:
    server's ``diconnectionHandler`` removes the slot when the original peer's
    TCP FIN arrives.
 
-3. **Autoreconnect connects immediately** when the slot is in use — eviction
+3. **Second client connects immediately** when the slot is in use — eviction
    means the first attempt succeeds rather than retrying.
 """
 from __future__ import annotations
@@ -175,7 +175,7 @@ class TestLastConnectionWins:
 
 class TestReconnectAfterStop:
     """A name freed by ``stop()`` must be claimable again — by the same
-    ``Client`` object, by a fresh process, or by the autoreconnect loop."""
+    ``Client`` object or by a fresh process."""
 
     def test_same_client_can_reconnect_with_same_name(self, router_proc):
         """The literal user-reported scenario: connect, stop, connect again
@@ -242,9 +242,9 @@ class TestReconnectAfterStop:
         finally:
             b.stop()
 
-    def test_autoreconnect_connects_immediately_via_eviction(self, router_proc):
-        """An autoreconnecting client whose target name is in use must connect
-        on the first attempt by evicting the stale holder — no retry needed."""
+    def test_second_client_connects_via_eviction(self, router_proc):
+        """A second client whose target name is in use must connect on the
+        first attempt by evicting the stale holder — no retry needed."""
         from daffi import Client
 
         port, _ = router_proc
@@ -260,11 +260,7 @@ class TestReconnectAfterStop:
         try:
             assert ready.wait(timeout=10)
 
-            # With eviction, the first connect() succeeds immediately.
-            client = Client(
-                app_name="auto-id", host=HOST, port=port,
-                autoreconnect=True, reconnect_delay=0.5,
-            )
+            client = Client(app_name="auto-id", host=HOST, port=port)
             client.connect()
             assert client._conn_num is not None
 

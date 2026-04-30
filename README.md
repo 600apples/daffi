@@ -281,23 +281,6 @@ client.join()
 
 ---
 
-## Auto-reconnect
-
-```python
-client = Client(
-    app_name="resilient-caller",
-    host="127.0.0.1", port=6000,
-    autoreconnect=True,
-    reconnect_delay=2.0,   # seconds; doubles after each failure, capped at 60 s
-)
-conn = client.connect()   # returns AutoReconnect adapter
-
-# If the router restarts, this blocks transparently until reconnected
-result = conn.rpc(timeout=30).process("task")
-```
-
----
-
 ## Event handlers
 
 Receive `connected` / `disconnected` notifications for nodes joining or

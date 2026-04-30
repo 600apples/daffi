@@ -74,7 +74,11 @@
  * client.addEventHandler(fn)
  * ─────────────────────────────────────────────────────────────────────────────
  *   Subscribe to server-side events.  fn receives an event object:
- *     { type: "connected" | "disconnected", member: string }
+ *     { type: "connected" | "disconnected" | "evicted", member: string }
+ *
+ *   "evicted" fires when this client is displaced by a new connection with the
+ *   same app_name (last-connection-wins).  Autoreconnect is suppressed for this
+ *   event — the client is closed intentionally.
  *
  *   Example:
  *     client.addEventHandler(e => console.log(e.type, e.member));
@@ -344,6 +348,21 @@ function DaffiClient(name, options) {
                                 msgData.reject(`"${event.member}" disconnected`);
                             }
                         }
+                    } else if (event.type === 'evicted') {
+                        // This client was evicted — a new connection with the same
+                        // app_name took over its slot.  Do not autoreconnect; surface
+                        // the error to all in-flight callers and close intentionally.
+                        _intentionalClose = true;
+                        self.closed = true;
+                        const msg = `Evicted: a new connection with app_name "${self.name}" took over this slot.`;
+                        for (const msgData of Object.values(self.pendingMessages)) {
+                            if (!Array.isArray(msgData)) {
+                                if (msgData.timeoutId) clearTimeout(msgData.timeoutId);
+                                msgData.reject(msg);
+                            }
+                        }
+                        self.pendingMessages = {};
+                        if (_socket) _socket.close();
                     }
                     for (const h of self.eventHandlers) h(event);
                 },

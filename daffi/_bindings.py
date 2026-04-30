@@ -182,7 +182,7 @@ def set_lifecycle_fd(conn_num: int, fd: int) -> None:
 
     The native layer writes exactly one byte to signal why the connection ended:
 
-    * ``b'd'`` — normal disconnect  → Python raises :class:`ConnectionError`
+    * ``b'd'`` — normal disconnect  → Python raises :class:`~daffi.exceptions.Disconnected`
     * ``b'e'`` — client evicted     → Python raises :class:`~daffi.exceptions.Evicted`
 
     Closing the write-end (on user-initiated :meth:`~daffi.app.Client.stop`)

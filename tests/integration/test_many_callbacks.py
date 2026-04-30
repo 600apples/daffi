@@ -17,7 +17,7 @@ import time
 
 import pytest
 
-from conftest import HOST, TIMEOUT, wait_for_port, silence_subprocess, quiet_kill
+from conftest import HOST, TIMEOUT, wait_for_port, wait_for_members, silence_subprocess, quiet_kill
 
 N_CALLBACKS = 10   # must match the number defined in _proc_service_many
 
@@ -80,7 +80,7 @@ def many_cb_service(free_port):
     proc = mp.Process(target=_proc_service_many, args=(free_port,), daemon=True)
     proc.start()
     wait_for_port(free_port)
-    time.sleep(0.2)   # let all 10 callbacks register
+    wait_for_members(free_port, {"many-cb-svc"})
     yield free_port
     quiet_kill(proc)
 
@@ -90,7 +90,7 @@ def args_cb_service(free_port):
     proc = mp.Process(target=_proc_service_args, args=(free_port,), daemon=True)
     proc.start()
     wait_for_port(free_port)
-    time.sleep(0.15)
+    wait_for_members(free_port, {"args-cb-svc"})
     yield free_port
     quiet_kill(proc)
 

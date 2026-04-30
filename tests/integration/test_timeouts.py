@@ -309,7 +309,7 @@ class TestRpcTimeout:
         Either way the call must not hang.
         """
         from daffi import Client
-        from daffi._rpc_proxy import TransmissionFailure
+        from daffi.exceptions import TransmissionFailure
 
         client = Client(app_name="to-rpc-norcv", host=HOST, port=router_no_workers)
         conn = client.connect()

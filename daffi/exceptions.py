@@ -2,8 +2,6 @@
 Application-level exceptions for daffi.
 """
 
-from enum import Enum
-
 
 class BaseException(Exception):
     """Base class for all daffi exceptions. Provides a ``fire()`` helper for
@@ -21,20 +19,6 @@ class BaseException(Exception):
 class InitializationError(BaseException):
     """Raised when a component (Router, Service, or Client) fails to start or
     connect, or is configured incorrectly."""
-
-
-class DisconnectReason(bytes, Enum):
-    """Single-byte reason codes written to the lifecycle pipe by the native
-    layer when a client connection ends.  Inheriting from ``bytes`` means
-    each member *is* the raw byte value, so comparisons against
-    ``os.read(fd, 1)`` work without any conversion::
-
-        reason = os.read(lifecycle_r, 1)
-        if reason == DisconnectReason.EVICTED:
-            ...
-    """
-    DISCONNECTED = b"d"
-    EVICTED      = b"e"
 
 
 class Disconnected(BaseException):
@@ -62,7 +46,18 @@ class Evicted(BaseException):
     than attempting to reconnect."""
 
 
-class CallTimeout(BaseException):
+class TransmissionFailure(BaseException):
+    """Raised when a message cannot be delivered.
+
+    Common causes: no receiver found for the requested method, handshake
+    timeout, or an expected receiver disconnected mid-call."""
+
+
+class RemoteCallError(BaseException):
+    """Raised on the caller side when the remote executor raised an exception."""
+
+
+class CallTimeout(BaseException, TimeoutError):
     """Raised when an outgoing RPC call does not receive a response within
     the configured timeout window.
 

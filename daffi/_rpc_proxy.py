@@ -27,12 +27,7 @@ if TYPE_CHECKING:
     from daffi.app import Client
 
 from daffi._serialization import SerdeFormat, Serializer
-from daffi.exceptions import (
-    InitializationError,
-    CallTimeout,
-    TransmissionFailure,
-    RemoteCallError,
-)
+from daffi.exceptions import InitializationError, CallTimeout, TransmissionFailure, RemoteCallError
 from daffi.utils.misc import iterable
 from daffi._wakeup import WakeupFd
 from daffi.registry._executor_registry import EXECUTOR_REGISTRY
@@ -85,6 +80,7 @@ class ResponseNotifier:
         # RpcResult.result() loop iteration.
         self._lifecycle_error: Optional[Exception] = None
         set_response_fd(conn_num, self._wakeup.write_fd)
+
 
     @classmethod
     def register(cls, conn_num: int) -> "ResponseNotifier":
@@ -167,6 +163,7 @@ class ResponseNotifier:
         self._wakeup.drain()
 
 
+
 @contextmanager
 def system_exception_handler(
     msg_template: str,
@@ -203,13 +200,9 @@ def system_exception_handler(
                     methods = m.get("methods") or []
                     if methods:
                         cb_list = ", ".join(methods)
-                        peer_parts.append(
-                            f"      • {m['name']}\n          callbacks: [{cb_list}]"
-                        )
+                        peer_parts.append(f"      • {m['name']}\n          callbacks: [{cb_list}]")
                     else:
-                        peer_parts.append(
-                            f"      • {m['name']}\n          callbacks: (none)"
-                        )
+                        peer_parts.append(f"      • {m['name']}\n          callbacks: (none)")
                 peer_lines = "\n".join(peer_parts)
             else:
                 peer_lines = "      (none connected)"
@@ -223,7 +216,6 @@ def system_exception_handler(
 
         elif "ConnectionRefused" in origin and conn_info:
             import socket as _socket
-
             host, port, unix_sock_path = conn_info
             if unix_sock_path:
                 addr = f"unix://{unix_sock_path}"
@@ -524,30 +516,36 @@ class RpcResult:
         deadline = (self.send_ts + self.timeout) if self.timeout > 0 else None
 
         while True:
-            # Check for a connection lifecycle error first — set by the
-            # watcher thread via signal_lifecycle_error() on disconnect or
-            # eviction.  The actual response check comes right after so a
-            # response that arrived *before* the error still wins.
-            if (
-                notifier is not None
-                and (_lifecycle_err := notifier._lifecycle_error) is not None
-            ):
-                notifier._lifecycle_error = None
-                raise _lifecycle_err
-
+            # Check the message store FIRST — a response that arrived at the
+            # same moment as a disconnect signal must not be lost.  This
+            # matters because the Zig dispatcher inserts the response into
+            # msg_store and signals response_fd in the *same* loop iteration,
+            # then immediately calls triggerDisconnect after hitting EOF on
+            # the *next* receive.  The lifecycle watcher can therefore set
+            # _lifecycle_error before Python has a chance to drain
+            # msg_store, so checking lifecycle error first would silently
+            # discard a valid response.
             if res := get_message_from_client_store(self.uuid, self.conn_num):
                 return self._unpack_response(res)
+
+            # Only raise a lifecycle error when there is no response waiting.
+            # We capture and clear in one step so the slot is clean if the
+            # notifier is ever reused (e.g. the native layer recycles the
+            # same conn_num after a reconnect).  Multiple threads that woke
+            # simultaneously each capture the non-None value before any one
+            # of them clears it, so all of them still raise the correct error.
+            if notifier is not None and (
+                _lifecycle_err := notifier._lifecycle_error
+            ) is not None:
+                notifier._lifecycle_error = None
+                raise _lifecycle_err
 
             if deadline is not None:
                 remaining = deadline - time.time()
                 if remaining <= 0:
                     mark_message_as_expired(self.uuid, self.conn_num)
                     raise CallTimeout(
-                        call=(
-                            str(self.proxy)
-                            if self.proxy is not None
-                            else f"(uuid: {self.uuid})"
-                        ),
+                        call=str(self.proxy) if self.proxy is not None else f"(uuid: {self.uuid})",
                         timeout=self.timeout,
                         elapsed=time.time() - self.send_ts,
                         receivers=self.receivers or None,
@@ -608,7 +606,9 @@ class RpcResult:
                         f" All receivers: {self.receivers}"
                     )
 
-    def _unpack_response(self, res: Tuple) -> Tuple[bytes, int, int]:
+    def _unpack_response(
+        self, res: Tuple
+    ) -> Tuple[bytes, int, int]:
         """Decode a ``get_message_from_client_store`` tuple into a result.
 
         Mirrors the original inline logic from ``result()``: a 1-tuple is an
@@ -1204,222 +1204,3 @@ class ClientConnection:
                     f"Timed out after {timeout}s waiting for members: {missing}"
                 )
             time.sleep(interval)
-
-
-class _RetryCallProxy:
-    """Proxy returned by every :class:`AutoReconnect` call method.
-
-    Intercepts the remote function name and, when the function is eventually
-    called, executes it through :meth:`AutoReconnect._connection` so the
-    connection is guaranteed to be alive (or a reconnect is attempted first).
-
-    Usage (transparent — users call the same API as with a plain
-    :class:`ClientConnection`)::
-
-        conn = AutoReconnect(client)
-        result = conn.rpc(timeout=5).add(1, 2)   # retries on connection loss
-    """
-
-    __slots__ = ("_ar", "_method", "_args", "_kwargs")
-
-    def __init__(
-        self,
-        ar: "AutoReconnect",
-        method: str,
-        args: tuple,
-        kwargs: dict,
-    ) -> None:
-        self._ar = ar
-        self._method = method
-        self._args = args
-        self._kwargs = kwargs
-
-    def __getattr__(self, func_name: str):
-        def _invoke(*call_args: Any, **call_kwargs: Any) -> Any:
-            conn = self._ar._live_conn()
-            proxy = getattr(conn, self._method)(*self._args, **self._kwargs)
-            return getattr(proxy, func_name)(*call_args, **call_kwargs)
-
-        return _invoke
-
-
-class AutoReconnect:
-    """Event-driven reconnect adapter wrapping a :class:`ClientConnection`.
-
-    Returned by :meth:`~daffi.app.Client.connect` when ``autoreconnect=True``:
-
-    .. code-block:: python
-
-        conn = ClientConnection(client)
-        if client._autoreconnect:
-            conn = AutoReconnect(conn)
-
-    **For callers** — every call method (:meth:`rpc`, :meth:`cast`, etc.)
-    returns a :class:`_RetryCallProxy`.  When invoked the proxy checks that
-    the connection is alive (via :meth:`_live_conn`) and reconnects with
-    exponential back-off before executing the call.
-
-    **For workers** — the lifecycle watcher thread started unconditionally by
-    :meth:`~daffi.app.Client._do_connect` detects EOF and calls
-    :meth:`_reconnect_from_watcher`.  This path requires no extra thread
-    beyond the watcher that is already running for non-autoreconnect clients.
-
-    Example::
-
-        client = Client(app_name="worker", host="127.0.0.1", port=6000,
-                        autoreconnect=True, reconnect_delay=2.0)
-        conn = client.connect()   # returns AutoReconnect wrapping ClientConnection
-
-    Attributes:
-        conn: The wrapped :class:`ClientConnection`.
-    """
-
-    def __init__(self, conn: "ClientConnection") -> None:
-        self.conn = conn
-        # Guards _do_reconnect so concurrent callers (_live_conn from multiple
-        # user threads and the watcher thread) never attempt simultaneous
-        # reconnects.
-        self._lock = threading.Lock()
-        conn.client._reconnect_hook = self._reconnect_from_watcher
-
-    def __str__(self) -> str:
-        return f"AutoReconnect[{self.conn.client}]"
-
-    def __repr__(self) -> str:
-        return str(self)
-
-    @property
-    def client(self):
-        """The underlying :class:`~daffi.app.Client`."""
-        return self.conn.client
-
-    def _is_alive(self) -> bool:
-        """Return ``True`` when the native connection slot is still active."""
-        conn_num = self.conn.client._conn_num
-        if conn_num is None:
-            return False
-        try:
-            return dfcore.getAvailableMembers(conn_num) is not None
-        except Exception:
-            return False
-
-    def _reconnect_from_watcher(self, old_conn_num: int) -> None:
-        """Called by the lifecycle watcher thread on a normal (non-eviction) disconnect.
-
-        Acquires :attr:`_lock` to serialise against concurrent :meth:`_live_conn`
-        callers.  If :meth:`_live_conn` already reconnected (i.e. the client has a
-        fresh ``_conn_num`` that differs from *old_conn_num*) this method returns
-        immediately to avoid a double-reconnect.
-        """
-        with self._lock:
-            client = self.conn.client
-            # Guard against a race where _live_conn already reconnected.
-            if client._conn_num is not None and client._conn_num != old_conn_num:
-                return
-            td = client._task_dispatcher
-            if td is not None:
-                td._deregister_fds(old_conn_num)
-                td.connections.discard(client)
-            self._do_reconnect()
-
-    def _live_conn(self) -> "ClientConnection":
-        """Return the wrapped :class:`ClientConnection`, reconnecting first if needed.
-
-        Used by callers (outgoing RPC).  Serialised by :attr:`_lock` to avoid
-        racing with a concurrent :meth:`_reconnect_from_watcher` call.
-        """
-        if not self._is_alive():
-            with self._lock:
-                if not self._is_alive():
-                    client = self.conn.client
-                    old_num = client._conn_num
-                    td = client._task_dispatcher
-                    if td is not None:
-                        td._deregister_fds(old_num)
-                        td.connections.discard(client)
-                    self._do_reconnect()
-        return self.conn
-
-    def _do_reconnect(self) -> None:
-        """Tear down stale native state and loop until reconnected.
-
-        Must be called with :attr:`_lock` held.  Safe from both the
-        task-dispatcher poller thread (via :meth:`_on_disconnect`) and regular
-        user threads (via :meth:`_live_conn`).  The task dispatcher is *not*
-        stopped — its threads are reused for the new connection.
-        """
-        client = self.conn.client
-
-        old_num = client._conn_num
-        client._conn_num = None
-        client._conn_type = None
-
-        if old_num is not None:
-            # Detach the response-notifier thread from the dying connection
-            # *before* freeing the native slot.  ``_do_connect`` will create
-            # a fresh notifier for the new conn_num.
-            ResponseNotifier.unregister(old_num)
-            try:
-                dfcore.stopClient(old_num)
-            except Exception:
-                pass
-
-        while True:
-            delay = client._reconnect_delay
-            client.logger.warning(f"Connection lost — reconnecting in {delay:.1f}s…")
-            time.sleep(delay)
-            try:
-                # _do_connect registers a fresh ResponseNotifier and starts a
-                # new lifecycle watcher that will call _reconnect_from_watcher
-                # if this new connection also drops.
-                client._do_connect()
-                client.logger.debug("Reconnected successfully.")
-                return
-            except Exception as exc:
-                client.logger.warning(f"Reconnect failed: {exc}")
-                if client._conn_num is not None:
-                    # The half-initialised connection may have a notifier
-                    # registered by _do_connect — unregister it before we
-                    # free the native slot to avoid a leak.
-                    ResponseNotifier.unregister(client._conn_num)
-                    try:
-                        dfcore.stopClient(client._conn_num)
-                    except Exception:
-                        pass
-                    client._conn_num = None
-
-    def rpc(self, *args: Any, **kwargs: Any) -> _RetryCallProxy:
-        """Reconnect-aware :meth:`~ClientConnection.rpc` proxy."""
-        return _RetryCallProxy(self, "rpc", args, kwargs)
-
-    def rpc_nowait(self, *args: Any, **kwargs: Any) -> _RetryCallProxy:
-        """Reconnect-aware :meth:`~ClientConnection.rpc_nowait` proxy."""
-        return _RetryCallProxy(self, "rpc_nowait", args, kwargs)
-
-    def cast(self, *args: Any, **kwargs: Any) -> _RetryCallProxy:
-        """Reconnect-aware :meth:`~ClientConnection.cast` proxy."""
-        return _RetryCallProxy(self, "cast", args, kwargs)
-
-    def cast_nowait(self, *args: Any, **kwargs: Any) -> _RetryCallProxy:
-        """Reconnect-aware :meth:`~ClientConnection.cast_nowait` proxy."""
-        return _RetryCallProxy(self, "cast_nowait", args, kwargs)
-
-    def stream(self, *args: Any, **kwargs: Any) -> _RetryCallProxy:
-        """Reconnect-aware :meth:`~ClientConnection.stream` proxy."""
-        return _RetryCallProxy(self, "stream", args, kwargs)
-
-    def stream_nowait(self, *args: Any, **kwargs: Any) -> _RetryCallProxy:
-        """Reconnect-aware :meth:`~ClientConnection.stream_nowait` proxy."""
-        return _RetryCallProxy(self, "stream_nowait", args, kwargs)
-
-    def wait_for_members(self, *members: str, **kwargs: Any) -> None:
-        """Reconnect-aware :meth:`~ClientConnection.wait_for_members` proxy.
-
-        Ensures the connection is alive before polling, so it is safe to call
-        even before the first successful reconnect.
-        """
-        self._live_conn().wait_for_members(*members, **kwargs)
-
-    def stop(self) -> None:
-        """Stop the underlying client (no background thread to join)."""
-        self.conn.client.stop()

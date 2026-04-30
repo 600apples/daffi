@@ -198,10 +198,12 @@ const ClientEntry = struct {
             // Find intersection between provided receiver and available receivers
             const actual_receiver = try self.client_handler.findReceiverForMethod(func_name, if (!std.mem.eql(u8, receiver, "")) receiver else null);
             const actual_uuid = self.generateUUID();
+            log.debug("[{s}] sendMessage REQUEST func={s} uuid={d} receiver={s}", .{ self.client_handler.app_name, func_name, actual_uuid, actual_receiver });
             try self.msgpool.sendMessage(self.connection, data, actual_uuid, flag, decoder, is_bytes, return_result, self.client_handler.app_name, actual_receiver, func_name);
             return .{ .receiver = actual_receiver, .uuid = actual_uuid, .timestamp = misc.timestamp() };
         } else {
             std.debug.assert(uuid != 0);
+            log.debug("[{s}] sendMessage RESPONSE func={s} uuid={d} receiver={s}", .{ self.client_handler.app_name, func_name, uuid, receiver });
             try self.msgpool.sendMessage(self.connection, data, uuid, flag, decoder, is_bytes, return_result, self.client_handler.app_name, receiver, func_name);
             return .{ .receiver = receiver, .uuid = uuid, .timestamp = misc.timestamp() };
         }
@@ -246,14 +248,17 @@ const ClientEntry = struct {
     }
 
     pub fn setRequestFdClientEntry(self: *ClientEntry, fd: i32) void {
+        log.debug("[{s}] setRequestFd fd={d}", .{ self.client_handler.app_name, fd });
         self.client_handler.tasks_queue.request_fd = fd;
     }
 
     pub fn setResponseFdClientEntry(self: *ClientEntry, fd: i32) void {
+        log.debug("[{s}] setResponseFd fd={d}", .{ self.client_handler.app_name, fd });
         self.client_handler.msg_store.response_fd = fd;
     }
 
     pub fn setLifecycleFdClientEntry(self: *ClientEntry, fd: i32) void {
+        log.debug("[{s}] setLifecycleFd fd={d}", .{ self.client_handler.app_name, fd });
         self.client_handler.tasks_queue.lifecycle_fd = fd;
     }
 

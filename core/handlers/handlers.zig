@@ -195,7 +195,9 @@ pub fn ServerHandler(comptime HandlerConnectionT: ConnectionType) type {
                 var service_hs = try Handshake.create(allocator, &[_]Handshake.MemberData{.{ .name = self.app_name, .methods = methods }}, "service");
                 const data = try service_hs.toJson(allocator);
                 try message.setData(data);
-                for (self.chan_mapper.channels.values()) |c| try self.sendToConnection(Message, c.conn, message);
+                for (self.chan_mapper.channels.values()) |c| {
+                    try self.sendToConnection(Message, c.conn, message);
+                }
 
                 // Store event message for service itself.
                 const event_message = try serde.createEventMessage(self.allocator, 0, connection_name, "connected");
@@ -336,7 +338,7 @@ pub fn ServerHandler(comptime HandlerConnectionT: ConnectionType) type {
                         // Notify remaining peers so they purge the stale slot.
                         for (self.chan_mapper.channels.values()) |c| try self.sendToConnection(Message, c.conn, evicted_event);
                         // Also notify the evicted connection itself so Python can
-                        // raise Evicted instead of the generic ConnectionError.
+                        // raise EvictedError instead of the generic ConnectionError.
                         try self.sendToConnection(Message, stale_conn, evicted_event);
                         stale_conn.close();
                     }
@@ -765,8 +767,9 @@ pub const ClientHandler = struct {
         } else if (std.mem.eql(u8, event.value.type, "evicted")) {
             if (std.mem.eql(u8, event.value.member, self.app_name)) {
                 // THIS client is being evicted — signal the Python disconnect
-                // watcher pipe so it can raise Evicted instead of the
+                // watcher pipe so it can raise EvictedError instead of the
                 // generic ConnectionError.
+                log_client.warn("[{s}] this client is being evicted — signalling eviction fd", .{self.app_name});
                 self.tasks_queue.triggerEviction();
             } else {
                 // A PEER was evicted — remove its stale slot from our map.

@@ -109,9 +109,9 @@ const server_methods = [_]PyMethodDef{
         .ml_doc   =
             \\setServiceRequestFd(conn_num, fd)
             \\
-            \\Register the fd signalled by the native layer when an incoming request
-            \\is pushed onto the Service task queue.  The TaskDispatcher poller
-            \\blocks on this fd — no busy-wait or fixed-interval polling.
+            \\Register an eventfd or pipe write-end that the native layer will signal
+            \\whenever a message is pushed onto the Service task queue.
+            \\Call once after startServer() returns and before the handshake.
         ,
     },
 };
@@ -215,9 +215,10 @@ const client_methods = [_]PyMethodDef{
         .ml_doc   =
             \\setClientRequestFd(conn_num, fd)
             \\
-            \\Register the fd signalled by the native layer when an incoming request
-            \\is pushed onto a Client task queue (worker in a router topology).
-            \\The TaskDispatcher poller blocks on this fd — no busy-wait.
+            \\Register an eventfd or pipe write-end for a Client connection used
+            \\as a worker in a router topology.
+            \\Called once after startClient() returns so the Python task dispatcher is
+            \\notified immediately instead of relying on the 1 ms fallback poll.
         ,
     },
     .{

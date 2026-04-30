@@ -162,69 +162,6 @@ node_b.join()
 
 ---
 
-## Automatic reconnection
-
-If the Router is restarted, connected clients lose their link.  Pass
-`autoreconnect=True` to have `connect()` return an **`AutoReconnect`**
-adapter instead of a plain `ClientConnection`.  Every call made through
-the adapter (`rpc`, `cast`, `stream`, …) checks the connection liveness
-first: if the link is down it **blocks with exponential back-off** until
-the Router comes back, then sends the request on the fresh connection.
-
-```python
-from daffi import Client, callback
-
-@callback
-def multiply(a: int, b: int) -> int:
-    return a * b
-
-if __name__ == "__main__":
-    client = Client(
-        app_name="calc-caller",
-        host="127.0.0.1",
-        port=6001,
-        autoreconnect=True,   # connect() returns AutoReconnect adapter
-        reconnect_delay=2.0,  # first retry after 2 s; then 4 s, 8 s … up to 60 s
-    )
-    conn = client.connect()   # conn is AutoReconnect, same API as ClientConnection
-
-    while True:
-        # If the router is down, this call blocks here until reconnected.
-        result = conn.rpc(timeout=5).multiply(6, 7)
-        print(f"multiply(6, 7) = {result}")
-```
-
-For workers (no outgoing RPC calls, only incoming callbacks), the adapter is
-still returned and the task-dispatcher is restarted automatically after each
-reconnect — callbacks are re-announced to the new Router:
-
-```python
-if __name__ == "__main__":
-    worker = Client(
-        app_name="calc-worker",
-        host="127.0.0.1",
-        port=6001,
-        autoreconnect=True,
-        reconnect_delay=2.0,
-    )
-    conn = worker.connect()  # AutoReconnect; callbacks re-registered on reconnect
-    worker.join()
-```
-
-When the Router restarts the worker logs the reconnect cycle:
-
-```
-WARNING  … Connection lost — reconnecting in 2.0 s…
-WARNING  … Connection lost — reconnecting in 4.0 s…
-INFO     … has been connected successfully. connection info: tcp: […]
-INFO     … 'multiply' registered.
-```
-
-`reconnect_delay` controls the *base* retry interval; it doubles after each
-failed attempt, capped at 60 seconds.
-
----
-
 ## cast() via Router
 
 `cast()` fans out to **every** worker that exposes the requested function and collects all results.
@@ -290,9 +227,6 @@ conn.wait_for_members("worker-1", "worker-2", interval=0.5)
 | `*members` | `str` | — | One or more peer names to wait for. |
 | `timeout` | `float \| None` | `None` | Max seconds to wait. `None` = wait forever. |
 | `interval` | `float` | `1.0` | Poll interval in seconds. |
-
-`wait_for_members()` is also available on the `AutoReconnect` adapter returned
-when `autoreconnect=True`.
 
 ---
 

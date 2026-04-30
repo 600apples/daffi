@@ -22,6 +22,60 @@ const O_NONBLOCK: c_int = switch (@import("builtin").os.tag) {
 };
 extern "c" fn fcntl(fd: c_int, cmd: c_int, ...) c_int;
 
+// ── TCP keepalive + user timeout — declared manually ─────────────────────────
+const IPPROTO_TCP: c_int = 6;
+
+/// TCP_KEEPIDLE (Linux) / TCP_KEEPALIVE (Darwin): seconds of inactivity before
+/// the kernel sends the first keepalive probe.
+const TCP_KEEPIDLE: c_int = switch (@import("builtin").os.tag) {
+    .macos, .ios, .watchos, .tvos, .visionos => 0x10,
+    else => 4,
+};
+/// TCP_KEEPINTVL: seconds between consecutive keepalive probes.
+const TCP_KEEPINTVL: c_int = switch (@import("builtin").os.tag) {
+    .macos, .ios, .watchos, .tvos, .visionos => 0x101,
+    else => 5,
+};
+/// TCP_KEEPCNT: number of unanswered probes before the connection is declared dead.
+const TCP_KEEPCNT: c_int = switch (@import("builtin").os.tag) {
+    .macos, .ios, .watchos, .tvos, .visionos => 0x102,
+    else => 6,
+};
+/// TCP_USER_TIMEOUT (Linux only, value 18): max milliseconds any transmitted
+/// data may remain unacknowledged before the kernel aborts the connection.
+/// This covers the active-traffic case (data in-flight but no ACKs) where
+/// keepalive probes are never sent because the connection is not idle.
+const TCP_USER_TIMEOUT: c_int = 18;  // Linux; ignored on other platforms
+
+/// Apply dead-connection detection to *fd*.
+///
+/// Two complementary mechanisms are used so both idle and active-traffic
+/// scenarios are covered with a ~25 s worst-case detection time:
+///
+/// 1. **TCP keepalive** — fires when the connection is idle (no data in-flight).
+///    idle=10 s → first probe; every 5 s; give up after 3 probes (25 s total).
+///
+/// 2. **TCP_USER_TIMEOUT** (Linux only) — caps how long unacknowledged data
+///    may sit in-flight before the kernel forcibly closes the socket.  Without
+///    this, actively sending data to a dead peer triggers TCP retransmissions
+///    for up to ~15 minutes before the kernel gives up.  Set to 25 000 ms so
+///    both idle and active paths detect failures in roughly the same window.
+fn applyKeepalive(fd: c_int) void {
+    const on:   c_int = 1;
+    const idle: c_int = 10;
+    const intvl: c_int = 5;
+    const cnt:  c_int = 3;
+    _ = c.setsockopt(fd, c.SOL_SOCKET, c.SO_KEEPALIVE, &on,   @sizeOf(c_int));
+    _ = c.setsockopt(fd, IPPROTO_TCP,  TCP_KEEPIDLE,   &idle, @sizeOf(c_int));
+    _ = c.setsockopt(fd, IPPROTO_TCP,  TCP_KEEPINTVL,  &intvl,@sizeOf(c_int));
+    _ = c.setsockopt(fd, IPPROTO_TCP,  TCP_KEEPCNT,    &cnt,  @sizeOf(c_int));
+    // TCP_USER_TIMEOUT is Linux-specific; the setsockopt silently fails on
+    // other platforms, so it is safe to call unconditionally.
+    const user_timeout: c_int = 25_000;  // milliseconds
+    _ = c.setsockopt(fd, IPPROTO_TCP, TCP_USER_TIMEOUT, &user_timeout, @sizeOf(c_int));
+}
+
+// ── poll — declared manually ─────────────────────────────────────────────────
 const POLLOUT: c_short = 4;
 const PollFd = extern struct {
     fd:      c_int,
@@ -153,6 +207,7 @@ pub fn tcpConnectToHost(_: Allocator, host: []const u8, port: u16) !Stream {
         if (rc == 0) {
             // Rare fast path: connected synchronously (e.g. loopback).
             _ = fcntl(fd, F_SETFL, orig_flags);
+            applyKeepalive(fd);
             return Stream{ .handle = fd };
         }
 
@@ -180,6 +235,7 @@ pub fn tcpConnectToHost(_: Allocator, host: []const u8, port: u16) !Stream {
 
         // Restore blocking mode for normal send/recv I/O.
         _ = fcntl(fd, F_SETFL, orig_flags);
+        applyKeepalive(fd);
         return Stream{ .handle = fd };
     }
     return error.ConnectionRefused;
@@ -269,6 +325,7 @@ pub const Server = struct {
         var addr_len: c.socklen_t = @sizeOf(c.sockaddr_storage);
         const fd = c.accept(self.handle, @ptrCast(&addr_storage), &addr_len);
         if (fd < 0) return error.AcceptError;
+        applyKeepalive(fd);
 
         var addr = Address{ .family = addr_storage.ss_family };
         const copy_len = @min(@sizeOf(Address), addr_len);

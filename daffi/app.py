@@ -9,22 +9,21 @@ import socket
 import threading
 
 from abc import ABC
-from enum import IntEnum
+from enum import Enum, IntEnum
 from threading import Event
-from typing import Optional, List, Callable, Dict, Any, Union
+from typing import Optional, List, Callable, Dict, Any
 
 from . import dfcore
 
 from daffi.utils import colors
-from daffi.utils.logger import get_daffi_logger
-from daffi.exceptions import InitializationError, Disconnected, Evicted, DisconnectReason
+from daffi.utils.logger import get_daffi_logger, sync_native_log_level
+from daffi.exceptions import InitializationError, Disconnected, Evicted
 from daffi.utils.misc import string_uuid
-from daffi._bindings import set_client_lifecycle_fd
+from daffi._bindings import set_lifecycle_fd, set_response_fd
 from daffi._rpc_proxy import (
     RpcProxy,
     SerdeFormat,
     ClientConnection,
-    AutoReconnect,
     ResponseNotifier,
     system_exception_handler,
 )
@@ -38,6 +37,20 @@ class ServerMode(IntEnum):
 
     ROUTER = 0
     SERVICE = 1
+
+
+class DisconnectReason(bytes, Enum):
+    """Single-byte reason codes written to the lifecycle pipe by the native
+    layer when a client connection ends.  Inheriting from ``bytes`` means
+    each member *is* the raw byte value, so comparisons against
+    ``os.read(fd, 1)`` work without any conversion::
+
+        reason = os.read(lifecycle_r, 1)
+        if reason == DisconnectReason.EVICTED:
+            ...
+    """
+    DISCONNECTED = b"d"
+    EVICTED      = b"e"
 
 
 class EventsMixin:
@@ -199,6 +212,11 @@ class Application(EventsMixin, ABC):
             raise InitializationError(
                 "Windows platform doesn't support unix sockets. Provide host and port to use TCP"
             )
+
+        # Propagate Python's current log level to the native Zig layer so that
+        # std.log.debug / .info / .warn calls in the extension respect whatever
+        # level the caller configured (e.g. logging.basicConfig(level=DEBUG)).
+        sync_native_log_level()
 
         set_signal_handler(self.stop)
 
@@ -414,26 +432,12 @@ class Client(Application):
     """A client that connects to a :class:`Router` or :class:`Service` and
     issues RPC calls.
 
-    Example — simple call::
+    Example::
 
         client = Client(app_name="my-client", host="127.0.0.1", port=5000)
         conn = client.connect()
         result = conn.rpc(timeout=5).add(1, 2)
         client.stop()
-
-    Example — caller with automatic reconnect::
-
-        client = Client(
-            app_name="my-caller",
-            host="127.0.0.1", port=6000,
-            autoreconnect=True,
-            reconnect_delay=2.0,
-        )
-        conn = client.connect()   # returns AutoReconnect instance
-
-        # If the router restarts, this call blocks until reconnected, then
-        # sends the request transparently — no manual retry loop needed.
-        result = conn.rpc(timeout=5).process("task")
     """
 
     def __init__(
@@ -447,24 +451,7 @@ class Client(Application):
         cert_file: str = "",
         key_file: str = "",
         ca_file: str = "",
-        autoreconnect: bool = False,
-        reconnect_delay: float = 2.0,
     ):
-        """
-        Args:
-            autoreconnect:   When ``True``, :meth:`connect` returns an
-                             :class:`~daffi.rpc_proxy.AutoReconnect` adapter
-                             instead of a plain :class:`~daffi.rpc_proxy.ClientConnection`.
-                             Every call on the adapter checks the connection liveness
-                             first and blocks with exponential back-off until
-                             reconnected if the server is unreachable.
-                             Default: ``False``.
-            reconnect_delay: Base delay in seconds before the first reconnect
-                             attempt.  Doubles after each failure, capped at
-                             60 s.  Default: ``2.0``.
-
-            All other arguments are the same as :class:`Application`.
-        """
         super().__init__(
             app_name=app_name,
             host=host,
@@ -476,8 +463,6 @@ class Client(Application):
             key_file=key_file,
             ca_file=ca_file,
         )
-        self._autoreconnect = autoreconnect
-        self._reconnect_delay = max(0.5, reconnect_delay)
         # Single pipe used by the lifecycle watcher thread (always started).
         # The native layer writes one DisconnectReason byte to the write-end:
         #   DisconnectReason.DISCONNECTED → Disconnected
@@ -485,9 +470,6 @@ class Client(Application):
         # Closing the write-end from stop() makes the read-end go EOF, which
         # the watcher interprets as a clean shutdown (no error surfaced).
         self._lifecycle_pipe_w: Optional[int] = None
-        # Set by AutoReconnect.__init__; called by the watcher on normal
-        # disconnect when autoreconnect=True.  None for non-autoreconnect.
-        self._reconnect_hook: Optional[Any] = None
 
     @property
     def info(self) -> str:
@@ -502,22 +484,15 @@ class Client(Application):
             )
             return f"tcp: [ host {self.host!r}, port: {self.port!r}{type_part} ]"
 
-    def connect(self) -> Union["ClientConnection", "AutoReconnect"]:
+    def connect(self) -> "ClientConnection":
         """Connect to the server, perform the handshake, and return a connection handle.
-
-        Returns a :class:`~daffi.rpc_proxy.ClientConnection` normally.
-        When ``autoreconnect=True`` was passed to the constructor it returns an
-        :class:`~daffi.rpc_proxy.AutoReconnect` adapter instead — the API is
-        identical, but each call transparently reconnects on connection loss before
-        executing.
 
         Connection-level protection (encryption + peer authentication) is
         delegated to TLS — pass ``tls=True`` together with ``ca_file`` on the
         constructor to authenticate the server's certificate.
 
         Returns:
-            A :class:`~daffi.rpc_proxy.ClientConnection` (normal) or
-            :class:`~daffi.rpc_proxy.AutoReconnect` (when ``autoreconnect=True``).
+            A :class:`~daffi.rpc_proxy.ClientConnection`.
 
         Raises:
             RuntimeError: If the client is already connected.
@@ -526,10 +501,7 @@ class Client(Application):
         if self._conn_num is not None:
             raise RuntimeError("Client is already connected")
         self._do_connect()
-        conn = ClientConnection(self)
-        if self._autoreconnect:
-            conn = AutoReconnect(conn)
-        return conn
+        return ClientConnection(self)
 
     def _do_connect(self) -> None:
         """Low-level connect: allocate native slot, handshake, start dispatcher."""
@@ -581,7 +553,6 @@ class Client(Application):
     def _start_disconnect_watcher(self) -> None:
         """Start a daemon thread that handles all connection lifecycle events.
 
-        Always started — regardless of whether ``autoreconnect`` is enabled.
         This is the single, central place that reacts to the native layer
         signalling that the connection has ended.
 
@@ -599,17 +570,9 @@ class Client(Application):
         microseconds of the connection drop rather than waiting for the next
         liveness-check timeout.
 
-        After waking in-flight calls the watcher branches:
-
-        * **Normal disconnect + autoreconnect=True**: calls
-          :attr:`_reconnect_hook` (set by :class:`AutoReconnect`) which
-          performs the retry loop in this thread.  A new watcher is started
-          for the fresh connection inside :meth:`_do_connect`.
-
-        * **Eviction** (regardless of autoreconnect) or **normal disconnect
-          with autoreconnect=False**: tears down the client and delivers the
-          error — either via :attr:`_connection_error` for a parked
-          :meth:`join`, or by re-raising from this thread otherwise.
+        After waking in-flight calls the watcher tears down the client and
+        delivers the error — either via :attr:`_connection_error` for a parked
+        :meth:`join`, or by re-raising from this thread otherwise.
 
         A user-initiated :meth:`stop` closes the write-end, causing an EOF
         read of zero bytes which the watcher treats as a clean shutdown.
@@ -617,7 +580,7 @@ class Client(Application):
         r, w = os.pipe()
         self._lifecycle_pipe_w = w
         conn_num_at_start = self._conn_num
-        set_client_lifecycle_fd(conn_num_at_start, w)
+        set_lifecycle_fd(conn_num_at_start, w)
 
         def _watch(stop_event: Event, client_ref, lifecycle_r: int, conn_num: int) -> None:
             reason = b""
@@ -641,16 +604,14 @@ class Client(Application):
                 return
 
             if reason == DisconnectReason.EVICTED:
-                err = Evicted(
+                err: Exception = Evicted(
                     f"This client (app_name={client_ref.app_name!r}) was evicted — "
                     "a new connection with the same app_name took over its slot."
                 )
             else:
                 err = Disconnected(
                     "Server disconnected unexpectedly.\n\n"
-                    "  The router or service this client was connected to has stopped.\n"
-                    "  If you want to reconnect automatically, use:\n"
-                    "      Client(..., autoreconnect=True)"
+                    "  The router or service this client was connected to has stopped."
                 )
 
             # Wake every in-flight RpcResult.result() waiter immediately so
@@ -658,22 +619,23 @@ class Client(Application):
             # individual timeouts expire.
             ResponseNotifier.signal_lifecycle_error(conn_num, err)
 
-            # For normal disconnects with autoreconnect=True: hand off to the
-            # reconnect hook and return — _do_connect inside the hook will
-            # start a fresh watcher for the new connection.
-            reconnect_hook = client_ref._reconnect_hook
-            if reconnect_hook is not None and reason != DisconnectReason.EVICTED:
-                reconnect_hook(conn_num)
-                return
-
-            # Non-recoverable path: record the error, tear down, and surface.
+            # Record the error, tear down, and surface.
             client_ref._connection_error = err
             was_joining = client_ref._joining
-            try:
-                client_ref.stop()
-            except Exception:
-                pass
-            if not was_joining:
+            if was_joining:
+                # Joining path: call stop() to set _stop_event so join() wakes up.
+                try:
+                    client_ref.stop()
+                except Exception:
+                    pass
+            else:
+                # Non-joining path: do NOT call stop() here.  Doing so races
+                # with any in-flight RpcResult.result() that is about to read
+                # from the native message store — dfcore.stopClient() frees the
+                # ClientEntry while Python may still be calling
+                # get_message_from_client_store on the same conn_num.
+                # The caller's finally block (e.g. `finally: client.stop()`)
+                # owns teardown; it runs after the RPC result is determined.
                 raise err
 
         t = threading.Thread(
@@ -685,8 +647,8 @@ class Client(Application):
         t.start()
 
     def stop(self, *_, **__):
-        """Stop the client: signal the reconnect loop, join task-dispatcher
-        threads, then destroy the native connection.
+        """Stop the client: join task-dispatcher threads, then destroy the
+        native connection.
 
         Idempotent and safe to call from multiple threads.  Two invariants:
 
@@ -701,6 +663,15 @@ class Client(Application):
           ``_conn_num`` is still set.
         """
         with self._stop_lock:
+            if self._conn_num is not None:
+                try:
+                    set_lifecycle_fd(self._conn_num, -1)
+                except Exception:
+                    pass
+                try:
+                    set_response_fd(self._conn_num, -1)
+                except Exception:
+                    pass
             # Wake the disconnect-watcher thread so it exits cleanly.
             # Closing the lifecycle pipe write-end makes the read-end go EOF,
             # which the watcher interprets as a clean (user-initiated) stop.
