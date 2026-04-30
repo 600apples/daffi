@@ -43,7 +43,7 @@ import time
 
 import pytest
 
-from conftest import HOST, TIMEOUT, wait_for_port, silence_subprocess, quiet_kill
+from .conftest import HOST, TIMEOUT, wait_for_port, silence_subprocess, quiet_kill
 
 # Must match core/store/ClientMessageStore.zig  ``const buf_size: u16 = 2048;``
 BUF_SIZE = 2048

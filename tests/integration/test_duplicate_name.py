@@ -30,7 +30,7 @@ import time
 
 import pytest
 
-from conftest import (
+from .conftest import (
     HOST,
     quiet_kill,
     silence_subprocess,

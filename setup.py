@@ -41,7 +41,7 @@ import platform
 import tarfile
 import tempfile
 import urllib.request
-from setuptools import setup, Extension
+from setuptools import setup, Extension, Command
 from setuptools.command.build_ext import build_ext
 
 
@@ -107,6 +107,48 @@ def _ensure_zig() -> str:
     os.chmod(zig_exe, 0o755)
     print(f"setup.py: Zig {_ZIG_VERSION} ready at {zig_exe!r}")
     return zig_exe
+
+
+class EnsureZig(Command):
+    """Setuptools command: download Zig if absent and (optionally) symlink it.
+
+    Usage from a shell script::
+
+        python setup.py ensure_zig
+        python setup.py ensure_zig --symlink /usr/local/bin/zig
+
+    cibuildwheel ``before-all`` example::
+
+        before-all = "python setup.py ensure_zig --symlink /usr/local/bin/zig"
+
+    The command calls :func:`_ensure_zig`, which checks PATH first and only
+    downloads when Zig is genuinely absent.  The optional ``--symlink``
+    argument creates a symlink so that subsequent shell commands can call
+    ``zig`` without an absolute path.
+    """
+
+    description = "ensure Zig is available; download it if not in PATH"
+    user_options = [
+        ("symlink=", None, "create a symlink to the zig binary at this path"),
+    ]
+
+    def initialize_options(self):
+        self.symlink = None
+
+    def finalize_options(self):
+        pass
+
+    def run(self):
+        zig_exe = _ensure_zig()
+        print(f"ensure_zig: Zig ready at {zig_exe!r}")
+        if self.symlink:
+            link = self.symlink
+            os.makedirs(os.path.dirname(link), exist_ok=True)
+            if os.path.lexists(link):
+                os.remove(link)
+            os.symlink(zig_exe, link)
+            print(f"ensure_zig: symlinked {zig_exe!r} → {link!r}")
+        subprocess.check_call([zig_exe, "version"])
 
 
 def _find_openssl():
@@ -241,5 +283,8 @@ dfcore = Extension("daffi.dfcore", sources=["core/core.zig"])
 
 setup(
     ext_modules=[dfcore],
-    cmdclass={"build_ext": ZigBuilder},
+    cmdclass={
+        "build_ext": ZigBuilder,
+        "ensure_zig": EnsureZig,
+    },
 )

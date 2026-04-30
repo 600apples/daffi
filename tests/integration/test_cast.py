@@ -16,7 +16,7 @@ import time
 
 import pytest
 
-from conftest import (
+from .conftest import (
     HOST, TIMEOUT, wait_for_port, wait_for_members,
     silence_subprocess, quiet_kill, proc_router,
 )

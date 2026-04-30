@@ -120,11 +120,13 @@ class TestCallbackFunction:
         with pytest.raises(InitializationError):
             callback(lambda x: x)
 
-    def test_async_def_raises(self):
-        with pytest.raises(InitializationError):
-            @callback
-            async def my_async_fn():
-                pass
+    def test_async_def_allowed(self):
+        # async def callbacks are accepted so they can be used with daffi.aio.
+        # The sync task dispatcher guards against accidental use of async
+        # callbacks in the synchronous runtime.
+        @callback
+        async def my_async_fn():
+            pass
 
     def test_generator_function_raises(self):
         with pytest.raises(InitializationError):

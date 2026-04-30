@@ -42,7 +42,7 @@ import time
 
 import pytest
 
-from conftest import (
+from .conftest import (
     HOST,
     TIMEOUT,
     quiet_kill,

@@ -55,7 +55,7 @@ import time
 
 import pytest
 
-from conftest import HOST, TIMEOUT, wait_for_port, wait_for_members, silence_subprocess, quiet_kill
+from .conftest import HOST, TIMEOUT, wait_for_port, wait_for_members, silence_subprocess, quiet_kill
 from daffi.exceptions import Disconnected, InitializationError, RemoteCallError, TransmissionFailure
 
 # ── constants ──────────────────────────────────────────────────────────────────

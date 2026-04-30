@@ -64,15 +64,15 @@ except ImportError:
 class _ConnEntry(NamedTuple):
     """All fd-related state for one registered connection, keyed by conn_num."""
 
-    conn: Any
-    wakeup: WakeupFd  # task-arrival channel (eventfd on Linux, pipe on macOS)
-    lifecycle: WakeupFd  # lifecycle / stop channel (always a pipe)
+    conn:      Any
+    wakeup:    WakeupFd   # task-arrival channel (eventfd on Linux, pipe on macOS)
+    lifecycle: WakeupFd   # lifecycle / stop channel (always a pipe)
 
 
 class EventType(str):
     """String constants for the two peer-lifecycle event types emitted by daffi."""
 
-    CONNECTED = "connected"
+    CONNECTED    = "connected"
     DISCONNECTED = "disconnected"
 
 
@@ -86,11 +86,17 @@ def _handle_lifecycle_signal(conn, conn_num: int, reason: bytes) -> None:
     ``LifecycleSignal.INIT`` re-runs the handshake and returns normally.
 
     All disconnect variants (DISCONNECTED, EVICTED, NORMAL) wake in-flight
-    RPC waiters, store the error on *conn*, log it if the caller is not
-    blocking in ``join()``, then always call ``conn.stop()`` to release
-    resources.  By the time ``stop()`` is called every in-flight waiter has
-    already received the error via ``signal_lifecycle_error``, so there is
-    no race with ``RpcResult.result()``.
+    RPC waiters, store the error on *conn*, then either:
+
+    * **joining path** — call ``conn.stop()`` so ``join()`` unblocks.
+      ``stop_for_connection`` detects it is being called from the poller
+      thread and skips joining itself, avoiding a deadlock.
+    * **non-joining path** — log the error and return.  ``conn.stop()`` is
+      intentionally *not* called here: the user's thread may still be inside
+      a Zig RPC call, and calling ``dfcore.stopClient`` concurrently from the
+      poller would deadlock on the per-connection Zig lock.  The in-flight
+      waiter is already woken by ``signal_lifecycle_error``; the user's
+      ``finally`` block is responsible for calling ``client.stop()``.
     """
     if reason == LifecycleSignal.INIT:
         RpcProxy._process_client_handshake(conn_num)
@@ -118,9 +124,10 @@ def _handle_lifecycle_signal(conn, conn_num: int, reason: bytes) -> None:
     conn._connection_error = err
     conn._disconnected = True
 
-    if not conn._joining:
-        conn.logger.debug(f"Error in connection {conn_num}: {err!r}")
-    conn.stop()
+    if conn._joining:
+        conn.stop()
+    else:
+        conn.logger.error(f"Error in connection {conn_num}: {err}")
 
 
 def _invoke_callback(
@@ -136,9 +143,16 @@ def _invoke_callback(
         promoted from ``OPAQUE`` to ``PICKLE`` when an exception is raised
         (error payloads must always be picklable).
     """
+    import asyncio as _asyncio
     cb = EXECUTOR_REGISTRY.get(func_name)
     args, kwargs = Serializer.deserialize(serde, data)
     try:
+        if _asyncio.iscoroutinefunction(cb):
+            raise TypeError(
+                f"Callback {func_name!r} is an async def coroutine and cannot be "
+                "used with the synchronous dispatcher. "
+                "Use daffi.aio (AsyncClient / AsyncService) instead."
+            )
         result = cb(*args, **kwargs)
         return result, MessageFlag.RESPONSE, serde
     except:  # noqa: E722
@@ -344,12 +358,10 @@ class TaskDispatcher:
         lc = WakeupFd(pipe=True)
 
         self._conns[conn_num] = _ConnEntry(conn=connection, wakeup=wakeup, lifecycle=lc)
-        self._rfd_to_conn_num[wakeup.read_fd] = conn_num
-        self._rfd_to_conn_num[lc.read_fd] = conn_num
+        self._rfd_to_conn_num[wakeup.read_fd]  = conn_num
+        self._rfd_to_conn_num[lc.read_fd]      = conn_num
 
-        set_request_fd(
-            conn_num, wakeup.write_fd, server_mode=bool(connection.server_mode)
-        )
+        set_request_fd(conn_num, wakeup.write_fd, server_mode=bool(connection.server_mode))
         if connection.server_mode is None:
             set_lifecycle_fd(conn_num, lc.write_fd)
 

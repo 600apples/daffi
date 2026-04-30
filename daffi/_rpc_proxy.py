@@ -27,12 +27,7 @@ if TYPE_CHECKING:
     from daffi.app import Client
 
 from daffi._serialization import SerdeFormat, Serializer
-from daffi.exceptions import (
-    InitializationError,
-    CallTimeout,
-    TransmissionFailure,
-    RemoteCallError,
-)
+from daffi.exceptions import InitializationError, CallTimeout, TransmissionFailure, RemoteCallError
 from daffi.utils.misc import iterable
 from daffi._wakeup import WakeupFd
 from daffi.registry._executor_registry import EXECUTOR_REGISTRY
@@ -85,6 +80,7 @@ class ResponseNotifier:
         # RpcResult.result() loop iteration.
         self._lifecycle_error: Optional[Exception] = None
         set_response_fd(conn_num, self._wakeup.write_fd)
+
 
     @classmethod
     def register(cls, conn_num: int) -> "ResponseNotifier":
@@ -167,6 +163,7 @@ class ResponseNotifier:
         self._wakeup.drain()
 
 
+
 @contextmanager
 def system_exception_handler(
     msg_template: str,
@@ -203,13 +200,9 @@ def system_exception_handler(
                     methods = m.get("methods") or []
                     if methods:
                         cb_list = ", ".join(methods)
-                        peer_parts.append(
-                            f"      • {m['name']}\n          callbacks: [{cb_list}]"
-                        )
+                        peer_parts.append(f"      • {m['name']}\n          callbacks: [{cb_list}]")
                     else:
-                        peer_parts.append(
-                            f"      • {m['name']}\n          callbacks: (none)"
-                        )
+                        peer_parts.append(f"      • {m['name']}\n          callbacks: (none)")
                 peer_lines = "\n".join(peer_parts)
             else:
                 peer_lines = "      (none connected)"
@@ -223,7 +216,6 @@ def system_exception_handler(
 
         elif "ConnectionRefused" in origin and conn_info:
             import socket as _socket
-
             host, port, unix_sock_path = conn_info
             if unix_sock_path:
                 addr = f"unix://{unix_sock_path}"
@@ -241,7 +233,9 @@ def system_exception_handler(
                     except OSError:
                         pass
                 if in_use:
-                    hint = f"\n  Port {port} on {host} is already occupied by another process."
+                    hint = (
+                        f"\n  Port {port} on {host} is already occupied by another process."
+                    )
                 else:
                     hint = (
                         f"\n  The server could not bind to {addr}.\n"
@@ -255,15 +249,53 @@ def system_exception_handler(
         raise errtype(msg_template.format(origin)).with_traceback(None) from None
 
 
+class _BoundRpc:
+    """Immutable callable returned by :meth:`RpcProxy.__getattr__`.
+
+    Closes over ``func_name`` at creation time — the parent proxy is never
+    mutated, so sharing one :class:`RpcProxy` across multiple threads is safe::
+
+        proxy = conn.rpc(timeout=5)
+        t1 = threading.Thread(target=lambda: proxy.echo("a"))
+        t2 = threading.Thread(target=lambda: proxy.multiply(3, 4))
+        # Both threads capture distinct _BoundRpc objects with their own func_name.
+    """
+
+    __slots__ = ("_proxy", "_func_name")
+
+    def __init__(self, proxy: "RpcProxy", func_name: str) -> None:
+        self._proxy = proxy
+        self._func_name = func_name
+
+    def __str__(self) -> str:
+        req_name = "rpc call" if self._proxy.return_result else "rpc_nowait"
+        to_receiver = f" to {self._proxy.receiver}" if self._proxy.receiver else ""
+        return f"{req_name}{to_receiver}(fn: {self._func_name!r})"
+
+    __repr__ = __str__
+
+    def __call__(self, *args, **kwargs):
+        self._proxy.conn._ensure_connected()
+        if self._proxy.return_result:
+            return self._proxy._process_rpc(self._func_name, *args, **kwargs)
+        else:
+            self._proxy._process_stream(self._func_name, *args, **kwargs)
+
+
 class RpcProxy:
     """Lazy call builder returned by :meth:`~daffi.app.ClientConnection.rpc`
     and :meth:`~daffi.app.ClientConnection.rpc_nowait`.
 
-    Attribute access captures the remote function name; calling the proxy
-    sends the message::
+    The proxy itself is **immutable** after construction.  :meth:`__getattr__`
+    returns a :class:`_BoundRpc` that closes over the function name — the same
+    proxy instance can be shared safely across threads::
 
-        result = conn.rpc(timeout=5).add(1, 2)   # blocking — returns result
-        conn.rpc_nowait().log_event(payload)      # fire-and-forget
+        proxy = conn.rpc(timeout=5)
+        result = proxy.add(1, 2)          # sequential — fine
+        # concurrent — also fine, each __getattr__ creates a distinct _BoundRpc:
+        with ThreadPoolExecutor() as pool:
+            f1 = pool.submit(proxy.echo, "a")
+            f2 = pool.submit(proxy.multiply, 3, 4)
     """
 
     def __init__(
@@ -283,60 +315,37 @@ class RpcProxy:
         self.serde = serde
         self.return_result = return_result
         self.logger = logger
-        self._func_name = None
         self._receiver = {receiver} if receiver else set()
-        self._uuid = None
 
-    def __str__(self):
+    def __str__(self) -> str:
         req_name = "rpc call" if self.return_result else "rpc_nowait"
         to_receiver = f" to {self.receiver}" if self.receiver else ""
-        details = (
-            f"(fn: {self._func_name!r}, uuid: {self._uuid})"
-            if self._uuid
-            else f"(fn: {self._func_name!r})"
-        )
-        return f"{req_name}{to_receiver}{details}"
+        return f"{req_name}{to_receiver}"
 
     __repr__ = __str__
 
-    def __call__(self, *args, **kwargs) -> Tuple[int, int]:
-        """Send the captured call to the remote node.
+    def __getattr__(self, item: str) -> "_BoundRpc":
+        """Return an immutable callable bound to *item* as the remote function name."""
+        return _BoundRpc(self, item)
 
-        For blocking calls (:meth:`~daffi.app.ClientConnection.rpc`) this
-        waits for the response and returns the deserialised result.  For
-        fire-and-forget calls (:meth:`~daffi.app.ClientConnection.stream`) it
-        returns ``None`` immediately.
-        """
-        self.conn._ensure_connected()
-        if self.return_result:
-            return self._process_rpc(*args, **kwargs)
-        else:
-            self._process_stream(*args, **kwargs)
-
-    def __getattr__(self, item):
-        """Capture the remote function name via attribute access."""
-        self._func_name = item
-        return self
-
-    def _process_rpc(self, *args, **kwargs):
+    def _process_rpc(self, func_name: str, *args, **kwargs):
         """Send a blocking RPC call and return the deserialised result."""
         conn_num = self.conn.client._conn_num
         data, is_bytes = Serializer.serialize(self.serde, *args, **kwargs)
-        assert self._func_name is not None
+        label = f"rpc call(fn: {func_name!r})"
         with system_exception_handler(
-            f"Unable to proceed with {self}: {{}}", TransmissionFailure, conn_num
+            f"Unable to proceed with {label}: {{}}", TransmissionFailure, conn_num
         ):
             uuid, ts, found_receiver = send_message_from_client(
                 data=data,
                 flag=MessageFlag.REQUEST,
                 serde=self.serde,
                 receiver=self.receiver,
-                func_name=self._func_name,
+                func_name=func_name,
                 return_result=self.return_result,
                 conn_num=conn_num,
                 is_bytes=is_bytes,
             )
-        self._uuid = uuid
         found_receivers = (
             None
             if not found_receiver
@@ -348,7 +357,7 @@ class RpcProxy:
                 if not (_memebers := get_available_members(conn_num))
                 else f"\nAvailable receivers: {_memebers}"
             )
-            raise TransmissionFailure(f"No receivers found for {self}." + members)
+            raise TransmissionFailure(f"No receivers found for {label}." + members)
         elif missing_receivers := self._receiver - found_receivers:
             self.logger.warning(
                 f"Receiver(s): {missing_receivers} seems to be offline."
@@ -364,10 +373,9 @@ class RpcProxy:
         data, flag, serde = result.result()
         return Serializer.deserialize(serde, data)[0][0]
 
-    def _process_stream(self, *args, **kwargs):
+    def _process_stream(self, func_name: str, *args, **kwargs):
         """Send one or more fire-and-forget messages without waiting for replies."""
         conn_num = self.conn.client._conn_num
-        assert self._func_name is not None
         if args:
             data = args[0]
         elif kwargs:
@@ -378,18 +386,18 @@ class RpcProxy:
             items = [(args, kwargs)]
         else:
             items = iter(zip(data, repeat({})))
-
+        label = f"rpc_nowait(fn: {func_name!r})"
         for a, k in items:
             data, is_bytes = Serializer.serialize(self.serde, *a, **k)
             with system_exception_handler(
-                f"Unable to proceed with {self}: {{}}", TransmissionFailure, conn_num
+                f"Unable to proceed with {label}: {{}}", TransmissionFailure, conn_num
             ):
                 uuid, ts, found_receiver = send_message_from_client(
                     data=data,
                     flag=MessageFlag.REQUEST,
                     serde=self.serde,
                     receiver=self.receiver,
-                    func_name=self._func_name,
+                    func_name=func_name,
                     return_result=self.return_result,
                     conn_num=conn_num,
                     is_bytes=is_bytes,
@@ -400,7 +408,7 @@ class RpcProxy:
                     if not (_memebers := get_available_members(conn_num))
                     else f"\nAvailable receivers: {_memebers}"
                 )
-                raise TransmissionFailure(f"No receivers found for {self}." + members)
+                raise TransmissionFailure(f"No receivers found for {label}." + members)
             elif missing_receivers := self._receiver - set(
                 found_receiver.split(METADATA_SEPARATOR)
             ):
@@ -540,10 +548,9 @@ class RpcResult:
             # same conn_num after a reconnect).  Multiple threads that woke
             # simultaneously each capture the non-None value before any one
             # of them clears it, so all of them still raise the correct error.
-            if (
-                notifier is not None
-                and (_lifecycle_err := notifier._lifecycle_error) is not None
-            ):
+            if notifier is not None and (
+                _lifecycle_err := notifier._lifecycle_error
+            ) is not None:
                 notifier._lifecycle_error = None
                 raise _lifecycle_err
 
@@ -552,11 +559,7 @@ class RpcResult:
                 if remaining <= 0:
                     mark_message_as_expired(self.uuid, self.conn_num)
                     raise CallTimeout(
-                        call=(
-                            str(self.proxy)
-                            if self.proxy is not None
-                            else f"(uuid: {self.uuid})"
-                        ),
+                        call=str(self.proxy) if self.proxy is not None else f"(uuid: {self.uuid})",
                         timeout=self.timeout,
                         elapsed=time.time() - self.send_ts,
                         receivers=self.receivers or None,
@@ -617,7 +620,9 @@ class RpcResult:
                         f" All receivers: {self.receivers}"
                     )
 
-    def _unpack_response(self, res: Tuple) -> Tuple[bytes, int, int]:
+    def _unpack_response(
+        self, res: Tuple
+    ) -> Tuple[bytes, int, int]:
         """Decode a ``get_message_from_client_store`` tuple into a result.
 
         Mirrors the original inline logic from ``result()``: a 1-tuple is an
@@ -640,12 +645,38 @@ class RpcResult:
         return data, flag, serde
 
 
+class _BoundBroadcast:
+    """Immutable callable returned by :meth:`BroadcastProxy.__getattr__`.
+
+    Closes over ``func_name`` at creation time — the parent proxy is never
+    mutated, making it safe to share across threads.
+    """
+
+    __slots__ = ("_proxy", "_func_name")
+
+    def __init__(self, proxy: "BroadcastProxy", func_name: str) -> None:
+        self._proxy = proxy
+        self._func_name = func_name
+
+    def __str__(self) -> str:
+        kind = "cast" if self._proxy.return_result else "cast_nowait"
+        return f"{kind}(fn: {self._func_name!r})"
+
+    __repr__ = __str__
+
+    def __call__(self, *args, **kwargs):
+        self._proxy.conn._ensure_connected()
+        if self._proxy.return_result:
+            return self._proxy._process_call_all(self._func_name, *args, **kwargs)
+        self._proxy._process_cast_all(self._func_name, *args, **kwargs)
+
+
 class BroadcastProxy:
     """Lazy call builder returned by :meth:`~daffi.app.ClientConnection.cast`
     and :meth:`~daffi.app.ClientConnection.cast_nowait`.
 
-    Sends the captured call to **every** connected peer that exposes the
-    requested method (or to an explicit list of receivers).
+    The proxy itself is **immutable** after construction.  :meth:`__getattr__`
+    returns a :class:`_BoundBroadcast` that closes over the function name.
 
     * :meth:`~ClientConnection.cast` issues an rpc to each peer, waits for all
       responses, and returns a ``{peer_name: result_or_exception}`` dict.
@@ -669,7 +700,6 @@ class BroadcastProxy:
         self.serde = serde
         self.return_result = return_result
         self.logger = logger
-        self._func_name: Optional[str] = None
         if receiver is None:
             self._explicit_receivers: Optional[List[str]] = None
         elif isinstance(receiver, str):
@@ -677,27 +707,15 @@ class BroadcastProxy:
         else:
             self._explicit_receivers = list(receiver)
 
-    def __getattr__(self, item: str) -> "BroadcastProxy":
-        """Capture the remote function name via attribute access."""
-        self._func_name = item
-        return self
+    def __getattr__(self, item: str) -> "_BoundBroadcast":
+        """Return an immutable callable bound to *item* as the remote function name."""
+        return _BoundBroadcast(self, item)
 
-    def __call__(self, *args, **kwargs):
-        """Dispatch the broadcast call.
-
-        Returns a ``{name: result}`` dict for :meth:`~ClientConnection.cast`,
-        or ``None`` for :meth:`~ClientConnection.cast_nowait`.
-        """
-        self.conn._ensure_connected()
-        if self.return_result:
-            return self._process_call_all(*args, **kwargs)
-        self._process_cast_all(*args, **kwargs)
-
-    def _resolve_receivers(self, conn_num: int) -> List[str]:
+    def _resolve_receivers(self, conn_num: int, func_name: str) -> List[str]:
         """Return the list of peer names to target.
 
         Uses the explicit list when provided; otherwise auto-discovers every
-        connected peer that exposes :attr:`_func_name`.
+        connected peer that exposes *func_name*.
         """
         if self._explicit_receivers is not None:
             return self._explicit_receivers
@@ -710,11 +728,11 @@ class BroadcastProxy:
             if name == self_name:
                 continue
             methods = m.get("methods") or []
-            if self._func_name in methods:
+            if func_name in methods:
                 result.append(name)
         return result
 
-    def _process_call_all(self, *args, **kwargs) -> dict:
+    def _process_call_all(self, func_name: str, *args, **kwargs) -> dict:
         """Fan out to all matching peers and collect ``{name: result}`` dict.
 
         Each peer's result is awaited individually.  If a peer raises an
@@ -724,11 +742,11 @@ class BroadcastProxy:
         """
         conn_num = self.conn.client._conn_num
         data, is_bytes = Serializer.serialize(self.serde, *args, **kwargs)
-        receivers = self._resolve_receivers(conn_num)
+        receivers = self._resolve_receivers(conn_num, func_name)
         if not receivers:
             available = [m["name"] for m in get_available_members(conn_num)]
             raise TransmissionFailure(
-                f"No receivers found for call_all(fn={self._func_name!r})."
+                f"No receivers found for call_all(fn={func_name!r})."
                 + (f"\nAvailable peers: {available}" if available else "")
             )
         # Send to each receiver and collect (uuid → name) handles.
@@ -744,7 +762,7 @@ class BroadcastProxy:
                     flag=MessageFlag.REQUEST,
                     serde=self.serde,
                     receiver=receiver_name,
-                    func_name=self._func_name,
+                    func_name=func_name,
                     return_result=True,
                     conn_num=conn_num,
                     is_bytes=is_bytes,
@@ -771,15 +789,15 @@ class BroadcastProxy:
                 results[name] = exc
         return results
 
-    def _process_cast_all(self, *args, **kwargs) -> None:
+    def _process_cast_all(self, func_name: str, *args, **kwargs) -> None:
         """Fan out to all matching peers, fire-and-forget."""
         conn_num = self.conn.client._conn_num
         data, is_bytes = Serializer.serialize(self.serde, *args, **kwargs)
-        receivers = self._resolve_receivers(conn_num)
+        receivers = self._resolve_receivers(conn_num, func_name)
         if not receivers:
             available = [m["name"] for m in get_available_members(conn_num)]
             raise TransmissionFailure(
-                f"No receivers found for cast_all(fn={self._func_name!r})."
+                f"No receivers found for cast_all(fn={func_name!r})."
                 + (f"\nAvailable peers: {available}" if available else "")
             )
         for receiver_name in receivers:
@@ -793,15 +811,74 @@ class BroadcastProxy:
                     flag=MessageFlag.REQUEST,
                     serde=self.serde,
                     receiver=receiver_name,
-                    func_name=self._func_name,
+                    func_name=func_name,
                     return_result=False,
                     conn_num=conn_num,
                     is_bytes=is_bytes,
                 )
 
 
+class _BoundStream:
+    """Immutable callable returned by :meth:`_StreamBase.__getattr__`.
+
+    Closes over ``func_name`` at creation time — the parent stream proxy is
+    never mutated.  Subclassed by :class:`_BoundStreamBlocking` and
+    :class:`_BoundStreamNowait` which implement the concrete ``__call__``.
+    """
+
+    __slots__ = ("_proxy", "_func_name")
+
+    def __init__(self, proxy: "_StreamBase", func_name: str) -> None:
+        self._proxy = proxy
+        self._func_name = func_name
+
+    def __str__(self) -> str:
+        return (
+            f"{self._proxy.__class__.__name__}(fn: {self._func_name!r},"
+            f" receiver: {self._proxy.receiver!r})"
+        )
+
+    __repr__ = __str__
+
+
+class _BoundStreamBlocking(_BoundStream):
+    """Bound call for :class:`StreamProxy` — waits for ack per chunk."""
+
+    def __call__(self, gen) -> None:
+        self._proxy.conn._ensure_connected()
+        conn_num = self._proxy.conn.client._conn_num
+        chunks = gen if iterable(gen) else [gen]
+        for chunk in chunks:
+            uuid, ts, _ = self._proxy._send_chunk(
+                self._func_name, conn_num, chunk, return_result=True
+            )
+            RpcResult(
+                conn_num=conn_num,
+                uuid=uuid,
+                ts=ts,
+                timeout=self._proxy.timeout,
+                receivers=self._proxy._receiver or None,
+                proxy=self._proxy,
+            ).result()
+
+
+class _BoundStreamNowait(_BoundStream):
+    """Bound call for :class:`StreamNowaitProxy` — fire-and-forget per chunk."""
+
+    def __call__(self, gen) -> None:
+        self._proxy.conn._ensure_connected()
+        conn_num = self._proxy.conn.client._conn_num
+        chunks = gen if iterable(gen) else [gen]
+        for chunk in chunks:
+            self._proxy._send_chunk(self._func_name, conn_num, chunk, return_result=False)
+
+
 class _StreamBase:
-    """Shared init/repr logic for the two stream proxy variants."""
+    """Shared init for the two stream proxy variants.
+
+    The proxy itself is **immutable** after construction.  :meth:`__getattr__`
+    is overridden by each subclass to return the appropriate bound object.
+    """
 
     def __init__(
         self,
@@ -816,30 +893,26 @@ class _StreamBase:
         self.serde = serde
         self.timeout = int(timeout or 0)
         self.logger = logger
-        self._func_name: Optional[str] = None
         self._receiver = {receiver} if receiver else set()
 
-    def __str__(self):
-        return f"{self.__class__.__name__}(fn: {self._func_name!r}, receiver: {self.receiver!r})"
+    def __str__(self) -> str:
+        return f"{self.__class__.__name__}(receiver: {self.receiver!r})"
 
     __repr__ = __str__
 
-    def __getattr__(self, item: str) -> "_StreamBase":
-        self._func_name = item
-        return self
-
-    def _send_chunk(self, conn_num: int, chunk, return_result: bool):
+    def _send_chunk(self, func_name: str, conn_num: int, chunk, return_result: bool):
         """Serialise and send one chunk; return (uuid, ts, found_receiver)."""
+        label = f"{self.__class__.__name__}(fn: {func_name!r})"
         data, is_bytes = Serializer.serialize(self.serde, chunk)
         with system_exception_handler(
-            f"Unable to stream to {self}: {{}}", TransmissionFailure, conn_num
+            f"Unable to stream to {label}: {{}}", TransmissionFailure, conn_num
         ):
             uuid, ts, found_receiver = send_message_from_client(
                 data=data,
                 flag=MessageFlag.REQUEST,
                 serde=self.serde,
                 receiver=self.receiver,
-                func_name=self._func_name,
+                func_name=func_name,
                 return_result=return_result,
                 conn_num=conn_num,
                 is_bytes=is_bytes,
@@ -850,7 +923,7 @@ class _StreamBase:
                 if not (_members := get_available_members(conn_num))
                 else f"\nAvailable receivers: {_members}"
             )
-            raise TransmissionFailure(f"No receiver found for {self}." + members)
+            raise TransmissionFailure(f"No receiver found for {label}." + members)
         elif missing := self._receiver - set(found_receiver.split(METADATA_SEPARATOR)):
             self.logger.warning(f"Receiver(s) {missing} seem to be offline.")
         return uuid, ts, found_receiver
@@ -873,33 +946,8 @@ class StreamProxy(_StreamBase):
         conn.stream(serde=SerdeFormat.OPAQUE).receive_chunk(data_source())
     """
 
-    def __call__(self, gen) -> None:
-        """Iterate *gen*, sending each chunk and waiting for an ack before continuing.
-
-        Args:
-            gen: A generator, iterator, or any iterable.  Each yielded item is
-                 sent as a separate blocking message.  A single non-iterable
-                 value is wrapped in a list and sent as one message.
-
-        Raises:
-            TransmissionFailure: If no receiver is found for any chunk.
-            TimeoutError: If the per-chunk timeout expires waiting for an ack.
-        """
-        self.conn._ensure_connected()
-        assert self._func_name is not None
-        conn_num = self.conn.client._conn_num
-        chunks = gen if iterable(gen) else [gen]
-        for chunk in chunks:
-            uuid, ts, _ = self._send_chunk(conn_num, chunk, return_result=True)
-            # Wait for the ack (result is discarded — only backpressure matters).
-            RpcResult(
-                conn_num=conn_num,
-                uuid=uuid,
-                ts=ts,
-                timeout=self.timeout,
-                receivers=self._receiver or None,
-                proxy=self,
-            ).result()
+    def __getattr__(self, item: str) -> "_BoundStreamBlocking":
+        return _BoundStreamBlocking(self, item)
 
 
 class StreamNowaitProxy(_StreamBase):
@@ -912,22 +960,8 @@ class StreamNowaitProxy(_StreamBase):
         conn.stream_nowait(serde=SerdeFormat.OPAQUE).receive_chunk(data_source())
     """
 
-    def __call__(self, gen) -> None:
-        """Iterate *gen* and send each yielded value without waiting for replies.
-
-        Args:
-            gen: A generator, iterator, or any iterable.  Each yielded item is
-                 sent as a separate fire-and-forget message.
-
-        Raises:
-            TransmissionFailure: If no receiver is found for any chunk.
-        """
-        self.conn._ensure_connected()
-        assert self._func_name is not None
-        conn_num = self.conn.client._conn_num
-        chunks = gen if iterable(gen) else [gen]
-        for chunk in chunks:
-            self._send_chunk(conn_num, chunk, return_result=False)
+    def __getattr__(self, item: str) -> "_BoundStreamNowait":
+        return _BoundStreamNowait(self, item)
 
 
 class ClientConnection:
@@ -979,11 +1013,11 @@ class ClientConnection:
         client = self.client
         if not client._disconnected:
             return
-        client.logger.debug(
+        client.logger.info(
             "Connection was lost in the background; attempting one reconnect..."
         )
         if not client._try_reconnect():
-            raise InitializationError(
+            raise TransmissionFailure(
                 "Client was disconnected and the reconnect attempt failed."
             )
 

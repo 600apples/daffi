@@ -30,7 +30,7 @@ import json
 import math
 import pytest
 
-from conftest import HOST, TIMEOUT
+from .conftest import HOST, TIMEOUT
 
 # ── skip marker for MSGPACK ───────────────────────────────────────────────────
 

@@ -17,7 +17,7 @@ import threading
 
 import pytest
 
-from conftest import (
+from .conftest import (
     HOST,
     TIMEOUT,
     wait_for_port,

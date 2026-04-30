@@ -1,0 +1,18 @@
+"""
+aio/router/02_cast — Router (async).
+
+Start first, then run 2_worker.py (×3 terminals), then 3_caller.py.
+"""
+import asyncio
+from daffi.aio import AsyncRouter
+
+
+async def main():
+    router = AsyncRouter(host="0.0.0.0", port=6002)
+    await router.start()
+    print("Router running on 0.0.0.0:6002 — press Ctrl+C to stop.")
+    await router.join()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

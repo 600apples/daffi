@@ -27,10 +27,16 @@ class callback:
     Decorated callables are added to the global :data:`~daffi.registry.executor_registry.EXECUTOR_REGISTRY`
     so the framework can dispatch incoming RPC requests to them.
 
+    Both regular (``def``) and coroutine (``async def``) functions are
+    supported.  Coroutine callbacks are awaited by the
+    :class:`~daffi.aio._task_dispatcher.AsyncTaskDispatcher`; using them with
+    the synchronous :class:`~daffi._task_dispatcher.TaskDispatcher` raises a
+    clear error at call time.
+
     Restrictions:
         - Lambda functions are **not** supported.
-        - Coroutine functions (``async def``) are **not** supported.
-        - Generator functions are **not** supported.
+        - Generator functions (``yield``) are **not** supported.
+        - Async generator functions (``async def`` + ``yield``) are **not** supported.
         - Methods whose names start with ``_`` are silently skipped.
         - Methods decorated with :func:`~daffi.registry._local.local` are skipped.
 
@@ -42,9 +48,14 @@ class callback:
         def add(a: int, b: int) -> int:
             return a + b
 
+        # async callbacks work with daffi.aio (AsyncTaskDispatcher)
+        @callback
+        async def add_async(a: int, b: int) -> int:
+            return a + b
+
         @callback
         class MathOps:
-            def multiply(self, a: int, b: int) -> int:
+            async def multiply(self, a: int, b: int) -> int:
                 return a * b
     """
 
@@ -65,20 +76,15 @@ class callback:
                 raise InitializationError(
                     f"Not supported. {name!r} is a lambda — use a named function instead."
                 )
-            if iscoroutinefunction(func):
-                raise InitializationError(
-                    f"Not supported. {name!r} is a coroutine (async def) — "
-                    f"daffi callbacks must be regular synchronous functions."
-                )
             if isgeneratorfunction(func):
                 raise InitializationError(
                     f"Not supported. {name!r} is a generator (uses yield) — "
-                    f"daffi callbacks must be regular synchronous functions."
+                    f"use a regular or async function instead."
                 )
             if isasyncgenfunction(func):
                 raise InitializationError(
                     f"Not supported. {name!r} is an async generator (async def + yield) — "
-                    f"daffi callbacks must be regular synchronous functions."
+                    f"use a regular or async function instead."
                 )
             EXECUTOR_REGISTRY.register(name=name, func=func, cls=cls)
 

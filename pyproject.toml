@@ -45,6 +45,9 @@ Source      = "https://github.com/600apples/daffi"
 [tool.setuptools.packages.find]
 include = ["daffi*"]
 
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+
 
 [tool.cibuildwheel]
 # CPython 3.10 – 3.13; skip PyPy, 32-bit, and musl (Windows handled separately)
@@ -62,20 +65,14 @@ manylinux-x86_64-image  = "quay.io/pypa/manylinux_2_28_x86_64"
 manylinux-aarch64-image = "quay.io/pypa/manylinux_2_28_aarch64"
 
 before-all = """
-    # Ensure required build tools are available in the minimal manylinux image.
+    # Install system build prerequisites that _ensure_zig() depends on.
     # openssl-devel provides <openssl/ssl.h> needed by core/network/tls.zig.
     yum install -y curl xz openssl-devel 2>/dev/null || dnf install -y curl xz openssl-devel 2>/dev/null || true
 
-    ARCH=$(uname -m)
-    ZIG_VERSION="0.16.0"
-    ZIG_TAR="zig-${ARCH}-linux-${ZIG_VERSION}.tar.xz"
-    ZIG_URL="https://ziglang.org/download/${ZIG_VERSION}/${ZIG_TAR}"
-
-    echo "Downloading Zig ${ZIG_VERSION} for ${ARCH} ..."
-    curl -fL "${ZIG_URL}" -o "/tmp/${ZIG_TAR}"
-    tar -xJf "/tmp/${ZIG_TAR}" -C /opt
-    ln -sf "/opt/zig-${ARCH}-linux-${ZIG_VERSION}/zig" /usr/local/bin/zig
-    zig version
+    # Download Zig (if absent) and symlink it into PATH via setup.py.
+    # _ensure_zig() in setup.py handles version pinning, caching, and
+    # platform detection — no duplicated logic here.
+    python setup.py ensure_zig --symlink /usr/local/bin/zig
 """
 
 # auditwheel repair bundles libssl/libcrypto into the wheel automatically
@@ -88,27 +85,19 @@ repair-wheel-command = "auditwheel repair -w {dest_dir} {wheel}"
 archs = ["native"]
 
 before-all = """
-    # xz is needed by BSD tar's -J flag; openssl@3 for static linking in setup.py.
+    # xz is needed by Python's tarfile (xz extraction); openssl@3 for static
+    # linking in setup.py (_find_openssl resolves it by Homebrew prefix).
     brew install xz openssl@3 || true
 
-    # Map uname -m (arm64) to Zig's arch name (aarch64).
-    RAW_ARCH=$(uname -m)
-    if [ "$RAW_ARCH" = "arm64" ]; then ZIG_ARCH="aarch64"; else ZIG_ARCH="$RAW_ARCH"; fi
-
-    ZIG_VERSION="0.16.0"
-    ZIG_TAR="zig-${ZIG_ARCH}-macos-${ZIG_VERSION}.tar.xz"
-    ZIG_URL="https://ziglang.org/download/${ZIG_VERSION}/${ZIG_TAR}"
-
-    echo "Downloading Zig ${ZIG_VERSION} for ${ZIG_ARCH} ..."
-    curl -fL "${ZIG_URL}" -o "/tmp/${ZIG_TAR}"
-    tar -xJf "/tmp/${ZIG_TAR}" -C /tmp
-    sudo ln -sf "/tmp/zig-${ZIG_ARCH}-macos-${ZIG_VERSION}/zig" /usr/local/bin/zig
-    zig version
+    # Download Zig (if absent) and symlink it into PATH via setup.py.
+    # _ensure_zig() handles platform/arch detection and caching.
+    python setup.py ensure_zig --symlink /usr/local/bin/zig
 
     # Homebrew openssl@3 .a archives can be universal2 fat binaries.
     # Zig links all slices it finds into the output dylib, producing a
     # universal2 .so that delocate --require-archs rejects.
     # Thin the archives to the native arch so the output is pure-arch.
+    RAW_ARCH=$(uname -m)
     if [ "$RAW_ARCH" = "arm64" ]; then
         OPENSSL_LIB="/opt/homebrew/opt/openssl@3/lib"
     else

@@ -16,7 +16,7 @@ import json
 
 import pytest
 
-from conftest import HOST, TIMEOUT
+from .conftest import HOST, TIMEOUT
 
 
 def _msgpack_available() -> bool:

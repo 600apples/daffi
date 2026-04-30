@@ -23,7 +23,7 @@ import multiprocessing as mp
 
 import pytest
 
-from conftest import (
+from .conftest import (
     HOST,
     TIMEOUT,
     wait_for_port,

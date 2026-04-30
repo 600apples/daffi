@@ -22,7 +22,7 @@ import time
 
 import pytest
 
-from conftest import (
+from .conftest import (
     HOST,
     wait_for_port,
     silence_subprocess,
