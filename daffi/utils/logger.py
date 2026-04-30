@@ -12,8 +12,6 @@ from typing import Callable
 
 from daffi.utils import colors
 
-logging.basicConfig(level=logging.INFO)
-
 
 def _python_level_to_native(python_level: int) -> int:
     """Convert a Python logging level integer to the Zig native level.

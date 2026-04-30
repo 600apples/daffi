@@ -25,8 +25,8 @@ from daffi.app import (
     Router,
     Service,
     Client,
-    SerdeFormat,
 )
+from daffi._serialization import SerdeFormat
 from daffi.registry import callback, local, alias
 from daffi.__about__ import __version__
 

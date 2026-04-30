@@ -48,6 +48,7 @@ from conftest import (
     quiet_kill,
     silence_subprocess,
     wait_for_port,
+    wait_for_members,
 )
 
 # ── tunables ──────────────────────────────────────────────────────────────────
@@ -190,7 +191,7 @@ def chunked_router(free_port):
         target=_proc_chunked_worker, args=(free_port,), daemon=True
     )
     wproc.start()
-    time.sleep(0.4)   # let worker register its callbacks
+    wait_for_members(free_port, {"chunk-worker"})
     yield free_port
     quiet_kill(wproc)
     quiet_kill(rproc)

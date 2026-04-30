@@ -168,12 +168,10 @@ pub fn setClientRequestFd(_: [*c]PyObject, args: [*c]PyObject) callconv(.c) [*c]
     return Py_BuildValue("");
 }
 
-/// Register the single pipe write-end used by the non-autoreconnect
-/// disconnect watcher.  The native layer writes one byte to it to signal
-/// why the connection ended:
-///   'd' (0x64) — normal disconnect  → Python raises ConnectionError
-///   'e' (0x65) — client evicted     → Python raises EvictedError
-/// Having a single fd eliminates the need for select() on multiple pipes.
+/// Register the pipe write-end that the native layer writes to once when the
+/// connection is lost (EOF / network error).  The Python task dispatcher
+/// selects on the corresponding read end so it can react immediately without
+/// a dedicated polling thread.
 ///
 /// setLifecycleFd(conn_num: int, fd: int) -> None
 pub fn setLifecycleFd(_: [*c]PyObject, args: [*c]PyObject) callconv(.c) [*c]PyObject {
@@ -208,8 +206,6 @@ pub fn setLogLevel(_: [*c]PyObject, args: [*c]PyObject) callconv(.c) [*c]PyObjec
     if (!(py.PyArg_ParseTuple(args, "i", &level) != 0)) return Py_BuildValue("");
     const clamped: u32 = @intCast(@max(0, @min(4, level)));
     @import("../log.zig").setLevel(clamped);
-    // Emit a confirmation log so callers can see the level took effect.
-    std.log.scoped(.dfcore).info("native log level set to {d}", .{clamped});
     return Py_BuildValue("");
 }
 

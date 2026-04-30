@@ -169,35 +169,30 @@ pub fn ServerHandler(comptime HandlerConnectionT: ConnectionType) type {
                 };
                 defer client_hs.deinit();
                 const connection_name = try allocator.dupe(u8, message.getTransmitter());
-                // Last-connection-wins: if a slot for this name already exists
-                // (stale zombie from an abrupt network cut or process kill that
-                // never sent a TCP FIN), evict it and accept the new peer.
-                // The evicted connection is closed AFTER we release the channel
-                // map entry so that its reader thread's diconnectionHandler call
-                // finds no channel and returns cleanly.
-                //
-                // Push an "evicted" EVENT to tasks_queue so the service's
-                // @on_member_evicted handlers can react (e.g. cancel in-flight
-                // work for the old slot) before the "connected" event fires.
-                if (self.chan_mapper.evictChannel(connection_name)) |stale_conn| {
-                    log_service.warn("evicting stale slot for '{s}' — new connection takes over", .{connection_name});
-                    const evict_event = try serde.createEventMessage(self.allocator, 0, connection_name, "evicted");
-                    // Notify the service's Python handlers.
-                    try self.tasks_queue.pushMessageToQueue(evict_event);
-                    // Notify the evicted client itself so it can raise Evicted.
-                    try self.sendToConnection(Message, stale_conn, evict_event);
-                    stale_conn.close();
+                // Reject duplicate ``app_name`` — see RouterHandler.onHandshake
+                // for the rationale.  Fires only when a *second* live peer
+                // tries to claim a name still in use; clean reconnects work
+                // because ``diconnectionHandler`` frees the slot first.
+                if (self.chan_mapper.hasChannel(connection_name)) {
+                    log_service.warn("rejected duplicate connect for {s}", .{connection_name});
+                    const reason = try std.fmt.allocPrint(
+                        allocator,
+                        "app_name {s} is already connected to this service",
+                        .{connection_name},
+                    );
+                    var rejection = try Handshake.createRejection(allocator, "service", reason);
+                    const data = try rejection.toJson(allocator);
+                    try message.setData(data);
+                    try self.sendToConnection(Message, conn, message);
+                    return;
                 }
                 _ = try self.chan_mapper.getOrCreateChannel(conn, connection_name);
-                log_service.info("client connected: {s}  total_peers={d}", .{ connection_name, self.chan_mapper.channels.count() });
                 const methods = self.methods orelse serde.PLACEHOLDER;
 
                 var service_hs = try Handshake.create(allocator, &[_]Handshake.MemberData{.{ .name = self.app_name, .methods = methods }}, "service");
                 const data = try service_hs.toJson(allocator);
                 try message.setData(data);
-                for (self.chan_mapper.channels.values()) |c| {
-                    try self.sendToConnection(Message, c.conn, message);
-                }
+                for (self.chan_mapper.channels.values()) |c| try self.sendToConnection(Message, c.conn, message);
 
                 // Store event message for service itself.
                 const event_message = try serde.createEventMessage(self.allocator, 0, connection_name, "connected");
@@ -231,10 +226,6 @@ pub fn ServerHandler(comptime HandlerConnectionT: ConnectionType) type {
                     return;
                 };
                 const connection_name = try allocator.dupe(u8, chan.connection_name); // for event
-                log_service.info("client disconnected: {s}  peers_remaining={d}", .{
-                    connection_name,
-                    self.chan_mapper.channels.count() - 1,
-                });
                 self.chan_mapper.destroyChannel(chan);
 
                 // Store event message for service itself.
@@ -249,7 +240,7 @@ pub fn ServerHandler(comptime HandlerConnectionT: ConnectionType) type {
                         const addr = conn.getAddr();
                         log_service.debug("incomplete message from {?}", .{addr});
                     },
-                    else => log_service.warn("failed to receive message: {}", .{err}),
+                    else => log_service.debug("failed to receive message: {}", .{err}),
                 }
             }
 
@@ -316,31 +307,27 @@ pub fn ServerHandler(comptime HandlerConnectionT: ConnectionType) type {
                     try self.sendToConnection(Message, conn, message);
                     return;
                 };
-                // Last-connection-wins: if a slot for this name already exists
-                // (stale zombie from an abrupt network cut or process kill that
-                // never sent a TCP FIN), evict it and accept the new peer.
-                // evictChannel atomically removes the map entry and returns the
-                // old connection pointer; we close the socket after the map is
-                // clean so the reader thread's diconnectionHandler finds no
-                // channel and returns without further mutation.
+                // Names are the routing identity here, so a duplicate must be
+                // refused: silently overwriting ``chan.conn`` would hijack the
+                // original peer's slot and break ``getChannelByConnection``-
+                // based disconnect cleanup (it matches by pointer identity).
                 //
-                // We broadcast an "evicted" EVENT to every *remaining* client
-                // immediately after the map entry is removed so they can purge
-                // the stale slot from their own chan_mapper before the normal
-                // "connected" broadcast arrives for the new peer.  The EVENT is
-                // sent while self.mutex is still held so no other handshake or
-                // disconnect can interleave and produce an inconsistent view.
+                // Genuine reconnects after ``stop()`` race with the server's
+                // ``diconnectionHandler``; if the slot hasn't been freed yet
+                // the caller (typically ``AutoReconnect``) retries.
                 for (client_hs.value.members) |mb| {
-                    if (self.chan_mapper.evictChannel(mb.name)) |stale_conn| {
-                        log_router.warn("evicting stale slot for '{s}' — new connection takes over", .{mb.name});
-                        var evicted_event = try serde.createEventMessage(self.allocator, 0, mb.name, "evicted");
-                        defer evicted_event.deinit();
-                        // Notify remaining peers so they purge the stale slot.
-                        for (self.chan_mapper.channels.values()) |c| try self.sendToConnection(Message, c.conn, evicted_event);
-                        // Also notify the evicted connection itself so Python can
-                        // raise EvictedError instead of the generic ConnectionError.
-                        try self.sendToConnection(Message, stale_conn, evicted_event);
-                        stale_conn.close();
+                    if (self.chan_mapper.hasChannel(mb.name)) {
+                        log_router.warn("rejected duplicate connect for {s} (slot still occupied)", .{mb.name});
+                        const reason = try std.fmt.allocPrint(
+                            allocator,
+                            "app_name {s} is already connected to this router",
+                            .{mb.name},
+                        );
+                        var rejection = try Handshake.createRejection(allocator, "router", reason);
+                        const data = try rejection.toJson(allocator);
+                        try message.setData(data);
+                        try self.sendToConnection(Message, conn, message);
+                        return;
                     }
                 }
                 for (client_hs.value.members) |mb| {
@@ -364,7 +351,6 @@ pub fn ServerHandler(comptime HandlerConnectionT: ConnectionType) type {
                 // Send the full member list only to the NEW client (transmitter ==
                 // its own app_name, so onHandshake inserts into the message store and
                 // the Python side unblocks from _process_client_handshake).
-                log_router.info("client connected: {s}  total_peers={d}", .{ connection_name, all_chans.len });
                 try self.sendToConnection(Message, conn, message);
 
                 // Notify existing clients about the new peer.
@@ -460,10 +446,6 @@ pub fn ServerHandler(comptime HandlerConnectionT: ConnectionType) type {
                     return;
                 };
                 const connection_name = try allocator.dupe(u8, chan.connection_name);
-                log_router.info("client disconnected: {s}  peers_remaining={d}", .{
-                    connection_name,
-                    self.chan_mapper.channels.count() - 1,
-                });
                 self.chan_mapper.destroyChannel(chan);
 
                 // Send a "disconnected" EVENT to every remaining client.
@@ -495,7 +477,7 @@ pub fn ServerHandler(comptime HandlerConnectionT: ConnectionType) type {
                         const addr = conn.getAddr();
                         log_router.debug("incomplete message from {?}", .{addr});
                     },
-                    else => log_router.warn("failed to receive message: {}", .{err}),
+                    else => log_router.debug("failed to receive message: {}", .{err}),
                 }
             }
         };
@@ -677,7 +659,6 @@ pub const ClientHandler = struct {
                 return;
             };
             defer client_hs.deinit();
-            log_client.info("[{s}] own handshake received  members={d}", .{ self.app_name, client_hs.value.members.len });
             self.chan_mapper.clearAllChannels();
             for (client_hs.value.members) |mb| {
                 var chan = try self.chan_mapper.getOrCreateChannel(conn, mb.name);
@@ -756,32 +737,9 @@ pub const ClientHandler = struct {
             // Must hold client_handler.mutex while mutating chan_mapper so we
             // don't race with findReceiverForMethod / getAvailableMembersClientEntry
             // which iterate allChannels() under the same lock.
-            log_client.info("[{s}] peer departed: {s}  peers_remaining={d}", .{
-                self.app_name,
-                event.value.member,
-                if (self.chan_mapper.channels.count() > 0) self.chan_mapper.channels.count() - 1 else 0,
-            });
             self.mutex.lock();
             self.chan_mapper.destroyChannelByName(event.value.member);
             self.mutex.unlock();
-        } else if (std.mem.eql(u8, event.value.type, "evicted")) {
-            if (std.mem.eql(u8, event.value.member, self.app_name)) {
-                // THIS client is being evicted — signal the Python disconnect
-                // watcher pipe so it can raise EvictedError instead of the
-                // generic ConnectionError.
-                log_client.warn("[{s}] this client is being evicted — signalling eviction fd", .{self.app_name});
-                self.tasks_queue.triggerEviction();
-            } else {
-                // A PEER was evicted — remove its stale slot from our map.
-                log_client.info("[{s}] peer evicted: {s}  peers_remaining={d}", .{
-                    self.app_name,
-                    event.value.member,
-                    if (self.chan_mapper.channels.count() > 0) self.chan_mapper.channels.count() - 1 else 0,
-                });
-                self.mutex.lock();
-                self.chan_mapper.destroyChannelByName(event.value.member);
-                self.mutex.unlock();
-            }
         }
 
         // Push to task queue so Python on_member_added / on_member_removed
@@ -822,7 +780,7 @@ pub const ClientHandler = struct {
                 const addr = conn.getAddr();
                 log_client.debug("incomplete message from {?}", .{addr});
             },
-            else => log_client.warn("failed to receive message: {}", .{err}),
+            else => log_client.debug("failed to receive message: {}", .{err}),
         }
     }
 };

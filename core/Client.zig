@@ -154,7 +154,7 @@ const ClientEntry = struct {
         while (true) {
             const message = self.msgpool.receiveMessage(self.connection) catch |err| {
                 if (!self.connection.suspended) {
-                    log.warn("[{s}] connection lost: {}", .{ self.client_handler.app_name, err });
+                    log.debug("[{s}] connection lost: {}", .{ self.client_handler.app_name, err });
                 } else {
                     log.debug("[{s}] connection closed intentionally", .{self.client_handler.app_name});
                 }

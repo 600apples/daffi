@@ -46,11 +46,10 @@ class LifecycleSignal(bytes, Enum):
     """
 
     DISCONNECTED = b"d"
-    EVICTED      = b"e"
-    NORMAL       = b"n"
-    INIT         = b"i"
-    STOP         = b"s"
-
+    EVICTED = b"e"
+    NORMAL = b"n"
+    INIT = b"i"
+    STOP = b"s"
 
 
 class WakeupFd:

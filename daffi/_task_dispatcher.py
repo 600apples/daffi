@@ -64,15 +64,15 @@ except ImportError:
 class _ConnEntry(NamedTuple):
     """All fd-related state for one registered connection, keyed by conn_num."""
 
-    conn:      Any
-    wakeup:    WakeupFd   # task-arrival channel (eventfd on Linux, pipe on macOS)
-    lifecycle: WakeupFd   # lifecycle / stop channel (always a pipe)
+    conn: Any
+    wakeup: WakeupFd  # task-arrival channel (eventfd on Linux, pipe on macOS)
+    lifecycle: WakeupFd  # lifecycle / stop channel (always a pipe)
 
 
 class EventType(str):
     """String constants for the two peer-lifecycle event types emitted by daffi."""
 
-    CONNECTED    = "connected"
+    CONNECTED = "connected"
     DISCONNECTED = "disconnected"
 
 
@@ -86,17 +86,11 @@ def _handle_lifecycle_signal(conn, conn_num: int, reason: bytes) -> None:
     ``LifecycleSignal.INIT`` re-runs the handshake and returns normally.
 
     All disconnect variants (DISCONNECTED, EVICTED, NORMAL) wake in-flight
-    RPC waiters, store the error on *conn*, then either:
-
-    * **joining path** — call ``conn.stop()`` so ``join()`` unblocks.
-      ``stop_for_connection`` detects it is being called from the poller
-      thread and skips joining itself, avoiding a deadlock.
-    * **non-joining path** — raise the error, which propagates out of
-      ``handle_task_queue`` and terminates the poller thread visibly via
-      ``threading.excepthook``.  ``stop()`` is intentionally *not* called
-      here to avoid racing with any ``RpcResult.result()`` still reading
-      from the native message store; the caller's ``finally`` block owns
-      teardown.
+    RPC waiters, store the error on *conn*, log it if the caller is not
+    blocking in ``join()``, then always call ``conn.stop()`` to release
+    resources.  By the time ``stop()`` is called every in-flight waiter has
+    already received the error via ``signal_lifecycle_error``, so there is
+    no race with ``RpcResult.result()``.
     """
     if reason == LifecycleSignal.INIT:
         RpcProxy._process_client_handshake(conn_num)
@@ -106,10 +100,7 @@ def _handle_lifecycle_signal(conn, conn_num: int, reason: bytes) -> None:
     if reason == LifecycleSignal.NORMAL:
         # Graceful server-side shutdown — mirror a user-initiated stop():
         # tear down cleanly, unblock join() if waiting, surface no error.
-        try:
-            conn.stop()
-        except Exception:
-            pass
+        conn.stop()
         return
 
     if reason == LifecycleSignal.EVICTED:
@@ -125,14 +116,11 @@ def _handle_lifecycle_signal(conn, conn_num: int, reason: bytes) -> None:
 
     ResponseNotifier.signal_lifecycle_error(conn_num, err)
     conn._connection_error = err
+    conn._disconnected = True
 
-    if conn._joining:
-        try:
-            conn.stop()
-        except Exception:
-            pass
-    else:
-        raise err
+    if not conn._joining:
+        conn.logger.debug(f"Error in connection {conn_num}: {err!r}")
+    conn.stop()
 
 
 def _invoke_callback(
@@ -356,10 +344,12 @@ class TaskDispatcher:
         lc = WakeupFd(pipe=True)
 
         self._conns[conn_num] = _ConnEntry(conn=connection, wakeup=wakeup, lifecycle=lc)
-        self._rfd_to_conn_num[wakeup.read_fd]  = conn_num
-        self._rfd_to_conn_num[lc.read_fd]      = conn_num
+        self._rfd_to_conn_num[wakeup.read_fd] = conn_num
+        self._rfd_to_conn_num[lc.read_fd] = conn_num
 
-        set_request_fd(conn_num, wakeup.write_fd, server_mode=bool(connection.server_mode))
+        set_request_fd(
+            conn_num, wakeup.write_fd, server_mode=bool(connection.server_mode)
+        )
         if connection.server_mode is None:
             set_lifecycle_fd(conn_num, lc.write_fd)
 

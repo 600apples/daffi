@@ -10,7 +10,7 @@ import threading
 from abc import ABC
 from enum import IntEnum
 from threading import Event
-from typing import Optional, List, Callable, Dict, Any
+from typing import Optional, List, Callable, Any
 
 from . import dfcore
 
@@ -21,13 +21,12 @@ from daffi.utils.misc import string_uuid
 from daffi._bindings import set_lifecycle_fd, set_response_fd
 from daffi._rpc_proxy import (
     RpcProxy,
-    SerdeFormat,
     ClientConnection,
     ResponseNotifier,
     system_exception_handler,
 )
 from daffi._signals import set_signal_handler
-from daffi._task_dispatcher import TaskDispatcher, EventType
+from daffi._task_dispatcher import TaskDispatcher
 from daffi.registry._executor_registry import EXECUTOR_REGISTRY
 
 
@@ -62,7 +61,7 @@ class EventsMixin:
     """
 
     def __init_events__(self) -> None:
-        self._on_member_added_handlers:   List[Callable[[str], Any]] = []
+        self._on_member_added_handlers: List[Callable[[str], Any]] = []
         self._on_member_removed_handlers: List[Callable[[str], Any]] = []
 
     def on_member_added(self, handler: Callable[[str], Any]) -> Callable[[str], Any]:
@@ -94,7 +93,6 @@ class EventsMixin:
         """
         self._on_member_removed_handlers.append(handler)
         return handler
-
 
 
 class Application(EventsMixin, ABC):
@@ -165,6 +163,12 @@ class Application(EventsMixin, ABC):
         # non-None and both call ``dfcore.stopClient`` (double-free).
         self._stop_lock = threading.Lock()
         self._connection_error: Optional[Exception] = None
+        # Set to True by the background lifecycle watcher when an unexpected
+        # disconnect or eviction is detected.  Cleared by a successful
+        # reconnect.  Checked at the start of every RPC call so a clear,
+        # actionable error (or a transparent reconnect) is surfaced instead of
+        # a cryptic native-layer failure.
+        self._disconnected: bool = False
         # True only while a thread is parked in :meth:`join` waiting on
         # ``_stop_event``.  Used by the disconnect watcher to decide whether
         # an unexpected disconnect can be surfaced via ``join`` (which will
@@ -448,6 +452,9 @@ class Client(Application):
             key_file=key_file,
             ca_file=ca_file,
         )
+        # Serialises concurrent reconnect attempts so only one thread
+        # performs the reconnect while others wait and then reuse the result.
+        self._reconnect_lock = threading.Lock()
 
     @property
     def info(self) -> str:
@@ -528,6 +535,67 @@ class Client(Application):
         )
         self._task_dispatcher.start_for_connection(self)
         self._register_executors()
+
+    def _try_reconnect(self) -> bool:
+        """Attempt one reconnection after a background disconnect.
+
+        Thread-safe — :attr:`_reconnect_lock` prevents two threads from racing
+        to reconnect at the same time.  The second thread to acquire the lock
+        finds ``_disconnected`` already cleared and returns immediately.
+
+        Resets all internal state so :meth:`_do_connect` starts from a clean
+        slate (fresh :class:`~daffi._task_dispatcher.TaskDispatcher`, cleared
+        stop-event, no stale error).
+
+        Returns:
+            ``True`` when the reconnect succeeded, ``False`` otherwise.
+        """
+        with self._reconnect_lock:
+            if not self._disconnected:
+                # Another thread already reconnected while we were waiting.
+                return self._conn_num is not None
+            try:
+                self._stop_event.clear()
+                self._connection_error = None
+                self._disconnected = False
+                # Force a fresh dispatcher + poller thread; the old one has
+                # already exited because stop_event was set during teardown.
+                self._task_dispatcher = None
+                self._do_connect()
+                return True
+            except Exception as exc:
+                self.logger.warning(f"Reconnect attempt failed: {exc!r}")
+                return False
+
+    def join(self):
+        """Block until stopped; attempt one reconnect on a background disconnect.
+
+        Overrides :meth:`Application.join` so that an unexpected disconnect
+        while this call is blocking triggers a single reconnection attempt
+        instead of immediately surfacing the error.  On success the method
+        returns normally — the caller may call :meth:`join` again to keep
+        blocking or issue new RPC calls.  On failure the original disconnect
+        error is re-raised.
+        """
+        self._joining = True
+        try:
+            self._stop_event.wait()
+        finally:
+            self._joining = False
+
+        if self._disconnected:
+            err = self._connection_error
+            self.logger.info(
+                "Connection lost while joining; attempting one reconnect..."
+            )
+            if self._try_reconnect():
+                return  # reconnected — caller can re-join or proceed
+            if err is not None:
+                raise err
+            return
+
+        if self._connection_error is not None:
+            raise self._connection_error
 
     def stop(self, *_, **__):
         """Stop the client: join task-dispatcher threads, then destroy the
