@@ -12,7 +12,8 @@ OpenSSL discovery order
 -----------------------
 1. ``OPENSSL_DIR`` environment variable
 2. macOS: arch-native Homebrew prefix (``/opt/homebrew`` or ``/usr/local``)
-3. System default paths
+3. Windows: common installation paths (``C:\\Program Files\\OpenSSL-Win64``, etc.)
+4. System default paths
 
 OpenSSL linking strategy
 ------------------------
@@ -23,8 +24,8 @@ GitHub Actions the Homebrew dylibs may be universal2 fat binaries which
 ``delocate`` can't process cleanly.  Static linking embeds the OpenSSL code
 directly and produces a wheel with no external dylib dependency.
 
-On Linux dynamic linking is used instead — ``auditwheel repair`` handles
-bundling ``libssl.so``/``libcrypto.so`` into the wheel correctly.
+On Linux and Windows dynamic linking is used — ``auditwheel`` (Linux) and
+``delvewheel`` (Windows) bundle the shared libraries into the wheel correctly.
 
 Cross-compilation
 -----------------
@@ -67,6 +68,9 @@ def _ensure_zig() -> str:
         os_name = "macos"
     elif sys.platform.startswith("linux"):
         os_name = "linux"
+    elif sys.platform == "win32":
+        os_name = "windows"
+        arch = "x86_64"  # Windows builds are AMD64 only
     else:
         raise RuntimeError(
             f"Unsupported platform {sys.platform!r}. "
@@ -75,26 +79,41 @@ def _ensure_zig() -> str:
 
     dir_name = f"zig-{arch}-{os_name}-{_ZIG_VERSION}"
     zig_dir  = os.path.join(tempfile.gettempdir(), dir_name)
-    zig_exe  = os.path.join(zig_dir, "zig")
+    zig_exe  = os.path.join(zig_dir, "zig.exe" if sys.platform == "win32" else "zig")
 
     if os.path.isfile(zig_exe):
         print(f"setup.py: reusing cached Zig at {zig_exe!r}")
         return zig_exe
 
-    tarball  = f"{dir_name}.tar.xz"
-    url      = f"https://ziglang.org/download/{_ZIG_VERSION}/{tarball}"
-    archive  = os.path.join(tempfile.gettempdir(), tarball)
+    if sys.platform == "win32":
+        archive_name = f"{dir_name}.zip"
+        url     = f"https://ziglang.org/download/{_ZIG_VERSION}/{archive_name}"
+        archive = os.path.join(tempfile.gettempdir(), archive_name)
 
-    print(f"setup.py: zig not found in PATH — downloading {url!r} …")
-    try:
-        urllib.request.urlretrieve(url, archive)
-    except Exception:
-        # urllib may lack SSL on some minimal environments; fall back to curl.
-        subprocess.check_call(["curl", "-fsSL", url, "-o", archive])
+        print(f"setup.py: zig not found in PATH — downloading {url!r} …")
+        try:
+            urllib.request.urlretrieve(url, archive)
+        except Exception:
+            subprocess.check_call(["curl", "-fsSL", url, "-o", archive])
 
-    print(f"setup.py: extracting {archive!r} …")
-    with tarfile.open(archive, "r:xz") as tf:
-        tf.extractall(tempfile.gettempdir())
+        print(f"setup.py: extracting {archive!r} …")
+        import zipfile
+        with zipfile.ZipFile(archive, "r") as zf:
+            zf.extractall(tempfile.gettempdir())
+    else:
+        tarball  = f"{dir_name}.tar.xz"
+        url      = f"https://ziglang.org/download/{_ZIG_VERSION}/{tarball}"
+        archive  = os.path.join(tempfile.gettempdir(), tarball)
+
+        print(f"setup.py: zig not found in PATH — downloading {url!r} …")
+        try:
+            urllib.request.urlretrieve(url, archive)
+        except Exception:
+            subprocess.check_call(["curl", "-fsSL", url, "-o", archive])
+
+        print(f"setup.py: extracting {archive!r} …")
+        with tarfile.open(archive, "r:xz") as tf:
+            tf.extractall(tempfile.gettempdir())
 
     os.remove(archive)
 
@@ -104,7 +123,8 @@ def _ensure_zig() -> str:
             f"Check that {url!r} is correct."
         )
 
-    os.chmod(zig_exe, 0o755)
+    if sys.platform != "win32":
+        os.chmod(zig_exe, 0o755)
     print(f"setup.py: Zig {_ZIG_VERSION} ready at {zig_exe!r}")
     return zig_exe
 
@@ -199,6 +219,22 @@ def _find_openssl():
             except (subprocess.CalledProcessError, FileNotFoundError):
                 continue
 
+    elif sys.platform == "win32":
+        # GitHub Actions windows-2022/2025 runners and typical local installs.
+        candidates = [
+            r"C:\Program Files\OpenSSL-Win64",
+            r"C:\Program Files\OpenSSL",
+            r"C:\OpenSSL-Win64",
+            r"C:\OpenSSL",
+        ]
+        for candidate in candidates:
+            if os.path.isdir(candidate):
+                print(f"setup.py: found OpenSSL at {candidate!r}")
+                return (
+                    os.path.join(candidate, "include"),
+                    os.path.join(candidate, "lib"),
+                )
+
     return None, None
 
 
@@ -257,20 +293,27 @@ class ZigBuilder(build_ext):
         if openssl_include:
             cmd.append(f"-I{openssl_include}")
 
-        # On macOS: link OpenSSL statically using the Homebrew .a archives so
-        # the wheel contains no LC_LOAD_DYLIB references to libssl/libcrypto.
-        # delocate then has nothing to bundle and the repair step is a no-op.
-        #
-        # On Linux: link dynamically; auditwheel bundles the .so files fine.
         if sys.platform == "darwin" and openssl_lib:
+            # macOS: static OpenSSL so delocate has no dylibs to bundle.
             ssl_a = os.path.join(openssl_lib, "libssl.a")
             crypto_a = os.path.join(openssl_lib, "libcrypto.a")
             if os.path.exists(ssl_a) and os.path.exists(crypto_a):
                 cmd.extend([ssl_a, crypto_a])
             else:
-                # Static archives missing — fall back to dynamic linking.
+                cmd.extend([f"-L{openssl_lib}", "-lssl", "-lcrypto"])
+        elif sys.platform == "win32":
+            # Windows: link Python import library explicitly (Zig doesn't
+            # auto-discover it the way MSVC does), then OpenSSL dynamically.
+            # delvewheel will bundle libssl/libcrypto DLLs into the wheel.
+            python_ver = f"python{sys.version_info.major}{sys.version_info.minor}"
+            python_libs_dir = os.path.join(sys.prefix, "libs")
+            if os.path.isdir(python_libs_dir):
+                cmd.append(f"-L{python_libs_dir}")
+            cmd.append(f"-l{python_ver}")
+            if openssl_lib:
                 cmd.extend([f"-L{openssl_lib}", "-lssl", "-lcrypto"])
         else:
+            # Linux: dynamic OpenSSL; auditwheel bundles the .so files.
             if openssl_lib:
                 cmd.append(f"-L{openssl_lib}")
             cmd.extend(["-lssl", "-lcrypto"])

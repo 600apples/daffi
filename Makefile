@@ -96,9 +96,9 @@ CIBW        = cibuildwheel --output-dir $(WHEELHOUSE)
 # aarch64 once QEMU is set up, e.g.:  make wheels-linux LINUX_ARCHS=x86_64,aarch64
 LINUX_ARCHS ?= x86_64
 
-.PHONY: wheels wheels-linux wheels-linux-all wheels-macos wheels-qemu wheels-upload wheels-clean
+.PHONY: wheels wheels-linux wheels-linux-all wheels-macos wheels-qemu wheels-ci wheels-upload wheels-clean
 
-wheels: wheels-linux  ## Build Linux wheels for LINUX_ARCHS (default: x86_64)
+wheels: wheels-linux  ## Build local Linux wheels; use wheels-ci to build Linux+macOS via GitHub Actions
 
 wheels-linux:  ## Build Linux manylinux wheels — requires Docker (see LINUX_ARCHS)
 	@echo "==> Building Linux manylinux wheels (cp310..cp313 × $(LINUX_ARCHS))..."
@@ -129,6 +129,19 @@ wheels-qemu:  ## Register QEMU binfmt handlers for multi-arch emulation (run onc
 	@echo "Registered handlers:"
 	@ls /proc/sys/fs/binfmt_misc/ 2>/dev/null || echo "(none visible — may need a re-login)"
 
+wheels-ci:  ## Trigger GitHub Actions to build all wheels (Linux + macOS), then download them
+	@echo "==> Triggering wheels.yml on GitHub Actions …"
+	gh workflow run wheels.yml --ref main
+	@echo "Waiting 15 s for the run to be registered …"
+	sleep 15
+	$(eval RUN_ID := $(shell gh run list --workflow=wheels.yml --limit 1 --json databaseId --jq '.[0].databaseId'))
+	@echo "Run ID: $(RUN_ID)"
+	@echo "Waiting for all jobs to finish (this may take 10–15 minutes) …"
+	gh run watch $(RUN_ID)
+	gh run download $(RUN_ID) --dir $(WHEELHOUSE)/
+	@echo ""
+	@echo "  Wheels downloaded to $(WHEELHOUSE)/."
+
 wheels-upload:  ## Upload all wheels in $(WHEELHOUSE)/ to PyPI
 	@echo "==> Uploading $(WHEELHOUSE)/*.whl to PyPI..."
 	@echo "    Set TWINE_PASSWORD=<your-token> and optionally TWINE_USERNAME=__token__"
@@ -136,6 +149,49 @@ wheels-upload:  ## Upload all wheels in $(WHEELHOUSE)/ to PyPI
 
 wheels-clean:  ## Remove the wheelhouse/ directory
 	rm -rf $(WHEELHOUSE)
+
+# ── Release ───────────────────────────────────────────────────────────────────
+# Prerequisites (install once): pip install hatch
+#
+# Usage:
+#   make release-patch   # 3.0.0 → 3.0.1
+#   make release-minor   # 3.0.0 → 3.1.0
+#   make release-major   # 3.0.0 → 4.0.0
+#
+# Each target bumps the version in daffi/__about__.py, commits, tags, and
+# pushes.  The tag push triggers the "Build & Publish Wheels" GitHub Action
+# which builds wheels for all platforms and publishes to PyPI automatically.
+#
+# Requires a remote named "origin" with push access.
+
+.PHONY: release-patch release-minor release-major _release
+
+release-patch: _check-clean  ## Bump patch (x.y.Z), tag, push → triggers PyPI release
+	@hatch version patch
+	@$(MAKE) _release
+
+release-minor: _check-clean  ## Bump minor (x.Y.0), tag, push → triggers PyPI release
+	@hatch version minor
+	@$(MAKE) _release
+
+release-major: _check-clean  ## Bump major (X.0.0), tag, push → triggers PyPI release
+	@hatch version major
+	@$(MAKE) _release
+
+_release:
+	$(eval NEW_VERSION := $(shell hatch version))
+	git add daffi/__about__.py
+	git commit -m "chore: release $(NEW_VERSION)"
+	git tag "$(NEW_VERSION)"
+	git push origin HEAD --follow-tags
+	@echo ""
+	@echo "  Released $(NEW_VERSION) — wheels.yml is now building on GitHub Actions."
+
+_check-clean:
+	@if [ -n "$$(git status --porcelain)" ]; then \
+	    echo "Error: working tree is not clean. Commit or stash your changes first."; \
+	    exit 1; \
+	fi
 
 # ── Build ─────────────────────────────────────────────────────────────────────
 

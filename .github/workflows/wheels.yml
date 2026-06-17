@@ -3,7 +3,7 @@ name: Build & Publish Wheels
 on:
   push:
     tags:
-      - "[0-9]*"       # trigger on version tags, e.g. 2.0.0
+      - "[0-9]*"       # version tags pushed by release.yml, e.g. 3.0.1
   workflow_dispatch:   # allow manual runs from the Actions UI
 
 concurrency:
@@ -11,7 +11,7 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # ── Build binary wheels ─────────────────────────────────────────────────────
+  # ── Binary wheels ────────────────────────────────────────────────────────────
   build-wheels:
     name: Wheels · ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
@@ -19,25 +19,17 @@ jobs:
       fail-fast: false
       matrix:
         os:
-          - ubuntu-latest   # Linux x86_64 + aarch64 (via QEMU)
-          - macos-13        # macOS x86_64 (Intel)
-          - macos-14        # macOS arm64  (Apple Silicon)
+          - ubuntu-24.04        # Linux x86_64  (native)
+          - ubuntu-24.04-arm    # Linux aarch64 (native — no QEMU)
+          - macos-13            # macOS x86_64  (Intel)
+          - macos-14            # macOS arm64   (Apple Silicon)
 
     steps:
       - uses: actions/checkout@v4
 
-      # ── QEMU for Linux aarch64 cross-build ──────────────────────────────────
-      - name: Set up QEMU (Linux aarch64)
-        if: runner.os == 'Linux'
-        uses: docker/setup-qemu-action@v3
-        with:
-          platforms: aarch64
-
-      # ── Build wheels ─────────────────────────────────────────────────────────
       - name: Build wheels
-        uses: pypa/cibuildwheel@v2.22.0
+        uses: pypa/cibuildwheel@v3.4.1
         env:
-          # cibuildwheel reads [tool.cibuildwheel] from pyproject.toml
           CIBW_BUILD_VERBOSITY: 1
 
       - name: Upload wheel artifacts
@@ -46,7 +38,7 @@ jobs:
           name: wheels-${{ matrix.os }}
           path: wheelhouse/*.whl
 
-  # ── Build source distribution ───────────────────────────────────────────────
+  # ── Source distribution ──────────────────────────────────────────────────────
   build-sdist:
     name: Source distribution
     runs-on: ubuntu-latest
@@ -71,7 +63,7 @@ jobs:
           name: sdist
           path: dist/*.tar.gz
 
-  # ── Publish to PyPI ─────────────────────────────────────────────────────────
+  # ── Publish to PyPI ──────────────────────────────────────────────────────────
   publish:
     name: Publish to PyPI
     runs-on: ubuntu-latest
@@ -82,7 +74,7 @@ jobs:
       name: pypi
       url: https://pypi.org/p/daffi
     permissions:
-      id-token: write   # required for PyPI Trusted Publishing (no API token needed)
+      id-token: write   # required for PyPI Trusted Publishing (OIDC)
 
     steps:
       - name: Download all artifacts

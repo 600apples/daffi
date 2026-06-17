@@ -117,10 +117,6 @@ The event loop is never blocked.
 | `AsyncService` | `Service` | Listen for incoming connections; own server (no Router needed). |
 | `AsyncRouter` | `Router` | Pure message broker — forwards calls between Clients. |
 
-Short aliases `Client`, `Service`, `Router` are also exported from `daffi.aio`
-for convenience, but using the explicit `Async*` names is recommended in code
-that mixes both interfaces to avoid confusion.
-
 ---
 
 ## API reference
