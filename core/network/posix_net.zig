@@ -46,6 +46,11 @@ const TCP_KEEPCNT: c_int = switch (@import("builtin").os.tag) {
 /// This covers the active-traffic case (data in-flight but no ACKs) where
 /// keepalive probes are never sent because the connection is not idle.
 const TCP_USER_TIMEOUT: c_int = 18;  // Linux; ignored on other platforms
+/// TCP_NODELAY (value 1 on all POSIX platforms): disable Nagle's algorithm.
+/// Without this, the kernel coalesces small writes into larger TCP segments,
+/// introducing up to ~200 ms of latency per round-trip — fatal for interactive
+/// terminal use where each keystroke is a tiny payload.
+const TCP_NODELAY: c_int = 1;
 
 /// Apply dead-connection detection to *fd*.
 ///
@@ -65,6 +70,7 @@ fn applyKeepalive(fd: c_int) void {
     const idle: c_int = 10;
     const intvl: c_int = 5;
     const cnt:  c_int = 3;
+    _ = c.setsockopt(fd, IPPROTO_TCP,  TCP_NODELAY,    &on,   @sizeOf(c_int));
     _ = c.setsockopt(fd, c.SOL_SOCKET, c.SO_KEEPALIVE, &on,   @sizeOf(c_int));
     _ = c.setsockopt(fd, IPPROTO_TCP,  TCP_KEEPIDLE,   &idle, @sizeOf(c_int));
     _ = c.setsockopt(fd, IPPROTO_TCP,  TCP_KEEPINTVL,  &intvl,@sizeOf(c_int));
