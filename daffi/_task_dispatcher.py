@@ -21,10 +21,10 @@ workers=1 (default)
     sole executor; no additional thread is spawned.  This is the fastest mode
     and the right choice for fast / I/O-bound callbacks.
 
-workers=N (thread pool)
-    A pool of N-1 dedicated worker **threads** picks tasks off a shared
-    ``queue.Queue`` and executes them in parallel.  Good for I/O-bound
-    callbacks; the GIL limits CPU parallelism.
+        workers=N (thread pool)
+            A pool of N dedicated worker **threads** picks tasks off a shared
+            ``queue.Queue`` and executes them in parallel.  Good for I/O-bound
+            callbacks; the GIL limits CPU parallelism.
 """
 
 import json
@@ -213,7 +213,7 @@ class TaskDispatcher:
 
                  * ``1`` (default) — callbacks run **inline** in the poller
                    thread.  Zero overhead; ideal for fast / I/O-bound callbacks.
-                 * ``N >= 2`` — a pool of N-1 worker threads executes callbacks
+                 * ``N >= 2`` — a pool of N worker threads executes callbacks
                    concurrently.
 
     Raises:
@@ -261,9 +261,9 @@ class TaskDispatcher:
         No-op when ``workers == 1`` (inline mode) or the pool is already
         running.
         """
-        if self._workers:
+        if self._workers or self.workers == 1:
             return
-        for i in range(self.workers - 1):
+        for i in range(self.workers):
             t = Thread(
                 target=self._worker_loop,
                 name=f"daffi-worker-{i}",

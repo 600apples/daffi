@@ -128,7 +128,7 @@ pub fn sendMessageFromServer(_: [*c]PyObject, args: [*c]PyObject) callconv(.c) [
         return null;
     }
 
-    // #1: skip PyBytes_FromObject when data is already a bytes object.
+    // skip PyBytes_FromObject when data is already a bytes object.
     var size: i64 = 0;
     var raw_buf: [*c]u8 = undefined;
     var converted: ?*PyObject = null;
@@ -153,7 +153,7 @@ pub fn sendMessageFromServer(_: [*c]PyObject, args: [*c]PyObject) callconv(.c) [
     const pfunc_name = std.mem.span(func_name);
     const preturn_result = if (return_result == 0) false else true;
 
-    // #5: release GIL around the blocking TCP write.
+    // release GIL around the blocking TCP write.
     const py_state = py.PyEval_SaveThread();
     const msgident = Server.sendMessage(pdata, puuid, pflag, pdecoder, pis_bytes, preturn_result, preceiver, pfunc_name, conn_num) catch |err| {
         py.PyEval_RestoreThread(py_state);

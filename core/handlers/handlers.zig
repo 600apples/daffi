@@ -294,20 +294,6 @@ pub fn ServerHandler(comptime HandlerConnectionT: ConnectionType) type {
 
             // ----------------------------- ROUTER HANDLERS -----------------------------
             fn onHandshake(self: *Self, conn: *ParentConnT, message: *Message, _: *bool) !void {
-                // #12: The old code held self.mutex for the full duration of
-                // onHandshake, including the N TCP writes to existing clients.
-                // With N peers connected, each new join caused N blocking sends
-                // under the mutex, serialising all concurrent RPCs (join storm).
-                //
-                // Fix: we now release self.mutex BEFORE broadcasting.  To prevent
-                // the classic UAF (a broadcast target disconnects between us
-                // capturing its conn pointer and actually writing to it), we call
-                // conn.retain() for each broadcast target while still holding the
-                // mutex, then release the mutex, send, and release all refs.
-                //
-                // The broadcasts are built with self.allocator (heap) so they
-                // outlive the arena and the mutex section.
-
                 self.mutex.lock();
                 // errdefer unlocks on error paths that occur while holding the mutex.
                 var locked = true;
@@ -401,21 +387,6 @@ pub fn ServerHandler(comptime HandlerConnectionT: ConnectionType) type {
 
             fn onRequest(self: *Self, _: *ParentConnT, message: *Message, _: *bool) !void {
                 log_router.debug("onRequest func={s} receiver={s}", .{ message.getFuncName(), message.getReceiver() });
-                // #3: previously the router mutex was held for the entire
-                // lookup + TCP write, blocking all concurrent RPCs while one
-                // send was in progress.
-                //
-                // Fix: retain() the target connection before releasing the
-                // mutex, perform the write outside the mutex, then release().
-                // This eliminates the "mutex held across blocking write" issue
-                // while still preventing the UAF race:
-                //   • retain() bumps the refcount while we hold the mutex
-                //     (guaranteeing the connection pointer is valid).
-                //   • Even if the peer disconnects concurrently, serverLoop's
-                //     defer conn.destroy() → conn.release() only frees the
-                //     connection when the refcount drops to 0.
-                //   • release() in the defer below decrements and frees if
-                //     we were the last holder.
                 self.mutex.lock();
                 const target_conn: ?*ParentConnT = blk: {
                     if (self.findChannel(message.getFuncName(), message.getReceiver())) |c| {
