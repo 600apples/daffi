@@ -122,15 +122,6 @@ const ClientEntry = struct {
             self.alloc.destroy(self);
             return;
         }
-        // Phase 1 — signal the dispatcher to exit, then join its thread.
-        //
-        // Joining is strictly better than spinning on `disconnected`:
-        //   • zero CPU: the joining thread sleeps in the kernel until the
-        //     dispatcher's thread_id is deallocated.
-        //   • exact wakeup: the join returns as soon as the dispatcher exits,
-        //     with no 1 ms polling granularity.
-        //   • simpler: no nanosleep loop, no spins counter, no log spam.
-        //
         if (self.has_dispatcher) {
             if (!self.disconnected.load(.acquire)) {
                 log.debug("[{s}] destroy phase-1: closing connection, joining dispatcher", .{self.client_handler.app_name});

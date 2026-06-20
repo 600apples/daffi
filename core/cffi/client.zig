@@ -62,11 +62,6 @@ pub fn sendMessageFromClient(_: [*c]PyObject, args: [*c]PyObject) callconv(.c) [
         return null;
     }
 
-    // #1: avoid an extra heap copy when `data` is already a bytes object.
-    // PyBytes_FromObject() on a bytes argument just INCREFs and returns it,
-    // wasting a refcount bump and the AsStringAndSize round-trip cost.
-    // For any other buffer-protocol type (bytearray, memoryview …) we still
-    // go through the conversion path but we now correctly DECREF the result.
     var size: i64 = 0;
     var raw_buf: [*c]u8 = undefined;
     var converted: ?*PyObject = null;
@@ -91,7 +86,7 @@ pub fn sendMessageFromClient(_: [*c]PyObject, args: [*c]PyObject) callconv(.c) [
     const pfunc_name = std.mem.span(func_name);
     const preturn_result = if (return_result == 0) false else true;
 
-    // #5: release the GIL around the blocking TCP write so other Python
+    // release the GIL around the blocking TCP write so other Python
     // threads can run while this one waits for the socket buffer to drain.
     // No Python API calls are made between SaveThread and RestoreThread.
     const py_state = py.PyEval_SaveThread();

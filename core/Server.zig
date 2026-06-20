@@ -239,8 +239,20 @@ fn serverLoop(conn: *ServerHandler.ConnectionT, msgpool: *MessagePool, msg_handl
         // dequeue and free any consumed messages.
         msg_handler.triggerWakeup();
     } else |err| {
-        if (conn.peer_addr) |addr|
-            log.warn("serverLoop recv error from {f}: {}", .{ @import("network/connection.zig").fmtNetAddr(addr), err });
+        if (conn.peer_addr) |addr| {
+            // Clean peer hang-up (short-lived clients) is expected — debug only.
+            // Unexpected recv failures stay at warn.
+            switch (err) {
+                error.EOF => log.debug(
+                    "serverLoop peer disconnected from {f}",
+                    .{@import("network/connection.zig").fmtNetAddr(addr)},
+                ),
+                else => log.warn(
+                    "serverLoop recv error from {f}: {}",
+                    .{@import("network/connection.zig").fmtNetAddr(addr), err},
+                ),
+            }
+        }
         try msg_handler.handleErr(conn, err);
     }
     try msg_handler.handleDisconnect(conn);

@@ -228,11 +228,6 @@ pub fn Connection(comptime contype: ConnectionType) type {
             self.op_table.close(self.ctx);
         }
 
-        /// Release the caller's reference to this connection.
-        /// When the reference count reaches zero all Zig memory is freed.
-        /// Existing call-sites that use destroy() as the sole owner are
-        /// safe: with refcount==1 (initial value) this is equivalent to
-        /// the old unconditional free.
         pub fn destroy(self: *Self) void {
             self.release();
         }

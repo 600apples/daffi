@@ -294,24 +294,11 @@ pub fn ServerHandler(comptime HandlerConnectionT: ConnectionType) type {
 
             // ----------------------------- ROUTER HANDLERS -----------------------------
             fn onHandshake(self: *Self, conn: *ParentConnT, message: *Message, _: *bool) !void {
-                // #12: The old code held self.mutex for the full duration of
-                // onHandshake, including the N TCP writes to existing clients.
-                // With N peers connected, each new join caused N blocking sends
-                // under the mutex, serialising all concurrent RPCs (join storm).
-                //
-                // Fix: we now release self.mutex BEFORE broadcasting.  To prevent
-                // the classic UAF (a broadcast target disconnects between us
-                // capturing its conn pointer and actually writing to it), we call
-                // conn.retain() for each broadcast target while still holding the
-                // mutex, then release the mutex, send, and release all refs.
-                //
-                // The broadcasts are built with self.allocator (heap) so they
-                // outlive the arena and the mutex section.
-
                 self.mutex.lock();
-                // errdefer unlocks on error paths that occur while holding the mutex.
+                // Unlock on every exit while still holding the mutex. Cleared to
+                // false after the intentional unlock before the broadcast section.
                 var locked = true;
-                errdefer if (locked) self.mutex.unlock();
+                defer if (locked) self.mutex.unlock();
 
                 var arena = ArenaAllocator.init(self.allocator);
                 defer arena.deinit();
@@ -368,17 +355,20 @@ pub fn ServerHandler(comptime HandlerConnectionT: ConnectionType) type {
                 defer connected_event.deinit();
 
                 // Collect broadcast targets with retain() so their connections
-                // stay alive after we release self.mutex.
-                // 512 slots cover any realistic cluster size; extras are skipped.
-                var bcast_conns: [512]*ParentConnT = undefined;
-                var bcast_count: usize = 0;
+                // stay alive after we release self.mutex.  Size grows with the
+                // number of peers — no fixed cap / silent skip.
+                var bcast_conns: std.ArrayList(*ParentConnT) = .empty;
+                defer {
+                    for (bcast_conns.items) |c| c.release();
+                    bcast_conns.deinit(self.allocator);
+                }
                 for (self.chan_mapper.channels.values()) |c| {
                     if (std.mem.eql(u8, connection_name, c.connection_name)) continue;
-                    if (bcast_count < bcast_conns.len) {
-                        c.conn.retain();
-                        bcast_conns[bcast_count] = c.conn;
-                        bcast_count += 1;
-                    }
+                    c.conn.retain();
+                    bcast_conns.append(self.allocator, c.conn) catch |err| {
+                        c.conn.release();
+                        return err;
+                    };
                 }
 
                 // Release the mutex BEFORE the N TCP writes so concurrent RPCs
@@ -386,36 +376,18 @@ pub fn ServerHandler(comptime HandlerConnectionT: ConnectionType) type {
                 self.mutex.unlock();
                 locked = false;
 
-                // Release all retained references when done regardless of errors.
-                defer for (bcast_conns[0..bcast_count]) |c| c.release();
-
                 // 1. Mini-HANDSHAKE so receiving clients update their routing tables.
                 if (mini_broadcast) |mb| {
-                    for (bcast_conns[0..bcast_count]) |c|
+                    for (bcast_conns.items) |c|
                         self.sendToConnection(Message, c, mb) catch {};
                 }
                 // 2. "connected" EVENT drives @on_event("connected") handlers.
-                for (bcast_conns[0..bcast_count]) |c|
+                for (bcast_conns.items) |c|
                     self.sendToConnection(Message, c, connected_event) catch {};
             }
 
             fn onRequest(self: *Self, _: *ParentConnT, message: *Message, _: *bool) !void {
                 log_router.debug("onRequest func={s} receiver={s}", .{ message.getFuncName(), message.getReceiver() });
-                // #3: previously the router mutex was held for the entire
-                // lookup + TCP write, blocking all concurrent RPCs while one
-                // send was in progress.
-                //
-                // Fix: retain() the target connection before releasing the
-                // mutex, perform the write outside the mutex, then release().
-                // This eliminates the "mutex held across blocking write" issue
-                // while still preventing the UAF race:
-                //   • retain() bumps the refcount while we hold the mutex
-                //     (guaranteeing the connection pointer is valid).
-                //   • Even if the peer disconnects concurrently, serverLoop's
-                //     defer conn.destroy() → conn.release() only frees the
-                //     connection when the refcount drops to 0.
-                //   • release() in the defer below decrements and frees if
-                //     we were the last holder.
                 self.mutex.lock();
                 const target_conn: ?*ParentConnT = blk: {
                     if (self.findChannel(message.getFuncName(), message.getReceiver())) |c| {
