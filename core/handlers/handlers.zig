@@ -294,29 +294,35 @@ pub fn ServerHandler(comptime HandlerConnectionT: ConnectionType) type {
 
             // ----------------------------- ROUTER HANDLERS -----------------------------
             fn onHandshake(self: *Self, conn: *ParentConnT, message: *Message, _: *bool) !void {
+                // #12: The old code held self.mutex for the full duration of
+                // onHandshake, including the N TCP writes to existing clients.
+                // With N peers connected, each new join caused N blocking sends
+                // under the mutex, serialising all concurrent RPCs (join storm).
+                //
+                // Fix: we now release self.mutex BEFORE broadcasting.  To prevent
+                // the classic UAF (a broadcast target disconnects between us
+                // capturing its conn pointer and actually writing to it), we call
+                // conn.retain() for each broadcast target while still holding the
+                // mutex, then release the mutex, send, and release all refs.
+                //
+                // The broadcasts are built with self.allocator (heap) so they
+                // outlive the arena and the mutex section.
+
                 self.mutex.lock();
-                defer self.mutex.unlock();
+                // errdefer unlocks on error paths that occur while holding the mutex.
+                var locked = true;
+                errdefer if (locked) self.mutex.unlock();
+
                 var arena = ArenaAllocator.init(self.allocator);
                 defer arena.deinit();
-                var allocator = arena.allocator();
-                const connection_name = try allocator.dupe(u8, message.getTransmitter()); // for event
-                const client_hs = Handshake.fromJson(allocator, message.getData()) catch |err| {
+                var alloc = arena.allocator();
+                const connection_name = try alloc.dupe(u8, message.getTransmitter()); // for event
+                const client_hs = Handshake.fromJson(alloc, message.getData()) catch |err| {
                     log_router.err("handshake parse error from {s}: {s}", .{ connection_name, @errorName(err) });
                     try message.writeErrorMessage("failed to parse handshake message: {s}", .{@errorName(err)});
                     try self.sendToConnection(Message, conn, message);
                     return;
                 };
-                // Last-connection-wins: if a slot for this name already exists
-                // (stale zombie from an abrupt network cut or process kill that
-                // never sent a TCP FIN), evict it and accept the new peer.
-                // evictChannel atomically removes the map entry and returns the
-                // old connection pointer; we close the socket after the map is
-                // clean so the reader thread's diconnectionHandler finds no
-                // channel and returns without further mutation.
-                //
-                // Broadcast an "evicted" EVENT to every remaining client so
-                // they purge the stale slot from their own chan_mapper before
-                // the normal "connected" broadcast arrives for the new peer.
                 for (client_hs.value.members) |mb| {
                     if (self.chan_mapper.evictChannel(mb.name)) |stale_conn| {
                         log_router.warn("evicting stale slot for '{s}' — new connection takes over", .{mb.name});
@@ -334,100 +340,121 @@ pub fn ServerHandler(comptime HandlerConnectionT: ConnectionType) type {
                         for (methods) |mt| try chan.addMethod(mt);
                     }
                 }
-                // Capture allChannels() once so chan_count and the slice are consistent.
-                // Holding self.mutex prevents concurrent onHandshake/diconnectionHandler
-                // from modifying the ChannelsMapper between the count check and iteration.
                 const all_chans = self.chan_mapper.allChannels();
-                var memberdata = try allocator.alloc(Handshake.MemberData, all_chans.len);
+                var memberdata = try alloc.alloc(Handshake.MemberData, all_chans.len);
                 for (all_chans, 0..) |*c, idx| {
-                    memberdata[idx] = .{ .name = c.connection_name, .methods = try c.joinedMethods(allocator, serde.UNIT_SEPARATOR) };
+                    memberdata[idx] = .{ .name = c.connection_name, .methods = try c.joinedMethods(alloc, serde.UNIT_SEPARATOR) };
                 }
-                var router_hs = try Handshake.create(allocator, memberdata, "router");
-                const data = try router_hs.toJson(allocator);
-                try message.setData(data);
-                // Send the full member list only to the NEW client (transmitter ==
-                // its own app_name, so onHandshake inserts into the message store and
-                // the Python side unblocks from _process_client_handshake).
+                var router_hs = try Handshake.create(alloc, memberdata, "router");
+                const hs_data = try router_hs.toJson(alloc);
+                try message.setData(hs_data);
+                // Send the full member list to the NEW client while still holding
+                // the mutex (conn is this thread's accepted socket — no UAF risk).
                 try self.sendToConnection(Message, conn, message);
 
-                // Notify existing clients about the new peer.
-                //
-                // Two messages are sent (always in this order so chan_mapper is
-                // up-to-date before the Python @on_event handler fires):
-                //
-                //   1. Mini-HANDSHAKE  — only when the new client has ≥1 method.
-                //      The add-only branch in ClientHandler.onHandshake updates
-                //      the receiving client's chan_mapper (enables routing to the
-                //      new peer).  Pure callers (no methods) are skipped here
-                //      because nothing in the network ever routes an RPC *to*
-                //      them, so the routing map gains nothing from them.
-                //
-                //   2. "connected" EVENT — sent unconditionally to ALL existing
-                //      clients, regardless of whether the new peer has methods.
-                //      This is the signal that drives @on_event("connected")
-                //      Python handlers (e.g. a monitoring router that discovers
-                //      workers as they join).  The EVENT arrives after the
-                //      mini-HANDSHAKE (TCP order), so by the time Python wakes
-                //      up the chan_mapper is already updated.
+                // Build broadcast messages while holding mutex so channel state
+                // is consistent with what we captured above.
+                var mini_broadcast: ?*Message = null;
                 const new_chan = self.chan_mapper.channels.getPtr(connection_name) orelse unreachable;
                 if (new_chan.methods.hash_map.count() > 0) {
-                    const new_member_methods = try new_chan.joinedMethods(allocator, serde.UNIT_SEPARATOR);
-                    var mini_memberdata = try allocator.alloc(Handshake.MemberData, 1);
+                    const new_member_methods = try new_chan.joinedMethods(alloc, serde.UNIT_SEPARATOR);
+                    var mini_memberdata = try alloc.alloc(Handshake.MemberData, 1);
                     mini_memberdata[0] = .{ .name = connection_name, .methods = new_member_methods };
-                    var mini_broadcast = try serde.createHandshakeMessage(self.allocator, mini_memberdata, 0, "router");
-                    defer mini_broadcast.deinit();
-                    for (self.chan_mapper.channels.values()) |c| {
-                        if (!std.mem.eql(u8, connection_name, c.connection_name))
-                            try self.sendToConnection(Message, c.conn, mini_broadcast);
+                    mini_broadcast = try serde.createHandshakeMessage(self.allocator, mini_memberdata, 0, "router");
+                }
+                defer if (mini_broadcast) |mb| mb.deinit();
+
+                var connected_event = try serde.createEventMessage(self.allocator, 0, connection_name, "connected");
+                defer connected_event.deinit();
+
+                // Collect broadcast targets with retain() so their connections
+                // stay alive after we release self.mutex.
+                // 512 slots cover any realistic cluster size; extras are skipped.
+                var bcast_conns: [512]*ParentConnT = undefined;
+                var bcast_count: usize = 0;
+                for (self.chan_mapper.channels.values()) |c| {
+                    if (std.mem.eql(u8, connection_name, c.connection_name)) continue;
+                    if (bcast_count < bcast_conns.len) {
+                        c.conn.retain();
+                        bcast_conns[bcast_count] = c.conn;
+                        bcast_count += 1;
                     }
                 }
 
-                // Always send a "connected" EVENT so @on_event("connected")
-                // handlers fire for every joining peer (with or without methods).
-                var connected_event = try serde.createEventMessage(self.allocator, 0, connection_name, "connected");
-                defer connected_event.deinit();
-                for (self.chan_mapper.channels.values()) |c| {
-                    if (!std.mem.eql(u8, connection_name, c.connection_name))
-                        try self.sendToConnection(Message, c.conn, connected_event);
+                // Release the mutex BEFORE the N TCP writes so concurrent RPCs
+                // are not blocked while we drain N socket buffers.
+                self.mutex.unlock();
+                locked = false;
+
+                // Release all retained references when done regardless of errors.
+                defer for (bcast_conns[0..bcast_count]) |c| c.release();
+
+                // 1. Mini-HANDSHAKE so receiving clients update their routing tables.
+                if (mini_broadcast) |mb| {
+                    for (bcast_conns[0..bcast_count]) |c|
+                        self.sendToConnection(Message, c, mb) catch {};
                 }
+                // 2. "connected" EVENT drives @on_event("connected") handlers.
+                for (bcast_conns[0..bcast_count]) |c|
+                    self.sendToConnection(Message, c, connected_event) catch {};
             }
 
             fn onRequest(self: *Self, _: *ParentConnT, message: *Message, _: *bool) !void {
                 log_router.debug("onRequest func={s} receiver={s}", .{ message.getFuncName(), message.getReceiver() });
-                // Hold self.mutex for the ENTIRE lookup + send.
+                // #3: previously the router mutex was held for the entire
+                // lookup + TCP write, blocking all concurrent RPCs while one
+                // send was in progress.
                 //
-                // Rationale: after findChannel() returns a Channel copy with
-                // c.conn, the mutex must still be held when sendToConnection()
-                // runs.  Without it, the race is:
-                //
-                //   1. onRequest releases mutex, extracts c.conn.
-                //   2. Client disconnects: diconnectionHandler (mutex) removes
-                //      the channel; serverLoop defer calls conn.destroy().
-                //   3. onRequest calls sendToConnection(c.conn, ...) on freed
-                //      memory → SIGSEGV.
-                //
-                // Holding the mutex prevents step 2 from completing its
-                // conn.destroy() before step 3 finishes: diconnectionHandler
-                // waits for the mutex, so conn lives at least as long as the
-                // send.  The conn.wlock (inner lock) serialises concurrent
-                // writes within sendToConnection — no new deadlock is introduced
-                // because no callee of onRequest holds the RouterHandler.mutex.
+                // Fix: retain() the target connection before releasing the
+                // mutex, perform the write outside the mutex, then release().
+                // This eliminates the "mutex held across blocking write" issue
+                // while still preventing the UAF race:
+                //   • retain() bumps the refcount while we hold the mutex
+                //     (guaranteeing the connection pointer is valid).
+                //   • Even if the peer disconnects concurrently, serverLoop's
+                //     defer conn.destroy() → conn.release() only frees the
+                //     connection when the refcount drops to 0.
+                //   • release() in the defer below decrements and frees if
+                //     we were the last holder.
                 self.mutex.lock();
-                defer self.mutex.unlock();
-                if (self.findChannel(message.getFuncName(), message.getReceiver())) |c|
-                    try self.sendToConnection(Message, c.conn, message)
-                else
+                const target_conn: ?*ParentConnT = blk: {
+                    if (self.findChannel(message.getFuncName(), message.getReceiver())) |c| {
+                        c.conn.retain();
+                        break :blk c.conn;
+                    }
+                    break :blk null;
+                };
+                self.mutex.unlock();
+
+                if (target_conn) |c| {
+                    defer c.release();
+                    self.sendToConnection(Message, c, message) catch |err|
+                        log_router.debug("onRequest: send to {s} failed: {}", .{ message.getReceiver(), err });
+                } else {
                     log_router.debug("no route for request to: {s}", .{message.getReceiver()});
+                }
             }
 
             fn onResponse(self: *Self, _: *ParentConnT, message: *Message, _: *bool) !void {
                 log_router.debug("onResponse receiver={s} uuid={}", .{ message.getReceiver(), message.getUuid() });
+                // Same retain/release pattern as onRequest — see its comment.
                 self.mutex.lock();
-                defer self.mutex.unlock();
-                if (self.findChannel(null, message.getReceiver())) |c|
-                    try self.sendToConnection(Message, c.conn, message)
-                else
+                const target_conn: ?*ParentConnT = blk: {
+                    if (self.findChannel(null, message.getReceiver())) |c| {
+                        c.conn.retain();
+                        break :blk c.conn;
+                    }
+                    break :blk null;
+                };
+                self.mutex.unlock();
+
+                if (target_conn) |c| {
+                    defer c.release();
+                    self.sendToConnection(Message, c, message) catch |err|
+                        log_router.debug("onResponse: send to {s} failed: {}", .{ message.getReceiver(), err });
+                } else {
                     log_router.debug("no route for response to: {s}", .{message.getReceiver()});
+                }
             }
 
             // --------------------- ROUTER CONNECTION LIFECYCLE ----------------------
@@ -505,13 +532,14 @@ pub const ClientHandler = struct {
 
     pub fn init(allocator: Allocator, app_name: []const u8) !*ClientHandler {
         const self = try allocator.create(ClientHandler);
-        self.* = .{ .chan_mapper = try ChannelsMapperT.init(allocator), .tasks_queue = try TasksQueue.init(allocator), .allocator = allocator, .msg_store = ClientMessageStore{ .allocator = allocator }, .app_name = try allocator.dupe(u8, app_name) };
+        self.* = .{ .chan_mapper = try ChannelsMapperT.init(allocator), .tasks_queue = try TasksQueue.init(allocator), .allocator = allocator, .msg_store = ClientMessageStore.init(allocator), .app_name = try allocator.dupe(u8, app_name) };
         return self;
     }
 
     pub fn deinit(self: *ClientHandler) void {
         self.tasks_queue.deinit();
         self.chan_mapper.deinit();
+        self.msg_store.deinit();
         self.allocator.free(self.app_name);
         self.allocator.destroy(self);
     }
@@ -582,10 +610,7 @@ pub const ClientHandler = struct {
         // findReceiverDupe / getOrCreateChannel).  onEvent follows the same
         // order, so no deadlock is possible.
         self.mutex.lock();
-        defer {
-            self.mutex.unlock();
-            self.chan_iterator.reset();
-        }
+        defer self.mutex.unlock();
         if (receiver) |rec| {
             if (mem.eql(u8, rec, self.app_name)) return error.ReceiverNotFound;
             return self.chan_mapper.findReceiverDupe(self.allocator, rec, method) catch |err| switch (err) {
@@ -595,16 +620,32 @@ pub const ClientHandler = struct {
                 },
                 else => return err,
             };
-        } else {
-            var found_channels = std.array_list.Managed(ChannelsMapperT.Channel).init(self.allocator);
-            defer found_channels.deinit();
-            for (self.chan_mapper.allChannels()) |*c| {
-                if (mem.eql(u8, c.connection_name, self.app_name)) continue;
-                if (c.containsMethod(method)) try found_channels.append(c.*);
-            }
-            if (self.chan_iterator.next(found_channels.items)) |*c| {
-                return try self.allocator.dupe(u8, c.connection_name);
-            }
+        }
+        // #9: round-robin across method-matching channels WITHOUT allocating an
+        // intermediate list.  Two O(N) passes over allChannels() avoid the
+        // heap allocation entirely; N is the number of connected peers which is
+        // small in practice.
+        //
+        // Pass 1: count matching channels so we can wrap the position modulo that count.
+        // Pass 2: pick the channel at the round-robin index.
+        const all = self.chan_mapper.allChannels();
+        var match_count: usize = 0;
+        for (all) |*c| {
+            if (mem.eql(u8, c.connection_name, self.app_name)) continue;
+            if (c.containsMethod(method)) match_count += 1;
+        }
+        if (match_count == 0) return error.ReceiverNotFound;
+
+        // Advance the position by 1 so successive calls rotate to the next peer.
+        const pos = self.chan_iterator.position % match_count;
+        self.chan_iterator.position = (pos + 1) % match_count;
+
+        var idx: usize = 0;
+        for (all) |*c| {
+            if (mem.eql(u8, c.connection_name, self.app_name)) continue;
+            if (!c.containsMethod(method)) continue;
+            if (idx == pos) return try self.allocator.dupe(u8, c.connection_name);
+            idx += 1;
         }
         return error.ReceiverNotFound;
     }
