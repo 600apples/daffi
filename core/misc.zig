@@ -25,17 +25,23 @@ pub inline fn debugPrint(comptime fmt: []const u8, args: anytype) void {
 }
 
 /// std.Thread.Mutex was removed in 0.16.
-/// For wasm (single-threaded) this is a no-op. For native targets it is a
-/// simple atomic spinlock until the codebase is ported to std.Io.Mutex.
+/// For wasm (single-threaded) this is a no-op stub.
+/// For native targets we delegate to pthread_mutex_t which uses a futex
+/// internally on Linux and a ulock/os_unfair_lock on macOS — no busy-spin.
 pub const Mutex = if (is_wasm) struct {
     pub fn lock(_: *@This()) void {}
     pub fn unlock(_: *@This()) void {}
     pub fn tryLock(_: *@This()) bool { return true; }
 } else struct {
-    inner: std.atomic.Mutex = .unlocked,
+    inner: std.c.pthread_mutex_t = std.c.PTHREAD_MUTEX_INITIALIZER,
+
     pub fn lock(self: *@This()) void {
-        while (!self.inner.tryLock()) std.atomic.spinLoopHint();
+        _ = std.c.pthread_mutex_lock(&self.inner);
     }
-    pub fn unlock(self: *@This()) void { self.inner.unlock(); }
-    pub fn tryLock(self: *@This()) bool { return self.inner.tryLock(); }
+    pub fn unlock(self: *@This()) void {
+        _ = std.c.pthread_mutex_unlock(&self.inner);
+    }
+    pub fn tryLock(self: *@This()) bool {
+        return std.c.pthread_mutex_trylock(&self.inner) == .SUCCESS;
+    }
 };

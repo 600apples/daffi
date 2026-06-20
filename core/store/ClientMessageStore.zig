@@ -6,10 +6,11 @@ const Allocator = std.mem.Allocator;
 
 const ClientMessageStore = @This();
 
-const buf_size: u16 = 2048;
-
-// Per-instance buffer (not global) so multiple connections don't share state.
-buf: [buf_size]?*Message = [_]?*Message{null} ** buf_size,
+/// HashMap from uuid → *Message.  Replaces the old modulo-2048 fixed array
+/// which silently dropped responses when two in-flight RPCs happened to share
+/// the same (uuid % 2048) slot.  AutoHashMap grows dynamically and has O(1)
+/// amortised insert/lookup with no collision limit.
+map: std.AutoHashMap(u16, *Message),
 mutex: Mutex = .{},
 allocator: Allocator,
 /// File descriptor (eventfd or pipe write-end) signalled whenever a new
@@ -35,18 +36,27 @@ inline fn signalWakeup(self: *ClientMessageStore) void {
     _ = write(@intCast(self.response_fd), @as([*]const u8, @ptrCast(&val)), @sizeOf(u64));
 }
 
+pub fn init(allocator: Allocator) ClientMessageStore {
+    return .{ .allocator = allocator, .map = std.AutoHashMap(u16, *Message).init(allocator) };
+}
+
+pub fn deinit(self: *ClientMessageStore) void {
+    // Free any messages still in the store (e.g. on abrupt shutdown).
+    var it = self.map.valueIterator();
+    while (it.next()) |msg_ptr| msg_ptr.*.deinit();
+    self.map.deinit();
+}
+
 /// Store a response message.
-/// Returns error.StoreFull when another message already occupies the slot
-/// (hash collision from having >= buf_size simultaneous in-flight RPCs).
+/// Returns error.StoreFull when another message already occupies this uuid
+/// slot (i.e. two in-flight RPCs with the same uuid, which should not happen
+/// under normal operation).
 pub fn insert(self: *ClientMessageStore, msg: *Message) !void {
     self.mutex.lock();
     defer self.mutex.unlock();
-    const uuid = msg.getUuid();
-    const hash = @rem(uuid, buf_size);
-    if (self.buf[hash] != null) {
-        return error.StoreFull;
-    }
-    self.buf[hash] = msg;
+    const result = try self.map.getOrPut(msg.getUuid());
+    if (result.found_existing) return error.StoreFull;
+    result.value_ptr.* = msg;
 }
 
 /// Explicitly notify Python ``RpcResult`` waiters that a new response may
@@ -57,23 +67,17 @@ pub fn triggerWakeup(self: *ClientMessageStore) void {
 }
 
 /// Retrieve and remove the response for uuid.
-/// Returns null if no message is present or if the stored message belongs
-/// to a different uuid (collision guard — should not happen with correct
-/// insert, but protects against stale state).
+/// Returns null if no message is present for that uuid.
 pub fn fetch(self: *ClientMessageStore, uuid: u16) ?*Message {
     self.mutex.lock();
     defer self.mutex.unlock();
-    const hash = @rem(uuid, buf_size);
-    const msg = self.buf[hash] orelse return null;
-    if (msg.getUuid() != uuid) return null; // collision guard — leave message in place
-    self.buf[hash] = null;
+    const msg = self.map.get(uuid) orelse return null;
+    _ = self.map.remove(uuid);
     return msg;
 }
 
 pub fn setTimeoutError(self: *ClientMessageStore, uuid: u16) !void {
-    // fetch() already verifies the UUID, so no extra check needed here.
     if (self.fetch(uuid)) |msg| {
         try msg.writeErrorMessage("Timeout error", .{});
     }
 }
-

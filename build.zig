@@ -15,14 +15,17 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("core/wasm.zig"),
             .target = target,
             .optimize = optimize,
-            .pic = true,
         });
 
-        const lib = b.addLibrary(.{
+        // Use addExecutable with entry disabled: avoids the wasm-ld "-shared is not
+        // yet stable" warning that addLibrary(.linkage = .dynamic) triggers in
+        // Zig 0.16+.  rdynamic exports all pub functions, which is exactly what
+        // the JS client needs.
+        const lib = b.addExecutable(.{
             .name = "app",
             .root_module = root_module,
-            .linkage = .dynamic,
         });
+        lib.entry = .disabled;
         lib.rdynamic = true;
         b.installArtifact(lib);
 
