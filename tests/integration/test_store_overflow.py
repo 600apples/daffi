@@ -1,39 +1,19 @@
 """
-Integration tests for ClientMessageStore overflow handling.
+Integration tests for ClientMessageStore — concurrent in-flight RPCs.
 
 Background
 ----------
-Each Client connection has an internal response store backed by a fixed-size
-hash table (``buf_size = 2048``).  The hash key is ``uuid % buf_size``.
-If two in-flight RPCs have UUIDs that map to the same slot (N and N + buf_size),
-the second response to arrive finds the slot occupied and the native handler
-fires ``error.StoreFull``.
+The old store was a fixed-size 2048-slot hash table keyed by ``uuid % 2048``.
+Two in-flight RPCs whose UUIDs differed by exactly 2048 would collide and one
+response was silently dropped (``StoreFull``).
 
-``onResponse`` in the Zig handler catches StoreFull, logs a warning, drops the
-duplicate response, and continues — the connection is **not** killed.
-The Python caller whose response was dropped eventually receives a TimeoutError.
+The new store is an ``AutoHashMap`` keyed by the full 16-bit UUID.  Every
+in-flight RPC gets its own distinct entry — no false collisions, no dropped
+responses.  The tests below verify:
 
-How we trigger it deterministically
-------------------------------------
-UUID assignment is sequential per connection starting from 1.
-Fire-and-forget calls (``rpc_nowait``, ``return_result=False``) advance the
-counter but never insert anything into the client-side store.
-
-Strategy — send *both* colliding requests before polling either one:
-
-1. Send ``BUF_SIZE - 1`` (= 2047) ``rpc_nowait`` calls → UUID counter = 2047.
-2. Send UUID 2048 (``hold_echo``) **without waiting** for the response.
-   Slot 0 = 2048 % 2048.
-3. Send 2047 more ``rpc_nowait`` calls → UUID counter = 4095.
-4. Send UUID 4096 (``hold_echo``) **without waiting**.
-   Slot 0 = 4096 % 2048 — **same slot as UUID 2048**.
-5. Sleep 500 ms so the service barrier releases and the Zig dispatcher inserts
-   **both** responses into slot 0 in rapid succession (<200 ns apart, before
-   any Python polling thread can wake from its ≥50 µs sleep).
-   StoreFull fires for the second response → it is dropped.
-6. Poll for UUID 2048 and UUID 4096 concurrently.
-   Exactly one finds its response in the store; the other times out.
-7. Verify the connection is still alive with a follow-up rpc().
+  1. Two concurrent requests both get their responses delivered.
+  2. rpc_nowait never pollutes the store.
+  3. Heavy concurrent usage from many threads stays correct.
 """
 from __future__ import annotations
 
@@ -45,9 +25,6 @@ import pytest
 
 from .conftest import HOST, TIMEOUT, wait_for_port, silence_subprocess, quiet_kill
 
-# Must match core/store/ClientMessageStore.zig  ``const buf_size: u16 = 2048;``
-BUF_SIZE = 2048
-
 
 # ── subprocess entry points ────────────────────────────────────────────────────
 
@@ -55,10 +32,8 @@ def _proc_service_overflow(port: int) -> None:
     """Service with two callbacks:
 
     * ``hold_echo`` — waits on a 2-party barrier so that exactly two calls are
-      released simultaneously.  This guarantees responses for UUID 2048 and
-      UUID 4096 are sent back-to-back with no gap between them.
-    * ``fast_echo`` — returns immediately; used solely to advance the UUID
-      counter without touching the client message store.
+      released simultaneously, ensuring both responses arrive close together.
+    * ``fast_echo`` — returns immediately; used for no-wait calls.
     """
     silence_subprocess()
     from daffi import Service, callback
@@ -94,23 +69,15 @@ def overflow_service(free_port):
 # ── tests ─────────────────────────────────────────────────────────────────────
 
 class TestStoreOverflow:
-    """Verify that a full ClientMessageStore gracefully drops the overflowing
-    response and that the connection survives."""
+    """Verify correct concurrent behaviour of the AutoHashMap-backed store."""
 
-    def test_overflow_drops_one_response_connection_survives(self, overflow_service):
-        """
-        Engineer a deterministic UUID hash collision between two rpc() calls,
-        verify that exactly one is dropped (TimeoutError) and that the
-        connection remains alive afterwards.
+    def test_concurrent_requests_both_succeed(self, overflow_service):
+        """Both in-flight requests must deliver their responses.
 
-        Why this is reliable
-        --------------------
-        Both requests are sent *before* any polling begins.  A 500 ms sleep
-        gives the service time to release the barrier and lets the Zig
-        dispatcher (no GIL) insert *both* responses into slot 0 within ~200 ns
-        — far shorter than Python's ≥50 µs polling sleep.  StoreFull fires
-        for the second insert, dropping that response.  When polling finally
-        starts (after the sleep), exactly one response is in the store.
+        With the old 2048-slot modulo store, two RPCs whose UUIDs shared the
+        same slot would cause one response to be dropped (StoreFull).  With the
+        new AutoHashMap every UUID is a distinct key — both responses must
+        arrive successfully.
         """
         from daffi import Client
         from daffi._bindings import send_message_from_client, MessageFlag
@@ -122,56 +89,31 @@ class TestStoreOverflow:
         conn_num = client._conn_num
 
         try:
-            # ── step 1: fire the first hold_echo to anchor the UUID slot ─────
-            # The connection handshake has already consumed some UUIDs.  We
-            # don't know the exact counter, so we send UUID_A and then advance
-            # by exactly BUF_SIZE - 1 rpc_nowait calls so that UUID_B = UUID_A
-            # + BUF_SIZE, ensuring they hash to the same slot.
+            # Send two concurrent hold_echo requests without registering
+            # waiters so neither is fetched until we poll below.
             data_a, ib_a = Serializer.serialize(SerdeFormat.PICKLE, "payload-a")
-            uuid_a, ts_a, found = send_message_from_client(
+            uuid_a, ts_a, found_a = send_message_from_client(
                 data=data_a, flag=MessageFlag.REQUEST, serde=SerdeFormat.PICKLE,
                 receiver="", func_name="hold_echo", return_result=True,
                 conn_num=conn_num, is_bytes=ib_a,
             )
-            assert found, "No receiver found for hold_echo"
+            assert found_a, "No receiver found for hold_echo"
 
-            # ── step 2: advance UUID counter by exactly BUF_SIZE - 1 ─────────
-            # Each rpc_nowait increments the UUID counter by 1 without creating
-            # a store entry.  After BUF_SIZE - 1 calls the counter is at
-            # uuid_a + (BUF_SIZE - 1), so the next send gets UUID_B = uuid_a + BUF_SIZE.
-            for _ in range(BUF_SIZE - 1):
-                conn.rpc_nowait().fast_echo(None)
-
-            # ── step 3: send UUID_B (same slot as UUID_A — collision!) ────────
             data_b, ib_b = Serializer.serialize(SerdeFormat.PICKLE, "payload-b")
-            uuid_b, ts_b, found = send_message_from_client(
+            uuid_b, ts_b, found_b = send_message_from_client(
                 data=data_b, flag=MessageFlag.REQUEST, serde=SerdeFormat.PICKLE,
                 receiver="", func_name="hold_echo", return_result=True,
                 conn_num=conn_num, is_bytes=ib_b,
             )
-            assert found, "No receiver found for hold_echo"
-            assert uuid_b == uuid_a + BUF_SIZE, (
-                f"Expected UUID_B = {uuid_a + BUF_SIZE}, got {uuid_b}. "
-                "UUID counter was not advanced by exactly BUF_SIZE - 1."
-            )
-            assert uuid_a % BUF_SIZE == uuid_b % BUF_SIZE, (
-                f"Both UUIDs must hash to the same slot "
-                f"(uuid_a={uuid_a} slot={uuid_a % BUF_SIZE}, "
-                f"uuid_b={uuid_b} slot={uuid_b % BUF_SIZE})."
-            )
+            assert found_b, "No receiver found for hold_echo"
 
-            # ── step 5: sleep so the dispatcher processes both responses ──────
-            # The service barrier needs to receive *both* hold_echo calls before
-            # releasing.  The 2047 fast_echo calls in step 3 are queued ahead of
-            # UUID 4096's hold_echo; with workers=40 they complete in ~50 ms.
-            # After the barrier releases, both responses travel over loopback and
-            # the Zig dispatcher (no GIL) inserts them within ~200 ns of each
-            # other — before any Python polling sleep can expire.
-            # StoreFull fires for whichever UUID arrived second; its response is
-            # dropped.  After 500 ms, exactly one response is in the store.
+            # UUIDs must be distinct.
+            assert uuid_a != uuid_b
+
+            # Wait for barrier to release and both responses to arrive.
             time.sleep(0.5)
 
-            # ── step 6: poll for both UUIDs concurrently ─────────────────────
+            # Poll both UUIDs concurrently — both must succeed.
             results: list = [None, None]
             errors:  list = [None, None]
 
@@ -182,42 +124,24 @@ class TestStoreOverflow:
                         timeout=5, receivers=None, proxy=None,
                     ).result()
                     results[idx] = Serializer.deserialize(serde, data)[0][0]
-                except TimeoutError as exc:
+                except Exception as exc:
                     errors[idx] = exc
 
             t_a = threading.Thread(target=_poll, args=(0, uuid_a, ts_a), daemon=True)
             t_b = threading.Thread(target=_poll, args=(1, uuid_b, ts_b), daemon=True)
-            t_a.start()
-            t_b.start()
-            t_a.join(timeout=15)
-            t_b.join(timeout=10)
+            t_a.start(); t_b.start()
+            t_a.join(timeout=15); t_b.join(timeout=10)
 
-            # ── step 7: exactly one caller must have received TimeoutError ────
-            n_errors  = sum(1 for e in errors  if e is not None)
-            n_success = sum(1 for r in results if r is not None)
-
-            assert n_errors == 1, (
-                f"Expected 1 StoreFull-caused TimeoutError, got {n_errors}.\n"
-                f"  errors={errors}\n  results={results}\n"
-                "If n_errors=0 both responses were inserted (timing changed);\n"
-                "if n_errors=2 the connection died instead of just dropping one."
+            assert errors == [None, None], (
+                f"One or both requests failed: {errors}"
             )
-            assert n_success == 1, (
-                f"Expected 1 successful result, got {n_success}.\n"
-                f"  errors={errors}\n  results={results}"
+            assert set(results) == {"payload-a", "payload-b"}, (
+                f"Expected both payloads delivered, got: {results}"
             )
 
-            # The successful payload must be one of the two we sent.
-            good = results[0] if results[0] is not None else results[1]
-            assert good in ("payload-a", "payload-b"), (
-                f"Unexpected result: {good!r}"
-            )
-
-            # ── step 8: connection must still be alive ────────────────────────
-            ping = conn.rpc(timeout=TIMEOUT).fast_echo("ping-after-overflow")
-            assert ping == "ping-after-overflow", (
-                f"Connection died after StoreFull; got {ping!r}"
-            )
+            # Connection must still be alive.
+            ping = conn.rpc(timeout=TIMEOUT).fast_echo("ping-after-concurrent")
+            assert ping == "ping-after-concurrent"
 
         finally:
             client.stop()
@@ -246,8 +170,8 @@ class TestStoreOverflow:
     def test_connection_survives_heavy_concurrent_rpc(self, overflow_service):
         """
         50 threads sharing one connection each fire 10 rpc() calls.
-        With buf_size=2048 >> 50 concurrent RPCs there is no collision;
-        all results must be correct.
+        All results must be correct — the HashMap handles concurrent inserts
+        without false collisions.
         """
         from daffi import Client
 

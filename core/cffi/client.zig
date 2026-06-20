@@ -61,11 +61,28 @@ pub fn sendMessageFromClient(_: [*c]PyObject, args: [*c]PyObject) callconv(.c) [
         PyErr_SetString(py.PyExc_ValueError, "unable to parse provided arguments");
         return null;
     }
-    const src = py.PyBytes_FromObject(data);
+
+    // #1: avoid an extra heap copy when `data` is already a bytes object.
+    // PyBytes_FromObject() on a bytes argument just INCREFs and returns it,
+    // wasting a refcount bump and the AsStringAndSize round-trip cost.
+    // For any other buffer-protocol type (bytearray, memoryview …) we still
+    // go through the conversion path but we now correctly DECREF the result.
     var size: i64 = 0;
-    var buffer: [*]u8 = undefined;
-    if (py.PyBytes_AsStringAndSize(src, @ptrCast(&buffer), &size) < 0) return null;
-    const pdata = buffer[0..@as(usize, @intCast(size))];
+    var raw_buf: [*c]u8 = undefined;
+    var converted: ?*PyObject = null;
+
+    if (py.PyBytes_Check(data) != 0) {
+        if (py.PyBytes_AsStringAndSize(data, @ptrCast(&raw_buf), &size) < 0) return null;
+    } else {
+        converted = py.PyBytes_FromObject(data);
+        if (converted == null) { PyErr_SetString(py.PyExc_ValueError, "cannot convert to bytes"); return null; }
+        if (py.PyBytes_AsStringAndSize(converted.?, @ptrCast(&raw_buf), &size) < 0) {
+            py.Py_DECREF(converted.?);
+            return null;
+        }
+    }
+    const pdata = raw_buf[0..@as(usize, @intCast(size))];
+
     const puuid: u16 = @as(u16, @truncate(uuid));
     const pflag: MessageFlag = @enumFromInt(@as(std.meta.Tag(MessageFlag), @truncate(flag)));
     const pdecoder: MessageDecoder = @enumFromInt(@as(std.meta.Tag(MessageDecoder), @truncate(decoder)));
@@ -73,10 +90,22 @@ pub fn sendMessageFromClient(_: [*c]PyObject, args: [*c]PyObject) callconv(.c) [
     const preceiver = std.mem.span(receiver);
     const pfunc_name = std.mem.span(func_name);
     const preturn_result = if (return_result == 0) false else true;
+
+    // #5: release the GIL around the blocking TCP write so other Python
+    // threads can run while this one waits for the socket buffer to drain.
+    // No Python API calls are made between SaveThread and RestoreThread.
+    const py_state = py.PyEval_SaveThread();
     const msgident = Client.sendMessage(pdata, puuid, pflag, pdecoder, pis_bytes, preturn_result, preceiver, pfunc_name, conn_num) catch |err| {
+        py.PyEval_RestoreThread(py_state);
+        if (converted) |s| py.Py_DECREF(s);
         PyErr_SetString(py.PyExc_ValueError, @errorName(err));
         return null;
     };
+    py.PyEval_RestoreThread(py_state);
+
+    // data has been copied into Zig-owned memory; safe to DECREF now.
+    if (converted) |s| py.Py_DECREF(s);
+
     const found_receiver: []const u8 = msgident.receiver;
     // For REQUEST flags ``found_receiver`` is a caller-owned duplicate
     // produced by ``findReceiverForMethod`` while the appropriate mutex was
