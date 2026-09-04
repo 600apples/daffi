@@ -182,11 +182,15 @@ class AsyncTaskDispatcher:
     # ------------------------------------------------------------------
 
     def _start_workers(self) -> None:
-        """Create worker tasks if not already running (workers >= 2 only)."""
-        if self._workers:
+        """Create worker tasks if not already running (workers >= 2 only).
+
+        Spawns ``workers`` asyncio tasks — matching the sync TaskDispatcher
+        pool size for ``workers=N``.
+        """
+        if self._workers or self.workers == 1:
             return
         loop = asyncio.get_event_loop()
-        for i in range(self.workers - 1):
+        for i in range(self.workers):
             t = loop.create_task(
                 self._worker_loop(), name=f"daffi-aio-worker-{i}"
             )

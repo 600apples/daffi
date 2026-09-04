@@ -127,13 +127,24 @@ pub fn sendMessageFromServer(_: [*c]PyObject, args: [*c]PyObject) callconv(.c) [
         PyErr_SetString(py.PyExc_ValueError, "unable to parse provided arguments");
         return null;
     }
-    const src = py.PyBytes_FromObject(data);
+
+    // skip PyBytes_FromObject when data is already a bytes object.
     var size: i64 = 0;
-    var buffer: [*]u8 = undefined;
-    if (py.PyBytes_AsStringAndSize(src, @ptrCast(&buffer), &size) < 0) {
-        return null;
+    var raw_buf: [*c]u8 = undefined;
+    var converted: ?*PyObject = null;
+
+    if (py.PyBytes_Check(data) != 0) {
+        if (py.PyBytes_AsStringAndSize(data, @ptrCast(&raw_buf), &size) < 0) return null;
+    } else {
+        converted = py.PyBytes_FromObject(data);
+        if (converted == null) { PyErr_SetString(py.PyExc_ValueError, "cannot convert to bytes"); return null; }
+        if (py.PyBytes_AsStringAndSize(converted.?, @ptrCast(&raw_buf), &size) < 0) {
+            py.Py_DECREF(converted.?);
+            return null;
+        }
     }
-    const pdata = buffer[0..@as(usize, @intCast(size))];
+    const pdata = raw_buf[0..@as(usize, @intCast(size))];
+
     const puuid: u16 = @as(u16, @truncate(uuid));
     const pflag: MessageFlag = @enumFromInt(@as(std.meta.Tag(MessageFlag), @truncate(flag)));
     const pdecoder: MessageDecoder = @enumFromInt(@as(std.meta.Tag(MessageDecoder), @truncate(decoder)));
@@ -141,10 +152,19 @@ pub fn sendMessageFromServer(_: [*c]PyObject, args: [*c]PyObject) callconv(.c) [
     const preceiver = std.mem.span(receiver);
     const pfunc_name = std.mem.span(func_name);
     const preturn_result = if (return_result == 0) false else true;
+
+    // release GIL around the blocking TCP write.
+    const py_state = py.PyEval_SaveThread();
     const msgident = Server.sendMessage(pdata, puuid, pflag, pdecoder, pis_bytes, preturn_result, preceiver, pfunc_name, conn_num) catch |err| {
+        py.PyEval_RestoreThread(py_state);
+        if (converted) |s| py.Py_DECREF(s);
         PyErr_SetString(py.PyExc_ValueError, @errorName(err));
         return null;
     };
+    py.PyEval_RestoreThread(py_state);
+
+    if (converted) |s| py.Py_DECREF(s);
+
     const found_receiver: []const u8 = msgident.receiver;
     return Py_BuildValue("(Iks#)", msgident.uuid, @as(c_long, msgident.timestamp), found_receiver.ptr, found_receiver.len);
 }

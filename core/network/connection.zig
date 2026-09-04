@@ -15,7 +15,9 @@ const SynParser = WebConnection.SynParser;
 const ServerConnection = network.ServerConnection;
 const Allocator = std.mem.Allocator;
 const assert = std.debug.assert;
-const is_wasm = @import("../misc.zig").is_wasm;
+const misc    = @import("../misc.zig");
+const is_wasm = misc.is_wasm;
+const Mutex   = misc.Mutex;
 
 pub const ConnectionType = enum {
     ClientConnectionType,
@@ -93,11 +95,19 @@ pub fn Connection(comptime contype: ConnectionType) type {
         ctx: *anyopaque,
         op_table: OperationTable,
         allocator: Allocator,
-        wlock: bool = false,
+        /// Write-side mutex — prevents concurrent writes to the same socket.
+        /// Uses pthread_mutex_t (OS futex) instead of a busy-spin bool.
+        wlock: Mutex = .{},
         suspended: bool = false,
         is_websocket: bool = false,
         /// Remote peer address, set on accepted client connections.
         peer_addr: ?NetAddress = null,
+        /// Reference count for server-accepted connections shared between the
+        /// serverLoop thread and router onRequest/onResponse routing threads.
+        /// Initial value is 1 (the serverLoop owns the connection).  Callers
+        /// that need the connection to outlive a mutex release call retain()
+        /// before releasing the mutex and release() when done.
+        refcount: std.atomic.Value(u32) = std.atomic.Value(u32).init(1),
 
         pub const Self = @This();
         pub const Config = T.Config;
@@ -118,9 +128,24 @@ pub fn Connection(comptime contype: ConnectionType) type {
 
         pub fn write(self: *Self, data: []const u8) anyerror!void {
             comptime if (is_wasm or contype != .ClientConnectionType) @compileError("write() not available for this connection type");
-            while (@atomicRmw(bool, &self.wlock, .Xchg, true, .seq_cst)) {} // two threads should not write at the same time
-            defer assert(@atomicRmw(bool, &self.wlock, .Xchg, false, .seq_cst));
+            self.wlock.lock();
+            defer self.wlock.unlock();
             try self.op_table.write(self.ctx, data);
+        }
+
+        /// Increment the reference count.  Call before releasing a lock that
+        /// protects this connection pointer when another thread may destroy it.
+        pub fn retain(self: *Self) void {
+            _ = self.refcount.fetchAdd(1, .monotonic);
+        }
+
+        /// Decrement the reference count.  Frees all resources when the count
+        /// reaches zero (i.e. this was the last owner).
+        pub fn release(self: *Self) void {
+            if (self.refcount.fetchSub(1, .acq_rel) == 1) {
+                self.op_table.destroy(self.ctx);
+                self.allocator.destroy(self);
+            }
         }
 
         // ServerConnectionType: accept
@@ -203,11 +228,8 @@ pub fn Connection(comptime contype: ConnectionType) type {
             self.op_table.close(self.ctx);
         }
 
-        /// Free all Zig memory for this connection (ctx struct + outer Connection struct).
-        /// Must be called after close() and after all threads have finished accessing self.
         pub fn destroy(self: *Self) void {
-            self.op_table.destroy(self.ctx);
-            self.allocator.destroy(self);
+            self.release();
         }
 
         pub fn getAddr(self: *Self) ?NetAddress {

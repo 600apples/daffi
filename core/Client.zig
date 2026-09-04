@@ -64,6 +64,10 @@ const ClientEntry = struct {
     /// detect a dead connection before calling stopClient(), which frees the
     /// ClientEntry itself.
     disconnected: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// Handle for the dispatcher thread.  Valid only when has_dispatcher==true.
+    /// destroy() joins this thread instead of spinning on `disconnected`.
+    dispatcher_thread: std.Thread = undefined,
+    has_dispatcher: bool = false,
     /// Allocator used to create this entry; stored so stopClient can free it.
     alloc: Allocator,
 
@@ -118,21 +122,15 @@ const ClientEntry = struct {
             self.alloc.destroy(self);
             return;
         }
-        // Phase 1 — wait for the dispatcher thread to exit its receive loop.
-        if (!self.disconnected.load(.acquire)) {
-            log.debug("[{s}] destroy phase-1: closing connection, waiting for dispatcher", .{self.client_handler.app_name});
-            self.connection.close();
-            var spins: usize = 0;
-            while (!self.disconnected.load(.acquire)) {
-                const ts = std.c.timespec{ .sec = 0, .nsec = 1_000_000 };
-                _ = std.c.nanosleep(&ts, null);
-                spins += 1;
-                if (spins % 500 == 0)
-                    log.warn("[{s}] destroy phase-1: still waiting for dispatcher after ~{d}ms", .{ self.client_handler.app_name, spins });
+        if (self.has_dispatcher) {
+            if (!self.disconnected.load(.acquire)) {
+                log.debug("[{s}] destroy phase-1: closing connection, joining dispatcher", .{self.client_handler.app_name});
+                self.connection.close();
+            } else {
+                log.debug("[{s}] destroy phase-1: dispatcher already exited (disconnected=true)", .{self.client_handler.app_name});
             }
-            log.debug("[{s}] destroy phase-1: dispatcher exited after ~{d}ms", .{ self.client_handler.app_name, spins });
-        } else {
-            log.debug("[{s}] destroy phase-1: dispatcher already exited (disconnected=true)", .{self.client_handler.app_name});
+            self.dispatcher_thread.join();
+            log.debug("[{s}] destroy phase-1: dispatcher joined", .{self.client_handler.app_name});
         }
         // Phase 2 — safe to free: dispatcher is done, Python workers are joined.
         log.debug("[{s}] destroy phase-2: freeing connection + msgpool", .{self.client_handler.app_name});
@@ -308,7 +306,11 @@ pub fn init(allocator: std.mem.Allocator, app_name: []const u8, config: ClientCo
     // unique, and O(1) to resolve — just @ptrFromInt(conn_num).
     const conn_num: usize = @intFromPtr(cl_entry);
     log.debug("[{s}] client init  conn_num=0x{x}", .{ app_name, conn_num });
-    if (!is_wasm) _ = try std.Thread.spawn(.{}, messageDispatcher, .{conn_num});
+    if (!is_wasm) {
+        const th = try std.Thread.spawn(.{}, messageDispatcher, .{conn_num});
+        cl_entry.dispatcher_thread = th;
+        cl_entry.has_dispatcher = true;
+    }
     return conn_num;
 }
 
