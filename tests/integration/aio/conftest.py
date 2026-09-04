@@ -35,9 +35,14 @@ TIMEOUT = 30
 
 # ── low-level helpers ─────────────────────────────────────────────────────────
 
-def wait_for_port(port: int, timeout: float = 15.0) -> None:
+def wait_for_port(port: int, timeout: float = 15.0, proc: mp.Process | None = None) -> None:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
+        if proc is not None and proc.exitcode is not None:
+            raise RuntimeError(
+                f"Subprocess exited with code {proc.exitcode} before "
+                f"{HOST}:{port} opened (check for ImportError / crash in child)"
+            )
         try:
             with socket.create_connection((HOST, port), timeout=0.1):
                 return
@@ -190,7 +195,7 @@ def direct_service(free_port):
     """Start an AsyncService subprocess; yield its port; terminate on teardown."""
     proc = mp.Process(target=proc_service, args=(free_port,), daemon=True)
     proc.start()
-    wait_for_port(free_port)
+    wait_for_port(free_port, proc=proc)
     wait_for_members(free_port, {"integ-aio-service"})
     yield free_port
     quiet_kill(proc)
@@ -201,7 +206,7 @@ def router_with_worker(free_port):
     """Start AsyncRouter + one AsyncWorker subprocess; yield the router port."""
     rproc = mp.Process(target=proc_router, args=(free_port,), daemon=True)
     rproc.start()
-    wait_for_port(free_port)
+    wait_for_port(free_port, proc=rproc)
 
     wproc = mp.Process(
         target=proc_worker, args=(free_port, "integ-aio-worker"), daemon=True

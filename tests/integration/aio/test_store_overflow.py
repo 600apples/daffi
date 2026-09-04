@@ -24,6 +24,26 @@ from .conftest import HOST, TIMEOUT, wait_for_port, silence_subprocess, quiet_ki
 BUF_SIZE = 2048
 
 
+class _AsyncBarrier2:
+    """Two-party asyncio barrier compatible with Python 3.10.
+
+    ``asyncio.Barrier`` exists only on 3.11+; this mirrors the sync test's
+    ``threading.Barrier(2)`` so both hold_echo calls release together.
+    """
+
+    def __init__(self) -> None:
+        self._n = 0
+        self._lock = asyncio.Lock()
+        self._event = asyncio.Event()
+
+    async def wait(self) -> None:
+        async with self._lock:
+            self._n += 1
+            if self._n >= 2:
+                self._event.set()
+        await self._event.wait()
+
+
 def _proc_service_overflow(port: int) -> None:
     silence_subprocess()
 
@@ -31,7 +51,7 @@ def _proc_service_overflow(port: int) -> None:
         from daffi import callback
         from daffi.aio import AsyncService
 
-        _barrier = asyncio.Barrier(2)
+        _barrier = _AsyncBarrier2()
 
         @callback
         async def hold_echo(payload):
@@ -53,7 +73,7 @@ def _proc_service_overflow(port: int) -> None:
 def overflow_service(free_port):
     proc = mp.Process(target=_proc_service_overflow, args=(free_port,), daemon=True)
     proc.start()
-    wait_for_port(free_port)
+    wait_for_port(free_port, proc=proc)
     time.sleep(0.2)
     yield free_port
     quiet_kill(proc)

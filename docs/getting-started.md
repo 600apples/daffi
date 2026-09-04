@@ -9,7 +9,7 @@ pip install daffi
 pip install "daffi[msgpack]"
 ```
 
-Requires Python 3.9+. Linux and macOS are supported.
+Requires Python 3.10+. Linux and macOS are supported.
 
 ---
 
