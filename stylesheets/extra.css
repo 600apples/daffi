@@ -1,0 +1,65 @@
+* {
+    font-family: Verdana, Geneva, Tahoma, sans-serif !important;
+}
+
+/* ── Light-mode pastel tint ──────────────────────────────────────────────────
+   The default Material scheme uses pure white.  Override the background
+   variables with a very soft lavender-gray so the page feels warmer without
+   losing contrast on text.
+   ──────────────────────────────────────────────────────────────────────────── */
+[data-md-color-scheme="default"] {
+    --md-default-bg-color:          #e8e8f0;   /* page canvas */
+    --md-default-bg-color--light:   #edecf5;   /* hover / mild highlight */
+    --md-default-bg-color--lighter: #f2f2f8;   /* subtle inset areas */
+    --md-default-bg-color--lightest:#f7f7fb;   /* nearly white for cards */
+
+    --md-code-bg-color:             #dedeed;   /* inline & fenced code */
+
+    /* Sidebar and nav strip */
+    --md-sidebar-bg-color:          #e4e4ed;
+
+    /* Table stripe */
+    --md-typeset-table-color:       rgba(99, 99, 180, 0.07);
+}
+
+header {
+background: linear-gradient(51deg, rgb(225, 225, 242) 0%, rgba(53,53,68,1) 70%);
+}
+
+header:after{
+    z-index:-1;
+    position:absolute;
+	bottom: 0;
+	right: 0;
+    content: url('../images/bg.jpg');
+	transform: scale(2, 1.005);
+    opacity:0.15;
+}
+
+.hll {
+    background: rgb(237,237,246) !important;
+}
+
+.md-main {
+	width: 99%;
+}
+
+.md-search__input {
+    border: 1px solid #2b8ff3;
+}
+
+.admonition.info {
+    background-color: #6f6ff1 !important;
+    color: white !important;
+}
+
+.admonition-title {
+    background-color: #b3b3f1d6 !important;
+}
+
+a[href$=".png"]>img {
+  clear: both;
+  float: left;
+  width: 50%;
+  margin: 0 3rem 0.4rem 0.4rem;
+}

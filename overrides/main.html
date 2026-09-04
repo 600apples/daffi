@@ -1,0 +1,23 @@
+{% extends "base.html" %}
+
+{% block extrahead %}
+{{ super() }}
+<script>
+  /*
+   * Force dark palette (index 0) as the default on first visit.
+   *
+   * Timing: Material's base.html includes partials/javascripts/base.html at
+   * line 79, which defines __md_get/__md_set.  This extrahead block is at
+   * line 83 — so __md_get/__md_set are already available here.
+   *
+   * The palette JS (partials/javascripts/palette.html) runs later, inside
+   * <body> via the header partial, so it reads whatever we write here.
+   *
+   * Material scopes its localStorage keys as  pathname + "." + key, e.g.
+   * "/.__palette".  Using __md_get/__md_set ensures we match that scoping.
+   */
+  if (!__md_get("__palette")) {
+    __md_set("__palette", { index: 0 });
+  }
+</script>
+{% endblock %}
