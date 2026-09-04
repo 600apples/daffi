@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import asyncio
 import multiprocessing as mp
-import time
 
 import pytest
 
@@ -173,32 +172,39 @@ class TestMemberRemovedEventAsync:
         from daffi.aio import AsyncClient
 
         removed: list[str] = []
+        joined = asyncio.Event()
         event = asyncio.Event()
 
         client = AsyncClient(app_name="evt-watcher-removed", host=HOST, port=router_port)
         conn = await client.connect()
 
+        @conn.on_member_added
+        def _on_added(name: str):
+            if name == "evt-leaver":
+                joined.set()
+
         @conn.on_member_removed
         def _on_removed(name: str):
-            removed.append(name)
-            event.set()
+            if name == "evt-leaver":
+                removed.append(name)
+                event.set()
 
         proc = mp.Process(target=_worker_proc, args=(router_port, "evt-leaver"), daemon=True)
         proc.start()
-        await asyncio.sleep(0.5)
-        proc.terminate()
-        proc.join(timeout=5)
-
         try:
+            await asyncio.wait_for(joined.wait(), timeout=_EVENT_TIMEOUT)
+            quiet_kill(proc)
             await asyncio.wait_for(event.wait(), timeout=_EVENT_TIMEOUT)
             assert "evt-leaver" in removed
         finally:
             await client.stop()
+            quiet_kill(proc)
 
     async def test_added_not_called_on_remove(self, router_port):
         from daffi.aio import AsyncClient
 
-        added_called = [False]
+        added: list[str] = []
+        joined = asyncio.Event()
         removed_event = asyncio.Event()
 
         client = AsyncClient(app_name="evt-no-add-on-rm", host=HOST, port=router_port)
@@ -206,22 +212,24 @@ class TestMemberRemovedEventAsync:
 
         @conn.on_member_added
         def _on_added(name: str):
-            # Only the joiner itself triggers this; filter out the initial join.
-            pass
+            if name == "evt-rm-only":
+                added.append(name)
+                joined.set()
 
         @conn.on_member_removed
         def _on_removed(name: str):
-            removed_event.set()
+            if name == "evt-rm-only":
+                removed_event.set()
 
         proc = mp.Process(target=_worker_proc, args=(router_port, "evt-rm-only"), daemon=True)
         proc.start()
-        await asyncio.sleep(0.3)
-        added_called[0] = False  # reset after initial join
-        proc.terminate()
-        proc.join(timeout=5)
-
         try:
+            await asyncio.wait_for(joined.wait(), timeout=_EVENT_TIMEOUT)
+            added.clear()  # discard the join event; only care about post-kill
+            quiet_kill(proc)
             await asyncio.wait_for(removed_event.wait(), timeout=_EVENT_TIMEOUT)
-            assert not added_called[0], "on_member_added fired on a removal event"
+            await asyncio.sleep(0.3)
+            assert added == [], f"on_member_added fired on a removal event: {added}"
         finally:
             await client.stop()
+            quiet_kill(proc)
