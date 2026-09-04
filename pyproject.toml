@@ -89,6 +89,9 @@ before-all = """
     python setup.py ensure_zig --symlink /usr/local/bin/zig
 """
 
+# Drop any host-built .so leftovers so auditwheel never sees a newer glibc ABI.
+before-build = "rm -rf build"
+
 repair-wheel-command = "auditwheel repair -w {dest_dir} {wheel}"
 
 # ── macOS ─────────────────────────────────────────────────────────────────────
