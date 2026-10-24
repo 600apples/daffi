@@ -56,6 +56,60 @@ from setuptools.command.build_ext import build_ext
 _ZIG_VERSION = "0.16.0"
 _OPENSSL_VERSION = os.environ.get("DAFFI_OPENSSL_VERSION", "3.4.1")
 
+# SHA-256 of every archive this script downloads and then executes / links
+# against.  Source: https://ziglang.org/download/index.json and the
+# ``.tar.gz.sha256`` files published with each OpenSSL GitHub release.
+# Bump these together with the versions above.
+_ZIG_SHA256 = {
+    ("aarch64", "macos"):   "b23d70deaa879b5c2d486ed3316f7eaa53e84acf6fc9cc747de152450d401489",
+    ("x86_64",  "macos"):   "0387557ed1877bc6a2e1802c8391953baddba76081876301c522f52977b52ba7",
+    ("aarch64", "linux"):   "ea4b09bfb22ec6f6c6ceac57ab63efb6b46e17ab08d21f69f3a48b38e1534f17",
+    ("x86_64",  "linux"):   "70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00",
+    ("x86_64",  "windows"): "68659eb5f1e4eb1437a722f1dd889c5a322c9954607f5edcf337bc3684a75a7e",
+}
+_OPENSSL_SHA256 = {
+    "3.4.1": "002a2d6b30b58bf4bea46c43bdd96365aaf8daa6c428782aa4feee06da197df3",
+}
+
+
+def _sha256_of(path: str) -> str:
+    import hashlib
+
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _verify_sha256(path: str, expected: "str | None", what: str) -> None:
+    """Abort (and delete *path*) unless it matches the pinned SHA-256."""
+    if not expected:
+        raise RuntimeError(
+            f"No pinned SHA-256 for {what}; refusing to use an unverified download. "
+            "Install it yourself (and put it on PATH / set OPENSSL_DIR), or add "
+            "its checksum to setup.py."
+        )
+    actual = _sha256_of(path)
+    if actual.lower() != expected.lower():
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        raise RuntimeError(
+            f"SHA-256 mismatch for {what}: expected {expected}, got {actual}. "
+            "The download was corrupted or tampered with and has been deleted."
+        )
+
+
+def _safe_extractall(tf, dest: str) -> None:
+    """``extractall`` that refuses path traversal / special files when the
+    running Python supports extraction filters (3.12+, backported to 3.9+)."""
+    if isinstance(tf, tarfile.TarFile) and hasattr(tarfile, "data_filter"):
+        tf.extractall(dest, filter="data")
+    else:
+        tf.extractall(dest)
+
 
 def _ensure_zig() -> str:
     """Return the path to a ``zig`` executable.
@@ -93,6 +147,8 @@ def _ensure_zig() -> str:
         print(f"setup.py: reusing cached Zig at {zig_exe!r}")
         return zig_exe
 
+    zig_sha = _ZIG_SHA256.get((arch, os_name)) if _ZIG_VERSION == "0.16.0" else None
+
     if sys.platform == "win32":
         archive_name = f"{dir_name}.zip"
         url     = f"https://ziglang.org/download/{_ZIG_VERSION}/{archive_name}"
@@ -104,6 +160,7 @@ def _ensure_zig() -> str:
         except Exception:
             subprocess.check_call(["curl", "-fsSL", url, "-o", archive])
 
+        _verify_sha256(archive, zig_sha, f"Zig {_ZIG_VERSION} ({arch}-{os_name})")
         print(f"setup.py: extracting {archive!r} …")
         import zipfile
         with zipfile.ZipFile(archive, "r") as zf:
@@ -119,9 +176,10 @@ def _ensure_zig() -> str:
         except Exception:
             subprocess.check_call(["curl", "-fsSL", url, "-o", archive])
 
+        _verify_sha256(archive, zig_sha, f"Zig {_ZIG_VERSION} ({arch}-{os_name})")
         print(f"setup.py: extracting {archive!r} …")
         with tarfile.open(archive, "r:xz") as tf:
-            tf.extractall(tempfile.gettempdir())
+            _safe_extractall(tf, tempfile.gettempdir())
 
     os.remove(archive)
 
@@ -299,10 +357,16 @@ def _ensure_openssl_unix():
     if not os.path.isdir(src_dir):
         if not os.path.isfile(tarball):
             _download_file(url, tarball)
+        _verify_sha256(
+            tarball,
+            os.environ.get("DAFFI_OPENSSL_SHA256") or _OPENSSL_SHA256.get(_OPENSSL_VERSION),
+            f"OpenSSL {_OPENSSL_VERSION} source tarball "
+            "(set DAFFI_OPENSSL_SHA256 when overriding DAFFI_OPENSSL_VERSION)",
+        )
         print(f"setup.py: extracting {tarball!r} …")
         os.makedirs(src_root, exist_ok=True)
         with tarfile.open(tarball, "r:gz") as tf:
-            tf.extractall(src_root)
+            _safe_extractall(tf, src_root)
 
     if not os.path.isdir(src_dir):
         raise RuntimeError(
@@ -372,7 +436,7 @@ def _ensure_openssl_windows():
     os.makedirs(extract_root, exist_ok=True)
     print(f"setup.py: extracting {archive!r} …")
     with tarfile.open(archive, "r:gz") as tf:
-        tf.extractall(extract_root)
+        _safe_extractall(tf, extract_root)
 
     top = next(
         os.path.join(extract_root, name)

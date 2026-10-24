@@ -16,22 +16,10 @@ const HandlerMode = handlers.HandlerMode;
 
 const allocator = std.heap.c_allocator;
 
-const ThreadArray = struct {
-    buffer: [256]?std.Thread = [_]?std.Thread{null} ** 256,
-    len: usize = 0,
-
-    pub fn append(self: *@This(), thread: std.Thread) !void {
-        if (self.len >= 256) return error.Overflow;
-        self.buffer[self.len] = thread;
-        self.len += 1;
-    }
-
-    pub fn get(self: *const @This(), idx: usize) std.Thread {
-        return self.buffer[idx].?;
-    }
-};
-
-var serverHandlerThreads: ?ThreadArray = null;
+/// Dispatcher thread per slot.  Only touched while the GIL is held by the
+/// calling Python thread (startServer) or by the one thread that owns the slot's
+/// lifecycle (stopServer), so no extra locking is needed.
+var serverHandlerThreads: [256]?std.Thread = [_]?std.Thread{null} ** 256;
 
 /// Bind to host:port, start the server dispatcher thread, and return a
 /// connection handle (conn_num).  mode: 0 = Router, 1 = Service.
@@ -45,27 +33,40 @@ pub fn startServer(_: [*c]PyObject, args: [*c]PyObject) callconv(.c) [*c]PyObjec
     var cert_file: [*:0]u8 = undefined;
     var key_file: [*:0]u8 = undefined;
     if (!(py.PyArg_ParseTuple(args, "slpspss", &host, &port, &mode, &app_name, &tls_enabled, &cert_file, &key_file) != 0)) return Py_BuildValue("");
+    // Validate everything that comes from Python: an out-of-range value used to
+    // hit `@intCast`/`unreachable`, i.e. abort the whole interpreter.
     const pmode: HandlerMode = switch (mode) {
         0 => .Router,
         1 => .Service,
-        else => unreachable,
+        else => {
+            PyErr_SetString(py.PyExc_ValueError, "invalid server mode");
+            return null;
+        },
     };
+    if (port < 0 or port > std.math.maxInt(u16)) {
+        PyErr_SetString(py.PyExc_ValueError, "port must be in range 0-65535");
+        return null;
+    }
     const pport: u16 = @intCast(port);
     const phost = std.mem.span(host);
     const papp_name = std.mem.span(app_name);
     const ptls = tls_enabled != 0;
     const pcert_file = std.mem.span(cert_file);
     const pkey_file = std.mem.span(key_file);
-    if (serverHandlerThreads == null) {
-        serverHandlerThreads = ThreadArray{};
-    }
-    const conn_num: usize = @rem(serverHandlerThreads.?.len, 256);
+
+    const conn_num = Server.acquireSlot() orelse {
+        PyErr_SetString(py.PyExc_ValueError, "too many servers started in this process (limit 256)");
+        return null;
+    };
     const cfg = @import("../network/ServerConnection.zig").Config{
         .host = phost, .port = pport, .mode = pmode,
         .tls = ptls, .cert_file = pcert_file, .key_file = pkey_file,
     };
-    const handler_thread = std.Thread.spawn(.{}, Server.messageDispatcher, .{ allocator, papp_name, cfg, conn_num }) catch return Py_BuildValue("");
-    serverHandlerThreads.?.append(handler_thread) catch return Py_BuildValue("");
+    const handler_thread = std.Thread.spawn(.{}, Server.messageDispatcher, .{ allocator, papp_name, cfg, conn_num }) catch {
+        Server.releaseSlot(conn_num);
+        return Py_BuildValue("");
+    };
+    serverHandlerThreads[conn_num] = handler_thread;
     // Block until the dispatcher thread has either finished initialisation
     // (serverReady = true) or failed (serverFailed = true).
     // 100 µs × 100 000 = 10 s maximum wait.
@@ -77,37 +78,41 @@ pub fn startServer(_: [*c]PyObject, args: [*c]PyObject) callconv(.c) [*c]PyObjec
     // Signal failure to Python by raising ValueError("ConnectionRefused")
     // so system_exception_handler can catch and enrich the message.
     if (Server.hasFailed(conn_num)) {
+        // A failed dispatcher has already unwound, so this join returns at once.
+        handler_thread.join();
+        serverHandlerThreads[conn_num] = null;
+        Server.releaseSlot(conn_num);
+        PyErr_SetString(py.PyExc_ValueError, "ConnectionRefused");
+        return null;
+    }
+    if (!Server.isReady(conn_num)) {
+        // Still initialising after 10 s (e.g. a hung name lookup).  Joining could
+        // block the interpreter indefinitely, so abandon the thread (and its
+        // slot) instead.
+        handler_thread.detach();
+        serverHandlerThreads[conn_num] = null;
         PyErr_SetString(py.PyExc_ValueError, "ConnectionRefused");
         return null;
     }
     return Py_BuildValue("k", @as(c_ulong, conn_num));
 }
 
-/// Signal the server identified by conn_num to stop and release all
-/// associated native resources.
+/// Stop the server identified by conn_num and release every native resource
+/// it owns: the listening socket, all accepted connections, their threads and
+/// the message pool.  Blocks (with the GIL released) until that is done, so
+/// the port can be rebound as soon as this returns.
 pub fn stopServer(_: [*c]PyObject, args: [*c]PyObject) callconv(.c) [*c]PyObject {
     var conn_num: usize = undefined;
     if (!(py.PyArg_ParseTuple(args, "k", &conn_num) != 0)) return Py_BuildValue("");
+    if (conn_num >= serverHandlerThreads.len) return Py_BuildValue("");
+    const thread = serverHandlerThreads[conn_num] orelse return Py_BuildValue("");
+    serverHandlerThreads[conn_num] = null;
+
+    const py_state = py.PyEval_SaveThread();
     Server.destroyHandler(conn_num);
-    return Py_BuildValue("");
-}
-
-/// Block the calling thread until the server dispatcher thread for conn_num
-/// has fully exited.  Call after stopServer().
-pub fn joinServer(_: [*c]PyObject, args: [*c]PyObject) callconv(.c) [*c]PyObject {
-    var conn_num: usize = undefined;
-    if (!(py.PyArg_ParseTuple(args, "k", &conn_num) != 0)) return Py_BuildValue("");
-    serverHandlerThreads.?.get(conn_num).join();
-    return Py_BuildValue("");
-}
-
-/// Detach the server dispatcher thread for conn_num so it runs independently
-/// and its resources are reclaimed automatically when it exits.
-/// After detaching, joinServer() must not be called.
-pub fn detachServer(_: [*c]PyObject, args: [*c]PyObject) callconv(.c) [*c]PyObject {
-    var conn_num: usize = undefined;
-    if (!(py.PyArg_ParseTuple(args, "k", &conn_num) != 0)) return Py_BuildValue("");
-    serverHandlerThreads.?.get(conn_num).detach();
+    thread.join();
+    Server.releaseSlot(conn_num);
+    py.PyEval_RestoreThread(py_state);
     return Py_BuildValue("");
 }
 
@@ -146,8 +151,16 @@ pub fn sendMessageFromServer(_: [*c]PyObject, args: [*c]PyObject) callconv(.c) [
     const pdata = raw_buf[0..@as(usize, @intCast(size))];
 
     const puuid: u16 = @as(u16, @truncate(uuid));
-    const pflag: MessageFlag = @enumFromInt(@as(std.meta.Tag(MessageFlag), @truncate(flag)));
-    const pdecoder: MessageDecoder = @enumFromInt(@as(std.meta.Tag(MessageDecoder), @truncate(decoder)));
+    const pflag = std.enums.fromInt(MessageFlag, flag) orelse {
+        if (converted) |s| py.Py_DECREF(s);
+        PyErr_SetString(py.PyExc_ValueError, "invalid message flag");
+        return null;
+    };
+    const pdecoder = std.enums.fromInt(MessageDecoder, decoder) orelse {
+        if (converted) |s| py.Py_DECREF(s);
+        PyErr_SetString(py.PyExc_ValueError, "invalid message decoder");
+        return null;
+    };
     const pis_bytes = if (is_bytes == 0) false else true;
     const preceiver = std.mem.span(receiver);
     const pfunc_name = std.mem.span(func_name);

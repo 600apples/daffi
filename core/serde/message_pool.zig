@@ -12,6 +12,10 @@ const MessageFlag = serde.MessageFlag;
 const MessageDecoder = serde.MessageDecoder;
 const print = std.debug.print;
 
+/// First allocation made for an incoming message body.  Larger messages grow
+/// geometrically as data arrives.
+const INITIAL_RECV_CHUNK: usize = 64 * 1024;
+
 pub const StreamReadError = error{
     IncompleteMessage,
     EOF,
@@ -92,16 +96,31 @@ pub const MessagePool = struct {
         _ = try writer.write(&fulfillment);
     }
 
+    /// Receive one framed message from `reader`.
+    ///
+    /// The header comes from an untrusted peer, so it is validated before it is
+    /// used (`Header.parse`) and the payload buffer grows with the bytes that
+    /// actually arrive rather than being sized up-front from the claimed
+    /// `msg_len`.  Otherwise any peer that can reach the port could pin up to
+    /// 32 MiB per connection just by sending a 9-byte header.
     pub fn receiveMessage(self: *Self, reader: anytype) !*Message {
         var header_buf: [serde.HEADER_SIZE]u8 = undefined;
         try mustRead(reader, &header_buf);
-        const header = Header.fromBytes(&header_buf);
-        const msg_len = header.msg_len + header_buf.len;
-        const data_buf = try self.allocator.alloc(u8, msg_len);
-        errdefer self.allocator.free(data_buf);
-        @memcpy(data_buf[0..header_buf.len], &header_buf);
-        try mustRead(reader, data_buf[header_buf.len..]);
-        return try Message.create(self.allocator, header, data_buf);
+        const header = try Header.parse(&header_buf);
+        const total: usize = @as(usize, serde.HEADER_SIZE) + header.msg_len;
+
+        var buf = try self.allocator.alloc(u8, @min(total, INITIAL_RECV_CHUNK));
+        errdefer self.allocator.free(buf);
+        @memcpy(buf[0..header_buf.len], &header_buf);
+        var filled: usize = header_buf.len;
+        while (filled < total) {
+            if (filled == buf.len) {
+                buf = try self.allocator.realloc(buf, @min(total, buf.len * 2));
+            }
+            try mustRead(reader, buf[filled..]);
+            filled = buf.len;
+        }
+        return try Message.create(self.allocator, header, buf);
     }
 
     pub fn receiveWsMessage(self: *Self, reader: anytype) !?*Message {
@@ -110,7 +129,8 @@ pub const MessagePool = struct {
     }
 
     pub fn buildWsMessage(self: *Self, data: []const u8) !*Message {
-        const header = Header.fromBytes(data[0..serde.HEADER_SIZE]);
+        const header = try Header.parse(data);
+        if (data.len != @as(usize, serde.HEADER_SIZE) + header.msg_len) return error.LengthMismatch;
         const data_buf = try self.allocator.dupe(u8, data);
         errdefer self.allocator.free(data_buf);
         return try Message.create(self.allocator, header, data_buf);

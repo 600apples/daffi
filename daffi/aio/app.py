@@ -108,8 +108,8 @@ class AsyncServerMixin:
             conn_info=(self.host, self.port, self.unix_sock_path),
         ):
             self._conn_num = dfcore.startServer(
-                self.host,
-                self.port,
+                self._native_host,
+                self._native_port,
                 self.server_mode,
                 self.app_name,
                 self.tls,
@@ -127,13 +127,20 @@ class AsyncServerMixin:
     async def stop(self, *_, **__) -> None:
         """Stop the server and release resources."""
         self._unregister_executor_subscriber()
-        if not self._stop_event.is_set():
-            if self._conn_num is not None:
-                dfcore.stopServer(self._conn_num)
-                self._conn_num = None
-        self._stop_event.set()
-        if self._task_dispatcher:
-            await self._task_dispatcher.stop_for_connection(self)
+        async with self._stop_lock:
+            if self._stop_event.is_set():
+                return
+            # Stop the dispatcher first, while ``_conn_num`` is still set: it
+            # needs it to find the lifecycle fd that wakes the poller.
+            try:
+                conn_num = self._conn_num
+                if self._task_dispatcher:
+                    await self._task_dispatcher.stop_for_connection(self)
+                if conn_num is not None:
+                    dfcore.stopServer(conn_num)
+                    self._conn_num = None
+            finally:
+                self._stop_event.set()
 
 
 # ---------------------------------------------------------------------------
@@ -281,8 +288,8 @@ class AsyncClient(AsyncApplication):
         self._task_dispatcher._start_workers()
 
         self._conn_num = dfcore.startClient(
-            self.host,
-            self.port,
+            self._native_host,
+            self._native_port,
             self.app_name,
             self.tls,
             self.ca_file,

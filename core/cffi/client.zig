@@ -25,6 +25,10 @@ pub fn startClient(_: [*c]PyObject, args: [*c]PyObject) callconv(.c) [*c]PyObjec
     var tls_enabled: c_int = 0;
     var ca_file: [*:0]u8 = undefined;
     if (!(py.PyArg_ParseTuple(args, "slsps", &host, &port, &app_name, &tls_enabled, &ca_file) != 0)) return Py_BuildValue("");
+    if (port < 0 or port > std.math.maxInt(u16)) {
+        PyErr_SetString(py.PyExc_ValueError, "port must be in range 0-65535");
+        return null;
+    }
     const pport: u16 = @intCast(port);
     const phost = std.mem.span(host);
     const papp_name = std.mem.span(app_name);
@@ -41,7 +45,7 @@ pub fn startClient(_: [*c]PyObject, args: [*c]PyObject) callconv(.c) [*c]PyObjec
 pub fn stopClient(_: [*c]PyObject, args: [*c]PyObject) callconv(.c) [*c]PyObject {
     var conn_num: usize = undefined;
     if (!(py.PyArg_ParseTuple(args, "k", &conn_num) != 0)) return Py_BuildValue("");
-    Client.desctroyClient(conn_num) catch return Py_BuildValue("");
+    Client.destroyClient(conn_num) catch return Py_BuildValue("");
     return Py_BuildValue("");
 }
 
@@ -79,8 +83,16 @@ pub fn sendMessageFromClient(_: [*c]PyObject, args: [*c]PyObject) callconv(.c) [
     const pdata = raw_buf[0..@as(usize, @intCast(size))];
 
     const puuid: u16 = @as(u16, @truncate(uuid));
-    const pflag: MessageFlag = @enumFromInt(@as(std.meta.Tag(MessageFlag), @truncate(flag)));
-    const pdecoder: MessageDecoder = @enumFromInt(@as(std.meta.Tag(MessageDecoder), @truncate(decoder)));
+    const pflag = std.enums.fromInt(MessageFlag, flag) orelse {
+        if (converted) |s| py.Py_DECREF(s);
+        PyErr_SetString(py.PyExc_ValueError, "invalid message flag");
+        return null;
+    };
+    const pdecoder = std.enums.fromInt(MessageDecoder, decoder) orelse {
+        if (converted) |s| py.Py_DECREF(s);
+        PyErr_SetString(py.PyExc_ValueError, "invalid message decoder");
+        return null;
+    };
     const pis_bytes = if (is_bytes == 0) false else true;
     const preceiver = std.mem.span(receiver);
     const pfunc_name = std.mem.span(func_name);

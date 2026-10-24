@@ -43,6 +43,8 @@ allocator: Allocator,
 /// Non-null when the WebSocket connection runs over TLS (WSS).
 /// The ssl object is owned by this WebConnection and freed in close().
 ssl: ?*tls_impl.SslConn = null,
+/// Set by close() once the socket has been shut down (see ClientConnection).
+interrupted: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
 pub const Config = struct {};
 
@@ -57,6 +59,7 @@ pub fn init(allocator: Allocator, stream: net.Stream, addr: net.Address, _: Conf
     self.stream = stream;
     self.addr = addr;
     self.ssl = null;
+    self.interrupted = std.atomic.Value(bool).init(false);
     self.buffer_pool = try buffer.Pool.init(allocator, 32, 32768);
     self.buffer_provider = buffer.Provider.init(allocator, &self.buffer_pool, 32768);
     self.reader = try Reader.init(5120, serde.MAX_BYTES_MESSAGE, &self.buffer_provider);
@@ -72,6 +75,7 @@ pub fn initWithTls(allocator: Allocator, stream: net.Stream, addr: net.Address, 
     self.stream = stream;
     self.addr = addr;
     self.ssl = ssl;
+    self.interrupted = std.atomic.Value(bool).init(false);
     self.buffer_pool = try buffer.Pool.init(allocator, 32, 32768);
     self.buffer_provider = buffer.Provider.init(allocator, &self.buffer_pool, 32768);
     self.reader = try Reader.init(5120, serde.MAX_BYTES_MESSAGE, &self.buffer_provider);
@@ -195,7 +199,7 @@ fn writeClose(self: *WebConnection) !void {
 
 fn writeCloseWithCode(self: *WebConnection, code: u16) !void {
     var buf: [2]u8 = undefined;
-    std.mem.writeInt(u16, &buf, code, .Big);
+    std.mem.writeInt(u16, &buf, code, .big);
     return self.writeFrame(.close, &buf);
 }
 
@@ -231,23 +235,31 @@ fn writeFrame(self: *WebConnection, op_code: WebConnection.OpCode, data: []const
     }
 }
 
+/// Free the reader, buffer pool and the struct.  Does not touch the socket or
+/// TLS session — see destroy().
 pub fn deinit(self: *WebConnection) void {
     self.reader.deinit();
     self.buffer_pool.deinit();
     self.allocator.destroy(self);
 }
 
+/// Interrupt the connection (see ClientConnection.close): shut the socket down
+/// so blocked readers/writers return, but free nothing.  Idempotent.
 pub fn close(ctx: *anyopaque) void {
     const self: *WebConnection = @ptrCast(@alignCast(ctx));
+    self.interrupted.store(true, .release);
+    self.stream.shutdown();
+}
+
+/// Release the TLS session, the socket descriptor and all memory.  Called once,
+/// when the last reference to the connection is dropped.
+pub fn destroy(ctx: *anyopaque) void {
+    const self: *WebConnection = @ptrCast(@alignCast(ctx));
     if (self.ssl) |ssl| {
-        tls_impl.sslClose(ssl);
+        tls_impl.sslClose(ssl, !self.interrupted.load(.acquire));
         self.ssl = null;
     }
     self.stream.close();
-}
-
-pub fn destroy(ctx: *anyopaque) void {
-    const self: *WebConnection = @ptrCast(@alignCast(ctx));
     self.deinit();
 }
 
@@ -333,7 +345,16 @@ pub const SynParser = struct {
     pub fn tryWebSocket(self: *SynParser, stream: anytype) !bool {
         var buf: [serde.HEADER_SIZE]u8 = undefined;
 
-        _ = try stream.read(&buf);
+        // A single read() may return fewer than HEADER_SIZE bytes; the rest of
+        // `buf` would then be uninitialised stack memory and the "GET"/SYN
+        // decision would be made on garbage.  Insist on the full probe, and
+        // treat an early close as a failed connection attempt.
+        var got: usize = 0;
+        while (got < buf.len) {
+            const n = try stream.read(buf[got..]);
+            if (n == 0) return error.EOF;
+            got += n;
+        }
         if (ascii.startsWithIgnoreCase(&buf, "get")) {
             var handshake_state = try self.handshake_pool.acquire();
             defer self.handshake_pool.release(handshake_state);

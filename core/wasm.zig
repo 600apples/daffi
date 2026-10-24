@@ -141,7 +141,12 @@ export fn parseAndStoreMessage(data: [*:0]const u8, len: u32, conn_num: u32) voi
     var client_handler = entry.client_handler;
     const connection = entry.connection;
     var msg = entry.msgpool.buildWsMessage(actual_data) catch throwError("failed to build framed message\n");
-    defer msg.deinit();
+    // The handlers below may take ownership of `msg` (they set `consumed`) by
+    // parking it in the client's message store / task queue.  Freeing it here as
+    // well, as an unconditional `defer msg.deinit()` did, left a dangling
+    // pointer in that container and a double free when it was torn down.
+    var owned = true;
+    defer if (owned) msg.deinit();
     const uuid = msg.getUuid();
     const payload = msg.getData();
     switch (msg.getFlag()) {
@@ -149,13 +154,17 @@ export fn parseAndStoreMessage(data: [*:0]const u8, len: u32, conn_num: u32) voi
             const is_own = std.mem.eql(u8, msg.getTransmitter(), client_handler.app_name);
             if (is_own) {
                 // Own handshake response: clear + full rebuild, then resolve the JS promise.
-                // wasm owns the message (defer deinit above), so consumed is a dummy.
                 var consumed = false;
                 client_handler.onHandshake(connection, msg, &consumed) catch |err| {
                     consoleLog("failed to handle own handshake: {any}\n", .{err});
                     throwError("failed to handle own handshake\n");
                 };
                 _storeMessage(payload.ptr, payload.len, uuid, false, @intFromEnum(msg.getDecoder()));
+                if (consumed) {
+                    // JS has its copy of the payload now; reclaim the store's.
+                    owned = false;
+                    if (client_handler.msg_store.fetch(uuid)) |stored| stored.deinit();
+                }
             } else {
                 // Broadcast from another worker's reconnect: add-only so a stale
                 // broadcast arriving out-of-order cannot wipe out freshly added members.
@@ -170,12 +179,18 @@ export fn parseAndStoreMessage(data: [*:0]const u8, len: u32, conn_num: u32) voi
             // Update local chan_mapper before notifying JS event handlers so
             // that any RPC triggered from within an event handler sees the
             // correct (already-updated) member list.
-            // wasm owns the message (defer deinit above), so consumed is a dummy.
             var consumed = false;
             client_handler.onEvent(connection, msg, &consumed) catch {};
             _triggerEvent(payload.ptr, payload.len);
+            if (consumed) {
+                // onEvent queued it for Python; nothing consumes that queue in
+                // wasm, so take it back out and free it.
+                owned = false;
+                if (client_handler.tasks_queue.getMessageFromQueue()) |queued| queued.deinit();
+            }
         },
-        else => unreachable,
+        // REQUEST (and anything else) is not meaningful to a browser client.
+        else => {},
     }
 }
 
@@ -188,5 +203,5 @@ export fn initClient(data: [*:0]const u8) usize {
 /// Release the client slot allocated by initClient.  Must be called on
 /// reconnect so that old slots do not accumulate in the 512-entry table.
 export fn stopClient(conn_num: usize) void {
-    Client.desctroyClient(conn_num) catch {};
+    Client.destroyClient(conn_num) catch {};
 }

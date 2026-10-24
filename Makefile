@@ -13,6 +13,15 @@ test:  ## Run unit + integration tests (requires built dfcore extension)
 test-unit:  ## Run unit tests only — fast, no server subprocess required
 	$(PYTEST) tests/unit $(PYTEST_OPTS)
 
+.PHONY: test-zig
+test-zig:  ## Run the Zig unit tests (needs Python headers + a shared libpython and OpenSSL libs)
+	@PYINC=$$(python3 -c "import sysconfig;print(sysconfig.get_paths()['include'])"); \
+	PYLIB=$$(python3 -c "import sysconfig;print(sysconfig.get_config_var('LIBDIR'))"); \
+	PYVER=$$(python3 -c "import sysconfig;print(sysconfig.get_config_var('LDVERSION'))"); \
+	SSL=$${OPENSSL_DIR:-$$(brew --prefix openssl@3 2>/dev/null || echo /usr)}; \
+	zig test core/core.zig -lc -L$$PYLIB -lpython$$PYVER -rpath $$PYLIB -I $$PYINC \
+	    -I $$SSL/include $$SSL/lib/libssl.a $$SSL/lib/libcrypto.a
+
 .PHONY: test-integration
 test-integration:  ## Run integration tests — spawns Service / Router subprocesses
 	$(PYTEST) tests/integration $(PYTEST_OPTS)

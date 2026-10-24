@@ -62,7 +62,8 @@ pub const Handshake = struct {
 
     pub fn parse(buf: []u8, headers: *KeyValue) !Handshake {
         var data = buf;
-        const request_line_end = mem.indexOfScalar(u8, data, '\r') orelse unreachable;
+        const request_line_end = mem.indexOfScalar(u8, data, '\r') orelse return error.InvalidRequestLine;
+        if (request_line_end + 2 > data.len) return error.InvalidRequestLine;
         var request_line = data[0..request_line_end];
 
         if (!ascii.endsWithIgnoreCase(request_line, "http/1.1")) {
@@ -77,7 +78,8 @@ pub const Handshake = struct {
         data = data[request_line_end + 2 ..];
 
         while (data.len > 4) {
-            const index = mem.indexOfScalar(u8, data, '\r') orelse unreachable;
+            const index = mem.indexOfScalar(u8, data, '\r') orelse return error.InvalidHeader;
+            if (index + 2 > data.len) return error.InvalidHeader;
             const separator = mem.indexOfScalar(u8, data[0..index], ':') orelse return error.InvalidHeader;
 
             const name = mem.trim(u8, toLower(data[0..separator]), &ascii.whitespace);
@@ -118,6 +120,9 @@ pub const Handshake = struct {
         // us some leeway into parsing it
         const separator = mem.indexOfScalar(u8, request_line, ' ') orelse return error.InvalidRequestLine;
         const method = request_line[0..separator];
+        // "GET HTTP/1.1" (no URL) makes `len - 9 < separator + 1`; slicing that
+        // used to be an out-of-range panic reachable by any unauthenticated peer.
+        if (request_line.len < separator + 1 + 9) return error.InvalidRequestLine;
         const url = mem.trim(u8, request_line[separator + 1 .. request_line.len - 9], &ascii.whitespace);
 
         return .{
@@ -125,7 +130,7 @@ pub const Handshake = struct {
             .url = url,
             .method = method,
             .headers = headers,
-            .raw_header = buf[request_line_end + 2 .. request_length + 2],
+            .raw_header = buf[request_line_end + 2 .. @max(request_line_end + 2, @min(request_length + 2, buf.len))],
         };
     }
 

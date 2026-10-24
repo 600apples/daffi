@@ -13,6 +13,9 @@ const NetAddress = connection.NetAddress;
 
 const ServerConnection = @This();
 
+/// How often a blocked accept() returns control to check for shutdown.
+const ACCEPT_POLL_MS: c_int = 200;
+
 pub const op_table = OperationTable{
     .read = read,
     .readNoBuffer = readNoBuffer,
@@ -44,8 +47,14 @@ pub fn init(allocator: Allocator, config: Config) !*ServerConnection {
     const host = config.host orelse "0.0.0.0";
     const options = net.ListenOptions{ .kernel_backlog = 512 };
 
+    // A host containing '/' can only be a Unix-domain socket path; never hand
+    // it to the resolver (what it answers for such a name is platform-specific).
+    const is_unix_path = std.mem.indexOfScalar(u8, host, '/') != null;
+    const resolved: ?*net.AddressList =
+        if (is_unix_path) null else (net.getAddressList(allocator, host, config.port) catch null);
+
     var listener: anyerror!net.Server = undefined;
-    if (net.getAddressList(allocator, host, config.port)) |addrlist| {
+    if (resolved) |addrlist| {
         defer addrlist.deinit();
         listener = error.ConnectionRefused;
         for (addrlist.addrs) |*addr| {
@@ -55,7 +64,7 @@ pub fn init(allocator: Allocator, config: Config) !*ServerConnection {
                 break;
             }
         }
-    } else |_| {
+    } else {
         // host is a Unix socket path — remove any stale socket file first
         var path_buf: [256]u8 = undefined;
         if (host.len >= path_buf.len) return error.NameTooLong;
@@ -70,7 +79,14 @@ pub fn init(allocator: Allocator, config: Config) !*ServerConnection {
     const self = try allocator.create(ServerConnection);
     self.* = ServerConnection{ .listener = l, .allocator = allocator };
 
-    if (config.tls and config.cert_file.len > 0 and config.key_file.len > 0) {
+    if (config.tls) {
+        // Asking for TLS but providing no certificate must fail loudly, not
+        // quietly fall back to serving plaintext.
+        if (config.cert_file.len == 0 or config.key_file.len == 0) {
+            self.listener.deinit();
+            allocator.destroy(self);
+            return error.TlsCertRequired;
+        }
         tls_impl.init();
         // Build null-terminated copies for the C API (only needed during init).
         var cert_buf: [512]u8 = undefined;
@@ -111,7 +127,9 @@ pub fn write(_: *anyopaque, _: []const u8) !void {
 /// caller can perform the TLS handshake on the new connection.
 pub fn accept(ctx: *anyopaque) !AcceptedConnection {
     const self: *ServerConnection = @ptrCast(@alignCast(ctx));
-    const conn = try self.listener.accept();
+    // Wake up periodically (error.Timeout) so the accept loop can notice that
+    // the server was asked to stop.
+    const conn = try self.listener.acceptTimeout(ACCEPT_POLL_MS);
     var na = NetAddress{};
     const len = @min(na.bytes.len, conn.address.bytes.len);
     @memcpy(na.bytes[0..len], conn.address.bytes[0..len]);
@@ -122,18 +140,20 @@ pub fn accept(ctx: *anyopaque) !AcceptedConnection {
     };
 }
 
-/// Close the listening socket and, if TLS is active, free the shared SSL_CTX.
-pub fn close(ctx: *anyopaque) void {
+/// Nothing to interrupt: the accept loop polls with a timeout and notices the
+/// owning Connection's `suspended` flag by itself.  (Closing a listening fd
+/// from another thread does not reliably wake a blocked accept().)
+pub fn close(_: *anyopaque) void {}
+
+/// Close the listening socket, free the shared
+/// SSL_CTX (TLS mode) and the struct.  Called once, by the accept-loop owner.
+pub fn destroy(ctx: *anyopaque) void {
     const self: *ServerConnection = @ptrCast(@alignCast(ctx));
     if (self.ssl_ctx) |sc| {
         tls_impl.freeCtx(sc);
         self.ssl_ctx = null;
     }
     self.listener.deinit();
-}
-
-pub fn destroy(ctx: *anyopaque) void {
-    const self: *ServerConnection = @ptrCast(@alignCast(ctx));
     self.allocator.destroy(self);
 }
 

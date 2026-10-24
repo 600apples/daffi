@@ -11,6 +11,11 @@ const ClientMessageStore = @This();
 /// the same (uuid % 2048) slot.  AutoHashMap grows dynamically and has O(1)
 /// amortised insert/lookup with no collision limit.
 map: std.AutoHashMap(u16, *Message),
+/// uuids whose caller already gave up (timed out) before the response arrived.
+/// A response that shows up later is dropped instead of being parked in `map`
+/// forever (nobody will ever fetch it), and `clearExpired` forgets a uuid when
+/// it is handed out again so the u16 wrap-around cannot drop a live response.
+expired: std.AutoHashMap(u16, void),
 mutex: Mutex = .{},
 allocator: Allocator,
 /// File descriptor (eventfd or pipe write-end) signalled whenever a new
@@ -37,7 +42,7 @@ inline fn signalWakeup(self: *ClientMessageStore) void {
 }
 
 pub fn init(allocator: Allocator) ClientMessageStore {
-    return .{ .allocator = allocator, .map = std.AutoHashMap(u16, *Message).init(allocator) };
+    return .{ .allocator = allocator, .map = std.AutoHashMap(u16, *Message).init(allocator), .expired = std.AutoHashMap(u16, void).init(allocator) };
 }
 
 pub fn deinit(self: *ClientMessageStore) void {
@@ -45,6 +50,7 @@ pub fn deinit(self: *ClientMessageStore) void {
     var it = self.map.valueIterator();
     while (it.next()) |msg_ptr| msg_ptr.*.deinit();
     self.map.deinit();
+    self.expired.deinit();
 }
 
 /// Store a response message.
@@ -54,6 +60,8 @@ pub fn deinit(self: *ClientMessageStore) void {
 pub fn insert(self: *ClientMessageStore, msg: *Message) !void {
     self.mutex.lock();
     defer self.mutex.unlock();
+    // The waiter already timed out: refuse (the caller frees the message).
+    if (self.expired.remove(msg.getUuid())) return error.Expired;
     const result = try self.map.getOrPut(msg.getUuid());
     if (result.found_existing) return error.StoreFull;
     result.value_ptr.* = msg;
@@ -76,8 +84,22 @@ pub fn fetch(self: *ClientMessageStore, uuid: u16) ?*Message {
     return msg;
 }
 
+/// Called when the waiter for `uuid` gives up.  Frees a response that already
+/// arrived, or remembers the uuid so one that arrives later is discarded.
 pub fn setTimeoutError(self: *ClientMessageStore, uuid: u16) !void {
-    if (self.fetch(uuid)) |msg| {
-        try msg.writeErrorMessage("Timeout error", .{});
+    self.mutex.lock();
+    if (self.map.fetchRemove(uuid)) |kv| {
+        self.mutex.unlock();
+        kv.value.deinit();
+        return;
     }
+    defer self.mutex.unlock();
+    try self.expired.put(uuid, {});
+}
+
+/// Forget that `uuid` was ever expired; call when it is issued to a new request.
+pub fn clearExpired(self: *ClientMessageStore, uuid: u16) void {
+    self.mutex.lock();
+    defer self.mutex.unlock();
+    _ = self.expired.remove(uuid);
 }

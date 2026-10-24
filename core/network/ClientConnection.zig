@@ -29,6 +29,9 @@ ssl: ?*tls_impl.SslConn = null,
 /// Non-null when this connection owns its SSL_CTX (client-initiated TLS).
 /// Null for server-accepted TLS connections — the ServerConnection owns the ctx.
 ssl_ctx: ?*tls_impl.SslCtx = null,
+/// Set by close() once the socket has been shut down; destroy() then skips the
+/// TLS close_notify (it could no longer be delivered anyway).
+interrupted: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
 pub const Config = struct {
     host: []const u8,
@@ -44,43 +47,44 @@ const zero_timeout = std.mem.toBytes(posix.timeval{ .tv_sec = 0, .tv_usec = 0 })
 /// Initiate an outbound TCP (or Unix-socket) connection.
 /// If config.tls is true, a TLS client handshake is performed after the TCP connect.
 pub fn init(allocator: Allocator, config: Config) !*ClientConnection {
-    const stream = net.tcpConnectToHost(allocator, config.host, config.port) catch blk: {
-        break :blk try net.connectUnixSocket(config.host);
-    };
+    // '/' cannot occur in a host name, so such a host is a Unix socket path.
+    const stream = if (std.mem.indexOfScalar(u8, config.host, '/') != null)
+        try net.connectUnixSocket(config.host)
+    else
+        net.tcpConnectToHost(allocator, config.host, config.port) catch blk: {
+            break :blk try net.connectUnixSocket(config.host);
+        };
+    errdefer stream.close();
 
     const self = try allocator.create(ClientConnection);
+    errdefer allocator.destroy(self);
     self.* = ClientConnection{
         .stream = stream,
         .addr = null,
         .allocator = allocator,
     };
 
+    // Applies to plain TCP; the TLS path replaces it with non-blocking I/O.
+    try self.writeTimeout(1000);
+
     if (config.tls) {
         tls_impl.init();
         // Build a null-terminated copy of ca_file for the C API.
         var ca_buf: [512]u8 = undefined;
-        if (config.ca_file.len >= ca_buf.len) {
-            self.stream.close();
-            allocator.destroy(self);
-            return error.PathTooLong;
-        }
+        if (config.ca_file.len >= ca_buf.len) return error.PathTooLong;
         @memcpy(ca_buf[0..config.ca_file.len], config.ca_file);
         ca_buf[config.ca_file.len] = 0;
-        const ssl_ctx = tls_impl.clientCtx(@ptrCast(&ca_buf)) catch |err| {
-            self.stream.close();
-            allocator.destroy(self);
-            return err;
-        };
+        const ssl_ctx = try tls_impl.clientCtx(@ptrCast(&ca_buf));
+        errdefer tls_impl.freeCtx(ssl_ctx);
+        // Bound the blocking handshake so a server that accepts the TCP
+        // connection but never answers cannot hang the caller forever.
+        stream.setIoTimeout(tls_impl.HANDSHAKE_TIMEOUT_MS);
+        const ssl = try tls_impl.clientHandshake(ssl_ctx, @intCast(stream.handle), config.host);
+        tls_impl.finishHandshake(ssl);
         self.ssl_ctx = ssl_ctx;
-        self.ssl = tls_impl.clientHandshake(ssl_ctx, @intCast(stream.handle)) catch |err| {
-            tls_impl.freeCtx(ssl_ctx);
-            self.stream.close();
-            allocator.destroy(self);
-            return err;
-        };
+        self.ssl = ssl;
     }
 
-    try self.writeTimeout(1000);
     self.enableKeepalive(10, 5, 3);
     return self;
 }
@@ -127,12 +131,27 @@ pub fn accept(_: *anyopaque) anyerror!AcceptedConnection {
     @panic("accept not supported for client connections");
 }
 
-/// Close the connection: tear down TLS (if active), then close the socket.
-/// Does NOT free the ClientConnection struct — call destroy() for that.
+/// Interrupt the connection: shut the socket down so that any thread blocked
+/// in read()/write() returns immediately.  Idempotent and safe to call while
+/// other threads are using the connection.
+///
+/// Nothing is freed here — the descriptor, the TLS session and the struct are
+/// released by destroy(), which runs once the last reference is dropped.  Tearing
+/// the SSL object down from this thread while the reader is inside SSL_read
+/// (as an earlier version did) is a use-after-free.
 pub fn close(ctx: *anyopaque) void {
     const self: *ClientConnection = @ptrCast(@alignCast(ctx));
+    self.interrupted.store(true, .release);
+    self.stream.shutdown();
+}
+
+/// Release every resource: TLS session, owned SSL_CTX, the socket descriptor
+/// and the struct itself.  Called exactly once, when no thread references the
+/// connection any more (see Connection.release).
+pub fn destroy(ctx: *anyopaque) void {
+    const self: *ClientConnection = @ptrCast(@alignCast(ctx));
     if (self.ssl) |ssl| {
-        tls_impl.sslClose(ssl);
+        tls_impl.sslClose(ssl, !self.interrupted.load(.acquire));
         self.ssl = null;
     }
     if (self.ssl_ctx) |ssl_ctx| {
@@ -140,10 +159,6 @@ pub fn close(ctx: *anyopaque) void {
         self.ssl_ctx = null;
     }
     self.stream.close();
-}
-
-pub fn destroy(ctx: *anyopaque) void {
-    const self: *ClientConnection = @ptrCast(@alignCast(ctx));
     self.allocator.destroy(self);
 }
 

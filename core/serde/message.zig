@@ -139,29 +139,90 @@ pub const Header = packed struct {
     }
 
     pub fn fromMessage(message: []const u8) Header {
-        // Create header from message payload using well known offset bounds
+        // Create header from message payload using well known offset bounds.
+        // Trusted-input only (messages built locally); peer data must go
+        // through `parse`.
         const bytes = message[serde.HEADER_OFFSET_START..serde.HEADER_OFFSET_END];
         return Header.fromBytes(bytes);
     }
+
+    pub const ParseError = error{
+        /// Fewer than `Header.size` bytes were supplied.
+        HeaderTooShort,
+        /// `flag` does not name a `MessageFlag`.
+        InvalidFlag,
+        /// Header was produced on a machine with a different byte order.
+        InvalidEndian,
+        /// `metadata_len` is larger than `msg_len`.
+        InvalidMetadataLen,
+    };
+
+    /// Same bit layout as `Header`, but with plain integers in place of the
+    /// enum fields so that *any* bit pattern read from the wire is a valid
+    /// value of this type.  `Header.fromBytes` bit-casts straight into the
+    /// enum-bearing struct, which is illegal behaviour (a safety panic in
+    /// ReleaseSafe, i.e. a remotely triggerable abort) for an out-of-range flag.
+    const Raw = packed struct {
+        uuid: u16,
+        flag: u4,
+        decoder: u2,
+        is_bytes: bool,
+        return_result: bool,
+        msg_len: u25,
+        metadata_len: u15,
+        msg_parts: u7,
+        endian: u1,
+    };
+
+    comptime {
+        std.debug.assert(@bitSizeOf(Raw) == @bitSizeOf(Header));
+        std.debug.assert(@bitOffsetOf(Raw, "msg_len") == @bitOffsetOf(Header, "msg_len"));
+        std.debug.assert(@bitOffsetOf(Raw, "endian") == @bitOffsetOf(Header, "endian"));
+    }
+
+    /// Decode and validate a header received from an untrusted peer.
+    pub fn parse(bytes: []const u8) ParseError!Header {
+        if (bytes.len < size) return error.HeaderTooShort;
+        const raw: Raw = @bitCast(bytes[0..size].*);
+        if (raw.endian != @intFromEnum(native_endian)) return error.InvalidEndian;
+        if (raw.flag >= @typeInfo(MessageFlag).@"enum".fields.len) return error.InvalidFlag;
+        if (raw.metadata_len > raw.msg_len) return error.InvalidMetadataLen;
+        return .{
+            .uuid = raw.uuid,
+            .flag = @enumFromInt(raw.flag),
+            .decoder = @enumFromInt(raw.decoder),
+            .is_bytes = raw.is_bytes,
+            .return_result = raw.return_result,
+            .msg_len = raw.msg_len,
+            .metadata_len = raw.metadata_len,
+            .msg_parts = raw.msg_parts,
+            .endian = raw.endian,
+        };
+    }
 };
+
+/// Reject names that would corrupt the `transmitter|receiver|func_name` framing.
+fn validateSection(section: []const u8) error{InvalidMetadata}!void {
+    if (std.mem.indexOfScalar(u8, section, SECTION_SEPARATOR) != null) return error.InvalidMetadata;
+}
 
 const Metadata = struct {
     transmitter: ?[]const u8 = null,
     receiver: ?[]const u8 = null,
     func_name: ?[]const u8 = null,
 
-    pub fn initFromMetadataFromStr(self: *Metadata, metadata_str: []const u8) void {
+    pub fn initFromMetadataFromStr(self: *Metadata, metadata_str: []const u8) error{InvalidMetadata}!void {
         // metadata_str is in format: transmitter|receiver|func_name
+        // Exactly three sections are required; anything else is a malformed
+        // (or hostile) message and must be rejected rather than trusted.
         var iterator = std.mem.splitScalar(u8, metadata_str, SECTION_SEPARATOR);
-        var ind: usize = 0;
-        while (iterator.next()) |val| : (ind += 1) {
-            switch (ind) {
-                0 => self.transmitter = val,
-                1 => self.receiver = val,
-                2 => self.func_name = val,
-                else => unreachable,
-            }
-        }
+        const transmitter = iterator.next() orelse return error.InvalidMetadata;
+        const receiver = iterator.next() orelse return error.InvalidMetadata;
+        const func_name = iterator.next() orelse return error.InvalidMetadata;
+        if (iterator.next() != null) return error.InvalidMetadata;
+        self.transmitter = transmitter;
+        self.receiver = receiver;
+        self.func_name = func_name;
     }
 
     pub fn initMetadataFromFields(self: *Metadata, transmitter: []const u8, receiver: []const u8, func_name: []const u8) void {
@@ -197,19 +258,30 @@ pub const Message = struct {
         return fmt.format(writer, "<Message: {d:0>5}> | {s} |", .{ h.uuid, @tagName(h.flag) });
     }
 
+    pub const CreateError = error{
+        /// `data.len` does not equal `HEADER_SIZE + header.msg_len`.
+        LengthMismatch,
+        InvalidMetadata,
+    };
+
+    /// Wrap `data` (header + metadata + payload) in a Message.
+    /// On error ownership of `data` stays with the caller.
     pub fn create(allocator: Allocator, header: Header, data: []u8) !*Message {
-        var self = try allocator.create(Message);
+        if (header.metadata_len > header.msg_len) return error.InvalidMetadataLen;
+        if (data.len != @as(usize, serde.HEADER_SIZE) + header.msg_len) return error.LengthMismatch;
+        const self = try allocator.create(Message);
+        errdefer allocator.destroy(self);
         self.* = .{
             .header = header,
             .data = data,
             .allocator = allocator,
         };
-        self.metadata.initFromMetadataFromStr(self.getMetadata());
+        try self.metadata.initFromMetadataFromStr(self.getMetadata());
         return self;
     }
 
     pub fn fromRawMessage(allocator: Allocator, raw_message: *const RawMessage) !*Message {
-        const header = Header.fromMessage(raw_message.data);
+        const header = try Header.parse(raw_message.data);
         return try Message.create(allocator, header, raw_message.data);
     }
 
@@ -310,7 +382,7 @@ pub const Message = struct {
             self.allocator.free(self.data);
             self.data = new_data;
             // re-calculate metadata as it is pointed to wrong location
-            self.metadata.initFromMetadataFromStr(self.getMetadata());
+            self.metadata.initFromMetadataFromStr(self.getMetadata()) catch unreachable; // we just built it
         }
         self.setMessageLen(@as(@FieldType(Header, "msg_len"), @truncate(new_msg_len)));
     }
@@ -332,17 +404,21 @@ pub const Message = struct {
         const ptransmitter = transmitter orelse self.getTransmitter();
         const preceiver = receiver orelse self.getReceiver();
         const pfun_name = func_name orelse self.getFuncName();
+        try validateSection(ptransmitter);
+        try validateSection(preceiver);
+        try validateSection(pfun_name);
         const new_metadata_len = Metadata.calcMetadataLen(ptransmitter, preceiver, pfun_name);
         const data = self.getData();
         const new_msg_len: usize = data.len + new_metadata_len;
         if (new_msg_len > std.math.maxInt(@FieldType(Header, "msg_len"))) return error.ExceedsMaxMessageSize;
+        if (new_metadata_len > std.math.maxInt(@FieldType(Header, "metadata_len"))) return error.MetadataTooLong;
         const new_data = try serde.concatenateSlicesAlloc(self.allocator, &[_][]const u8{ self.data[0..serde.HEADER_OFFSET_END], ptransmitter, SECTION_SEPARATOR_SEQ, preceiver, SECTION_SEPARATOR_SEQ, pfun_name, data });
         self.allocator.free(self.data);
         self.data = new_data;
         self.setMessageLen(@as(@FieldType(Header, "msg_len"), @truncate(new_msg_len)));
         self.setMetadataLen(@as(@FieldType(Header, "metadata_len"), @truncate(new_metadata_len)));
         // re-calculate metadata as it is pointed to wrong location
-        self.metadata.initFromMetadataFromStr(self.getMetadata());
+        self.metadata.initFromMetadataFromStr(self.getMetadata()) catch unreachable; // we just built it
     }
 
     pub fn setUuid(self: *Message, uuid: @FieldType(Header, "uuid")) void {
@@ -419,9 +495,13 @@ pub const RawMessage = struct {
         const ptransmitter = transmitter orelse PLACEHOLDER;
         const preceiver = receiver orelse PLACEHOLDER;
         const pfun_name = func_name orelse PLACEHOLDER;
+        try validateSection(ptransmitter);
+        try validateSection(preceiver);
+        try validateSection(pfun_name);
         const metadata_len = Metadata.calcMetadataLen(ptransmitter, preceiver, pfun_name);
         const msg_len = data.len + metadata_len;
         if (msg_len > std.math.maxInt(@FieldType(Header, "msg_len"))) return error.ExceedsMaxMessageSize;
+        if (metadata_len > std.math.maxInt(@FieldType(Header, "metadata_len"))) return error.MetadataTooLong;
         const header: *const Header = &try Header.create(uuid, flag, decoder, is_bytes, return_result, msg_len, metadata_len);
         var backed_header_bytes: [serde.HEADER_SIZE]u8 = undefined;
         header.toBytes(&backed_header_bytes);
@@ -460,7 +540,7 @@ pub fn createEventMessage(allocator: Allocator, uuid: @FieldType(Header, "uuid")
 test "header to int" {
     var header = try Header.create(7777, .REQUEST, .JSON, false, true, 1000, 25);
     const backed_int = header.toInt();
-    try expect(backed_int == 0x8000320003e8901e61);
+    try expect(backed_int == 0x8100320003e8911e61);
     const restored = Header.fromInt(backed_int);
     try std.testing.expectEqual(header, restored);
 }
@@ -608,4 +688,68 @@ test "Message has transmitter/receiver" {
     defer msg.deinit();
     try expect(!msg.hasReceiver());
     try expect(!msg.hasTransmitter());
+}
+
+test "Header.parse accepts what toBytes produces" {
+    var header = try Header.create(7777, .REQUEST, .JSON, false, true, 1000, 25);
+    var bytes: [serde.HEADER_SIZE]u8 = undefined;
+    header.toBytes(&bytes);
+    const parsed = try Header.parse(&bytes);
+    try std.testing.expectEqual(header, parsed);
+}
+
+test "Header.parse rejects malformed headers" {
+    var header = try Header.create(1, .REQUEST, .JSON, false, true, 10, 5);
+    var bytes: [serde.HEADER_SIZE]u8 = undefined;
+    header.toBytes(&bytes);
+
+    // too short
+    try std.testing.expectError(error.HeaderTooShort, Header.parse(bytes[0 .. serde.HEADER_SIZE - 1]));
+    try std.testing.expectError(error.HeaderTooShort, Header.parse(&[_]u8{}));
+
+    // wrong endianness bit (top bit of the last byte)
+    var bad = bytes;
+    bad[8] ^= 0x80;
+    try std.testing.expectError(error.InvalidEndian, Header.parse(&bad));
+
+    // flag nibble (low 4 bits of byte 2) out of range
+    bad = bytes;
+    bad[2] = (bad[2] & 0xf0) | 0x0f;
+    try std.testing.expectError(error.InvalidFlag, Header.parse(&bad));
+
+    // metadata_len > msg_len: msg_len = 1, metadata_len = 100
+    var small = try Header.create(1, .REQUEST, .JSON, false, true, 1, 0);
+    small.toBytes(&bad);
+    small.metadata_len = 100;
+    small.toBytes(&bad);
+    try std.testing.expectError(error.InvalidMetadataLen, Header.parse(&bad));
+
+    // every all-ones / all-zeros header must return an error or a header, never panic
+    _ = Header.parse(&[_]u8{0xff} ** serde.HEADER_SIZE) catch {};
+    _ = Header.parse(&[_]u8{0x00} ** serde.HEADER_SIZE) catch {};
+}
+
+test "Metadata parsing rejects wrong section count" {
+    var md: Metadata = undefined;
+    try std.testing.expectError(error.InvalidMetadata, md.initFromMetadataFromStr("only-one"));
+    try std.testing.expectError(error.InvalidMetadata, md.initFromMetadataFromStr("a|b"));
+    try std.testing.expectError(error.InvalidMetadata, md.initFromMetadataFromStr("a|b|c|d"));
+    try md.initFromMetadataFromStr("a|b|c");
+}
+
+test "Message.create validates lengths and leaves ownership with the caller" {
+    const alloc = std.testing.allocator;
+    var header = try Header.create(1, .REQUEST, .JSON, false, true, 8, 8);
+
+    // data length does not match header.msg_len
+    const short = try alloc.alloc(u8, serde.HEADER_SIZE + 3);
+    defer alloc.free(short);
+    try std.testing.expectError(error.LengthMismatch, Message.create(alloc, header, short));
+
+    // metadata without exactly three sections
+    const data = try alloc.alloc(u8, serde.HEADER_SIZE + 8);
+    defer alloc.free(data);
+    @memset(data, 'x');
+    header.toBytes(data[0..serde.HEADER_SIZE]);
+    try std.testing.expectError(error.InvalidMetadata, Message.create(alloc, header, data));
 }

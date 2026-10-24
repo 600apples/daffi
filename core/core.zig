@@ -48,27 +48,9 @@ const server_methods = [_]PyMethodDef{
         .ml_doc   =
             \\stopServer(conn_num)
             \\
-            \\Signal the server to stop and release all native resources.
-        ,
-    },
-    .{
-        .ml_name  = "joinServer",
-        .ml_meth  = cffi.joinServer,
-        .ml_flags = 1,
-        .ml_doc   =
-            \\joinServer(conn_num)
-            \\
-            \\Block until the server dispatcher thread exits.
-        ,
-    },
-    .{
-        .ml_name  = "detachServer",
-        .ml_meth  = cffi.detachServer,
-        .ml_flags = 1,
-        .ml_doc   =
-            \\detachServer(conn_num)
-            \\
-            \\Detach the server thread; resources are reclaimed when it exits.
+            \\Stop the server and release all native resources (listening
+            \\socket, connections, threads).  Blocks until shutdown completes,
+            \\so the port can be rebound as soon as this returns.
         ,
     },
     .{
@@ -290,6 +272,9 @@ var module = py.PyModuleDef{
     .m_free     = null,
 };
 
-pub export fn PyInit_dfcore() [*]PyObject {
+// Nullable: on failure PyModule_Create returns NULL with a Python exception set,
+// which the interpreter turns into an ImportError.  A non-optional return type
+// would make that a safety-checked null-to-pointer cast (an abort in ReleaseSafe).
+pub export fn PyInit_dfcore() ?[*]PyObject {
     return PyModule_Create(&module);
 }

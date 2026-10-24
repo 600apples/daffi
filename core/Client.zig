@@ -1,7 +1,5 @@
 const std = @import("std");
 const builtin = @import("builtin");
-const net = std.net;
-const os = std.os;
 const posix = std.posix;
 const network = @import("network.zig");
 const handlers = @import("handlers.zig");
@@ -31,7 +29,9 @@ const Client = @This();
 fn setSignalHandler() !void {
     const internal_handler = struct {
         fn internal_handler(_: posix.SIG) callconv(.c) void {
-            std.process.exit(0);
+            // Async-signal-safe termination only; exit() would run atexit
+            // handlers from inside a signal context.
+            std.c._exit(0);
         }
     }.internal_handler;
     const act = posix.Sigaction{
@@ -54,11 +54,17 @@ pub const MessageAndDataIndentifier = struct {
     data: []const u8,
 };
 
+/// Live ClientEntry handles (see ClientEntry.get).
+const registry_alloc = if (is_wasm) std.heap.wasm_allocator else std.heap.c_allocator;
+var registry_mutex: misc.Mutex = .{};
+var registry: std.AutoHashMapUnmanaged(usize, void) = .empty;
+
 const ClientEntry = struct {
     connection: *ClientConnection,
     msgpool: *MessagePool,
     client_handler: *ClientHandler,
-    uuid: u16 = 0,
+    /// Last issued request uuid.  Atomic: many Python threads send concurrently.
+    uuid: std.atomic.Value(u16) = std.atomic.Value(u16).init(0),
     /// Set to true (with release ordering) by the dispatcher thread after it
     /// has freed connection/msgpool resources.  Python reads this (acquire) to
     /// detect a dead connection before calling stopClient(), which frees the
@@ -71,19 +77,31 @@ const ClientEntry = struct {
     /// Allocator used to create this entry; stored so stopClient can free it.
     alloc: Allocator,
 
+    /// Resolve a handle received from Python.  Only handles that were issued by
+    /// `init` and not yet destroyed are accepted; the previous version
+    /// dereferenced whatever integer it was given, so a stale or bogus handle
+    /// was a use-after-free (or a wild read).
     pub fn get(conn_num: usize) !*ClientEntry {
         if (conn_num == 0) return error.ClientNotInitialized;
+        registry_mutex.lock();
+        const known = registry.contains(conn_num);
+        registry_mutex.unlock();
+        if (!known) return error.ClientNotInitialized;
         const entry: *ClientEntry = @ptrFromInt(conn_num);
         if (entry.disconnected.load(.acquire)) return error.ClientNotInitialized;
-        if (entry.connection.suspended) return error.ConnectionLost;
+        if (entry.connection.isSuspended()) return error.ConnectionLost;
         return entry;
     }
 
+    /// Next request uuid (never 0, wraps at 65535).  A uuid that was timed out
+    /// earlier is "un-expired" so its new owner's response is not discarded.
     pub fn generateUUID(self: *ClientEntry) u16 {
-        const ov = @addWithOverflow(self.uuid, 1);
-        if (ov[1] != 0) self.uuid = 1 // skip 0
-        else self.uuid = ov[0];
-        return self.uuid;
+        while (true) {
+            const next = self.uuid.fetchAdd(1, .monotonic) +% 1;
+            if (next == 0) continue; // 0 is reserved
+            self.client_handler.msg_store.clearExpired(next);
+            return next;
+        }
     }
 
     /// Close the connection and free all associated resources.
@@ -151,7 +169,7 @@ const ClientEntry = struct {
         var msg_handler = self.client_handler.handler();
         while (true) {
             const message = self.msgpool.receiveMessage(self.connection) catch |err| {
-                if (!self.connection.suspended) {
+                if (!self.connection.isSuspended()) {
                     log.debug("[{s}] connection lost: {}", .{ self.client_handler.app_name, err });
                 } else {
                     log.debug("[{s}] connection closed intentionally", .{self.client_handler.app_name});
@@ -164,7 +182,14 @@ const ClientEntry = struct {
             // read any field of `message` when consumed==true — Python may have
             // already popped and freed the message (use-after-free).
             var consumed = false;
-            try msg_handler.handle(self.connection, message, &consumed);
+            msg_handler.handle(self.connection, message, &consumed) catch |err| {
+                // Don't unwind past the disconnect notification below: Python is
+                // waiting for it.  Treat a failing handler as a broken stream.
+                if (!consumed) message.deinit();
+                log.warn("[{s}] message handler failed: {}", .{ self.client_handler.app_name, err });
+                msg_handler.handleErr(self.connection, err) catch {};
+                break;
+            };
             if (!consumed) message.deinit();
             msg_handler.triggerWakeup();
         }
@@ -288,8 +313,11 @@ fn messageDispatcher(conn_num: usize) !void {
 
 pub fn init(allocator: std.mem.Allocator, app_name: []const u8, config: ClientConnection.Config) !usize {
     const conn = try ClientConnection.init(allocator, config);
-    var msgpool = try MessagePool.init(allocator);
+    errdefer conn.destroy();
+    const msgpool = try MessagePool.init(allocator);
+    errdefer msgpool.deinit();
     const client_handler = try ClientHandler.init(allocator, app_name);
+    errdefer client_handler.deinit();
     if (!is_wasm) {
         try setSignalHandler();
         // The SYN probe is sent by every daffi TCP client (plain and TLS alike).
@@ -301,12 +329,25 @@ pub fn init(allocator: std.mem.Allocator, app_name: []const u8, config: ClientCo
         try msgpool.sendSynMessage(conn);
     }
     const cl_entry = try allocator.create(ClientEntry);
+    errdefer allocator.destroy(cl_entry);
     cl_entry.* = ClientEntry{ .connection = conn, .msgpool = msgpool, .client_handler = client_handler, .alloc = allocator };
-    // The heap address of the ClientEntry is the connection number: unbounded,
-    // unique, and O(1) to resolve — just @ptrFromInt(conn_num).
+    // The heap address of the ClientEntry is the connection number: unbounded
+    // and unique.  It is also recorded in `registry` so stale handles can be
+    // rejected instead of dereferenced.
     const conn_num: usize = @intFromPtr(cl_entry);
+    {
+        registry_mutex.lock();
+        defer registry_mutex.unlock();
+        try registry.put(registry_alloc, conn_num, {});
+    }
+    errdefer {
+        registry_mutex.lock();
+        _ = registry.remove(conn_num);
+        registry_mutex.unlock();
+    }
     log.debug("[{s}] client init  conn_num=0x{x}", .{ app_name, conn_num });
     if (!is_wasm) {
+        // Count the thread as ours before it can run: it reads `cl_entry`.
         const th = try std.Thread.spawn(.{}, messageDispatcher, .{conn_num});
         cl_entry.dispatcher_thread = th;
         cl_entry.has_dispatcher = true;
@@ -314,8 +355,14 @@ pub fn init(allocator: std.mem.Allocator, app_name: []const u8, config: ClientCo
     return conn_num;
 }
 
-pub fn desctroyClient(conn_num: usize) !void {
+pub fn destroyClient(conn_num: usize) !void {
     if (conn_num == 0) return error.ClientNotInitialized;
+    // Invalidate the handle before anything is freed; also makes a second
+    // destroy of the same handle a harmless error instead of a double free.
+    registry_mutex.lock();
+    const was_live = registry.remove(conn_num);
+    registry_mutex.unlock();
+    if (!was_live) return error.ClientNotInitialized;
     const entry: *ClientEntry = @ptrFromInt(conn_num);
     log.debug("[{s}] stopClient called  conn_num=0x{x}", .{ entry.client_handler.app_name, conn_num });
     entry.destroy();

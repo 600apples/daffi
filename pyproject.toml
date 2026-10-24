@@ -24,6 +24,7 @@ classifiers = [
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
     "Programming Language :: Python :: 3.14",
+    "Programming Language :: Python :: 3.15",
     "Programming Language :: Python :: Implementation :: CPython",
     "Topic :: Software Development :: Libraries :: Python Modules",
     "Topic :: System :: Distributed Computing",
@@ -58,9 +59,9 @@ asyncio_mode = "auto"
 
 
 [tool.cibuildwheel]
-# CPython 3.10 – 3.14; skip PyPy and 32-bit.  Each OS section below sets its
+# CPython 3.10 – 3.15; skip PyPy and 32-bit.  Each OS section below sets its
 # own archs so a single runner only builds its native architecture.
-build = "cp310-* cp311-* cp312-* cp313-* cp314-*"
+build = "cp310-* cp311-* cp312-* cp313-* cp314-* cp315-*"
 skip  = "pp* *i686*"
 
 # Quick smoke test after every wheel build.

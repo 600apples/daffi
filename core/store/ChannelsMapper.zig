@@ -4,6 +4,12 @@ const Allocator = std.mem.Allocator;
 const Mutex = @import("../misc.zig").Mutex;
 const log = std.log.scoped(.store);
 
+/// Maps peer names to the connection they are reachable through.
+///
+/// Every Channel holds one *reference* on its connection (`retain()` when the
+/// channel is created or re-pointed, `release()` when it is removed).  Without
+/// that, a reader thread finishing and destroying its connection left a
+/// dangling `conn` pointer in the map that router threads would then write to.
 pub fn ChannelsMapper(comptime ConnectionT: type) type {
     return struct {
         channels: Channels,
@@ -78,6 +84,7 @@ pub fn ChannelsMapper(comptime ConnectionT: type) type {
                 chan.methods.deinit();
                 self.allocator.destroy(chan.methods);
                 self.allocator.free(chan.connection_name);
+                chan.conn.release();
             }
             self.channels.clearAndFree(self.allocator);
             self.allocator.destroy(self);
@@ -100,6 +107,18 @@ pub fn ChannelsMapper(comptime ConnectionT: type) type {
             self.mutex.lock();
             defer self.mutex.unlock();
             return self.channels.get(chan_uuid) orelse error.ChannelNotFound;
+        }
+
+        /// Look up *name* and return its connection with an extra reference
+        /// held; the caller must `release()` it.  Use this instead of
+        /// `getChannel(..).conn` whenever the connection is used after the map
+        /// lock is dropped.
+        pub fn retainConn(self: *Self, name: Uuid) !*ConnectionT {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            const chan = self.channels.getPtr(name) orelse return error.ChannelNotFound;
+            chan.conn.retain();
+            return chan.conn;
         }
 
         /// Lock-protected ``contains`` query.  Used by the server-side
@@ -140,11 +159,20 @@ pub fn ChannelsMapper(comptime ConnectionT: type) type {
             const result = try self.channels.getOrPut(self.allocator, chan_uuid_dup);
             const chan = result.value_ptr;
             if (!result.found_existing) {
-                chan.* = try Channel.init(self.allocator, conn, chan_uuid_dup);
+                chan.* = Channel.init(self.allocator, conn, chan_uuid_dup) catch |err| {
+                    _ = self.channels.swapRemove(chan_uuid_dup);
+                    self.allocator.free(chan_uuid_dup);
+                    return err;
+                };
+                conn.retain();
                 log.debug("channel created: {s}  total={d}", .{ chan_uuid, self.channels.count() });
             } else {
                 // just update connection. It might be different if client reconnected.
-                chan.conn = conn;
+                if (chan.conn != conn) {
+                    conn.retain();
+                    chan.conn.release();
+                    chan.conn = conn;
+                }
                 self.allocator.free(chan_uuid_dup);
                 log.debug("channel updated (conn ptr): {s}  total={d}", .{ chan_uuid, self.channels.count() });
             }
@@ -184,7 +212,9 @@ pub fn ChannelsMapper(comptime ConnectionT: type) type {
         }
 
         /// Atomically find and remove the channel for *name*, returning its
-        /// connection pointer so the caller can close the underlying socket.
+        /// connection so the caller can close the underlying socket.
+        /// Ownership of the channel's reference moves to the caller, who must
+        /// `release()` the returned connection when finished with it.
         /// Returns null if no channel with that name exists.
         ///
         /// Used by ``onHandshake`` to evict a stale/zombie slot before
@@ -192,11 +222,17 @@ pub fn ChannelsMapper(comptime ConnectionT: type) type {
         /// The caller must close the returned connection AFTER releasing any
         /// handler-level mutex that the socket's reader thread may need when
         /// it wakes up and calls ``diconnectionHandler``.
-        pub fn evictChannel(self: *Self, name: Uuid) ?*ConnectionT {
+        ///
+        /// A channel that is already served by `keep` is left alone: a peer
+        /// re-sending its handshake on the same connection (to advertise new
+        /// callbacks) must not have its own socket closed under it.
+        pub fn evictChannel(self: *Self, name: Uuid, keep: *ConnectionT) ?*ConnectionT {
             self.mutex.lock();
             defer self.mutex.unlock();
             const chan = self.channels.getPtr(name) orelse return null;
             const conn = chan.conn;
+            if (conn == keep) return null;
+            conn.retain(); // for the caller; the channel's own reference is dropped below
             self.destroyChannelLocked(chan);
             return conn;
         }
@@ -220,6 +256,7 @@ pub fn ChannelsMapper(comptime ConnectionT: type) type {
         ///   3. free the connection_name string (no longer needed as map key)
         fn destroyChannelLocked(self: *Self, chan: *Channel) void {
             const conn_name = chan.connection_name;
+            const conn = chan.conn;
             log.debug("channel destroy: {s}  remaining={d}", .{ conn_name, self.channels.count() - 1 });
             chan.methods.deinit();
             self.allocator.destroy(chan.methods);
@@ -230,6 +267,7 @@ pub fn ChannelsMapper(comptime ConnectionT: type) type {
                 return;
             }
             self.allocator.free(conn_name);
+            conn.release();
         }
 
         pub fn clearAllChannels(self: *Self) void {
@@ -240,6 +278,7 @@ pub fn ChannelsMapper(comptime ConnectionT: type) type {
                 chan.methods.deinit();
                 self.allocator.destroy(chan.methods);
                 self.allocator.free(chan.connection_name);
+                chan.conn.release();
             }
             self.channels.clearAndFree(self.allocator);
         }

@@ -1,7 +1,5 @@
 const std = @import("std");
 const mem = std.mem;
-const fifo = std.fifo;
-const net = std.net;
 const handlers = @import("../handlers.zig");
 const serde = @import("../serde.zig");
 const network = @import("../network.zig");
@@ -96,6 +94,7 @@ pub fn ServerHandler(comptime HandlerConnectionT: ConnectionType) type {
                 .Service => |*s| blk: {
                     s.tasks_queue.deinit();
                     s.chan_mapper.deinit();
+                    if (s.methods) |m| s.allocator.free(m);
                     break :blk s.allocator;
                 },
                 .Router => |*r| blk: {
@@ -156,8 +155,11 @@ pub fn ServerHandler(comptime HandlerConnectionT: ConnectionType) type {
 
             // ----------------------------- SERVICE HANDLERS -----------------------------
             fn onHandshake(self: *Self, conn: *ParentConnT, message: *Message, _: *bool) !void {
+                // The mutex only protects channel-map bookkeeping.  Socket writes
+                // (which can block on a slow peer) happen after it is released.
                 self.mutex.lock();
-                defer self.mutex.unlock();
+                var locked = true;
+                defer if (locked) self.mutex.unlock();
                 var arena = ArenaAllocator.init(self.allocator);
                 defer arena.deinit();
                 var allocator = arena.allocator();
@@ -169,6 +171,7 @@ pub fn ServerHandler(comptime HandlerConnectionT: ConnectionType) type {
                 };
                 defer client_hs.deinit();
                 const connection_name = try allocator.dupe(u8, message.getTransmitter());
+
                 // Last-connection-wins: if a slot for this name already exists
                 // (stale zombie from an abrupt network cut or process kill that
                 // never sent a TCP FIN), evict it and accept the new peer.
@@ -176,14 +179,16 @@ pub fn ServerHandler(comptime HandlerConnectionT: ConnectionType) type {
                 // map entry so that its reader thread's diconnectionHandler call
                 // finds no channel and returns cleanly.
                 //
-                // Push an "evicted" EVENT to tasks_queue so the service's
+                // An "evicted" EVENT is pushed to tasks_queue so the service's
                 // Python handlers can react before the "connected" event fires.
-                if (self.chan_mapper.evictChannel(connection_name)) |stale_conn| {
+                var stale_conn: ?*ParentConnT = null; // owned reference
+                defer if (stale_conn) |sc| sc.release();
+                var evict_event: ?*Message = null; // freed below unless handed to the queue
+                defer if (evict_event) |ev| ev.deinit();
+                if (self.chan_mapper.evictChannel(connection_name, conn)) |sc| {
+                    stale_conn = sc;
                     log_service.warn("evicting stale slot for '{s}' — new connection takes over", .{connection_name});
-                    const evict_event = try serde.createEventMessage(self.allocator, 0, connection_name, "evicted");
-                    try self.tasks_queue.pushMessageToQueue(evict_event);
-                    try self.sendToConnection(Message, stale_conn, evict_event);
-                    stale_conn.close();
+                    evict_event = try serde.createEventMessage(self.allocator, 0, connection_name, "evicted");
                 }
                 _ = try self.chan_mapper.getOrCreateChannel(conn, connection_name);
                 const methods = self.methods orelse serde.PLACEHOLDER;
@@ -191,11 +196,39 @@ pub fn ServerHandler(comptime HandlerConnectionT: ConnectionType) type {
                 var service_hs = try Handshake.create(allocator, &[_]Handshake.MemberData{.{ .name = self.app_name, .methods = methods }}, "service");
                 const data = try service_hs.toJson(allocator);
                 try message.setData(data);
-                for (self.chan_mapper.channels.values()) |c| try self.sendToConnection(Message, c.conn, message);
 
-                // Store event message for service itself.
+                // Snapshot (with references) everyone who must receive the reply.
+                var targets: std.ArrayList(*ParentConnT) = .empty;
+                defer {
+                    for (targets.items) |t| t.release();
+                    targets.deinit(self.allocator);
+                }
+                for (self.chan_mapper.channels.values()) |c| {
+                    try targets.ensureUnusedCapacity(self.allocator, 1);
+                    c.conn.retain();
+                    targets.appendAssumeCapacity(c.conn);
+                }
+
+                // Event message for the service itself.
                 const event_message = try serde.createEventMessage(self.allocator, 0, connection_name, "connected");
+                var event_pushed = false;
+                defer if (!event_pushed) event_message.deinit();
+
+                self.mutex.unlock();
+                locked = false;
+
+                if (stale_conn) |sc| {
+                    // Use the event BEFORE handing it to the queue: once pushed,
+                    // Python may dequeue and free it at any moment.
+                    try self.sendToConnection(Message, sc, evict_event.?);
+                    sc.close();
+                    const ev = evict_event.?;
+                    try self.tasks_queue.pushMessageToQueue(ev);
+                    evict_event = null; // queue owns it now
+                }
+                for (targets.items) |t| try self.sendToConnection(Message, t, message);
                 try self.tasks_queue.pushMessageToQueue(event_message);
+                event_pushed = true;
             }
 
             fn onRequest(self: *Self, _: *ParentConnT, message: *Message, consumed: *bool) !void {
@@ -207,10 +240,14 @@ pub fn ServerHandler(comptime HandlerConnectionT: ConnectionType) type {
                 // one lock on every single incoming RPC, making throughput
                 // proportional to 1/N instead of workers/N under high concurrency.
                 //
-                // Set consumed BEFORE pushing so the caller never reads message
-                // fields after the push (Python may free the message immediately).
-                consumed.* = true;
+                // The caller must not read message fields after the push (Python
+                // may free the message immediately).
+                //
+                // `consumed` is a flag on the caller's stack, not a field of the
+                // message, so it is safe (and more accurate) to set it only once
+                // the push has succeeded.
                 try self.tasks_queue.pushMessageToQueue(message);
+                consumed.* = true;
             }
 
             // ---------------------- SERVICE CONNECTION LIFECYCLE ------------------------
@@ -310,14 +347,22 @@ pub fn ServerHandler(comptime HandlerConnectionT: ConnectionType) type {
                     try self.sendToConnection(Message, conn, message);
                     return;
                 };
+                // Evict stale slots (last-connection-wins).  Only the bookkeeping
+                // happens under the mutex; the "evicted" notifications and the
+                // close are done after it is released (see below).
+                const Evicted = struct { name: []const u8, conn: *ParentConnT };
+                var evicted: std.ArrayList(Evicted) = .empty;
+                defer {
+                    for (evicted.items) |e| e.conn.release();
+                    evicted.deinit(self.allocator);
+                }
                 for (client_hs.value.members) |mb| {
-                    if (self.chan_mapper.evictChannel(mb.name)) |stale_conn| {
+                    if (self.chan_mapper.evictChannel(mb.name, conn)) |stale_conn| {
                         log_router.warn("evicting stale slot for '{s}' — new connection takes over", .{mb.name});
-                        var evicted_event = try serde.createEventMessage(self.allocator, 0, mb.name, "evicted");
-                        defer evicted_event.deinit();
-                        for (self.chan_mapper.channels.values()) |c| try self.sendToConnection(Message, c.conn, evicted_event);
-                        try self.sendToConnection(Message, stale_conn, evicted_event);
-                        stale_conn.close();
+                        evicted.append(self.allocator, .{ .name = try alloc.dupe(u8, mb.name), .conn = stale_conn }) catch |err| {
+                            stale_conn.release();
+                            return err;
+                        };
                     }
                 }
                 for (client_hs.value.members) |mb| {
@@ -342,9 +387,12 @@ pub fn ServerHandler(comptime HandlerConnectionT: ConnectionType) type {
                 // Build broadcast messages while holding mutex so channel state
                 // is consistent with what we captured above.
                 var mini_broadcast: ?*Message = null;
-                const new_chan = self.chan_mapper.channels.getPtr(connection_name) orelse unreachable;
-                if (new_chan.methods.hash_map.count() > 0) {
-                    const new_member_methods = try new_chan.joinedMethods(alloc, serde.UNIT_SEPARATOR);
+                // `connection_name` is the transmitter from the message metadata, while
+                // channels are registered under the names in the JSON body; a peer
+                // is free to make those differ, so the lookup can legitimately miss.
+                const new_chan = self.chan_mapper.channels.getPtr(connection_name);
+                if (new_chan != null and new_chan.?.methods.hash_map.count() > 0) {
+                    const new_member_methods = try new_chan.?.joinedMethods(alloc, serde.UNIT_SEPARATOR);
                     var mini_memberdata = try alloc.alloc(Handshake.MemberData, 1);
                     mini_memberdata[0] = .{ .name = connection_name, .methods = new_member_methods };
                     mini_broadcast = try serde.createHandshakeMessage(self.allocator, mini_memberdata, 0, "router");
@@ -375,6 +423,16 @@ pub fn ServerHandler(comptime HandlerConnectionT: ConnectionType) type {
                 // are not blocked while we drain N socket buffers.
                 self.mutex.unlock();
                 locked = false;
+
+                // 0. Tell everyone (and the evicted peer itself) that stale slots
+                //    were taken over, then drop the stale sockets.
+                for (evicted.items) |e| {
+                    var evicted_event = serde.createEventMessage(self.allocator, 0, e.name, "evicted") catch continue;
+                    defer evicted_event.deinit();
+                    for (bcast_conns.items) |c| self.sendToConnection(Message, c, evicted_event) catch {};
+                    self.sendToConnection(Message, e.conn, evicted_event) catch {};
+                    e.conn.close();
+                }
 
                 // 1. Mini-HANDSHAKE so receiving clients update their routing tables.
                 if (mini_broadcast) |mb| {
@@ -432,7 +490,8 @@ pub fn ServerHandler(comptime HandlerConnectionT: ConnectionType) type {
             // --------------------- ROUTER CONNECTION LIFECYCLE ----------------------
             fn diconnectionHandler(self: *Self, conn: *ParentConnT) !void {
                 self.mutex.lock();
-                defer self.mutex.unlock();
+                var locked = true;
+                defer if (locked) self.mutex.unlock();
                 var arena = ArenaAllocator.init(self.allocator);
                 defer arena.deinit();
                 var allocator = arena.allocator();
@@ -446,24 +505,32 @@ pub fn ServerHandler(comptime HandlerConnectionT: ConnectionType) type {
 
                 // Send a "disconnected" EVENT to every remaining client.
                 //
-                // The full HANDSHAKE broadcast that was sent here previously
-                // (clearAllChannels + rebuild on each receiving client) has been
-                // removed for two reasons:
-                //   1. It was O(N) work per remaining client × N remaining clients
-                //      = O(N²) work and network traffic on every disconnect.
-                //   2. With the add-only HANDSHAKE path now used for *connect*
-                //      broadcasts, a full-rebuild HANDSHAKE would over-write the
-                //      live chan_mapper state rather than just removing the
-                //      departed member.
-                //
-                // The "disconnected" EVENT is now the sole mechanism for removing
-                // a departed peer: the client-side ``onEvent`` handler calls
+                // The "disconnected" EVENT is the sole mechanism for removing a
+                // departed peer: the client-side ``onEvent`` handler calls
                 // ``destroyChannelByName`` in Zig (updating the chan_mapper
                 // atomically) and then pushes the event to the Python task queue
-                // so ``@on_event("disconnected")`` handlers are notified.
+                // so ``@on_event("disconnected")`` handlers are notified.  (A full
+                // HANDSHAKE rebuild here would be O(N^2) traffic per disconnect and
+                // would overwrite live chan_mapper state.)
+                //
+                // Targets are snapshotted with references and written to after the
+                // mutex is released, so one slow peer cannot stall the router.
+                var targets: std.ArrayList(*ParentConnT) = .empty;
+                defer {
+                    for (targets.items) |t| t.release();
+                    targets.deinit(self.allocator);
+                }
+                for (self.chan_mapper.channels.values()) |c| {
+                    try targets.ensureUnusedCapacity(self.allocator, 1);
+                    c.conn.retain();
+                    targets.appendAssumeCapacity(c.conn);
+                }
                 var event_message = try serde.createEventMessage(self.allocator, 0, connection_name, "disconnected");
                 defer event_message.deinit();
-                for (self.chan_mapper.channels.values()) |c| try self.sendToConnection(Message, c.conn, event_message);
+
+                self.mutex.unlock();
+                locked = false;
+                for (targets.items) |t| try self.sendToConnection(Message, t, event_message);
             }
 
             fn errorHandler(_: *Self, conn: *ParentConnT, err: anyerror) !void {
@@ -680,8 +747,8 @@ pub const ClientHandler = struct {
             // caller (dispatcher) does NOT free the message.
             // Set consumed BEFORE insert so it is always accurate even if the
             // dispatcher resumes before insert() returns.
-            consumed.* = true;
             try self.msg_store.insert(message);
+            consumed.* = true;
         } else {
             // Add-only broadcast update: parse with an arena to avoid permanent
             // allocations for member strings we will not keep.
@@ -754,24 +821,30 @@ pub const ClientHandler = struct {
 
         // Push to task queue so Python on_member_added / on_member_removed
         // handlers are called by the task dispatcher.
-        // Mark consumed BEFORE push — same race-safety rule as onRequest.
-        consumed.* = true;
+        // `consumed` lives on the caller's stack; it is set after the push so a
+        // failed push (OOM) leaves ownership with the caller.
         try self.tasks_queue.pushMessageToQueue(message);
+        consumed.* = true;
     }
 
     pub fn onRequest(self: *Self, _: *ParentConnT, message: *Message, consumed: *bool) !void {
-        // Mark consumed BEFORE pushing so the dispatcher never reads message
-        // fields after pushMessageToQueue() — Python can dequeue and free the
-        // message concurrently as soon as it is in the queue.
-        consumed.* = true;
+        // The dispatcher must not read message fields after the push — Python
+        // can dequeue and free the message concurrently.  `consumed` is only a
+        // caller-stack flag, so setting it after a successful push is safe.
         try self.tasks_queue.pushMessageToQueue(message);
+        consumed.* = true;
     }
 
     pub fn onResponse(self: *Self, _: *ParentConnT, message: *Message, consumed: *bool) !void {
-        self.msg_store.insert(message) catch {
-            // StoreFull: two RPCs share the same hash slot.  Leave consumed=false
-            // so the dispatcher frees the message via message.deinit().
-            log_client.warn("message store full, dropping response for uuid={}", .{message.getUuid()});
+        self.msg_store.insert(message) catch |err| {
+            // Leave consumed=false so the dispatcher frees the message via
+            // message.deinit().
+            switch (err) {
+                // The caller timed out and gave up on this uuid: expected.
+                error.Expired => log_client.debug("dropping late response for uuid={}", .{message.getUuid()}),
+                // Two in-flight RPCs share a uuid (u16 wrap-around under load).
+                else => log_client.warn("message store full, dropping response for uuid={}", .{message.getUuid()}),
+            }
             return;
         };
         // Transfer ownership to the message store.  Set consumed so the
@@ -783,7 +856,7 @@ pub const ClientHandler = struct {
     fn diconnectionHandler(_: *Self, _: *ParentConnT) !void {}
 
     fn errorHandler(_: *Self, conn: *ParentConnT, err: anyerror) !void {
-        conn.suspended = true;
+        conn.suspended.store(true, .release);
         switch (err) {
             error.EOF => {},
             error.IncompleteMessage => {

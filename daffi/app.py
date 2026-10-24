@@ -161,7 +161,8 @@ class Application(EventsMixin, ABC):
         # user thread + the disconnect watcher) cannot race on native
         # teardown — without it both threads could read ``_conn_num`` as
         # non-None and both call ``dfcore.stopClient`` (double-free).
-        self._stop_lock = threading.Lock()
+        self._stop_lock = threading.RLock()
+        self._stopping = False
         self._connection_error: Optional[Exception] = None
         # Set to True by the background lifecycle watcher when an unexpected
         # disconnect or eviction is detected.  Cleared by a successful
@@ -208,6 +209,18 @@ class Application(EventsMixin, ABC):
         sync_native_log_level()
 
         set_signal_handler(self.stop)
+
+    @property
+    def _native_host(self) -> str:
+        """What the native layer receives as ``host``: the Unix-socket path when
+        one was given (the core treats a host that is not an IP/hostname as a
+        socket path), otherwise the TCP host."""
+        return self.unix_sock_path or self.host or ""
+
+    @property
+    def _native_port(self) -> int:
+        """Port for the native layer; ``0`` is passed for Unix sockets."""
+        return 0 if self.unix_sock_path else (self.port or 0)
 
     @property
     def info(self) -> str:
@@ -354,8 +367,8 @@ class ServerMixin:
             conn_info=(self.host, self.port, self.unix_sock_path),
         ):
             self._conn_num = dfcore.startServer(
-                self.host,
-                self.port,
+                self._native_host,
+                self._native_port,
                 self.server_mode,
                 self.app_name,
                 self.tls,
@@ -371,14 +384,28 @@ class ServerMixin:
             RpcProxy._process_service_handshake(self._conn_num)
 
     def stop(self, *_, **__):
-        """Stop the server and release the native connection."""
-        if not self._stop_event.is_set():
-            if self._conn_num is not None:
-                dfcore.stopServer(self._conn_num)
-                self._conn_num = None
-        self._stop_event.set()
-        if self._task_dispatcher:
-            self._task_dispatcher.stop_for_connection(self)
+        """Stop the server and release the native connection.
+
+        The task dispatcher is stopped **before** the native server is torn
+        down, and while ``_conn_num`` is still set: ``stop_for_connection``
+        uses it to find the lifecycle fd it must signal to wake the poller
+        thread.  Clearing it first (as an earlier version did) made the signal
+        go nowhere and ``stop()`` block forever joining the poller.
+        """
+        with self._stop_lock:
+            if self._stopping or self._stop_event.is_set():
+                return
+            self._stopping = True
+            try:
+                conn_num = self._conn_num
+                if self._task_dispatcher:
+                    self._task_dispatcher.stop_for_connection(self)
+                if conn_num is not None:
+                    dfcore.stopServer(conn_num)
+                    self._conn_num = None
+            finally:
+                self._stopping = False
+                self._stop_event.set()
 
 
 class Router(Application, ServerMixin):
@@ -502,8 +529,8 @@ class Client(Application):
         self._task_dispatcher._start_workers()
 
         self._conn_num = dfcore.startClient(
-            self.host,
-            self.port,
+            self._native_host,
+            self._native_port,
             self.app_name,
             self.tls,
             self.ca_file,
