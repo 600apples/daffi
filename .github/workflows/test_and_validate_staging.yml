@@ -33,7 +33,7 @@ jobs:
     - name: Install Zig
       run: |
         set -e
-        ZIG_VERSION="0.16.0"
+        ZIG_VERSION="0.17.0"
         if [ "$(uname)" = "Darwin" ]; then
           RAW_ARCH=$(uname -m)
           if [ "$RAW_ARCH" = "arm64" ]; then ZIG_ARCH="aarch64"; else ZIG_ARCH="$RAW_ARCH"; fi

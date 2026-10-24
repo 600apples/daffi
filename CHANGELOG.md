@@ -13,6 +13,7 @@ All notable changes to this project are documented in this file.
 
 ### Changed
 
+- Migrated to Zig 0.17
 - **TLS:** the minimum protocol version is now TLS 1.2.
 - `stop()` on a `Service` / `Router` now blocks until the native server has
   fully shut down, so the port can be rebound right after it returns.

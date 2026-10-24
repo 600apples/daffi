@@ -1,6 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
-pub const is_wasm = builtin.cpu.arch == .wasm32 or builtin.cpu.arch == .wasm64;
+pub const is_wasm = builtin.target.cpu.arch == .wasm32 or builtin.target.cpu.arch == .wasm64;
 
 /// Returns seconds since Unix epoch (replaces std.time.timestamp removed in 0.16).
 pub fn timestamp() i64 {
@@ -21,7 +21,7 @@ pub const print = if (is_wasm) @import("wasm.zig").consoleLog else std.debug.pri
 
 /// Like `print` but compiled away in non-Debug builds.
 pub inline fn debugPrint(comptime fmt: []const u8, args: anytype) void {
-    if (builtin.mode == .Debug) print(fmt, args);
+    if (builtin.mode == .debug) print(fmt, args);
 }
 
 /// std.Thread.Mutex was removed in 0.16.

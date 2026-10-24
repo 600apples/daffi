@@ -92,7 +92,7 @@ pub const MessagePool = struct {
 
     pub fn sendSynMessage(_: *Self, writer: anytype) !void {
         // Create and send SYN message. This message is used to distinguish between websockets and raw TCP connections.
-        const fulfillment: [serde.HEADER_SIZE]u8 = [_]u8{ascii.control_code.us} ** serde.HEADER_SIZE;
+        const fulfillment: [serde.HEADER_SIZE]u8 = @splat(ascii.control_code.us);
         _ = try writer.write(&fulfillment);
     }
 

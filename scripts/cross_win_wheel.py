@@ -24,8 +24,8 @@ Usage
     # build wheel for a specific Python version:
     python3 scripts/cross_win_wheel.py --py-version 3.13
 
-    # use ReleaseFast instead of ReleaseSafe:
-    ZIG_OPT=ReleaseFast python3 scripts/cross_win_wheel.py
+    # use the `fast` optimize mode instead of `safe`:
+    ZIG_OPT=fast python3 scripts/cross_win_wheel.py
 
 Output
 ------
@@ -53,6 +53,9 @@ import zipfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
+
+from setup import _ensure_zig, zig_c_module_args  # noqa: E402
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
@@ -114,25 +117,6 @@ def _openssl_branch() -> str:
         return available[-1]
 
 
-def _find_zig() -> str:
-    zig = shutil.which("zig")
-    if zig:
-        return zig
-    # Ask setup.py to download it (same logic as wheel builds).
-    subprocess.check_call(
-        [sys.executable, str(ROOT / "setup.py"), "ensure_zig",
-         "--symlink", "/usr/local/bin/zig"],
-        cwd=ROOT,
-    )
-    zig = shutil.which("zig")
-    if not zig:
-        raise RuntimeError(
-            "zig not found after ensure_zig. "
-            "Install manually from https://ziglang.org/download/"
-        )
-    return zig
-
-
 # ── main ──────────────────────────────────────────────────────────────────────
 
 def main() -> None:
@@ -162,7 +146,7 @@ def main() -> None:
 
     print(f"\nBuilding  {wheel_name}")
     print(f"Zig target: x86_64-windows-gnu")
-    print(f"Optimization: {os.environ.get('ZIG_OPT', 'ReleaseSafe')}\n")
+    print(f"Optimization: {os.environ.get('ZIG_OPT', 'safe')}\n")
 
     with tempfile.TemporaryDirectory(prefix="daffi_cross_win_") as _tmp:
         tmp = Path(_tmp)
@@ -229,9 +213,9 @@ def main() -> None:
 
         # ── 3. Cross-compile ──────────────────────────────────────────────────
         print("\n[3/4] Compiling dfcore for Windows AMD64")
-        zig      = _find_zig()
+        zig      = _ensure_zig()
         pyd_out  = tmp / pyd_name
-        opt_mode = os.environ.get("ZIG_OPT", "ReleaseSafe")
+        opt_mode = os.environ.get("ZIG_OPT", "safe")
 
         cmd = [
             zig, "build-lib",
@@ -241,12 +225,11 @@ def main() -> None:
             f"-femit-bin={pyd_out}",
             "-fallow-shlib-undefined",
             "-dynamic",
-            f"-I{py_inc_dir}",
-            f"-I{openssl_inc}",
             f"-L{openssl_lib}",
             "-lssl",
             "-lcrypto",
-            str(ROOT / "core" / "core.zig"),
+            *zig_c_module_args(zig, str(tmp / "zig_c"), [str(py_inc_dir), str(openssl_inc)],
+                               "x86_64-windows-gnu"),
         ]
 
         print("  $ " + " ".join(str(c) for c in cmd))

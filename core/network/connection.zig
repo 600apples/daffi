@@ -35,7 +35,7 @@ pub const ConnectionType = enum {
 /// (106/110 bytes), which a 28-byte (`sockaddr_in6`-sized) buffer silently
 /// truncated, breaking Unix sockets whose path is longer than ~26 characters.
 pub const NetAddress = struct {
-    bytes: [128]u8 align(8) = [_]u8{0} ** 128,
+    bytes: [128]u8 align(8) = @splat(0),
 };
 
 /// Format a `NetAddress` for display.
@@ -48,9 +48,9 @@ fn formatNetAddrFn(addr: NetAddress, writer: *std.Io.Writer) std.Io.Writer.Error
     // Linux:   bytes[0..2] = sa_family (u16, native endian)
     // BSD/macOS: bytes[0] = sa_len, bytes[1] = sa_family (u8)
     const builtin = @import("builtin");
-    const bsd_layout = comptime builtin.os.tag.isBSD();
+    const bsd_layout = comptime builtin.target.os.tag.isBSD();
     const family: u16 = if (bsd_layout) addr.bytes[1] else std.mem.readInt(u16, addr.bytes[0..2], .little);
-    const af_inet6: u16 = comptime switch (builtin.os.tag) {
+    const af_inet6: u16 = comptime switch (builtin.target.os.tag) {
         .linux => 10,
         .macos, .ios, .tvos, .watchos, .visionos => 30,
         else => 28,
@@ -248,7 +248,7 @@ pub fn Connection(comptime contype: ConnectionType) type {
                 return err;
             };
             new_self.* = .{ .ctx = ctx, .op_table = table, .allocator = self.allocator, .is_websocket = is_websocket, .peer_addr = addr };
-            if (comptime @import("builtin").mode == .Debug)
+            if (comptime @import("builtin").mode == .debug)
                 std.debug.print("accepted {s} connection from {f}\n", .{ if (is_websocket) "web" else "native", fmtNetAddr(addr) });
             return new_self;
         }

@@ -31,8 +31,8 @@ pub const op_table = OperationTable{
 pub const ReadError = anyerror;
 pub const WriteError = anyerror;
 
-const CLOSE_NORMAL = ([_]u8{ @intFromEnum(OpCode.close), 2, 3, 232 })[0..]; // code: 1000
-const CLOSE_PROTOCOL_ERROR = ([_]u8{ @intFromEnum(OpCode.close), 2, 3, 234 })[0..]; //code: 1002
+const CLOSE_NORMAL = ([_]u8{ @backingInt(OpCode.close), 2, 3, 232 })[0..]; // code: 1000
+const CLOSE_PROTOCOL_ERROR = ([_]u8{ @backingInt(OpCode.close), 2, 3, 234 })[0..]; //code: 1002
 
 buffer_pool: buffer.Pool,
 buffer_provider: buffer.Provider,
@@ -208,7 +208,7 @@ fn writeFrame(self: *WebConnection, op_code: WebConnection.OpCode, data: []const
 
     // maximum possible prefix length. op_code + length_type + 8byte length
     var buf: [10]u8 = undefined;
-    buf[0] = @intFromEnum(op_code);
+    buf[0] = @backingInt(op_code);
 
     if (l <= 125) {
         buf[1] = @intCast(l);

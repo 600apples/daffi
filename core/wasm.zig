@@ -94,7 +94,7 @@ export fn sendMessage(data: [*:0]const u8, receiver: [*:0]const u8, func_name: [
     const actual_data: []const u8 = std.mem.span(data);
     const actual_receiver: []const u8 = std.mem.span(receiver);
     const actual_func_name: []const u8 = std.mem.span(func_name);
-    const decoder: MessageDecoder = @enumFromInt(serde);
+    const decoder = std.enums.fromInt(MessageDecoder, serde) orelse throwError("invalid serde\n");
     const is_bytes = switch (decoder) {
         .JSON => false,
         .OPAQUE, .PICKLE, .MSGPACK => true,
@@ -130,7 +130,7 @@ export fn sendMessage(data: [*:0]const u8, receiver: [*:0]const u8, func_name: [
 export fn getAvailableMembers(conn_num: usize) [*:0]const u8 {
     const json = Client.getAvailableMembers(allocator, conn_num) catch throwError("failed to get available members\n");
     defer allocator.free(json);
-    return (allocator.dupeZ(u8, json) catch @panic("OOM")).ptr;
+    return (allocator.dupeSentinel(u8, json, 0) catch @panic("OOM")).ptr;
 }
 
 export fn parseAndStoreMessage(data: [*:0]const u8, len: u32, conn_num: u32) void {
@@ -159,7 +159,7 @@ export fn parseAndStoreMessage(data: [*:0]const u8, len: u32, conn_num: u32) voi
                     consoleLog("failed to handle own handshake: {any}\n", .{err});
                     throwError("failed to handle own handshake\n");
                 };
-                _storeMessage(payload.ptr, payload.len, uuid, false, @intFromEnum(msg.getDecoder()));
+                _storeMessage(payload.ptr, payload.len, uuid, false, @backingInt(msg.getDecoder()));
                 if (consumed) {
                     // JS has its copy of the payload now; reclaim the store's.
                     owned = false;
@@ -173,8 +173,8 @@ export fn parseAndStoreMessage(data: [*:0]const u8, len: u32, conn_num: u32) voi
                 };
             }
         },
-        .RESPONSE => _storeMessage(payload.ptr, payload.len, uuid, false, @intFromEnum(msg.getDecoder())),
-        .ERROR => _storeMessage(payload.ptr, payload.len, uuid, true, @intFromEnum(msg.getDecoder())),
+        .RESPONSE => _storeMessage(payload.ptr, payload.len, uuid, false, @backingInt(msg.getDecoder())),
+        .ERROR => _storeMessage(payload.ptr, payload.len, uuid, true, @backingInt(msg.getDecoder())),
         .EVENTS => {
             // Update local chan_mapper before notifying JS event handlers so
             // that any RPC triggered from within an event handler sees the

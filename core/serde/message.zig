@@ -6,7 +6,7 @@ const meta = std.meta;
 const fmt = std.fmt;
 const Allocator = std.mem.Allocator;
 const Endian = std.builtin.Endian;
-const native_endian = builtin.cpu.arch.endian();
+const native_endian = builtin.target.cpu.arch.endian();
 const ArenaAllocator = std.heap.ArenaAllocator;
 
 const expect = std.testing.expect;
@@ -42,7 +42,7 @@ fn serdeFns(comptime T: type) type {
     return struct {
         // guaranteed to be divisible by 8
         pub const size: u32 = @divExact(@bitSizeOf(T), 8);
-        const backed_int_type = std.meta.Int(.unsigned, size * 8);
+        const backed_int_type = @Int(.unsigned, size * 8);
 
         pub fn toInt(self: T) backed_int_type {
             return @as(backed_int_type, @bitCast(self));
@@ -71,7 +71,7 @@ fn serdeFns(comptime T: type) type {
 
         pub fn setBits(_: T, comptime Ftype: type, comptime field_name: []const u8, v: Ftype, buf: []u8) void {
             const bit_offset = @bitOffsetOf(T, field_name);
-            std.mem.writePackedIntNative(Ftype, buf, bit_offset, v);
+            std.mem.writePackedInt(Ftype, buf, bit_offset, v, native_endian);
         }
     };
 }
@@ -85,10 +85,10 @@ pub const Header = packed struct {
     msg_len: u25, // this is not full message length, but only data + metadata length (without header)
     metadata_len: u15,
     msg_parts: u7 = 1, // number of expected receivers for broadcast message. used with Router mode only. // TODO: remove this field
-    endian: u1 = @intFromEnum(native_endian),
+    endian: u1 = @backingInt(native_endian),
 
     pub const size: u32 = @divExact(@bitSizeOf(@This()), 8);
-    const backed_int_type = std.meta.Int(.unsigned, size * 8);
+    const backed_int_type = @Int(.unsigned, size * 8);
 
     pub fn toInt(self: @This()) backed_int_type {
         return @as(backed_int_type, @bitCast(self));
@@ -115,7 +115,7 @@ pub const Header = packed struct {
 
     pub fn setBits(_: @This(), comptime Ftype: type, comptime field_name: []const u8, v: Ftype, buf: []u8) void {
         const bit_offset = @bitOffsetOf(@This(), field_name);
-        std.mem.writePackedIntNative(Ftype, buf, bit_offset, v);
+        std.mem.writePackedInt(Ftype, buf, bit_offset, v, native_endian);
     }
 
     pub fn create(
@@ -184,13 +184,13 @@ pub const Header = packed struct {
     pub fn parse(bytes: []const u8) ParseError!Header {
         if (bytes.len < size) return error.HeaderTooShort;
         const raw: Raw = @bitCast(bytes[0..size].*);
-        if (raw.endian != @intFromEnum(native_endian)) return error.InvalidEndian;
-        if (raw.flag >= @typeInfo(MessageFlag).@"enum".fields.len) return error.InvalidFlag;
+        if (raw.endian != @backingInt(native_endian)) return error.InvalidEndian;
+        const flag = std.enums.fromInt(MessageFlag, raw.flag) orelse return error.InvalidFlag;
         if (raw.metadata_len > raw.msg_len) return error.InvalidMetadataLen;
         return .{
             .uuid = raw.uuid,
-            .flag = @enumFromInt(raw.flag),
-            .decoder = @enumFromInt(raw.decoder),
+            .flag = flag,
+            .decoder = @fromBackingInt(raw.decoder),
             .is_bytes = raw.is_bytes,
             .return_result = raw.return_result,
             .msg_len = raw.msg_len,
@@ -428,13 +428,13 @@ pub const Message = struct {
 
     pub fn setFlag(self: *Message, flag: MessageFlag) void {
         self.header.flag = flag;
-        const value = @intFromEnum(flag);
+        const value = @backingInt(flag);
         self.header.setBits(std.meta.Tag(MessageFlag), "flag", value, self.data);
     }
 
     pub fn setDecoder(self: *Message, decoder: MessageDecoder) void {
         self.header.decoder = decoder;
-        const value = @intFromEnum(decoder);
+        const value = @backingInt(decoder);
         const ftype = std.meta.Tag(MessageDecoder);
         self.header.setBits(ftype, "decoder", value, self.data);
     }
@@ -580,7 +580,9 @@ test "serde big RawMessage" {
     const transmitter = "transmitter";
     const receiver = "receiver";
     const func_name = "func_name";
-    const data: []const u8 = "friedeggs" ** 11e5;
+    const data = try alloc.alloc(u8, 9_900_000);
+    defer alloc.free(data);
+    @memset(data, 'f');
 
     const message = try RawMessage.create(alloc, data, 1000, .REQUEST, .JSON, false, true, transmitter, receiver, func_name);
     defer alloc.free(message.data);
@@ -609,7 +611,7 @@ test "Message set fields" {
     const transmitter = "transmitter";
     const receiver = "receiver";
     const func_name = "func_name";
-    const data = &[_]u8{'1'} ** 100;
+    const data: [100]u8 = @splat('1');
 
     const metadata_len = Metadata.calcMetadataLen(transmitter, receiver, func_name);
     const msg_len = data.len + metadata_len;
@@ -617,11 +619,11 @@ test "Message set fields" {
     var backed_header_bytes: [serde.HEADER_SIZE]u8 = undefined;
     header.toBytes(&backed_header_bytes);
 
-    const raw_message = try RawMessage.create(alloc, data, 1000, .REQUEST, .JSON, false, true, transmitter, receiver, func_name);
+    const raw_message = try RawMessage.create(alloc, &data, 1000, .REQUEST, .JSON, false, true, transmitter, receiver, func_name);
     var msg = try Message.create(alloc, header, raw_message.data);
     defer msg.deinit();
 
-    try expect(std.mem.eql(u8, msg.getData(), data));
+    try expect(std.mem.eql(u8, msg.getData(), &data));
     try expect(std.mem.eql(u8, msg.getMetadata(), "transmitter|receiver|func_name"));
     try expect(std.mem.eql(u8, msg.getTransmitter(), transmitter));
     try expect(std.mem.eql(u8, msg.getReceiver(), receiver));
@@ -675,7 +677,7 @@ test "Message has transmitter/receiver" {
     const transmitter = "";
     const receiver = "";
     const func_name = "func_name";
-    const data = &[_]u8{'1'} ** 100;
+    const data: [100]u8 = @splat('1');
 
     const metadata_len = Metadata.calcMetadataLen(transmitter, receiver, func_name);
     const msg_len = data.len + metadata_len;
@@ -683,7 +685,7 @@ test "Message has transmitter/receiver" {
     var backed_header_bytes: [serde.HEADER_SIZE]u8 = undefined;
     header.toBytes(&backed_header_bytes);
 
-    const raw_message = try RawMessage.create(alloc, data, 1000, .REQUEST, .JSON, false, true, transmitter, receiver, func_name);
+    const raw_message = try RawMessage.create(alloc, &data, 1000, .REQUEST, .JSON, false, true, transmitter, receiver, func_name);
     var msg = try Message.create(alloc, header, raw_message.data);
     defer msg.deinit();
     try expect(!msg.hasReceiver());
@@ -725,8 +727,10 @@ test "Header.parse rejects malformed headers" {
     try std.testing.expectError(error.InvalidMetadataLen, Header.parse(&bad));
 
     // every all-ones / all-zeros header must return an error or a header, never panic
-    _ = Header.parse(&[_]u8{0xff} ** serde.HEADER_SIZE) catch {};
-    _ = Header.parse(&[_]u8{0x00} ** serde.HEADER_SIZE) catch {};
+    const all_ones: [serde.HEADER_SIZE]u8 = @splat(0xff);
+    const all_zeros: [serde.HEADER_SIZE]u8 = @splat(0x00);
+    _ = Header.parse(&all_ones) catch {};
+    _ = Header.parse(&all_zeros) catch {};
 }
 
 test "Metadata parsing rejects wrong section count" {

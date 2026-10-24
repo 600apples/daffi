@@ -1,22 +1,13 @@
 //! Minimal POSIX/C-socket networking — replaces std.net (removed in Zig 0.16).
 //! Requires linking with libc (-lc).
 
-const c = @cImport({
-    @cInclude("sys/socket.h");
-    @cInclude("sys/un.h");
-    @cInclude("netdb.h");
-    @cInclude("unistd.h");
-    @cInclude("arpa/inet.h");
-    @cInclude("netinet/in.h");
-    @cInclude("errno.h");
-    @cInclude("string.h");
-});
+const c = @import("posix_c");
 
 // ── fcntl — declared manually to avoid glibc bits/fcntl2.h ──────────────────
 const F_GETFL: c_int = 3;
 const F_SETFL: c_int = 4;
 /// O_NONBLOCK: 0x800 on Linux/x86-64 and most Linux arches; 0x4 on Darwin.
-const O_NONBLOCK: c_int = switch (@import("builtin").os.tag) {
+const O_NONBLOCK: c_int = switch (@import("builtin").target.os.tag) {
     .macos, .ios, .watchos, .tvos, .visionos => 0x0004,
     else => 0x0800,
 };
@@ -37,17 +28,17 @@ const IPPROTO_TCP: c_int = 6;
 
 /// TCP_KEEPIDLE (Linux) / TCP_KEEPALIVE (Darwin): seconds of inactivity before
 /// the kernel sends the first keepalive probe.
-const TCP_KEEPIDLE: c_int = switch (@import("builtin").os.tag) {
+const TCP_KEEPIDLE: c_int = switch (@import("builtin").target.os.tag) {
     .macos, .ios, .watchos, .tvos, .visionos => 0x10,
     else => 4,
 };
 /// TCP_KEEPINTVL: seconds between consecutive keepalive probes.
-const TCP_KEEPINTVL: c_int = switch (@import("builtin").os.tag) {
+const TCP_KEEPINTVL: c_int = switch (@import("builtin").target.os.tag) {
     .macos, .ios, .watchos, .tvos, .visionos => 0x101,
     else => 5,
 };
 /// TCP_KEEPCNT: number of unanswered probes before the connection is declared dead.
-const TCP_KEEPCNT: c_int = switch (@import("builtin").os.tag) {
+const TCP_KEEPCNT: c_int = switch (@import("builtin").target.os.tag) {
     .macos, .ios, .watchos, .tvos, .visionos => 0x102,
     else => 6,
 };
@@ -134,7 +125,7 @@ pub const Address = struct {
     // sizeof(sockaddr_storage): must hold a sockaddr_un (106/110 bytes), not just
     // a sockaddr_in6 (28), or long Unix-socket paths are truncated and the
     // casts to `*const sockaddr_un` read past the end of the buffer.
-    bytes: [128]u8 align(8) = [_]u8{0} ** 128,
+    bytes: [128]u8 align(8) = @splat(0),
     family: u16 = 0,
     port: u16 = 0,
 
@@ -182,7 +173,7 @@ pub const Stream = struct {
     handle: posix.socket_t,
 
     fn lastErrno() std.c.E {
-        return @enumFromInt(std.c._errno().*);
+        return @fromBackingInt(@intCast(std.c._errno().*));
     }
 
     pub fn read(self: Stream, buf: []u8) !usize {
@@ -261,7 +252,7 @@ const CONNECT_TIMEOUT_MS: c_int = 15_000;
 
 pub fn tcpConnectToHost(_: Allocator, host: []const u8, port: u16) !Stream {
     var port_buf: [8]u8 = undefined;
-    const port_str = std.fmt.bufPrintZ(&port_buf, "{d}", .{port}) catch return error.BadPort;
+    const port_str = std.fmt.bufPrintSentinel(&port_buf, "{d}", .{port}, 0) catch return error.BadPort;
 
     var hints: c.addrinfo = std.mem.zeroes(c.addrinfo);
     hints.ai_family = c.AF_UNSPEC;
@@ -355,7 +346,7 @@ pub const AddressList = struct {
 
 pub fn getAddressList(allocator: Allocator, host: []const u8, port: u16) !*AddressList {
     var port_buf: [8]u8 = undefined;
-    const port_str = std.fmt.bufPrintZ(&port_buf, "{d}", .{port}) catch return error.BadPort;
+    const port_str = std.fmt.bufPrintSentinel(&port_buf, "{d}", .{port}, 0) catch return error.BadPort;
 
     var hints: c.addrinfo = std.mem.zeroes(c.addrinfo);
     hints.ai_family = c.AF_UNSPEC;

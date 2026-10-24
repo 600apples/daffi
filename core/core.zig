@@ -15,7 +15,7 @@ pub const std_options: std.Options = .{
     .logFn    = @import("log.zig").logFn,
 };
 
-const py = @import("python.zig").c;
+const py = @import("python_c");
 const PyObject = py.PyObject;
 const PyMethodDef = py.PyMethodDef;
 const PyModule_Create = py.PyModule_Create;

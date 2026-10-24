@@ -1,6 +1,6 @@
 //! CFFI bindings — client-side functions exposed to the Python dfcore extension.
 
-const py = @import("../python.zig").c;
+const py = @import("python_c");
 const PyObject = py.PyObject;
 const Py_BuildValue = py.Py_BuildValue;
 const PyArg_ParseTuple = py.PyArg_ParseTuple;
@@ -156,8 +156,8 @@ pub fn getMessageFromClientStore(_: [*c]PyObject, args: [*c]PyObject) callconv(.
     }) orelse return Py_BuildValue("");
     defer msg.deinit();
     const data: []const u8 = msg.getData();
-    const flag: c_ushort = @intFromEnum(msg.getFlag());
-    const decoder: c_ushort = @intFromEnum(msg.getDecoder());
+    const flag: c_ushort = @backingInt(msg.getFlag());
+    const decoder: c_ushort = @backingInt(msg.getDecoder());
     const template = if (msg.isBytes()) "(y#IH)" else "(s#IH)";
     return Py_BuildValue(template, data.ptr, data.len, flag, decoder);
 }
@@ -181,8 +181,8 @@ pub fn getMessageForClientWorker(_: [*c]PyObject, args: [*c]PyObject) callconv(.
     defer msg.deinit();
     const uuid: c_uint = @as(c_uint, msg.getUuid());
     const data: []const u8 = msg.getData();
-    const flag: c_ushort = @intFromEnum(msg.getFlag());
-    const decoder: c_ushort = @intFromEnum(msg.getDecoder());
+    const flag: c_ushort = @backingInt(msg.getFlag());
+    const decoder: c_ushort = @backingInt(msg.getDecoder());
     const transmitter: []const u8 = msg.getTransmitter();
     const receiver: []const u8 = msg.getReceiver();
     const func_name: []const u8 = msg.getFuncName();

@@ -1,5 +1,5 @@
 //! OpenSSL TLS wrapper for server-side and client-side TLS.
-//! All OpenSSL @cImport is confined to this file; callers use the opaque
+//! All OpenSSL C bindings are confined to this file; callers use the opaque
 //! handle types SslConn and SslCtx so they never depend on C headers.
 //!
 //! Threading model
@@ -17,11 +17,7 @@ const std = @import("std");
 const net = @import("posix_net.zig");
 const Mutex = @import("../misc.zig").Mutex;
 
-const c = @cImport({
-    @cInclude("openssl/ssl.h");
-    @cInclude("openssl/err.h");
-    @cInclude("openssl/x509v3.h");
-});
+const c = @import("openssl_c");
 
 const log = std.log.scoped(.tls);
 const allocator = std.heap.c_allocator;

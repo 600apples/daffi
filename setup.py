@@ -3,10 +3,16 @@ Custom build configuration for the dfcore Zig extension.
 
 Zig auto-install
 ----------------
-If ``zig`` is not found in PATH, the build script downloads the official
-Zig 0.16.0 binary for the current platform into a temporary directory and
-uses it transparently.  No manual installation is required for
-``pip install -e .`` on a clean machine.
+If ``zig`` in PATH is missing or is not the pinned version (``_ZIG_VERSION``),
+the build script downloads the official Zig binary for the current platform
+into a temporary directory and uses it transparently.  No manual installation
+is required for ``pip install -e .`` on a clean machine.
+
+C headers
+---------
+Zig has no ``@cImport``.  The headers in ``core/c/`` are translated with
+``zig translate-c`` at build time and handed to the compiler as the modules
+``python_c``, ``posix_c`` and ``openssl_c`` (see ``zig_c_module_args``).
 
 OpenSSL discovery order
 -----------------------
@@ -53,7 +59,7 @@ from setuptools import setup, Extension, Command
 from setuptools.command.build_ext import build_ext
 
 
-_ZIG_VERSION = "0.16.0"
+_ZIG_VERSION = "0.17.0"
 _OPENSSL_VERSION = os.environ.get("DAFFI_OPENSSL_VERSION", "3.4.1")
 
 # SHA-256 of every archive this script downloads and then executes / links
@@ -61,11 +67,11 @@ _OPENSSL_VERSION = os.environ.get("DAFFI_OPENSSL_VERSION", "3.4.1")
 # ``.tar.gz.sha256`` files published with each OpenSSL GitHub release.
 # Bump these together with the versions above.
 _ZIG_SHA256 = {
-    ("aarch64", "macos"):   "b23d70deaa879b5c2d486ed3316f7eaa53e84acf6fc9cc747de152450d401489",
-    ("x86_64",  "macos"):   "0387557ed1877bc6a2e1802c8391953baddba76081876301c522f52977b52ba7",
-    ("aarch64", "linux"):   "ea4b09bfb22ec6f6c6ceac57ab63efb6b46e17ab08d21f69f3a48b38e1534f17",
-    ("x86_64",  "linux"):   "70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00",
-    ("x86_64",  "windows"): "68659eb5f1e4eb1437a722f1dd889c5a322c9954607f5edcf337bc3684a75a7e",
+    ("aarch64", "macos"):   "b607e9b9234790a008116ae5bdb71c6243b84b9fb42a53a9e70fde41c06c536a",
+    ("x86_64",  "macos"):   "4f9a1c5269aa17ebda5e6d3c2b89d6cbf36f7d2b22a0306e9ab98f25f95529c6",
+    ("aarch64", "linux"):   "9e8d11661d4ae3bd57702a3832781e23ad151dde5798e16a5ccd503f65234ff8",
+    ("x86_64",  "linux"):   "1cbe9df9f27e6b78d14ccbca43b6703a404ef79ef1c463de901d7f088d4e2026",
+    ("x86_64",  "windows"): "b5663f69581dcf391293fbf16c06cb80d81d806545ce618b4d0bab7f0eb8c428",
 }
 _OPENSSL_SHA256 = {
     "3.4.1": "002a2d6b30b58bf4bea46c43bdd96365aaf8daa6c428782aa4feee06da197df3",
@@ -112,16 +118,19 @@ def _safe_extractall(tf, dest: str) -> None:
 
 
 def _ensure_zig() -> str:
-    """Return the path to a ``zig`` executable.
+    """Return the path to a ``zig`` executable of version ``_ZIG_VERSION``.
 
-    Checks PATH first.  If not found, downloads the official Zig binary for
-    the current platform into ``/tmp/zig-<arch>-<os>-<version>/`` and returns
-    the path to the extracted binary.  Subsequent calls reuse the cached
-    download.
+    Uses the ``zig`` in PATH when it is that version.  Otherwise downloads the
+    official Zig binary for the current platform into
+    ``/tmp/zig-<arch>-<os>-<version>/`` and returns the path to the extracted
+    binary.  Subsequent calls reuse the cached download.
     """
     zig = shutil.which("zig")
     if zig:
-        return zig
+        found = subprocess.run([zig, "version"], capture_output=True, text=True).stdout.strip()
+        if found == _ZIG_VERSION:
+            return zig
+        print(f"setup.py: ignoring {zig!r} (Zig {found or 'unknown'}, need {_ZIG_VERSION})")
 
     machine = platform.machine().lower()
     arch = "aarch64" if machine in ("aarch64", "arm64") else "x86_64"
@@ -147,14 +156,14 @@ def _ensure_zig() -> str:
         print(f"setup.py: reusing cached Zig at {zig_exe!r}")
         return zig_exe
 
-    zig_sha = _ZIG_SHA256.get((arch, os_name)) if _ZIG_VERSION == "0.16.0" else None
+    zig_sha = _ZIG_SHA256.get((arch, os_name))
 
     if sys.platform == "win32":
         archive_name = f"{dir_name}.zip"
         url     = f"https://ziglang.org/download/{_ZIG_VERSION}/{archive_name}"
         archive = os.path.join(tempfile.gettempdir(), archive_name)
 
-        print(f"setup.py: zig not found in PATH — downloading {url!r} …")
+        print(f"setup.py: downloading Zig {_ZIG_VERSION} from {url!r} …")
         try:
             urllib.request.urlretrieve(url, archive)
         except Exception:
@@ -170,7 +179,7 @@ def _ensure_zig() -> str:
         url      = f"https://ziglang.org/download/{_ZIG_VERSION}/{tarball}"
         archive  = os.path.join(tempfile.gettempdir(), tarball)
 
-        print(f"setup.py: zig not found in PATH — downloading {url!r} …")
+        print(f"setup.py: downloading Zig {_ZIG_VERSION} from {url!r} …")
         try:
             urllib.request.urlretrieve(url, archive)
         except Exception:
@@ -612,34 +621,120 @@ def _require_python_headers(include_dirs) -> None:
     )
 
 
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_ZIG_ROOT = os.path.join(_HERE, "core", "core.zig")
+_C_MODULES = {
+    "python_c": os.path.join(_HERE, "core", "c", "python.h"),
+    "posix_c": os.path.join(_HERE, "core", "c", "posix.h"),
+    "openssl_c": os.path.join(_HERE, "core", "c", "openssl.h"),
+}
+
+
+def zig_c_module_args(zig, out_dir, include_dirs, target=None):
+    """Translate the headers in ``core/c/`` into ``out_dir`` and return the
+    ``zig build-lib`` / ``zig test`` arguments that compile ``core/core.zig``
+    with them importable as ``@import("<name>")``.
+
+    The returned arguments must come last on the command line: the ``-M``
+    flags close the option list of the root module.
+    """
+    os.makedirs(out_dir, exist_ok=True)
+    flags = ["-lc", *(f"-I{d}" for d in include_dirs if d)]
+    if target:
+        flags += ["-target", target]
+
+    args = [arg for name in _C_MODULES for arg in ("--dep", name)]
+    args.append(f"-Mroot={_ZIG_ROOT}")
+    for name, header in _C_MODULES.items():
+        out = os.path.join(out_dir, f"{name}.zig")
+        with open(out, "wb") as f:
+            subprocess.run([zig, "translate-c", *flags, header], stdout=f, check=True)
+        args.append(f"-M{name}={out}")
+    return args
+
+
+def _openssl_link_args(openssl_lib):
+    """Linker arguments for OpenSSL on POSIX.
+
+    Prefers static archives when present (macOS Homebrew, auto-built Linux
+    OpenSSL) and falls back to dynamic ``-lssl``/``-lcrypto``.
+    """
+    if openssl_lib:
+        ssl_a = os.path.join(openssl_lib, "libssl.a")
+        crypto_a = os.path.join(openssl_lib, "libcrypto.a")
+        if os.path.exists(ssl_a) and os.path.exists(crypto_a):
+            return [ssl_a, crypto_a]
+        return [f"-L{openssl_lib}", "-lssl", "-lcrypto"]
+    # System OpenSSL on default search paths (e.g. libssl-dev).
+    return ["-lssl", "-lcrypto"]
+
+
+class ZigTest(Command):
+    """Setuptools command: run the Zig unit tests (``python setup.py zig_test``).
+
+    Links against the running interpreter's shared libpython, so it needs a
+    Python built with ``--enable-shared`` (Homebrew, python.org, most distros).
+    """
+
+    description = "run the Zig unit tests in core/"
+    user_options = []
+
+    def initialize_options(self):
+        pass
+
+    def finalize_options(self):
+        pass
+
+    def run(self):
+        import sysconfig
+
+        zig = _ensure_zig()
+        include_dirs = [sysconfig.get_paths()["include"]]
+        _require_python_headers(include_dirs)
+        openssl_include, openssl_lib = _find_openssl()
+        if openssl_include:
+            include_dirs.append(openssl_include)
+
+        libdir = sysconfig.get_config_var("LIBDIR")
+        ldversion = sysconfig.get_config_var("LDVERSION")
+        cmd = [
+            zig, "test",
+            "-lc",
+            f"-L{libdir}", f"-lpython{ldversion}", "-rpath", libdir,
+            *_openssl_link_args(openssl_lib),
+            *zig_c_module_args(zig, os.path.join(_HERE, "build", "zig_test"), include_dirs),
+        ]
+        subprocess.check_call(cmd, cwd=_HERE)
+
+
 class ZigBuilder(build_ext):
     def build_extension(self, ext):
-        assert len(ext.sources) == 1, "ZigBuilder expects exactly one source file"
-
         out_dir = os.path.dirname(self.get_ext_fullpath(ext.name))
         os.makedirs(out_dir, exist_ok=True)
 
         _require_python_headers(self.include_dirs)
 
-        mode = "Debug" if self.debug else os.environ.get("ZIG_OPT", "ReleaseSafe")
+        mode = "debug" if self.debug else os.environ.get("ZIG_OPT", "safe")
         openssl_include, openssl_lib = _find_openssl()
         target = _zig_target()
+        zig = _ensure_zig()
+
+        include_dirs = list(self.include_dirs)
+        if openssl_include:
+            include_dirs.append(openssl_include)
 
         cmd = [
-            _ensure_zig(),
+            zig,
             "build-lib",
             "-O", mode,
             "-lc",
             f"-femit-bin={self.get_ext_fullpath(ext.name)}",
             "-fallow-shlib-undefined",
             "-dynamic",
-            *[f"-I{d}" for d in self.include_dirs],
         ]
 
         if target:
             cmd += ["-target", target]
-        if openssl_include:
-            cmd.append(f"-I{openssl_include}")
 
         if sys.platform == "win32":
             # Windows: link Python import library explicitly (Zig doesn't
@@ -652,20 +747,10 @@ class ZigBuilder(build_ext):
             cmd.append(f"-l{python_ver}")
             if openssl_lib:
                 cmd.extend([f"-L{openssl_lib}", "-lssl", "-lcrypto"])
-        elif openssl_lib:
-            # Prefer static archives when present (macOS Homebrew, auto-built
-            # Linux OpenSSL).  Falls back to dynamic -lssl/-lcrypto.
-            ssl_a = os.path.join(openssl_lib, "libssl.a")
-            crypto_a = os.path.join(openssl_lib, "libcrypto.a")
-            if os.path.exists(ssl_a) and os.path.exists(crypto_a):
-                cmd.extend([ssl_a, crypto_a])
-            else:
-                cmd.extend([f"-L{openssl_lib}", "-lssl", "-lcrypto"])
         else:
-            # System OpenSSL on default search paths (e.g. libssl-dev).
-            cmd.extend(["-lssl", "-lcrypto"])
+            cmd.extend(_openssl_link_args(openssl_lib))
 
-        cmd.append(ext.sources[0])
+        cmd += zig_c_module_args(zig, os.path.join(self.build_temp, "zig_c"), include_dirs, target)
         self.spawn(cmd)
 
         # Local Windows installs need OpenSSL DLLs next to the extension.
@@ -682,12 +767,12 @@ class ZigBuilder(build_ext):
                         print(f"setup.py: copied {name} → {out_dir!r}")
 
 
-dfcore = Extension("daffi.dfcore", sources=["core/core.zig"])
-
-setup(
-    ext_modules=[dfcore],
-    cmdclass={
-        "build_ext": ZigBuilder,
-        "ensure_zig": EnsureZig,
-    },
-)
+if __name__ == "__main__":
+    setup(
+        ext_modules=[Extension("daffi.dfcore", sources=["core/core.zig"])],
+        cmdclass={
+            "build_ext": ZigBuilder,
+            "ensure_zig": EnsureZig,
+            "zig_test": ZigTest,
+        },
+    )

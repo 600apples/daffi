@@ -15,12 +15,7 @@ test-unit:  ## Run unit tests only — fast, no server subprocess required
 
 .PHONY: test-zig
 test-zig:  ## Run the Zig unit tests (needs Python headers + a shared libpython and OpenSSL libs)
-	@PYINC=$$(python3 -c "import sysconfig;print(sysconfig.get_paths()['include'])"); \
-	PYLIB=$$(python3 -c "import sysconfig;print(sysconfig.get_config_var('LIBDIR'))"); \
-	PYVER=$$(python3 -c "import sysconfig;print(sysconfig.get_config_var('LDVERSION'))"); \
-	SSL=$${OPENSSL_DIR:-$$(brew --prefix openssl@3 2>/dev/null || echo /usr)}; \
-	zig test core/core.zig -lc -L$$PYLIB -lpython$$PYVER -rpath $$PYLIB -I $$PYINC \
-	    -I $$SSL/include $$SSL/lib/libssl.a $$SSL/lib/libcrypto.a
+	python3 setup.py zig_test
 
 .PHONY: test-integration
 test-integration:  ## Run integration tests — spawns Service / Router subprocesses
@@ -205,8 +200,8 @@ _check-clean:
 # ── Build ─────────────────────────────────────────────────────────────────────
 
 .PHONY: build
-build:  ## Build WASM (ReleaseFast) + Python C extension — no debug prints
-	zig build -Doptimize=ReleaseFast
+build:  ## Build WASM (fast) + Python C extension — no debug prints
+	zig build -Doptimize=fast
 	zig build python
 
 .PHONY: dev
@@ -214,8 +209,8 @@ dev:  ## Build C extension in Debug mode — enables connection debug prints
 	python3 setup.py build_ext --debug --inplace
 
 .PHONY: wasm
-wasm:  ## Compile app.wasm only (ReleaseFast); override with OPTIMIZE=Debug
-	zig build -Doptimize=$(if $(OPTIMIZE),$(OPTIMIZE),ReleaseFast)
+wasm:  ## Compile app.wasm only (fast); override with OPTIMIZE=debug
+	zig build -Doptimize=$(if $(OPTIMIZE),$(OPTIMIZE),fast)
 
 .PHONY: ext
 ext:  ## Build the Python C extension (dfcore) in-place

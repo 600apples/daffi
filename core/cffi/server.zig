@@ -1,6 +1,6 @@
 //! CFFI bindings — server-side functions exposed to the Python dfcore extension.
 
-const py = @import("../python.zig").c;
+const py = @import("python_c");
 const PyObject = py.PyObject;
 const Py_BuildValue = py.Py_BuildValue;
 const PyArg_ParseTuple = py.PyArg_ParseTuple;
@@ -19,7 +19,7 @@ const allocator = std.heap.c_allocator;
 /// Dispatcher thread per slot.  Only touched while the GIL is held by the
 /// calling Python thread (startServer) or by the one thread that owns the slot's
 /// lifecycle (stopServer), so no extra locking is needed.
-var serverHandlerThreads: [256]?std.Thread = [_]?std.Thread{null} ** 256;
+var serverHandlerThreads: [256]?std.Thread = @splat(null);
 
 /// Bind to host:port, start the server dispatcher thread, and return a
 /// connection handle (conn_num).  mode: 0 = Router, 1 = Service.
@@ -195,8 +195,8 @@ pub fn getMessageForServerWorker(_: [*c]PyObject, args: [*c]PyObject) callconv(.
     defer msg.deinit();
     const uuid: c_uint = @as(c_uint, msg.getUuid());
     const data: []const u8 = msg.getData();
-    const flag: c_ushort = @intFromEnum(msg.getFlag());
-    const decoder: c_ushort = @intFromEnum(msg.getDecoder());
+    const flag: c_ushort = @backingInt(msg.getFlag());
+    const decoder: c_ushort = @backingInt(msg.getDecoder());
     const transmitter: []const u8 = msg.getTransmitter();
     const receiver: []const u8 = msg.getReceiver();
     const func_name: []const u8 = msg.getFuncName();

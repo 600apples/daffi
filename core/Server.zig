@@ -109,8 +109,8 @@ const ServerEntry = struct {
 /// thread, and returned by `releaseSlot` once the dispatcher has fully exited,
 /// so slots are reused instead of being exhausted after 256 starts.
 var slots_mutex: Mutex = .{};
-var slot_used: [MAX_SERVERS]bool = [_]bool{false} ** MAX_SERVERS;
-var slot_entries: [MAX_SERVERS]?ServerEntry = [_]?ServerEntry{null} ** MAX_SERVERS;
+var slot_used: [MAX_SERVERS]bool = @splat(false);
+var slot_entries: [MAX_SERVERS]?ServerEntry = @splat(null);
 
 /// Per-slot ready flag.  Set to true (with release ordering) by the dispatcher
 /// thread after it has written the ServerEntry into the slot.  Polled

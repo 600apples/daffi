@@ -1,6 +1,5 @@
 const std = @import("std");
 const enums = std.enums;
-const meta = std.meta;
 const net = std.net;
 const serde = @import("../serde.zig");
 const Message = serde.Message;
@@ -20,17 +19,17 @@ pub fn MessageHandler(comptime T: type) type {
 
         const Self = @This();
 
-        pub const HandlersMapping = [meta.fields(MessageFlag).len]HandlerEntryFn;
+        const flag_info = @typeInfo(MessageFlag).@"enum";
+        pub const HandlersMapping = [flag_info.field_names.len]HandlerEntryFn;
         /// consumed: set to true by a handler that has transferred ownership of
         /// the message into a store or queue.  The caller must NOT touch the
         /// message after handle() returns when consumed == true.
         const HandlerEntryFn = *const fn (ctx: *T, conn: *T.ParentConnT, message: *Message, consumed: *bool) anyerror!void;
 
         pub fn createMapping(smapping: enums.EnumFieldStruct(MessageFlag, HandlerEntryFn, notSupported)) HandlersMapping {
-            const fields = meta.fields(MessageFlag);
-            var mapping: [fields.len]HandlerEntryFn = undefined;
-            inline for (fields) |field| {
-                mapping[field.value] = @field(smapping, field.name);
+            var mapping: HandlersMapping = undefined;
+            inline for (flag_info.field_names, flag_info.field_values) |name, value| {
+                mapping[value] = @field(smapping, name);
             }
             return mapping;
         }
@@ -41,7 +40,7 @@ pub fn MessageHandler(comptime T: type) type {
         /// message in that case (Python will call deinit() later).
         pub fn handle(self: Self, conn: *T.ParentConnT, message: *Message, consumed: *bool) !void {
             switch (message.getFlag()) {
-                inline else => |fl| try self.handlers_mapping[@intFromEnum(fl)](self.ptr, conn, message, consumed),
+                inline else => |fl| try self.handlers_mapping[@backingInt(fl)](self.ptr, conn, message, consumed),
             }
         }
 
