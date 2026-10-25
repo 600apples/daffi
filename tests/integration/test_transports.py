@@ -32,10 +32,27 @@ pytestmark = pytest.mark.skipif(
 OPENSSL = shutil.which("openssl")
 
 
+# Ports already returned by _port().  Binding port 0 and closing the socket
+# can hand that same port straight back (Linux does this), so two listeners
+# in one spec would be the same address.
+_issued_ports: set[int] = set()
+
+
 def _port() -> int:
-    with socket.socket() as sock:
-        sock.bind((HOST, 0))
-        return sock.getsockname()[1]
+    """A TCP port this process has not already handed out, left unbound."""
+    held: list[socket.socket] = []
+    try:
+        while True:
+            sock = socket.socket()
+            held.append(sock)
+            sock.bind((HOST, 0))
+            port = sock.getsockname()[1]
+            if port not in _issued_ports:
+                _issued_ports.add(port)
+                return port
+    finally:
+        for sock in held:
+            sock.close()
 
 
 def _sock(name: str) -> str:
