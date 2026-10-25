@@ -16,14 +16,8 @@ const HandlerMode = handlers.HandlerMode;
 
 const allocator = std.heap.c_allocator;
 
-/// Dispatcher thread per slot.  Only touched while the GIL is held by the
-/// calling Python thread (startServer) or by the one thread that owns the slot's
-/// lifecycle (stopServer), so no extra locking is needed.
-var serverHandlerThreads: [256]?std.Thread = @splat(null);
-
-/// Bind to host:port, start the server dispatcher thread, and return a
-/// connection handle (conn_num).  mode: 0 = Router, 1 = Service.
-/// Returns Python None on failure.
+/// Bind to host:port, start accepting connections and return a connection
+/// handle (conn_num).  mode: 0 = Router, 1 = Service.
 pub fn startServer(_: [*c]PyObject, args: [*c]PyObject) callconv(.c) [*c]PyObject {
     var host: [*:0]u8 = undefined;
     var port: c_long = undefined;
@@ -54,46 +48,23 @@ pub fn startServer(_: [*c]PyObject, args: [*c]PyObject) callconv(.c) [*c]PyObjec
     const pcert_file = std.mem.span(cert_file);
     const pkey_file = std.mem.span(key_file);
 
-    const conn_num = Server.acquireSlot() orelse {
-        PyErr_SetString(py.PyExc_ValueError, "too many servers started in this process (limit 256)");
-        return null;
-    };
     const cfg = @import("../network/ServerConnection.zig").Config{
         .host = phost, .port = pport, .mode = pmode,
         .tls = ptls, .cert_file = pcert_file, .key_file = pkey_file,
     };
-    const handler_thread = std.Thread.spawn(.{}, Server.messageDispatcher, .{ allocator, papp_name, cfg, conn_num }) catch {
-        Server.releaseSlot(conn_num);
-        return Py_BuildValue("");
+    // Binding (and resolving the host) may block: release the GIL meanwhile.
+    const py_state = py.PyEval_SaveThread();
+    const started = Server.start(allocator, papp_name, cfg);
+    py.PyEval_RestoreThread(py_state);
+    const conn_num = started catch |err| {
+        if (err == error.TooManyServers) {
+            PyErr_SetString(py.PyExc_ValueError, "too many servers started in this process (limit 256)");
+        } else {
+            // system_exception_handler catches this and enriches the message.
+            PyErr_SetString(py.PyExc_ValueError, "ConnectionRefused");
+        }
+        return null;
     };
-    serverHandlerThreads[conn_num] = handler_thread;
-    // Block until the dispatcher thread has either finished initialisation
-    // (serverReady = true) or failed (serverFailed = true).
-    // 100 µs × 100 000 = 10 s maximum wait.
-    const sleep_ts = std.c.timespec{ .sec = 0, .nsec = 100_000 };
-    var wait_iters: usize = 0;
-    while (!Server.isReady(conn_num) and !Server.hasFailed(conn_num) and wait_iters < 100_000) : (wait_iters += 1) {
-        _ = std.c.nanosleep(&sleep_ts, null);
-    }
-    // Signal failure to Python by raising ValueError("ConnectionRefused")
-    // so system_exception_handler can catch and enrich the message.
-    if (Server.hasFailed(conn_num)) {
-        // A failed dispatcher has already unwound, so this join returns at once.
-        handler_thread.join();
-        serverHandlerThreads[conn_num] = null;
-        Server.releaseSlot(conn_num);
-        PyErr_SetString(py.PyExc_ValueError, "ConnectionRefused");
-        return null;
-    }
-    if (!Server.isReady(conn_num)) {
-        // Still initialising after 10 s (e.g. a hung name lookup).  Joining could
-        // block the interpreter indefinitely, so abandon the thread (and its
-        // slot) instead.
-        handler_thread.detach();
-        serverHandlerThreads[conn_num] = null;
-        PyErr_SetString(py.PyExc_ValueError, "ConnectionRefused");
-        return null;
-    }
     return Py_BuildValue("k", @as(c_ulong, conn_num));
 }
 
@@ -104,14 +75,8 @@ pub fn startServer(_: [*c]PyObject, args: [*c]PyObject) callconv(.c) [*c]PyObjec
 pub fn stopServer(_: [*c]PyObject, args: [*c]PyObject) callconv(.c) [*c]PyObject {
     var conn_num: usize = undefined;
     if (!(py.PyArg_ParseTuple(args, "k", &conn_num) != 0)) return Py_BuildValue("");
-    if (conn_num >= serverHandlerThreads.len) return Py_BuildValue("");
-    const thread = serverHandlerThreads[conn_num] orelse return Py_BuildValue("");
-    serverHandlerThreads[conn_num] = null;
-
     const py_state = py.PyEval_SaveThread();
-    Server.destroyHandler(conn_num);
-    thread.join();
-    Server.releaseSlot(conn_num);
+    Server.stop(conn_num);
     py.PyEval_RestoreThread(py_state);
     return Py_BuildValue("");
 }

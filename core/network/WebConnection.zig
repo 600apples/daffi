@@ -20,9 +20,11 @@ const WebConnection = @This();
 
 pub const op_table = OperationTable{
     .read = read,
+    .readSome = readSome,
     .readNoBuffer = readNoBuffer,
     .write = write,
     .accept = accept,
+    .handle = handle,
     .close = close,
     .destroy = destroy,
     .getAddr = getAddr,
@@ -86,6 +88,16 @@ pub fn read(_: *anyopaque, _: []u8) !usize {
     @panic("read with buffer not implemented");
 }
 
+/// WebSocket sessions run on a blocking-pool thread in the evented model.
+pub fn readSome(_: *anyopaque, _: []u8) !usize {
+    @panic("readSome not supported for WebSocket connections");
+}
+
+pub fn handle(ctx: *anyopaque) std.posix.socket_t {
+    const self: *WebConnection = @ptrCast(@alignCast(ctx));
+    return self.stream.handle;
+}
+
 pub fn readNoBuffer(ctx: *anyopaque) !?[]const u8 {
     const self: *WebConnection = @ptrCast(@alignCast(ctx));
     return try self.readInternal();
@@ -96,7 +108,7 @@ pub fn write(ctx: *anyopaque, data: []const u8) !void {
     try self.writeBin(data);
 }
 
-pub fn accept(_: *anyopaque) !@import("../network/connection.zig").AcceptedConnection {
+pub fn accept(_: *anyopaque, _: c_int) !@import("../network/connection.zig").AcceptedConnection {
     @panic("not implemented");
 }
 

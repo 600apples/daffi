@@ -5,6 +5,8 @@ const network = @import("network.zig");
 const handlers = @import("handlers.zig");
 const serde = @import("serde.zig");
 const store = @import("store.zig");
+const runtime = @import("runtime.zig");
+const EventLoop = runtime.EventLoop;
 
 const assert = std.debug.assert;
 const MessageFlag = serde.MessageFlag;
@@ -65,15 +67,17 @@ const ClientEntry = struct {
     client_handler: *ClientHandler,
     /// Last issued request uuid.  Atomic: many Python threads send concurrently.
     uuid: std.atomic.Value(u16) = std.atomic.Value(u16).init(0),
-    /// Set to true (with release ordering) by the dispatcher thread after it
-    /// has freed connection/msgpool resources.  Python reads this (acquire) to
-    /// detect a dead connection before calling stopClient(), which frees the
-    /// ClientEntry itself.
+    /// Set to true (with release ordering) once the receiver has stopped for
+    /// good.  Python reads this (acquire) to detect a dead connection before
+    /// calling stopClient(), which frees the ClientEntry itself.
     disconnected: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-    /// Handle for the dispatcher thread.  Valid only when has_dispatcher==true.
-    /// destroy() joins this thread instead of spinning on `disconnected`.
-    dispatcher_thread: std.Thread = undefined,
-    has_dispatcher: bool = false,
+    /// What reads incoming messages (native targets): a dispatcher thread
+    /// (threads model) or an event-loop source (evented model).
+    receiver: union(enum) {
+        none,
+        thread: std.Thread,
+        source: *ClientSource,
+    } = .none,
     /// Allocator used to create this entry; stored so stopClient can free it.
     alloc: Allocator,
 
@@ -111,11 +115,10 @@ const ClientEntry = struct {
     /// worker threads that are still inside sendMessageClientEntry / msgpool:
     ///
     ///   Phase 1 — signal & wait
-    ///     If the dispatcher is still running (disconnected == false), close the
-    ///     connection socket so the dispatcher's receiveMessage returns with EOF.
-    ///     Then spin until the dispatcher has set disconnected = true.  At that
-    ///     point the dispatcher has exited its receive loop and will never touch
-    ///     connection or msgpool again.
+    ///     If the receiver is still running (disconnected == false), close the
+    ///     connection socket so it sees EOF, then wait until it has finished
+    ///     (join the dispatcher thread, or wait for the event source to be
+    ///     removed).  From then on it never touches connection or msgpool again.
     ///
     ///   Phase 2 — free resources
     ///     destroy() is always called by Python *after* stop_for_connection()
@@ -140,15 +143,22 @@ const ClientEntry = struct {
             self.alloc.destroy(self);
             return;
         }
-        if (self.has_dispatcher) {
+        if (self.receiver != .none) {
             if (!self.disconnected.load(.acquire)) {
-                log.debug("[{s}] destroy phase-1: closing connection, joining dispatcher", .{self.client_handler.app_name});
+                log.debug("[{s}] destroy phase-1: closing connection, waiting for receiver", .{self.client_handler.app_name});
                 self.connection.close();
             } else {
-                log.debug("[{s}] destroy phase-1: dispatcher already exited (disconnected=true)", .{self.client_handler.app_name});
+                log.debug("[{s}] destroy phase-1: receiver already exited (disconnected=true)", .{self.client_handler.app_name});
             }
-            self.dispatcher_thread.join();
-            log.debug("[{s}] destroy phase-1: dispatcher joined", .{self.client_handler.app_name});
+            switch (self.receiver) {
+                .none => unreachable,
+                .thread => |t| t.join(),
+                .source => |src| {
+                    src.done.wait();
+                    self.alloc.destroy(src);
+                },
+            }
+            log.debug("[{s}] destroy phase-1: receiver finished", .{self.client_handler.app_name});
         }
         // Phase 2 — safe to free: dispatcher is done, Python workers are joined.
         log.debug("[{s}] destroy phase-2: freeing connection + msgpool", .{self.client_handler.app_name});
@@ -158,47 +168,61 @@ const ClientEntry = struct {
         self.alloc.destroy(self);
     }
 
-    fn messageDispatcherClientEntry(self: *ClientEntry) !void {
-        // Only set the flag — connection and msgpool are freed by destroy()
-        // after Python has joined all worker threads (see destroy() doc above).
+    /// Threads model: receive until the connection ends.
+    fn messageDispatcherClientEntry(self: *ClientEntry) void {
         log.debug("[{s}] dispatcher started", .{self.client_handler.app_name});
-        defer {
-            log.debug("[{s}] dispatcher exiting — setting disconnected=true", .{self.client_handler.app_name});
-            self.disconnected.store(true, .release);
-        }
-        var msg_handler = self.client_handler.handler();
+        const msg_handler = self.client_handler.handler();
         while (true) {
             const message = self.msgpool.receiveMessage(self.connection) catch |err| {
-                if (!self.connection.isSuspended()) {
-                    log.debug("[{s}] connection lost: {}", .{ self.client_handler.app_name, err });
-                } else {
-                    log.debug("[{s}] connection closed intentionally", .{self.client_handler.app_name});
-                }
-                try msg_handler.handleErr(self.connection, err);
+                self.connectionEnded(msg_handler, err);
                 break;
             };
-            // `consumed` is set to true by the handler when it transfers ownership
-            // of the message to a store/queue.  After handle() returns we must NOT
-            // read any field of `message` when consumed==true — Python may have
-            // already popped and freed the message (use-after-free).
-            var consumed = false;
-            msg_handler.handle(self.connection, message, &consumed) catch |err| {
-                // Don't unwind past the disconnect notification below: Python is
-                // waiting for it.  Treat a failing handler as a broken stream.
-                if (!consumed) message.deinit();
-                log.warn("[{s}] message handler failed: {}", .{ self.client_handler.app_name, err });
-                msg_handler.handleErr(self.connection, err) catch {};
-                break;
-            };
-            if (!consumed) message.deinit();
-            msg_handler.triggerWakeup();
+            if (!self.dispatch(msg_handler, message)) break;
         }
+        self.finishReceiving(msg_handler);
+    }
+
+    /// Run the handler for one received message.  Returns false when the
+    /// connection should be dropped.
+    fn dispatch(self: *ClientEntry, msg_handler: anytype, message: *Message) bool {
+        // `consumed` is set to true by the handler when it transfers ownership
+        // of the message to a store/queue.  After handle() returns we must NOT
+        // read any field of `message` when consumed==true — Python may have
+        // already popped and freed the message (use-after-free).
+        var consumed = false;
+        msg_handler.handle(self.connection, message, &consumed) catch |err| {
+            // Don't skip the disconnect notification: Python is waiting for it.
+            // Treat a failing handler as a broken stream.
+            if (!consumed) message.deinit();
+            log.warn("[{s}] message handler failed: {}", .{ self.client_handler.app_name, err });
+            msg_handler.handleErr(self.connection, err) catch {};
+            return false;
+        };
+        if (!consumed) message.deinit();
+        msg_handler.triggerWakeup();
+        return true;
+    }
+
+    fn connectionEnded(self: *ClientEntry, msg_handler: anytype, err: anyerror) void {
+        if (!self.connection.isSuspended()) {
+            log.debug("[{s}] connection lost: {}", .{ self.client_handler.app_name, err });
+        } else {
+            log.debug("[{s}] connection closed intentionally", .{self.client_handler.app_name});
+        }
+        msg_handler.handleErr(self.connection, err) catch {};
+    }
+
+    /// Last step of the receiver.  Only sets the flag — connection and msgpool
+    /// are freed by destroy() after Python has joined all worker threads (see
+    /// destroy() doc above).
+    fn finishReceiving(self: *ClientEntry, msg_handler: anytype) void {
         // Notify Python that this connection is dead so AutoReconnect can
-        // react immediately without polling.  Must happen before the defer
-        // frees resources so wakeup/disconnect fds are still valid.
-        log.debug("[{s}] triggering disconnect fd", .{self.client_handler.app_name});
+        // react immediately without polling.
+        log.debug("[{s}] receiver exiting — triggering disconnect fd", .{self.client_handler.app_name});
         self.client_handler.tasks_queue.triggerDisconnect();
-        try msg_handler.handleDisconnect(self.connection);
+        msg_handler.handleDisconnect(self.connection) catch |err|
+            log.warn("[{s}] disconnect handler failed: {}", .{ self.client_handler.app_name, err });
+        self.disconnected.store(true, .release);
     }
 
     pub fn createMessageClientEntry(self: *ClientEntry, allocator: Allocator, data: []const u8, uuid: u16, flag: MessageFlag, decoder: MessageDecoder, is_bytes: bool, return_result: bool, receiver: []const u8, func_name: []const u8) !MessageAndDataIndentifier {
@@ -306,10 +330,63 @@ const ClientEntry = struct {
     }
 };
 
-fn messageDispatcher(conn_num: usize) !void {
-    var entry = try ClientEntry.get(conn_num);
-    try entry.messageDispatcherClientEntry();
-}
+/// Evented model: the client's connection served by an event loop.
+const ClientSource = struct {
+    source: EventLoop.Source,
+    entry: *ClientEntry,
+    decoder: serde.FrameDecoder,
+    /// Set once the source is removed and the entry is never touched again.
+    done: misc.Event = .{},
+
+    fn start(entry: *ClientEntry) !*ClientSource {
+        const loop = try runtime.loop();
+        const self = try entry.alloc.create(ClientSource);
+        errdefer entry.alloc.destroy(self);
+        self.* = .{
+            .source = .{ .fd = entry.connection.handle(), .onReadable = onReadable, .onRemoved = onRemoved },
+            .entry = entry,
+            .decoder = .init(entry.alloc),
+        };
+        try loop.register(&self.source);
+        return self;
+    }
+
+    /// Reads until the socket is drained: a TLS session may hold decrypted
+    /// bytes that no further socket readiness would report.
+    fn onReadable(source: *EventLoop.Source, scratch: []u8) EventLoop.Action {
+        const self: *ClientSource = @alignCast(@fieldParentPtr("source", source));
+        const entry = self.entry;
+        const msg_handler = entry.client_handler.handler();
+        while (true) {
+            const n = entry.connection.readSome(scratch) catch |err| switch (err) {
+                error.WouldBlock => return .keep,
+                else => {
+                    entry.connectionEnded(msg_handler, err);
+                    return .remove;
+                },
+            };
+            if (n == 0) {
+                entry.connectionEnded(msg_handler, error.EOF);
+                return .remove;
+            }
+            var input: []const u8 = scratch[0..n];
+            while (true) {
+                const message = (self.decoder.next(&input) catch |err| {
+                    entry.connectionEnded(msg_handler, err);
+                    return .remove;
+                }) orelse break;
+                if (!entry.dispatch(msg_handler, message)) return .remove;
+            }
+        }
+    }
+
+    fn onRemoved(source: *EventLoop.Source) void {
+        const self: *ClientSource = @alignCast(@fieldParentPtr("source", source));
+        self.entry.finishReceiving(self.entry.client_handler.handler());
+        self.decoder.deinit();
+        self.done.set();
+    }
+};
 
 pub fn init(allocator: std.mem.Allocator, app_name: []const u8, config: ClientConnection.Config) !usize {
     const conn = try ClientConnection.init(allocator, config);
@@ -347,10 +424,10 @@ pub fn init(allocator: std.mem.Allocator, app_name: []const u8, config: ClientCo
     }
     log.debug("[{s}] client init  conn_num=0x{x}", .{ app_name, conn_num });
     if (!is_wasm) {
-        // Count the thread as ours before it can run: it reads `cl_entry`.
-        const th = try std.Thread.spawn(.{}, messageDispatcher, .{conn_num});
-        cl_entry.dispatcher_thread = th;
-        cl_entry.has_dispatcher = true;
+        cl_entry.receiver = switch (runtime.model()) {
+            .threads => .{ .thread = try std.Thread.spawn(.{}, ClientEntry.messageDispatcherClientEntry, .{cl_entry}) },
+            .evented => .{ .source = try ClientSource.start(cl_entry) },
+        };
     }
     return conn_num;
 }

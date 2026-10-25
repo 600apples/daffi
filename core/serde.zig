@@ -10,6 +10,7 @@ pub const Handshake = @import("serde/handshake.zig").Handshake;
 pub const Event = @import("serde/handshake.zig").Event;
 pub const RawMessage = @import("serde/message.zig").RawMessage;
 pub const MessagePool = @import("serde/message_pool.zig").MessagePool;
+pub const FrameDecoder = @import("serde/message_pool.zig").FrameDecoder;
 pub const concatenateSlicesAlloc = @import("serde/slices.zig").concatenateSlicesAlloc;
 pub const concatenateSlicesAllocZ = @import("serde/slices.zig").concatenateSlicesAllocZ;
 pub const concatenateSlicesBuf = @import("serde/slices.zig").concatenateSlicesBuf;
@@ -30,5 +31,5 @@ pub const UNIT_SEPARATOR_SEQ = @import("serde/message.zig").UNIT_SEPARATOR_SEQ;
 test {
     _ = @import("serde/message.zig");
     // _ = @import("serde/slices.zig");
-    // _ = @import("serde/message_pool.zig");
+    _ = @import("serde/message_pool.zig");
 }

@@ -86,9 +86,16 @@ pub const AcceptedConnection = struct {
 
 pub const OperationTable = struct {
     read: *const fn (ctx: *anyopaque, buf: []u8) anyerror!usize,
+    /// Non-blocking read of whatever is available: 0 means end-of-stream,
+    /// `error.WouldBlock` that nothing is pending yet (evented model).
+    readSome: *const fn (ctx: *anyopaque, buf: []u8) anyerror!usize,
     readNoBuffer: *const fn (ctx: *anyopaque) anyerror!?[]const u8,
     write: *const fn (ctx: *anyopaque, data: []const u8) anyerror!void,
-    accept: *const fn (ctx: *anyopaque) anyerror!AcceptedConnection,
+    /// Wait up to `timeout_ms` for an inbound connection; `error.Timeout`
+    /// means none arrived.
+    accept: *const fn (ctx: *anyopaque, timeout_ms: c_int) anyerror!AcceptedConnection,
+    /// Descriptor to watch for readiness (evented model).
+    handle: *const fn (ctx: *anyopaque) posix.socket_t,
     /// close: shut down OS resources (socket/fd) and mark suspended.
     /// Does NOT free the ctx struct — call destroy() for that.
     close: *const fn (ctx: *anyopaque) void,
@@ -136,6 +143,16 @@ pub fn Connection(comptime contype: ConnectionType) type {
             return self.op_table.read(self.ctx, buf);
         }
 
+        pub fn readSome(self: *Self, buf: []u8) anyerror!usize {
+            comptime if (is_wasm or contype != .ClientConnectionType) @compileError("readSome() not available for this connection type");
+            return self.op_table.readSome(self.ctx, buf);
+        }
+
+        pub fn handle(self: *Self) posix.socket_t {
+            comptime if (is_wasm) @compileError("handle() not available on wasm");
+            return self.op_table.handle(self.ctx);
+        }
+
         pub fn readNoBuffer(self: *Self) anyerror!?[]const u8 {
             comptime if (is_wasm or contype != .ClientConnectionType) @compileError("readNoBuffer() not available for this connection type");
             return self.op_table.readNoBuffer(self.ctx);
@@ -176,8 +193,7 @@ pub fn Connection(comptime contype: ConnectionType) type {
         /// raw accepted descriptor.  `error.Timeout` means "nothing yet".
         pub fn acceptRaw(self: *Self, timeout_ms: c_int) !AcceptedConnection {
             comptime if (contype != .ServerConnectionType) @compileError("acceptRaw() not available for this connection type");
-            _ = timeout_ms; // the poll timeout is applied inside the op table
-            return try self.op_table.accept(self.ctx);
+            return try self.op_table.accept(self.ctx, timeout_ms);
         }
 
         /// Turn a raw accepted descriptor into a Connection: complete the TLS

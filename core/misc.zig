@@ -45,3 +45,50 @@ pub const Mutex = if (is_wasm) struct {
         return std.c.pthread_mutex_trylock(&self.inner) == .SUCCESS;
     }
 };
+
+/// pthread condition variable paired with `Mutex`.  Native targets only.
+pub const Condition = struct {
+    inner: std.c.pthread_cond_t = std.c.PTHREAD_COND_INITIALIZER,
+
+    pub fn wait(self: *Condition, mutex: *Mutex) void {
+        _ = std.c.pthread_cond_wait(&self.inner, &mutex.inner);
+    }
+
+    /// Returns false when `timeout_ms` elapsed without a signal.
+    pub fn timedWait(self: *Condition, mutex: *Mutex, timeout_ms: u32) bool {
+        var ts: std.c.timespec = undefined;
+        _ = std.c.clock_gettime(.REALTIME, &ts);
+        const ns: i64 = @as(i64, ts.nsec) + @as(i64, timeout_ms % 1000) * std.time.ns_per_ms;
+        ts.sec += @intCast(timeout_ms / 1000 + @as(u32, @intCast(@divTrunc(ns, std.time.ns_per_s))));
+        ts.nsec = @intCast(@mod(ns, std.time.ns_per_s));
+        return std.c.pthread_cond_timedwait(&self.inner, &mutex.inner, &ts) != .TIMEDOUT;
+    }
+
+    pub fn signal(self: *Condition) void {
+        _ = std.c.pthread_cond_signal(&self.inner);
+    }
+
+    pub fn broadcast(self: *Condition) void {
+        _ = std.c.pthread_cond_broadcast(&self.inner);
+    }
+};
+
+/// One-shot event: `set` once, any number of threads `wait` for it.
+pub const Event = struct {
+    mutex: Mutex = .{},
+    cond: Condition = .{},
+    is_set: bool = false,
+
+    pub fn set(self: *Event) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.is_set = true;
+        self.cond.broadcast();
+    }
+
+    pub fn wait(self: *Event) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        while (!self.is_set) self.cond.wait(&self.mutex);
+    }
+};

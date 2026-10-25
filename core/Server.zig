@@ -4,6 +4,8 @@ const serde = @import("serde.zig");
 const network = @import("network.zig");
 const handlers = @import("handlers.zig");
 const store = @import("store.zig");
+const runtime = @import("runtime.zig");
+const EventLoop = runtime.EventLoop;
 const posix = std.posix;
 const Mutex = misc.Mutex;
 const AcceptedConnection = @import("network/connection.zig").AcceptedConnection;
@@ -22,20 +24,38 @@ const MessageDecoder = serde.MessageDecoder;
 
 const MAX_SERVERS = 256;
 
-/// Per-server runtime state shared between the dispatcher (accept-loop) thread
-/// and the per-connection threads it spawns.
+/// How often the threaded accept loop wakes up to check for shutdown.
+const ACCEPT_POLL_MS: c_int = 200;
+
+/// How long stop waits for connections to finish before giving up and
+/// leaking the server's memory rather than freeing it under them.
+const DRAIN_TIMEOUT_MS: i64 = 10_000;
+
+fn HandlerOf(comptime mode: HandlerMode) type {
+    const H = @FieldType(ServerHandler, @tagName(mode));
+    return @typeInfo(@TypeOf(H.handler)).@"fn".return_type.?;
+}
+
+/// Per-server state shared between the accept side and every connection.
 const Runtime = struct {
     allocator: Allocator,
+    mode: HandlerMode,
+    app_name: []const u8,
     connection: *ServerConnection,
     msgpool: *MessagePool,
     server_handler: *ServerHandler,
-    /// Accepted connections whose thread is currently running.  Used to wake
-    /// those threads (by shutting their sockets down) when the server stops.
+    /// Accepted connections currently being served.  Used to interrupt them
+    /// (by shutting their sockets down) when the server stops.
     live_mutex: Mutex = .{},
     live: std.ArrayList(*ServerHandler.ConnectionT) = .empty,
-    /// Number of connection threads that may still touch this struct.  The
-    /// accept loop waits for it to reach zero before freeing anything.
-    active_threads: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+    /// Accepted connections whose thread or event source may still touch this
+    /// struct.  `stop` waits for it to reach zero before freeing anything.
+    active_connections: std.atomic.Value(usize) = .init(0),
+    /// Threads model: the accept-loop thread.
+    accept_thread: ?std.Thread = null,
+    /// Evented model: the listening socket registered on `listener_loop`.
+    listener_source: EventLoop.Source = undefined,
+    listener_loop: ?*EventLoop = null,
 
     /// Remember `conn` so shutdown can interrupt it.  Fails if the server is
     /// already stopping, in which case the caller must drop the connection.
@@ -64,6 +84,19 @@ const Runtime = struct {
         self.live_mutex.lock();
         defer self.live_mutex.unlock();
         for (self.live.items) |c| c.close();
+    }
+
+    fn handler(self: *Runtime, comptime mode: HandlerMode) HandlerOf(mode) {
+        return @field(self.server_handler, @tagName(mode)).handler();
+    }
+
+    fn deinit(self: *Runtime) void {
+        self.server_handler.deinit();
+        self.connection.destroy();
+        self.msgpool.deinit();
+        self.live.deinit(self.allocator);
+        self.allocator.free(self.app_name);
+        self.allocator.destroy(self);
     }
 };
 
@@ -105,50 +138,26 @@ const ServerEntry = struct {
     }
 };
 
-/// Slot table.  A slot is claimed by `acquireSlot`, filled in by the dispatcher
-/// thread, and returned by `releaseSlot` once the dispatcher has fully exited,
-/// so slots are reused instead of being exhausted after 256 starts.
+/// Slot table.  `start` claims a slot and publishes the server in it; `stop`
+/// withdraws the server and frees the slot for reuse.
 var slots_mutex: Mutex = .{};
 var slot_used: [MAX_SERVERS]bool = @splat(false);
 var slot_entries: [MAX_SERVERS]?ServerEntry = @splat(null);
 
-/// Per-slot ready flag.  Set to true (with release ordering) by the dispatcher
-/// thread after it has written the ServerEntry into the slot.  Polled
-/// (with acquire ordering) by startServer() so it can return only after the
-/// slot is safe for Python to use.
-var serverReady: [MAX_SERVERS]std.atomic.Value(bool) = blk: {
-    var arr: [MAX_SERVERS]std.atomic.Value(bool) = undefined;
-    for (&arr) |*v| v.* = std.atomic.Value(bool).init(false);
-    break :blk arr;
-};
-
-/// Set to true when the dispatcher thread fails during initialisation.
-/// Checked by startServer() so it can return None to Python instead of
-/// silently handing back a conn_num that will never be usable.
-var serverFailed: [MAX_SERVERS]std.atomic.Value(bool) = blk: {
-    var arr: [MAX_SERVERS]std.atomic.Value(bool) = undefined;
-    for (&arr) |*v| v.* = std.atomic.Value(bool).init(false);
-    break :blk arr;
-};
-
-/// Claim a free slot, or null if all MAX_SERVERS are in use.
-pub fn acquireSlot() ?usize {
+fn acquireSlot() ?usize {
     slots_mutex.lock();
     defer slots_mutex.unlock();
     for (&slot_used, 0..) |*used, i| {
         if (!used.*) {
             used.* = true;
             slot_entries[i] = null;
-            serverReady[i].store(false, .release);
-            serverFailed[i].store(false, .release);
             return i;
         }
     }
     return null;
 }
 
-pub fn releaseSlot(conn_num: usize) void {
-    if (conn_num >= MAX_SERVERS) return;
+fn releaseSlot(conn_num: usize) void {
     slots_mutex.lock();
     defer slots_mutex.unlock();
     slot_entries[conn_num] = null;
@@ -160,10 +169,6 @@ fn getEntry(conn_num: usize) !ServerEntry {
     slots_mutex.lock();
     defer slots_mutex.unlock();
     return slot_entries[conn_num] orelse error.ServerNotInitialized;
-}
-
-pub fn hasFailed(conn_num: usize) bool {
-    return serverFailed[conn_num].load(.acquire);
 }
 
 /// SIGINT/SIGTERM handler.  Only async-signal-safe calls are allowed here: the
@@ -191,16 +196,9 @@ pub const MessageIdentifier = struct {
     receiver: []const u8,
 };
 
-/// Returns true once the dispatcher thread for conn_num has finished
-/// initialising and written its ServerEntry.  Used by startServer() to
-/// avoid returning to Python before the entry is safe to call.
-pub fn isReady(conn_num: usize) bool {
-    return serverReady[conn_num].load(.acquire);
-}
-
 /// Register the eventfd (or pipe write-end) that the native layer should
 /// signal whenever a message is pushed onto the Service task queue for
-/// conn_num.  Must be called after startServer() returns and before any
+/// conn_num.  Must be called after start() returns and before any
 /// client can send messages (i.e. before the handshake advertises methods).
 pub fn setServiceRequestFd(conn_num: usize, fd: i32) void {
     const entry = getEntry(conn_num) catch return;
@@ -210,63 +208,112 @@ pub fn setServiceRequestFd(conn_num: usize, fd: i32) void {
     }
 }
 
-pub fn messageDispatcher(allocator: Allocator, app_name: []const u8, config: ServerConnection.Config, conn_num: usize) void {
-    messageDispatcherImpl(allocator, app_name, config, conn_num) catch |err| {
-        // Signal failure so startServer() returns None to Python.
-        // Suppress the raw `error: X` line on stderr — Python will raise a
-        // descriptive InitializationError instead.
+/// Bind, start accepting and return the server's handle (conn_num).  Accepting
+/// runs on a dedicated thread or on an event loop depending on the execution
+/// model; either way the server is fully usable once this returns.
+pub fn start(allocator: Allocator, app_name: []const u8, config: ServerConnection.Config) !usize {
+    return startImpl(allocator, app_name, config) catch |err| {
         log.err("{s}[{s}] failed to start: {}", .{ @tagName(config.mode), app_name, err });
-        serverFailed[conn_num].store(true, .release);
+        return err;
     };
 }
 
-/// How long stop waits for connection threads to finish before giving up and
-/// leaking the server's memory rather than freeing it under them.
-const DRAIN_TIMEOUT_MS: i64 = 10_000;
-
-fn messageDispatcherImpl(allocator: Allocator, app_name_arg: []const u8, config: ServerConnection.Config, conn_num: usize) !void {
-    // Entry point for server. It creates connection and message pool and starts server loop.
+fn startImpl(allocator: Allocator, app_name_arg: []const u8, config: ServerConnection.Config) !usize {
     try setSignalHandler();
+    const conn_num = acquireSlot() orelse return error.TooManyServers;
+    errdefer releaseSlot(conn_num);
 
     // The caller's strings (Python str buffers) are only guaranteed to live until
-    // startServer() returns; the handler keeps `app_name` for the server's lifetime.
+    // start() returns; the handler keeps `app_name` for the server's lifetime.
     const app_name = try allocator.dupe(u8, app_name_arg);
-    var app_name_live = true;
-    defer if (app_name_live) allocator.free(app_name);
-
-    const msgpool: *MessagePool = try MessagePool.init(allocator);
-    var msgpool_live = true;
-    defer if (msgpool_live) msgpool.deinit();
-    const conn: *ServerConnection = try ServerConnection.init(allocator, config);
-    var conn_live = true;
-    defer if (conn_live) conn.destroy();
+    errdefer allocator.free(app_name);
+    const msgpool = try MessagePool.init(allocator);
+    errdefer msgpool.deinit();
+    const conn = try ServerConnection.init(allocator, config);
+    errdefer conn.destroy();
     const server_handler = try ServerHandler.init(config.mode, allocator, app_name);
-    var handler_live = true;
-    defer if (handler_live) server_handler.deinit();
+    errdefer server_handler.deinit();
     const rt = try allocator.create(Runtime);
-    rt.* = .{ .allocator = allocator, .connection = conn, .msgpool = msgpool, .server_handler = server_handler };
-    var rt_live = true;
-    defer if (rt_live) {
-        rt.live.deinit(allocator);
-        allocator.destroy(rt);
+    errdefer allocator.destroy(rt);
+    rt.* = .{
+        .allocator = allocator,
+        .mode = config.mode,
+        .app_name = app_name,
+        .connection = conn,
+        .msgpool = msgpool,
+        .server_handler = server_handler,
     };
+
+    switch (runtime.model()) {
+        .threads => rt.accept_thread = try std.Thread.spawn(.{}, acceptLoop, .{rt}),
+        .evented => {
+            const loop = try runtime.loop();
+            rt.listener_source = .{ .fd = conn.handle(), .onReadable = onListenerReadable, .onRemoved = onListenerRemoved };
+            try loop.register(&rt.listener_source);
+            rt.listener_loop = loop;
+        },
+    }
 
     {
         slots_mutex.lock();
         defer slots_mutex.unlock();
         slot_entries[conn_num] = .{ .connection = conn, .msgpool = msgpool, .server_handler = server_handler, .runtime = rt };
     }
-    serverReady[conn_num].store(true, .release);
-    log.debug("{s}[{s}] listening on {s}:{d} conn_num={d}", .{
+    log.debug("{s}[{s}] listening on {s}:{d} conn_num={d} model={s}", .{
         @tagName(config.mode),
         app_name,
         config.host orelse "0.0.0.0",
         config.port,
         conn_num,
+        @tagName(runtime.model()),
     });
+    return conn_num;
+}
 
-    while (!conn.isSuspended()) {
-        const raw = conn.acceptRaw(0) catch |err| {
+/// Stop the server: stop accepting, interrupt every connection, wait until
+/// none of them can touch the server any more, then free everything and
+/// release the slot.  Blocks until done, so the port can be rebound at once.
+pub fn stop(conn_num: usize) void {
+    if (conn_num >= MAX_SERVERS) return;
+    const rt = blk: {
+        slots_mutex.lock();
+        defer slots_mutex.unlock();
+        const entry = slot_entries[conn_num] orelse return;
+        // Withdraw the entry first so no new caller picks the server up.
+        slot_entries[conn_num] = null;
+        break :blk entry.runtime;
+    };
+    defer releaseSlot(conn_num);
+
+    rt.connection.close();
+    if (rt.accept_thread) |t| t.join();
+    if (rt.listener_loop) |loop| loop.detach(&rt.listener_source);
+    log.debug("{s}[{s}] stopped accepting conn_num={d}", .{ @tagName(rt.mode), rt.app_name, conn_num });
+
+    rt.interruptAllLive();
+    const deadline = misc.milliTimestamp() + DRAIN_TIMEOUT_MS;
+    while (rt.active_connections.load(.acquire) != 0) {
+        if (misc.milliTimestamp() > deadline) {
+            // Freeing now would hand the stragglers dangling pointers.  Leaking a
+            // few structs is the lesser evil.
+            log.err("{s}[{s}] {d} connection(s) did not finish; leaking server state", .{ @tagName(rt.mode), rt.app_name, rt.active_connections.load(.acquire) });
+            return;
+        }
+        rt.interruptAllLive();
+        sleepMs(5);
+    }
+    rt.deinit();
+}
+
+fn sleepMs(ms: u32) void {
+    const ts = std.c.timespec{ .sec = @intCast(ms / 1000), .nsec = @intCast((ms % 1000) * std.time.ns_per_ms) };
+    _ = std.c.nanosleep(&ts, null);
+}
+
+/// Threads model: accept until the server is stopped.
+fn acceptLoop(rt: *Runtime) void {
+    while (!rt.connection.isSuspended()) {
+        const raw = rt.connection.acceptRaw(ACCEPT_POLL_MS) catch |err| {
             switch (err) {
                 // Periodic wake-up to re-check the shutdown flag.
                 error.Timeout => {},
@@ -278,96 +325,159 @@ fn messageDispatcherImpl(allocator: Allocator, app_name_arg: []const u8, config:
             }
             continue;
         };
-        // The per-connection thread does the protocol probe / TLS handshake so a
-        // silent peer cannot stall this loop.  Count it first so shutdown never
-        // frees `rt` while the thread is still starting up.
-        _ = rt.active_threads.fetchAdd(1, .acq_rel);
-        const spawned = switch (config.mode) {
-            .Service => std.Thread.spawn(.{}, serviceConnectionMain, .{ rt, raw }),
-            .Router => std.Thread.spawn(.{}, routerConnectionMain, .{ rt, raw }),
+        admit(rt, raw);
+    }
+}
+
+/// Evented model: drain the pending connections of a readable listener.
+fn onListenerReadable(source: *EventLoop.Source, _: []u8) EventLoop.Action {
+    const rt: *Runtime = @alignCast(@fieldParentPtr("listener_source", source));
+    while (true) {
+        const raw = rt.connection.acceptRaw(0) catch |err| {
+            if (err != error.Timeout) log.warn("failed to accept connection: {}", .{err});
+            return .keep;
         };
-        if (spawned) |th| {
-            th.detach();
-        } else |err| {
-            log.warn("failed to start connection thread: {}", .{err});
-            _ = rt.active_threads.fetchSub(1, .acq_rel);
-            (@import("network/posix_net.zig").Stream{ .handle = raw.fd }).close();
+        admit(rt, raw);
+    }
+}
+
+/// The listener never removes itself; `stop` detaches it.
+fn onListenerRemoved(_: *EventLoop.Source) void {}
+
+/// Hand an accepted descriptor to its own thread (threads model) or to the
+/// blocking pool (evented model) for the protocol probe / TLS handshake, so a
+/// silent peer cannot stall accepting.
+fn admit(rt: *Runtime, raw: AcceptedConnection) void {
+    // Counted first so stop never frees `rt` while the connection starts up.
+    _ = rt.active_connections.fetchAdd(1, .acq_rel);
+    const started = switch (rt.mode) {
+        .Service => startConnection(.Service, rt, raw),
+        .Router => startConnection(.Router, rt, raw),
+    };
+    started catch |err| {
+        log.warn("failed to start connection: {}", .{err});
+        _ = rt.active_connections.fetchSub(1, .acq_rel);
+        (@import("network/posix_net.zig").Stream{ .handle = raw.fd }).close();
+    };
+}
+
+fn startConnection(comptime mode: HandlerMode, rt: *Runtime, raw: AcceptedConnection) !void {
+    const main = struct {
+        fn main(r: *Runtime, a: AcceptedConnection) void {
+            connectionMain(mode, r, a);
         }
-    }
-
-    // ---- shutdown -------------------------------------------------------
-    log.debug("{s}[{s}] accept-loop exiting conn_num={d}", .{ @tagName(config.mode), app_name, conn_num });
-    // Stop new users first, then wake the connection threads and wait for them.
-    {
-        slots_mutex.lock();
-        slot_entries[conn_num] = null;
-        slots_mutex.unlock();
-    }
-    rt.interruptAllLive();
-    const deadline = misc.milliTimestamp() + DRAIN_TIMEOUT_MS;
-    while (rt.active_threads.load(.acquire) != 0) {
-        if (misc.milliTimestamp() > deadline) {
-            // Freeing now would hand the stragglers dangling pointers.  Leaking a
-            // few structs is the lesser evil.
-            log.err("{s}[{s}] {d} connection thread(s) did not exit; leaking server state", .{ @tagName(config.mode), app_name, rt.active_threads.load(.acquire) });
-            msgpool_live = false;
-            conn_live = false;
-            handler_live = false;
-            rt_live = false;
-            app_name_live = false;
-            return;
-        }
-        rt.interruptAllLive();
-        sleepMs(5);
+    }.main;
+    switch (runtime.model()) {
+        .threads => (try std.Thread.spawn(.{}, main, .{ rt, raw })).detach(),
+        .evented => try runtime.spawnBlocking(main, .{ rt, raw }),
     }
 }
 
-fn sleepMs(ms: u32) void {
-    const ts = std.c.timespec{ .sec = @intCast(ms / 1000), .nsec = @intCast((ms % 1000) * std.time.ns_per_ms) };
-    _ = std.c.nanosleep(&ts, null);
-}
-
-fn serviceConnectionMain(rt: *Runtime, raw: AcceptedConnection) void {
-    connectionMain(.Service, rt, raw);
-}
-
-fn routerConnectionMain(rt: *Runtime, raw: AcceptedConnection) void {
-    connectionMain(.Router, rt, raw);
-}
-
-/// Body of every per-connection thread: finish the accept (TLS + protocol
-/// detection), run the receive loop, then release the connection.
+/// Finish the accept (TLS + protocol detection), then serve the connection:
+/// on this thread in the threads model, and also for WebSocket sessions;
+/// otherwise as an event-loop source.
 fn connectionMain(comptime mode: HandlerMode, rt: *Runtime, raw: AcceptedConnection) void {
-    // Must be the last thing to run: once the count hits zero the accept loop is
-    // free to release `rt`, the message pool and the handler.
-    defer _ = rt.active_threads.fetchSub(1, .release);
-
     const client = rt.connection.upgradeAccepted(raw) catch |err| {
         // upgradeAccepted already closed the descriptor.
         log.debug("rejected incoming connection: {}", .{err});
+        _ = rt.active_connections.fetchSub(1, .release);
         return;
     };
     rt.registerLive(client) catch {
         client.destroy();
+        _ = rt.active_connections.fetchSub(1, .release);
         return;
     };
-    defer {
-        rt.unregisterLive(client);
-        // Drops the owner reference.  The socket is closed (and the struct freed)
-        // when the last reference goes — channels in the router/service map hold
-        // their own until the disconnect handler removes them.
-        client.destroy();
+    if (runtime.model() == .evented and !client.is_websocket) {
+        if (ConnectionSource(mode).attach(rt, client)) return else |err|
+            log.warn("cannot attach connection to an event loop ({}); serving it on a blocking thread", .{err});
     }
 
-    const handler = switch (mode) {
-        .Service => rt.server_handler.Service.handler(),
-        .Router => rt.server_handler.Router.handler(),
-    };
+    const handler = rt.handler(mode);
     if (client.is_websocket) {
         serverWsLoop(client, rt.msgpool, handler);
     } else {
         serverLoop(client, rt.msgpool, handler);
     }
+    releaseConnection(rt, client);
+}
+
+/// Last step for every accepted connection.  Decrementing the counter must be
+/// the very last access to `rt`: once it hits zero, stop may free it.
+fn releaseConnection(rt: *Runtime, client: *ServerHandler.ConnectionT) void {
+    rt.unregisterLive(client);
+    // Drops the owner reference.  The socket is closed (and the struct freed)
+    // when the last reference goes — channels in the router/service map hold
+    // their own until the disconnect handler removes them.
+    client.destroy();
+    _ = rt.active_connections.fetchSub(1, .release);
+}
+
+/// Evented model: a native connection served by an event loop.  Incoming bytes
+/// are decoded incrementally and each complete message is dispatched on the
+/// loop thread.
+fn ConnectionSource(comptime mode: HandlerMode) type {
+    return struct {
+        source: EventLoop.Source,
+        rt: *Runtime,
+        conn: *ServerHandler.ConnectionT,
+        decoder: serde.FrameDecoder,
+
+        const Self = @This();
+
+        fn attach(rt: *Runtime, conn: *ServerHandler.ConnectionT) !void {
+            const loop = try runtime.loop();
+            const self = try rt.allocator.create(Self);
+            errdefer rt.allocator.destroy(self);
+            self.* = .{
+                .source = .{ .fd = conn.handle(), .onReadable = onReadable, .onRemoved = onRemoved },
+                .rt = rt,
+                .conn = conn,
+                .decoder = .init(rt.allocator),
+            };
+            try loop.register(&self.source);
+        }
+
+        /// Reads until the socket is drained: a TLS session may hold decrypted
+        /// bytes that no further socket readiness would report.
+        fn onReadable(source: *EventLoop.Source, scratch: []u8) EventLoop.Action {
+            const self: *Self = @alignCast(@fieldParentPtr("source", source));
+            const handler = self.rt.handler(mode);
+            while (true) {
+                const n = self.conn.readSome(scratch) catch |err| switch (err) {
+                    error.WouldBlock => return .keep,
+                    else => {
+                        if (self.conn.peer_addr) |addr| log.warn("recv error from {f}: {}", .{ fmtNetAddr(addr), err });
+                        handler.handleErr(self.conn, err) catch {};
+                        return .remove;
+                    },
+                };
+                if (n == 0) {
+                    if (self.conn.peer_addr) |addr| log.debug("peer disconnected from {f}", .{fmtNetAddr(addr)});
+                    handler.handleErr(self.conn, error.EOF) catch {};
+                    return .remove;
+                }
+                var input: []const u8 = scratch[0..n];
+                while (true) {
+                    const message = (self.decoder.next(&input) catch |err| {
+                        handler.handleErr(self.conn, err) catch {};
+                        return .remove;
+                    }) orelse break;
+                    if (!dispatchMessage(self.conn, message, handler)) return .remove;
+                }
+            }
+        }
+
+        fn onRemoved(source: *EventLoop.Source) void {
+            const self: *Self = @alignCast(@fieldParentPtr("source", source));
+            const rt = self.rt;
+            const conn = self.conn;
+            finishConnection(conn, rt.handler(mode));
+            self.decoder.deinit();
+            rt.allocator.destroy(self);
+            releaseConnection(rt, conn);
+        }
+    };
 }
 
 /// Run the handler for one decoded message, honouring the ownership protocol.
@@ -446,14 +556,6 @@ fn finishConnection(conn: *ServerHandler.ConnectionT, msg_handler: anytype) void
 
 pub fn sendMessage(data: []const u8, uuid: u16, flag: MessageFlag, decoder: MessageDecoder, is_bytes: bool, return_result: bool, receiver: []const u8, func_name: []const u8, conn_num: usize) !MessageIdentifier {
     return try (try getEntry(conn_num)).sendMessageServerEntry(data, uuid, flag, decoder, is_bytes, return_result, receiver, func_name);
-}
-
-/// Ask the server in `conn_num` to stop.  Returns immediately; the dispatcher
-/// thread then wakes its connection threads, drains them and frees everything.
-/// The caller should join that thread (see cffi `stopServer`).
-pub fn destroyHandler(conn_num: usize) void {
-    const entry = getEntry(conn_num) catch return;
-    entry.connection.close();
 }
 
 pub fn getMessageForServerWorker(conn_num: usize) !?*Message {

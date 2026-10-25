@@ -6,9 +6,11 @@ const WasmConnection = @This();
 
 pub const op_table = OperationTable{
     .read = undefined, // wasm doesn't have net package functionality
+    .readSome = undefined, // wasm doesn't have net package functionality
     .readNoBuffer = undefined, // wasm doesn't have net package functionality
     .write = undefined, // wasm doesn't have net package functionality
     .accept = undefined, // wasm doesn't have net package functionality
+    .handle = undefined, // wasm doesn't have net package functionality
     .close = close,
     .destroy = destroy,
     .getAddr = undefined, // wasm doesn't have net package functionality

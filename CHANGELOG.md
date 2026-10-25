@@ -10,6 +10,12 @@ All notable changes to this project are documented in this file.
 - Python 3.15 support (classifiers, CI test matrix and prebuilt wheels).
 - TLS client verifies the server host name (DNS name or IP address) against
   the certificate when `ca_file` is given, and sends SNI.
+- Optional evented execution model for the native core, selected with
+  `DAFFI_EXECUTION_MODEL=evented` (default `threads`). Connections of
+  Routers, Services and Clients are multiplexed over a few kqueue/epoll
+  event-loop threads (`DAFFI_EVENT_LOOPS`, default: CPU count capped at 4)
+  instead of one OS thread each. `dfcore.getExecutionModel()` reports the
+  active model.
 
 ### Changed
 

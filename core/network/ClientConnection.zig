@@ -13,9 +13,11 @@ const ClientConnection = @This();
 
 pub const op_table = OperationTable{
     .read = read,
+    .readSome = readSome,
     .readNoBuffer = readNoBuffer,
     .write = write,
     .accept = accept,
+    .handle = handle,
     .close = close,
     .destroy = destroy,
     .getAddr = getAddr,
@@ -117,6 +119,17 @@ pub fn read(ctx: *anyopaque, buf: []u8) !usize {
     return try self.stream.readAll(buf);
 }
 
+pub fn readSome(ctx: *anyopaque, buf: []u8) !usize {
+    const self: *ClientConnection = @ptrCast(@alignCast(ctx));
+    if (self.ssl) |ssl| return tls_impl.sslReadSome(ssl, buf);
+    return self.stream.readSome(buf);
+}
+
+pub fn handle(ctx: *anyopaque) posix.socket_t {
+    const self: *ClientConnection = @ptrCast(@alignCast(ctx));
+    return self.stream.handle;
+}
+
 pub fn readNoBuffer(_: *anyopaque) !?[]const u8 {
     @panic("readNoBuffer not supported for client connections");
 }
@@ -127,7 +140,7 @@ pub fn write(ctx: *anyopaque, data: []const u8) !void {
     return try self.stream.writeAll(data);
 }
 
-pub fn accept(_: *anyopaque) anyerror!AcceptedConnection {
+pub fn accept(_: *anyopaque, _: c_int) anyerror!AcceptedConnection {
     @panic("accept not supported for client connections");
 }
 

@@ -245,6 +245,12 @@ pub fn setLogLevel(_: [*c]PyObject, args: [*c]PyObject) callconv(.c) [*c]PyObjec
     return Py_BuildValue("");
 }
 
+/// getExecutionModel() -> str
+pub fn getExecutionModel(_: [*c]PyObject, _: [*c]PyObject) callconv(.c) [*c]PyObject {
+    const name = @tagName(@import("../runtime.zig").model());
+    return Py_BuildValue("s#", name.ptr, @as(py.Py_ssize_t, @intCast(name.len)));
+}
+
 /// Return a JSON-encoded list of currently connected nodes, or None on error.
 pub fn getAvailableMembers(_: [*c]PyObject, args: [*c]PyObject) callconv(.c) [*c]PyObject {
     var conn_num: usize = undefined;

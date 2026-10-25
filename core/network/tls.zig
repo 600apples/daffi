@@ -211,6 +211,27 @@ pub fn sslRead(conn: *SslConn, buf: []u8) !usize {
     }
 }
 
+/// Non-blocking `sslRead` for event loops: returns decrypted bytes already
+/// available, 0 on end-of-stream, or `error.WouldBlock` when OpenSSL needs
+/// more input from the socket.  Callers must keep calling until WouldBlock —
+/// OpenSSL may hold buffered plaintext that no socket readiness will report.
+pub fn sslReadSome(conn: *SslConn, buf: []u8) !usize {
+    const s = session(conn);
+    if (buf.len == 0) return 0;
+    const len: c_int = @intCast(@min(buf.len, std.math.maxInt(c_int)));
+    s.mutex.lock();
+    defer s.mutex.unlock();
+    c.ERR_clear_error();
+    const n = c.SSL_read(s.ssl, buf.ptr, len);
+    if (n > 0) return @intCast(n);
+    return switch (c.SSL_get_error(s.ssl, n)) {
+        // WANT_WRITE (renegotiation) is resolved by the next blocking write.
+        c.SSL_ERROR_WANT_READ, c.SSL_ERROR_WANT_WRITE => error.WouldBlock,
+        c.SSL_ERROR_ZERO_RETURN, c.SSL_ERROR_SYSCALL => 0,
+        else => error.TlsReadError,
+    };
+}
+
 /// Read exactly buf.len bytes from a TLS connection (blocking loop).
 ///
 /// Use this when you must fill the entire buffer before proceeding

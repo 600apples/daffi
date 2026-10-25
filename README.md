@@ -281,6 +281,60 @@ client.join()
 
 ---
 
+## Native execution model (`threads` vs `evented`)
+
+The native core can serve connections in two ways, chosen per process with an
+environment variable:
+
+- `threads` (default): one OS thread per connection.
+- `evented`: all connections are multiplexed over a few event-loop threads
+  (kqueue on macOS, epoll on Linux).
+
+```bash
+DAFFI_EXECUTION_MODEL=evented python my_router.py
+```
+
+```python
+import os
+os.environ["DAFFI_EXECUTION_MODEL"] = "evented"   # before any node starts
+
+from daffi import dfcore
+print(dfcore.getExecutionModel())                 # "evented"
+```
+
+`DAFFI_EVENT_LOOPS` sets the number of loop threads (default: CPU count,
+capped at 4). Nothing else in your code changes. This is independent of
+`daffi.aio`, which is the Python asyncio API and works with both models.
+
+Measured with daffi's benchmark suite (release build, localhost):
+
+| | threads | evented |
+|---|---|---|
+| Sequential calls/s, Client → Service | 12,097 | 12,148 |
+| 200 concurrent clients → Service, calls/s | 14,559 | 15,272 |
+| Native threads with 64 clients connected | 67 | 7 |
+
+Speed is the same in both models. Python dominates the cost of a call. What
+differs is the thread count: with `threads` it grows by one per connection,
+with `evented` it stays flat.
+
+> **When to use `evented`:**
+> - A Router or Service with **many connections** (hundreds or more), especially
+>   mostly idle ones such as many workers waiting for tasks.
+> - Processes under **thread or memory limits** (e.g. containers).
+>
+> **Keep `threads`:**
+> - **Few connections.** There is no benefit to switching.
+> - Peers that may be **slow to read** large messages or streams. In the evented
+>   model a stalled peer can briefly hold up other connections on the same loop.
+> - Mostly **WebSocket (browser)** clients. They keep a thread each in both
+>   models.
+
+See the [execution model guide](https://600apples.github.io/daffi/usage/execution-model/)
+for details and full measurements.
+
+---
+
 ## Event handlers
 
 Receive `connected` / `disconnected` notifications for nodes joining or

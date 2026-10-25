@@ -43,6 +43,7 @@ nav:
     - Unix Sockets: usage/unix-sockets.md
     - TLS: usage/tls.md
     - Async Interface (daffi.aio): usage/aio.md
+    - Execution Model (threads vs evented): usage/execution-model.md
   - JavaScript Client: js-client.md
 
 plugins:

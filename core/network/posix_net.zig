@@ -189,6 +189,22 @@ pub const Stream = struct {
         }
     }
 
+    /// Read whatever is available without blocking, regardless of the
+    /// descriptor's mode.  Returns 0 on end-of-stream (or reset/shutdown) and
+    /// `error.WouldBlock` when nothing is pending.
+    pub fn readSome(self: Stream, buf: []u8) !usize {
+        while (true) {
+            const result = std.c.recv(self.handle, buf.ptr, buf.len, std.c.MSG.DONTWAIT);
+            if (result >= 0) return @intCast(result);
+            switch (lastErrno()) {
+                .INTR => continue,
+                .AGAIN => return error.WouldBlock,
+                .CONNRESET, .NOTCONN, .PIPE, .TIMEDOUT => return 0,
+                else => return error.ReadError,
+            }
+        }
+    }
+
     pub fn readAll(self: Stream, buf: []u8) !usize {
         var total: usize = 0;
         while (total < buf.len) {

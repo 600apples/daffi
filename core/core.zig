@@ -33,7 +33,7 @@ const server_methods = [_]PyMethodDef{
         .ml_doc   =
             \\startServer(host, port, mode, app_name, tls, cert_file, key_file) -> int | None
             \\
-            \\Bind to host:port and start the server dispatcher thread.
+            \\Bind to host:port and start accepting connections.
             \\Returns a conn_num handle, or None on failure.
             \\
             \\  tls       - True to enable TLS (requires cert_file and key_file)
@@ -253,7 +253,26 @@ const util_methods = [_]PyMethodDef{
             \\Python logger would also emit them.
         ,
     },
+    .{
+        .ml_name  = "getExecutionModel",
+        .ml_meth  = cffi.getExecutionModel,
+        .ml_flags = 4,
+        .ml_doc   =
+            \\getExecutionModel() -> str
+            \\
+            \\Execution model of the native core: "threads" (an OS thread per
+            \\connection) or "evented" (connections multiplexed over a few
+            \\event-loop threads).  Chosen once per process from the
+            \\DAFFI_EXECUTION_MODEL environment variable (default "threads");
+            \\DAFFI_EVENT_LOOPS sets the number of loop threads.
+        ,
+    },
 };
+
+test {
+    _ = @import("serde.zig");
+    _ = @import("runtime.zig");
+}
 
 // ── Combined method table ─────────────────────────────────────────────────────
 var methods = server_methods ++ client_methods ++ util_methods ++ [_]PyMethodDef{

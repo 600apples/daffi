@@ -13,14 +13,13 @@ const NetAddress = connection.NetAddress;
 
 const ServerConnection = @This();
 
-/// How often a blocked accept() returns control to check for shutdown.
-const ACCEPT_POLL_MS: c_int = 200;
-
 pub const op_table = OperationTable{
     .read = read,
+    .readSome = readSome,
     .readNoBuffer = readNoBuffer,
     .write = write,
     .accept = accept,
+    .handle = handle,
     .close = close,
     .destroy = destroy,
     .getAddr = getAddr,
@@ -114,6 +113,15 @@ pub fn read(_: *anyopaque, _: []u8) !usize {
     @panic("server connection does not support read");
 }
 
+pub fn readSome(_: *anyopaque, _: []u8) !usize {
+    @panic("server connection does not support readSome");
+}
+
+pub fn handle(ctx: *anyopaque) std.posix.socket_t {
+    const self: *ServerConnection = @ptrCast(@alignCast(ctx));
+    return self.listener.handle;
+}
+
 pub fn readNoBuffer(_: *anyopaque) !?[]const u8 {
     @panic("server connection does not support readNoBuffer");
 }
@@ -125,11 +133,9 @@ pub fn write(_: *anyopaque, _: []const u8) !void {
 /// Accept one inbound TCP connection.  If the server was started with TLS,
 /// the returned AcceptedConnection carries the shared ssl_ctx pointer so the
 /// caller can perform the TLS handshake on the new connection.
-pub fn accept(ctx: *anyopaque) !AcceptedConnection {
+pub fn accept(ctx: *anyopaque, timeout_ms: c_int) !AcceptedConnection {
     const self: *ServerConnection = @ptrCast(@alignCast(ctx));
-    // Wake up periodically (error.Timeout) so the accept loop can notice that
-    // the server was asked to stop.
-    const conn = try self.listener.acceptTimeout(ACCEPT_POLL_MS);
+    const conn = try self.listener.acceptTimeout(timeout_ms);
     var na = NetAddress{};
     const len = @min(na.bytes.len, conn.address.bytes.len);
     @memcpy(na.bytes[0..len], conn.address.bytes[0..len]);
