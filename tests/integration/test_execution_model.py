@@ -65,6 +65,7 @@ _FORK_AFTER_LOOPS_STARTED = textwrap.dedent(
 )
 
 
+@pytest.mark.execution_models_self_managed  # forces evented in its own subprocess
 @pytest.mark.skipif(sys.platform == "win32", reason="fork is POSIX-only")
 def test_evented_child_forked_after_loops_started():
     env = dict(os.environ, DAFFI_EXECUTION_MODEL="evented")

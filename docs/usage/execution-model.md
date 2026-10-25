@@ -8,6 +8,16 @@ daffi's native core, the part written in Zig that owns the sockets of every
 | `threads` (default) | Every connection gets its own OS thread that blocks on reads. | One per connection, plus one per server. |
 | `evented` | All connections are multiplexed over a few event-loop threads (kqueue on macOS, epoll on Linux). Incoming bytes are decoded as they arrive. | A fixed few (4 by default), however many connections there are. |
 
+Zig documents the same kind of split as **`Io.Threaded`** (blocking I/O on OS
+threads) vs **`Io.Evented`** (multiplexed / userspace scheduling) in
+[I/O as an Interface](https://ziglang.org/download/0.16.0/release-notes.html#IO-as-an-Interface)
+([Zig 0.16.0 release notes](https://ziglang.org/download/0.16.0/release-notes.html)).
+daffi’s `threads` / `evented` models follow that idea for the native networking
+core (custom epoll/kqueue loops); they are selected with
+`DAFFI_EXECUTION_MODEL` and are **not** the same as plugging in `std.Io.Evented`
+(Zig’s evented backend is still experimental and does not implement networking
+yet).
+
 The model only changes how the native core waits for network data. Your
 callbacks, call styles, serialization formats and the Python API are exactly
 the same in both models.
@@ -61,6 +71,30 @@ print(dfcore.getExecutionModel())   # "threads" or "evented"
 An unknown value logs a warning and falls back to the default. Child
 processes inherit the variable. Processes created with `fork` after daffi has
 started get their own event loops.
+
+### Running the test suite against both models
+
+The model is fixed for the life of a process, so pytest cannot flip mid-session.
+The root conftest therefore supports::
+
+    pytest --execution-model=both      # default: threads pass, then evented pass
+    pytest --execution-model=threads   # faster local loop
+    pytest --execution-model=evented
+
+`both` starts two fresh interpreters. Perf scripts that already loop over both
+models (`tests/perf/execution_model_*.py`) need no flag.
+
+### Long soak / memory-leak run
+
+For a multi-hour load with periodic RSS and CPU sampling (same idea as
+vast-csi's `ResourceSampler`), use::
+
+    python tests/perf/soak_leak_test.py                     # 3 h, threads then evented
+    python tests/perf/soak_leak_test.py --model evented
+    python tests/perf/soak_leak_test.py --hours 0.25 --clients 64   # shorter smoke
+
+See [`tests/perf/soak_leak_test.py`](https://github.com/600apples/daffi/blob/main/tests/perf/soak_leak_test.py)
+and [`tests/_resource_sampler.py`](https://github.com/600apples/daffi/blob/main/tests/_resource_sampler.py).
 
 ---
 
@@ -120,8 +154,8 @@ idle threaded one.
 
 **Keep `threads` (the default) when:**
 
-- There are only a **few connections**. Both models perform the same, and
-  `threads` is the long-standing default.
+- There are only a **few connections**. Both models perform about the same,
+  and `threads` is the long-standing default.
 - Peers may be **slow to read what they are sent**, e.g. large messages or
   streams to clients on slow or distant networks. In the evented model a
   Router forwards messages from its event-loop thread, and writes still block.

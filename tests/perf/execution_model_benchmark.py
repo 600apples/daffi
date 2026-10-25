@@ -14,7 +14,10 @@ Scenarios
 
 Run::
 
-    python tests/perf/execution_model_benchmark.py [--calls 20000] [--clients 64] [--seconds 5]
+    python tests/perf/execution_model_benchmark.py [--calls 20000] [--clients 64] [--seconds 5] [--repeats 5]
+
+Each scenario is repeated ``--repeats`` times; the table reports the **median**
+with ``[min–max]`` so run-to-run noise is visible instead of a lucky best run.
 """
 
 from __future__ import annotations
@@ -25,6 +28,7 @@ import logging
 import multiprocessing as mp
 import os
 import socket
+import statistics
 import subprocess
 import sys
 import threading
@@ -227,20 +231,34 @@ def bench_concurrent(n_clients: int, seconds: float) -> dict:
         _stop(svc)
 
 
+def _summarize(runs: list[dict]) -> dict:
+    """Collapse repeated scenario runs into ``{key: {median, min, max}}``."""
+    keys = runs[0].keys()
+    out = {}
+    for key in keys:
+        values = sorted(float(r[key]) for r in runs)
+        out[key] = {
+            "median": statistics.median(values),
+            "min": values[0],
+            "max": values[-1],
+        }
+    return out
+
+
 def run_model(calls: int, n_clients: int, seconds: float, repeats: int) -> dict:
     from daffi import dfcore
 
     model = dfcore.getExecutionModel()
 
-    def best(fn, *args):
-        runs = [fn(*args) for _ in range(repeats)]
-        return max(runs, key=lambda r: r["calls_per_s"])
+    def repeated(fn, *args):
+        return _summarize([fn(*args) for _ in range(repeats)])
 
     return {
         "model": model,
-        "direct": best(bench_direct, calls),
-        "router": best(bench_router, calls),
-        "concurrent": best(bench_concurrent, n_clients, seconds),
+        "direct": repeated(bench_direct, calls),
+        "router": repeated(bench_router, calls),
+        "concurrent": repeated(bench_concurrent, n_clients, seconds),
+        "repeats": repeats,
     }
 
 
@@ -248,24 +266,69 @@ def run_model(calls: int, n_clients: int, seconds: float, repeats: int) -> dict:
 
 def _print_table(results: dict) -> None:
     t, e = results["threads"], results["evented"]
+    repeats = results["threads"].get("repeats", "?")
 
-    def row(label, a, b, fmt="{:,.0f}"):
-        delta = (b - a) / a * 100 if a else 0.0
-        sign = "+" if delta >= 0 else ""
-        print(f"  {label:<38}{fmt.format(a):>14}{fmt.format(b):>14}   {sign}{delta:.1f}%")
+    def _faster(a: float, b: float, *, higher_is_better: bool) -> str:
+        """``evented faster +12.3%`` or ``threads faster +6.0%`` (medians)."""
+        if not a or not b:
+            return "n/a"
+        if higher_is_better:
+            if b >= a:
+                return f"evented faster +{(b - a) / a * 100:.1f}%"
+            return f"threads faster +{(a - b) / b * 100:.1f}%"
+        if b <= a:
+            return f"evented faster +{(a - b) / a * 100:.1f}%"
+        return f"threads faster +{(b - a) / b * 100:.1f}%"
 
-    print(f"\n  {'metric':<38}{'threads':>14}{'evented':>14}   evented vs threads")
-    print("  " + "-" * 84)
+    def _fmt(stat: dict, fmt: str) -> str:
+        med = fmt.format(stat["median"])
+        lo = fmt.format(stat["min"])
+        hi = fmt.format(stat["max"])
+        if lo == hi:
+            return med
+        return f"{med} [{lo}–{hi}]"
+
+    def row(label, a: dict, b: dict, fmt="{:,.0f}", *, higher_is_better=True, compare=True):
+        cmp = (
+            _faster(a["median"], b["median"], higher_is_better=higher_is_better)
+            if compare
+            else ""
+        )
+        print(f"  {label:<38}{_fmt(a, fmt):>22}{_fmt(b, fmt):>22}   {cmp}")
+
+    print(f"\n  median [min–max] over {repeats} repeats; comparison uses medians")
+    print(f"\n  {'metric':<38}{'threads':>22}{'evented':>22}   comparison")
+    print("  " + "-" * 106)
     for scenario, title in (("direct", "direct"), ("router", "via router")):
         row(f"{title}: calls/s", t[scenario]["calls_per_s"], e[scenario]["calls_per_s"])
-        row(f"{title}: p50 latency (µs)", t[scenario]["p50_us"], e[scenario]["p50_us"], "{:,.1f}")
-        row(f"{title}: p99 latency (µs)", t[scenario]["p99_us"], e[scenario]["p99_us"], "{:,.1f}")
+        row(
+            f"{title}: p50 latency (µs)",
+            t[scenario]["p50_us"], e[scenario]["p50_us"], "{:,.1f}",
+            higher_is_better=False,
+        )
+        row(
+            f"{title}: p99 latency (µs)",
+            t[scenario]["p99_us"], e[scenario]["p99_us"], "{:,.1f}",
+            higher_is_better=False,
+        )
     c_t, c_e = t["concurrent"], e["concurrent"]
     row("concurrent: calls/s", c_t["calls_per_s"], c_e["calls_per_s"])
-    row("concurrent: fairness (min/max client)", c_t["fairness_min_max"], c_e["fairness_min_max"], "{:.2f}")
-    row("service threads, idle", c_t["service_threads_idle"], c_e["service_threads_idle"], "{:d}")
-    row("service threads, clients connected", c_t["service_threads_connected"], c_e["service_threads_connected"], "{:d}")
-    row("service threads, under load", c_t["service_threads_busy"], c_e["service_threads_busy"], "{:d}")
+    row(
+        "concurrent: fairness (min/max client)",
+        c_t["fairness_min_max"], c_e["fairness_min_max"], "{:.2f}",
+    )
+    # Thread counts are a resource metric, not speed — no "faster" label.
+    row("service threads, idle", c_t["service_threads_idle"], c_e["service_threads_idle"], "{:.0f}", compare=False)
+    row(
+        "service threads, clients connected",
+        c_t["service_threads_connected"], c_e["service_threads_connected"], "{:.0f}",
+        compare=False,
+    )
+    row(
+        "service threads, under load",
+        c_t["service_threads_busy"], c_e["service_threads_busy"], "{:.0f}",
+        compare=False,
+    )
 
 
 def main() -> None:
@@ -273,7 +336,10 @@ def main() -> None:
     parser.add_argument("--calls", type=int, default=20_000, help="sequential calls per latency scenario")
     parser.add_argument("--clients", type=int, default=64, help="concurrent clients")
     parser.add_argument("--seconds", type=float, default=5.0, help="duration of the concurrent scenario")
-    parser.add_argument("--repeats", type=int, default=2, help="runs per scenario; the best is kept")
+    parser.add_argument(
+        "--repeats", type=int, default=5,
+        help="runs per scenario; table shows median [min–max] (default: 5)",
+    )
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
 
