@@ -21,7 +21,7 @@ def ping(msg: str) -> str:
 
 
 if __name__ == "__main__":
-    svc = Service(app_name="unix-service", transports=UnixTransport(SOCK))
+    svc = Service(app_name="unix-service", transport=UnixTransport(SOCK))
     svc.start()
     print(f"Service listening on unix://{SOCK} — press Ctrl+C to stop.")
     svc.join()

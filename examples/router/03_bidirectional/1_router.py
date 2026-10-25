@@ -11,7 +11,7 @@ Start first, then 2_node_b.py, then 3_node_a.py.
 from daffi import Router, TCPTransport
 
 if __name__ == "__main__":
-    router = Router(transports=TCPTransport("0.0.0.0", 6003))
+    router = Router(transport=TCPTransport("0.0.0.0", 6003))
     router.start()
     print("Router running on 0.0.0.0:6003 — press Ctrl+C to stop.")
     router.join()

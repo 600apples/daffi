@@ -10,7 +10,7 @@ from daffi import TCPTransport
 
 
 async def main():
-    router = AsyncRouter(transports=TCPTransport("0.0.0.0", 6002))
+    router = AsyncRouter(transport=TCPTransport("0.0.0.0", 6002))
     await router.start()
     print("Router running on 0.0.0.0:6002 — press Ctrl+C to stop.")
     await router.join()

@@ -6,6 +6,7 @@ Uses ``await conn.stream()`` and ``conn.stream_nowait()`` with OPAQUE serde.
 """
 
 from __future__ import annotations
+from tests.conftest import active_runtime
 
 import asyncio
 import multiprocessing as mp
@@ -29,8 +30,8 @@ LARGE_N = 200_000
 # ── subprocess: service with chunked-assembly callbacks ───────────────────────
 
 
-def _proc_service(port: int) -> None:
-    silence_subprocess()
+def _proc_service(runtime: str, port: int) -> None:
+    silence_subprocess(runtime)
 
     async def _main():
         from daffi import callback, TCPTransport
@@ -49,7 +50,8 @@ def _proc_service(port: int) -> None:
             return data
 
         svc = AsyncService(
-            app_name="chunk-aio-svc", workers=1, transports=TCPTransport(HOST, port)
+            app_name="chunk-aio-svc", workers=1, transport=TCPTransport(HOST, port),
+            runtime=runtime,
         )
         await svc.start()
         await svc.join()
@@ -57,15 +59,16 @@ def _proc_service(port: int) -> None:
     asyncio.run(_main())
 
 
-def _proc_router(port: int) -> None:
-    silence_subprocess()
+def _proc_router(runtime: str, port: int) -> None:
+    silence_subprocess(runtime)
 
     async def _main():
         from daffi.aio import AsyncRouter
         from daffi import TCPTransport
 
         r = AsyncRouter(
-            app_name="chunk-aio-router", transports=TCPTransport(HOST, port)
+            app_name="chunk-aio-router", transport=TCPTransport(HOST, port),
+            runtime=runtime,
         )
         await r.start()
         await r.join()
@@ -73,8 +76,8 @@ def _proc_router(port: int) -> None:
     asyncio.run(_main())
 
 
-def _proc_worker(port: int) -> None:
-    silence_subprocess()
+def _proc_worker(runtime: str, port: int) -> None:
+    silence_subprocess(runtime)
 
     async def _main():
         from daffi import callback, TCPTransport
@@ -93,7 +96,8 @@ def _proc_worker(port: int) -> None:
             return data
 
         client = AsyncClient(
-            app_name="chunk-aio-worker", workers=1, transport=TCPTransport(HOST, port)
+            app_name="chunk-aio-worker", workers=1, transport=TCPTransport(HOST, port),
+            runtime=runtime,
         )
         await client.connect()
         await client.join()
@@ -106,7 +110,7 @@ def _proc_worker(port: int) -> None:
 
 @pytest.fixture
 def direct_svc(free_port):
-    proc = mp.Process(target=_proc_service, args=(free_port,), daemon=True)
+    proc = mp.Process(target=_proc_service, args=(active_runtime(), free_port,), daemon=True)
     proc.start()
     wait_for_port(free_port)
     wait_for_members(free_port, {"chunk-aio-svc"})
@@ -116,11 +120,11 @@ def direct_svc(free_port):
 
 @pytest.fixture
 def router_worker(free_port):
-    rproc = mp.Process(target=_proc_router, args=(free_port,), daemon=True)
+    rproc = mp.Process(target=_proc_router, args=(active_runtime(), free_port,), daemon=True)
     rproc.start()
     wait_for_port(free_port)
 
-    wproc = mp.Process(target=_proc_worker, args=(free_port,), daemon=True)
+    wproc = mp.Process(target=_proc_worker, args=(active_runtime(), free_port,), daemon=True)
     wproc.start()
     wait_for_members(free_port, {"chunk-aio-worker"})
     yield free_port
@@ -164,7 +168,8 @@ class TestChunkedDirectAsync:
         from daffi import TCPTransport
 
         client = AsyncClient(
-            app_name="chk-sml", transport=TCPTransport(HOST, direct_svc)
+            app_name="chk-sml", transport=TCPTransport(HOST, direct_svc),
+            runtime=active_runtime(),
         )
         conn = await client.connect()
         payload = list(range(1_000))
@@ -178,7 +183,8 @@ class TestChunkedDirectAsync:
         from daffi import TCPTransport
 
         client = AsyncClient(
-            app_name="chk-lrg", transport=TCPTransport(HOST, direct_svc)
+            app_name="chk-lrg", transport=TCPTransport(HOST, direct_svc),
+            runtime=active_runtime(),
         )
         conn = await client.connect()
         payload = list(range(LARGE_N))
@@ -192,7 +198,8 @@ class TestChunkedDirectAsync:
         from daffi import TCPTransport
 
         client = AsyncClient(
-            app_name="chk-str", transport=TCPTransport(HOST, direct_svc)
+            app_name="chk-str", transport=TCPTransport(HOST, direct_svc),
+            runtime=active_runtime(),
         )
         conn = await client.connect()
         payload = "x" * (CHUNK_SIZE * 3)
@@ -207,7 +214,8 @@ class TestChunkedDirectAsync:
         from daffi import TCPTransport
 
         client = AsyncClient(
-            app_name="chk-nw", transport=TCPTransport(HOST, direct_svc)
+            app_name="chk-nw", transport=TCPTransport(HOST, direct_svc),
+            runtime=active_runtime(),
         )
         conn = await client.connect()
         payload = list(range(10_000))
@@ -226,7 +234,8 @@ class TestChunkedRouterAsync:
         from daffi import TCPTransport
 
         client = AsyncClient(
-            app_name="chk-rtr", transport=TCPTransport(HOST, router_worker)
+            app_name="chk-rtr", transport=TCPTransport(HOST, router_worker),
+            runtime=active_runtime(),
         )
         conn = await client.connect()
         payload = list(range(LARGE_N))
@@ -240,7 +249,8 @@ class TestChunkedRouterAsync:
         from daffi import TCPTransport
 
         client = AsyncClient(
-            app_name="chk-rtr-nw", transport=TCPTransport(HOST, router_worker)
+            app_name="chk-rtr-nw", transport=TCPTransport(HOST, router_worker),
+            runtime=active_runtime(),
         )
         conn = await client.connect()
         payload = {"key": list(range(5_000))}

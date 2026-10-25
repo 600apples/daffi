@@ -38,7 +38,7 @@ def process_order(order: Order) -> Order:
     order.status = Status.DONE
     return order
 
-svc = Service(app_name="order-service", transports=TCPTransport("127.0.0.1", 5004))
+svc = Service(app_name="order-service", transport=TCPTransport("127.0.0.1", 5004))
 svc.start(); svc.join()
 ```
 
@@ -75,7 +75,7 @@ def summarise(data: dict) -> dict:
     total = sum(i["price"] * i["qty"] for i in items)
     return {"item_count": len(items), "total": round(total, 2)}
 
-svc = Service(app_name="json-service", transports=TCPTransport("127.0.0.1", 5005))
+svc = Service(app_name="json-service", transport=TCPTransport("127.0.0.1", 5005))
 svc.start(); svc.join()
 ```
 
@@ -111,7 +111,7 @@ def transform(record: dict) -> dict:
         result["full_name"] = f"{result['first_name']} {result['last_name']}"
     return result
 
-svc = Service(app_name="msgpack-service", transports=TCPTransport("127.0.0.1", 5007))
+svc = Service(app_name="msgpack-service", transport=TCPTransport("127.0.0.1", 5007))
 svc.start(); svc.join()
 ```
 
@@ -147,7 +147,7 @@ def echo_raw(data: bytes) -> bytes:
     print(f"[service] received {len(data)} bytes")
     return data   # echo back
 
-svc = Service(app_name="raw-service", transports=TCPTransport("127.0.0.1", 5006))
+svc = Service(app_name="raw-service", transport=TCPTransport("127.0.0.1", 5006))
 svc.start(); svc.join()
 ```
 

@@ -23,8 +23,10 @@ pub fn startClient(_: [*c]PyObject, args: [*c]PyObject) callconv(.c) [*c]PyObjec
     var port: c_long = undefined;
     var app_name: [*:0]u8 = undefined;
     var tls_enabled: c_int = 0;
-    var ca_file: [*:0]u8 = undefined;
-    if (!(py.PyArg_ParseTuple(args, "slsps", &host, &port, &app_name, &tls_enabled, &ca_file) != 0)) return Py_BuildValue("");
+    var ca: [*:0]u8 = undefined;
+    var cert: [*:0]u8 = undefined;
+    var key: [*:0]u8 = undefined;
+    if (!(py.PyArg_ParseTuple(args, "slspsss", &host, &port, &app_name, &tls_enabled, &ca, &cert, &key) != 0)) return Py_BuildValue("");
     if (port < 0 or port > std.math.maxInt(u16)) {
         PyErr_SetString(py.PyExc_ValueError, "port must be in range 0-65535");
         return null;
@@ -33,10 +35,12 @@ pub fn startClient(_: [*c]PyObject, args: [*c]PyObject) callconv(.c) [*c]PyObjec
     const phost = std.mem.span(host);
     const papp_name = std.mem.span(app_name);
     const ptls = tls_enabled != 0;
-    const pca_file = std.mem.span(ca_file);
+    const pca = std.mem.span(ca);
+    const pcert = std.mem.span(cert);
+    const pkey = std.mem.span(key);
     const conn_num = Client.init(allocator, papp_name, .{
         .host = phost, .port = pport,
-        .tls = ptls, .ca_file = pca_file,
+        .tls = ptls, .ca = pca, .cert = pcert, .key = pkey,
     }) catch return Py_BuildValue("");
     return Py_BuildValue("k", @as(c_ulong, conn_num));
 }
@@ -245,10 +249,39 @@ pub fn setLogLevel(_: [*c]PyObject, args: [*c]PyObject) callconv(.c) [*c]PyObjec
     return Py_BuildValue("");
 }
 
-/// getExecutionModel() -> str
-pub fn getExecutionModel(_: [*c]PyObject, _: [*c]PyObject) callconv(.c) [*c]PyObject {
+/// getRuntime() -> str
+pub fn getRuntime(_: [*c]PyObject, _: [*c]PyObject) callconv(.c) [*c]PyObject {
     const name = @tagName(@import("../runtime.zig").model());
     return Py_BuildValue("s#", name.ptr, @as(py.Py_ssize_t, @intCast(name.len)));
+}
+
+/// setRuntime(name: str) -> None
+///
+/// Lock this process to "threads" or "evented". A later call must
+/// repeat the runtime already locked in this process.
+pub fn setRuntime(_: [*c]PyObject, args: [*c]PyObject) callconv(.c) [*c]PyObject {
+    var name: [*:0]const u8 = undefined;
+    if (PyArg_ParseTuple(args, "s", &name) == 0) return null;
+    const value = std.mem.span(name);
+    const runtime = @import("../runtime.zig");
+    const requested = std.meta.stringToEnum(runtime.Model, value) orelse {
+        PyErr_SetString(py.PyExc_ValueError, "runtime must be 'threads' or 'evented'");
+        return null;
+    };
+    runtime.configure(requested) catch |err| {
+        var buf: [192]u8 = undefined;
+        const msg = switch (err) {
+            error.RuntimeMismatch => std.fmt.bufPrintSentinel(
+                &buf,
+                "runtime is already '{s}'",
+                .{@tagName(runtime.model())},
+                0,
+            ),
+        } catch unreachable;
+        PyErr_SetString(py.PyExc_ValueError, msg);
+        return null;
+    };
+    return Py_BuildValue("");
 }
 
 /// Return a JSON-encoded list of currently connected nodes, or None on error.

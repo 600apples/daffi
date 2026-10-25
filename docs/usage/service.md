@@ -31,7 +31,7 @@ def greet(name: str) -> str:
 if __name__ == "__main__":
     svc = Service(
         app_name="calc-service",
-        transports=TCPTransport("127.0.0.1", 5001))
+        transport=TCPTransport("127.0.0.1", 5001))
     svc.start()
     print("Service running — press Ctrl+C to stop.")
     svc.join()   # blocks until Ctrl+C
@@ -42,9 +42,9 @@ if __name__ == "__main__":
 | Parameter | Type | Description |
 |---|---|---|
 | `app_name` | `str` | Unique name for this node. Auto-generated if omitted. |
-| `transports` | transport or sequence | One `TCPTransport` or `UnixTransport`, or several. Every listener shares this node's membership. `start()` brings all of them up at once or none of them. |
+| `transport` | transport or sequence | One `TCPTransport` or `UnixTransport`, or several. Every listener shares this node's membership. `start()` brings all of them up at once or none of them. TLS (`tls`, `cert`, `key`) is set on each `TCPTransport`. |
 | `workers` | `int` | Concurrency level for callback execution. Default: `1` (inline). |
-| `tls` | `bool` | Enable TLS. Requires `cert_file` and `key_file`. |
+| `runtime` | `Runtime` | `THREADS` or `EVENTED` for this process. Omit for `threads`. One process, one choice. |
 
 ### Concurrent callback execution
 
@@ -67,10 +67,10 @@ def fetch_data(query: str) -> dict:
     return {"result": query}
 
 # workers=1 (default): 10 concurrent callers finish in ~3 s total
-svc = Service( workers=1,transports=TCPTransport("127.0.0.1", 5000))
+svc = Service( workers=1,transport=TCPTransport("127.0.0.1", 5000))
 
 # workers=10: 10 concurrent callers all finish in ~0.3 s
-svc = Service( workers=10,transports=TCPTransport("127.0.0.1", 5000))
+svc = Service( workers=10,transport=TCPTransport("127.0.0.1", 5000))
 
 svc.start()
 svc.join()
@@ -126,6 +126,7 @@ if __name__ == "__main__":
 |---|---|---|
 | `app_name` | `str` | Unique name for this node. |
 | `transport` | `TCPTransport` or `UnixTransport` | The one address this client connects to. |
+| `runtime` | `Runtime` | `THREADS` or `EVENTED` for this process. A client uses the same runtime as the server. Omit for `threads`. |
 
 ### `conn.rpc()`
 
@@ -190,7 +191,7 @@ class TextProcessor:
 
 
 if __name__ == "__main__":
-    svc = Service(app_name="text-service", transports=TCPTransport("127.0.0.1", 5003))
+    svc = Service(app_name="text-service", transport=TCPTransport("127.0.0.1", 5003))
     svc.start()
     svc.join()
 ```
@@ -242,7 +243,7 @@ from daffi import Service, callback, TCPTransport
 def receive_chunk(data: bytes) -> None:
     print(f"[service] received {len(data)} bytes: {data!r}")
 
-svc = Service(app_name="stream-service", transports=TCPTransport("127.0.0.1", 5010))
+svc = Service(app_name="stream-service", transport=TCPTransport("127.0.0.1", 5010))
 svc.start(); svc.join()
 ```
 

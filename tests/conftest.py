@@ -4,18 +4,19 @@ Root pytest configuration for the daffi test suite.
 Adds the project root to sys.path so ``import daffi`` works even when
 the package is not installed into the active Python environment.
 
-Execution-model matrix
-----------------------
-The native core locks ``DAFFI_EXECUTION_MODEL`` once per process, so the suite
-cannot switch ``threads`` ↔ ``evented`` mid-session.  Use::
+Runtime matrix
+--------------
+The native runtime is chosen by the ``runtime`` argument and then locked
+for the process.  The suite cannot switch ``threads`` ↔ ``evented``
+mid-session.  Use::
 
-    pytest --execution-model=both          # default for integration: two fresh runs
-    pytest --execution-model=threads       # single model
-    pytest --execution-model=evented
+    pytest --runtime=both          # default: two fresh runs
+    pytest --runtime=threads       # single runtime
+    pytest --runtime=evented
 
-``both`` re-invokes pytest once per model in a subprocess (fresh interpreter,
-correct lock).  A session-scoped autouse fixture sets the env var and prints
-which model is active.
+``both`` re-invokes pytest once per runtime in a fresh interpreter.
+The ``runtime`` fixture locks that choice.  ``active_runtime()`` reads it
+back for subprocess arguments.
 """
 
 from __future__ import annotations
@@ -51,14 +52,14 @@ _RUNNER_ENV = "_DAFFI_EXEC_MODEL_RUNNER"
 def pytest_addoption(parser: pytest.Parser) -> None:
     group = parser.getgroup("daffi")
     group.addoption(
-        "--execution-model",
+        "--runtime",
         action="store",
         default="both",
         choices=("threads", "evented", "both"),
         help=(
-            "Native DAFFI_EXECUTION_MODEL to run against. "
+            "Native runtime to pass to every node. "
             "'both' (default) runs the suite twice in fresh interpreters "
-            "(threads, then evented). Use a single model for a faster loop."
+            "(threads, then evented). Use a single runtime for a faster loop."
         ),
     )
 
@@ -66,8 +67,8 @@ def pytest_addoption(parser: pytest.Parser) -> None:
 def pytest_configure(config: pytest.Config) -> None:
     config.addinivalue_line(
         "markers",
-        "execution_models_self_managed: test/module already covers threads+evented; "
-        "only collected under --execution-model=threads (or a single-model run)",
+        "runtimes_self_managed: test/module already covers threads+evented; "
+        "only collected under --runtime=threads (or a single-model run)",
     )
     config.addinivalue_line(
         "markers",
@@ -78,17 +79,17 @@ def pytest_configure(config: pytest.Config) -> None:
 # ── both → two fresh pytest processes ─────────────────────────────────────────
 
 
-def _strip_execution_model_args(argv: list[str]) -> list[str]:
+def _strip_runtime_args(argv: list[str]) -> list[str]:
     out: list[str] = []
     skip = False
     for arg in argv:
         if skip:
             skip = False
             continue
-        if arg == "--execution-model":
+        if arg == "--runtime":
             skip = True
             continue
-        if arg.startswith("--execution-model="):
+        if arg.startswith("--runtime="):
             continue
         out.append(arg)
     return out
@@ -96,8 +97,8 @@ def _strip_execution_model_args(argv: list[str]) -> list[str]:
 
 @pytest.hookimpl(tryfirst=True)
 def pytest_cmdline_main(config: pytest.Config):
-    """When ``--execution-model=both``, run pytest twice in clean subprocesses."""
-    model = config.getoption("--execution-model")
+    """When ``--runtime=both``, run pytest twice in clean subprocesses."""
+    model = config.getoption("--runtime")
     if model != "both":
         return None
     if os.environ.get(_RUNNER_ENV) == "1":
@@ -105,18 +106,16 @@ def pytest_cmdline_main(config: pytest.Config):
         return None
     # Discovery-only modes: do not double-invoke.
     if config.option.collectonly or getattr(config.option, "showfixtures", False):
-        os.environ.setdefault("DAFFI_EXECUTION_MODEL", "threads")
         return None
 
-    filtered = _strip_execution_model_args(sys.argv[1:])
+    filtered = _strip_runtime_args(sys.argv[1:])
     rc = 0
     for m in _EXEC_MODELS:
-        print(f"\n{'=' * 70}\n  DAFFI_EXECUTION_MODEL={m}\n{'=' * 70}\n", flush=True)
+        print(f"\n{'=' * 70}\n  runtime={m}\n{'=' * 70}\n", flush=True)
         env = os.environ.copy()
         env[_RUNNER_ENV] = "1"
-        env["DAFFI_EXECUTION_MODEL"] = m
         proc = subprocess.run(
-            [sys.executable, "-m", "pytest", *filtered, f"--execution-model={m}"],
+            [sys.executable, "-m", "pytest", *filtered, f"--runtime={m}"],
             env=env,
             cwd=str(ROOT),
         )
@@ -127,20 +126,34 @@ def pytest_cmdline_main(config: pytest.Config):
 
 # ── session fixture + collection tweaks ───────────────────────────────────────
 
+# Set by the ``runtime`` fixture. Not on the tests package: a script run as
+# ``python tests/perf/...`` must not need ``tests/__init__.py`` to import.
+SELECTED_RUNTIME = "threads"
+
+
+def active_runtime() -> str:
+    """Runtime locked for this interpreter by the ``runtime`` fixture."""
+    return SELECTED_RUNTIME
+
 
 @pytest.fixture(scope="session", autouse=True)
-def execution_model(pytestconfig: pytest.Config) -> str:
-    """Pin ``DAFFI_EXECUTION_MODEL`` for this interpreter before any native node starts.
+def runtime(pytestconfig: pytest.Config) -> str:
+    """Lock this interpreter to the ``--runtime`` choice before any node starts.
 
-    Spawned Service/Router/Client children inherit the same value.
+    Spawned children do not inherit that lock.  Their entry points take the
+    same value as a ``runtime`` argument.  ``active_runtime()`` reports the
+    value stored here.
     """
-    model = pytestconfig.getoption("--execution-model")
+    global SELECTED_RUNTIME
+    from daffi import dfcore
+
+    model = pytestconfig.getoption("--runtime")
     if model == "both":
-        # Should not happen: cmdline_main consumes ``both``. Fallback for safety.
-        model = os.environ.get("DAFFI_EXECUTION_MODEL", "threads")
+        model = "threads"
     assert model in _EXEC_MODELS, model
-    os.environ["DAFFI_EXECUTION_MODEL"] = model
-    print(f"\n[daffi] execution_model={model}\n", flush=True)
+    SELECTED_RUNTIME = model
+    dfcore.setRuntime(model)
+    print(f"\n[daffi] runtime={model}\n", flush=True)
     return model
 
 
@@ -148,17 +161,17 @@ def pytest_collection_modifyitems(
     config: pytest.Config, items: list[pytest.Item]
 ) -> None:
     """Drop self-managed matrix tests from the evented pass (they already cover both)."""
-    model = config.getoption("--execution-model")
+    model = config.getoption("--runtime")
     if model not in _EXEC_MODELS:
         return
     if model == "threads":
         return
     keep: list[pytest.Item] = []
     for item in items:
-        if item.get_closest_marker("execution_models_self_managed"):
+        if item.get_closest_marker("runtimes_self_managed"):
             item.add_marker(
                 pytest.mark.skip(
-                    reason="self-managed threads+evented matrix; runs under --execution-model=threads only"
+                    reason="self-managed threads+evented matrix; runs under --runtime=threads only"
                 )
             )
         keep.append(item)
@@ -166,6 +179,5 @@ def pytest_collection_modifyitems(
 
 
 def pytest_report_header(config: pytest.Config) -> list[str]:
-    model = config.getoption("--execution-model")
-    env_model = os.environ.get("DAFFI_EXECUTION_MODEL", "<unset>")
-    return [f"daffi execution-model: option={model}  env={env_model}"]
+    model = config.getoption("--runtime")
+    return [f"daffi runtime: {model}"]

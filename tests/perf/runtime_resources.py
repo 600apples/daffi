@@ -1,8 +1,8 @@
 """
 Compare memory (RSS) and CPU for daffi ``threads`` vs ``evented``.
 
-Each model runs in a fresh interpreter (``DAFFI_EXECUTION_MODEL``) so the
-Service/Router and all workers share that model.
+Each model runs in a fresh interpreter. That interpreter locks the
+runtime and passes the same value into the Service, Router, and workers.
 
 Scenarios
 ---------
@@ -11,8 +11,10 @@ Scenarios
 
 Run::
 
-    python tests/perf/execution_model_resources.py
-    python tests/perf/execution_model_resources.py --clients 64 --calls 300
+    python tests/perf/runtime_resources.py
+    python tests/perf/runtime_resources.py --clients 64 --calls 300
+
+Which model runs first is chosen at random.
 """
 
 from __future__ import annotations
@@ -20,7 +22,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-import os
+import random
 import subprocess
 import sys
 from pathlib import Path
@@ -43,7 +45,7 @@ def _run_worker(calls: int, clients: int, sample_s: float) -> dict:
     logging.disable(logging.CRITICAL)
     from daffi import dfcore
 
-    model = dfcore.getExecutionModel()
+    model = dfcore.getRuntime()
     many = scenario_many_clients(
         n_clients=clients, calls_per_client=calls, sample_s=sample_s
     )
@@ -149,23 +151,35 @@ def main() -> None:
         "--sample", type=float, default=1.0, help="CPU sample window seconds"
     )
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--runtime", choices=MODELS, help=argparse.SUPPRESS)
     args = parser.parse_args()
 
     if args.worker:
+        if args.runtime is None:
+            sys.exit("--runtime is required in worker mode")
+        import tests.conftest as _runtime_state
+        from daffi import dfcore
+
+        _runtime_state.SELECTED_RUNTIME = args.runtime
+        dfcore.setRuntime(args.runtime)
         print(
             "RESULT " + json.dumps(_run_worker(args.calls, args.clients, args.sample))
         )
         return
 
+    order = list(MODELS)
+    random.shuffle(order)
+    print(f"model order: {' then '.join(order)}", flush=True)
     results = {}
-    for model in MODELS:
+    for model in order:
         print(f"running {model} model…", flush=True)
-        env = dict(os.environ, DAFFI_EXECUTION_MODEL=model)
         proc = subprocess.run(
             [
                 sys.executable,
                 __file__,
                 "--worker",
+                "--runtime",
+                model,
                 "--clients",
                 str(args.clients),
                 "--calls",
@@ -173,7 +187,6 @@ def main() -> None:
                 "--sample",
                 str(args.sample),
             ],
-            env=env,
             capture_output=True,
             text=True,
             cwd=str(ROOT),

@@ -47,6 +47,7 @@ extension).
 """
 
 from __future__ import annotations
+from tests.conftest import active_runtime
 
 import multiprocessing as mp
 import os
@@ -80,23 +81,23 @@ N_CAST_WORKERS = 4  # workers for cast / partial-result tests
 # ── subprocess targets (module-level so they are picklable) ───────────────────
 
 
-def _intr_service(port: int, name: str = "intr-svc") -> None:
-    silence_subprocess()
+def _intr_service(runtime: str, port: int, name: str = "intr-svc") -> None:
+    silence_subprocess(runtime)
     from daffi import Service, callback, TCPTransport
 
     @callback
     def echo(payload):
         return payload
 
-    svc = Service(app_name=name, transports=TCPTransport(HOST, port))
+    svc = Service(app_name=name, transport=TCPTransport(HOST, port), runtime=runtime)
     svc.start()
     svc.join()
 
 
-def _intr_slow_service(port: int, name: str = "intr-slow-svc") -> None:
+def _intr_slow_service(runtime: str, port: int, name: str = "intr-slow-svc") -> None:
     """Service whose only callback sleeps 60 s before replying — lets tests
     reliably kill it while a call is in-flight."""
-    silence_subprocess()
+    silence_subprocess(runtime)
     import time as _t
     from daffi import Service, callback, TCPTransport
 
@@ -105,22 +106,22 @@ def _intr_slow_service(port: int, name: str = "intr-slow-svc") -> None:
         _t.sleep(60)
         return payload
 
-    svc = Service(app_name=name, transports=TCPTransport(HOST, port))
+    svc = Service(app_name=name, transport=TCPTransport(HOST, port), runtime=runtime)
     svc.start()
     svc.join()
 
 
-def _intr_router(port: int, name: str = "intr-router") -> None:
-    silence_subprocess()
+def _intr_router(runtime: str, port: int, name: str = "intr-router") -> None:
+    silence_subprocess(runtime)
     from daffi import Router, TCPTransport
 
-    r = Router(app_name=name, transports=TCPTransport(HOST, port))
+    r = Router(app_name=name, transport=TCPTransport(HOST, port), runtime=runtime)
     r.start()
     r.join()
 
 
-def _intr_worker(port: int, name: str) -> None:
-    silence_subprocess()
+def _intr_worker(runtime: str, port: int, name: str) -> None:
+    silence_subprocess(runtime)
     import time as _t
     from daffi import Client, callback, TCPTransport
 
@@ -128,7 +129,7 @@ def _intr_worker(port: int, name: str) -> None:
     def echo(payload):
         return payload
 
-    client = Client(app_name=name, transport=TCPTransport(HOST, port))
+    client = Client(app_name=name, transport=TCPTransport(HOST, port), runtime=runtime)
     client.connect()
     try:
         while True:
@@ -143,7 +144,7 @@ def _intr_worker(port: int, name: str) -> None:
 
 
 def _start_slow_service(port: int, name: str = "intr-slow-svc") -> mp.Process:
-    p = mp.Process(target=_intr_slow_service, args=(port, name), daemon=True)
+    p = mp.Process(target=_intr_slow_service, args=(active_runtime(), port, name), daemon=True)
     p.start()
     wait_for_port(port)
     time.sleep(0.3)
@@ -151,7 +152,7 @@ def _start_slow_service(port: int, name: str = "intr-slow-svc") -> mp.Process:
 
 
 def _start_service(port: int, name: str = "intr-svc") -> mp.Process:
-    p = mp.Process(target=_intr_service, args=(port, name), daemon=True)
+    p = mp.Process(target=_intr_service, args=(active_runtime(), port, name), daemon=True)
     p.start()
     wait_for_port(port)
     # Small grace after the TCP listener opens so the child finishes daffi
@@ -162,14 +163,14 @@ def _start_service(port: int, name: str = "intr-svc") -> mp.Process:
 
 
 def _start_router(port: int, name: str = "intr-router") -> mp.Process:
-    p = mp.Process(target=_intr_router, args=(port, name), daemon=True)
+    p = mp.Process(target=_intr_router, args=(active_runtime(), port, name), daemon=True)
     p.start()
     wait_for_port(port)
     return p
 
 
 def _start_worker(port: int, name: str) -> mp.Process:
-    p = mp.Process(target=_intr_worker, args=(port, name), daemon=True)
+    p = mp.Process(target=_intr_worker, args=(active_runtime(), port, name), daemon=True)
     p.start()
     return p
 
@@ -178,7 +179,7 @@ def _connect(port: int, name: str):
     """Return (client, conn) connected to *port*."""
     from daffi import Client, TCPTransport
 
-    client = Client(app_name=name, transport=TCPTransport(HOST, port))
+    client = Client(app_name=name, transport=TCPTransport(HOST, port), runtime=active_runtime())
     conn = client.connect()
     return client, conn
 
@@ -236,7 +237,8 @@ class TestServiceKilled:
         from daffi import Client, TCPTransport
 
         client = Client(
-            app_name="intr-dead-connect", transport=TCPTransport(HOST, free_port)
+            app_name="intr-dead-connect", transport=TCPTransport(HOST, free_port),
+            runtime=active_runtime(),
         )
         with pytest.raises(InitializationError):
             client.connect()

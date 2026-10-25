@@ -35,7 +35,7 @@ from daffi import Service, callback, TCPTransport
 def process(task: str) -> str:
     return f"done: {task}"
 
-svc = Service(transports=TCPTransport("127.0.0.1", 6000))
+svc = Service(transport=TCPTransport("127.0.0.1", 6000))
 svc.start()
 svc.join()   # blocks until Ctrl+C / SIGTERM
 ```

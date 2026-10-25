@@ -24,7 +24,7 @@ def add(a: int, b: int) -> int:
 if __name__ == "__main__":
     svc = Service(
         app_name="calc-service",
-        transports=[
+        transport=[
             TCPTransport("127.0.0.1", PORT),
             UnixTransport(SOCK),
         ],

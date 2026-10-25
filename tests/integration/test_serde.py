@@ -26,6 +26,7 @@ not just a unit-test of the serializer module.
 """
 
 from __future__ import annotations
+from tests.conftest import active_runtime
 
 import json
 import math
@@ -58,7 +59,7 @@ def _rpc(port: int, name: str, method: str, *args, serde, **kwargs):
     """Connect a fresh Client, fire one call, return the result."""
     from daffi import Client, TCPTransport
 
-    client = Client(app_name=name, transport=TCPTransport(HOST, port))
+    client = Client(app_name=name, transport=TCPTransport(HOST, port), runtime=active_runtime())
     conn = client.connect()
     try:
         proxy = conn.rpc(timeout=TIMEOUT, serde=serde)
@@ -141,7 +142,8 @@ class TestPickle:
         from daffi import Client, SerdeFormat, TCPTransport
 
         client = Client(
-            app_name="pk-multi", transport=TCPTransport(HOST, direct_service)
+            app_name="pk-multi", transport=TCPTransport(HOST, direct_service),
+            runtime=active_runtime(),
         )
         conn = client.connect()
         proxy = conn.rpc(timeout=TIMEOUT, serde=SerdeFormat.PICKLE)
@@ -211,7 +213,8 @@ class TestJson:
         from daffi import Client, SerdeFormat, TCPTransport
 
         client = Client(
-            app_name="js-multi", transport=TCPTransport(HOST, direct_service)
+            app_name="js-multi", transport=TCPTransport(HOST, direct_service),
+            runtime=active_runtime(),
         )
         conn = client.connect()
         proxy = conn.rpc(timeout=TIMEOUT, serde=SerdeFormat.JSON)
@@ -223,7 +226,8 @@ class TestJson:
         from daffi import Client, SerdeFormat, TCPTransport
 
         client = Client(
-            app_name="js-kwargs", transport=TCPTransport(HOST, direct_service)
+            app_name="js-kwargs", transport=TCPTransport(HOST, direct_service),
+            runtime=active_runtime(),
         )
         conn = client.connect()
         proxy = conn.rpc(timeout=TIMEOUT, serde=SerdeFormat.JSON)
@@ -303,7 +307,8 @@ class TestOpaque:
         from daffi import Client, SerdeFormat, TCPTransport
 
         client = Client(
-            app_name="op-multi-err", transport=TCPTransport(HOST, direct_service)
+            app_name="op-multi-err", transport=TCPTransport(HOST, direct_service),
+            runtime=active_runtime(),
         )
         conn = client.connect()
         proxy = conn.rpc(timeout=TIMEOUT, serde=SerdeFormat.OPAQUE)
@@ -318,7 +323,8 @@ class TestOpaque:
         from daffi import Client, SerdeFormat, TCPTransport
 
         client = Client(
-            app_name="op-kwarg", transport=TCPTransport(HOST, direct_service)
+            app_name="op-kwarg", transport=TCPTransport(HOST, direct_service),
+            runtime=active_runtime(),
         )
         conn = client.connect()
         proxy = conn.rpc(timeout=TIMEOUT, serde=SerdeFormat.OPAQUE)
@@ -406,7 +412,8 @@ class TestMsgpack:
         from daffi import Client, SerdeFormat, TCPTransport
 
         client = Client(
-            app_name="mp-multi", transport=TCPTransport(HOST, direct_service)
+            app_name="mp-multi", transport=TCPTransport(HOST, direct_service),
+            runtime=active_runtime(),
         )
         conn = client.connect()
         proxy = conn.rpc(timeout=TIMEOUT, serde=SerdeFormat.MSGPACK)
@@ -419,7 +426,8 @@ class TestMsgpack:
         from daffi import Client, SerdeFormat, TCPTransport
 
         client = Client(
-            app_name="mp-router", transport=TCPTransport(HOST, router_with_worker)
+            app_name="mp-router", transport=TCPTransport(HOST, router_with_worker),
+            runtime=active_runtime(),
         )
         conn = client.connect()
         proxy = conn.rpc(timeout=TIMEOUT, serde=SerdeFormat.MSGPACK)

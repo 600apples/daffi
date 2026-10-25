@@ -39,9 +39,11 @@ pub const Config = struct {
     host: []const u8,
     port: u16,
     tls: bool = false,
-    /// PEM file path for a CA bundle used to verify the server certificate.
-    /// Empty string disables peer verification.
-    ca_file: []const u8 = "",
+    /// CA trust: filesystem path or PEM material. Empty disables verification.
+    ca: []const u8 = "",
+    /// Client identity for mutual TLS (filesystem path or PEM material).
+    cert: []const u8 = "",
+    key: []const u8 = "",
 };
 
 const zero_timeout = std.mem.toBytes(posix.timeval{ .tv_sec = 0, .tv_usec = 0 });
@@ -71,12 +73,7 @@ pub fn init(allocator: Allocator, config: Config) !*ClientConnection {
 
     if (config.tls) {
         tls_impl.init();
-        // Build a null-terminated copy of ca_file for the C API.
-        var ca_buf: [512]u8 = undefined;
-        if (config.ca_file.len >= ca_buf.len) return error.PathTooLong;
-        @memcpy(ca_buf[0..config.ca_file.len], config.ca_file);
-        ca_buf[config.ca_file.len] = 0;
-        const ssl_ctx = try tls_impl.clientCtx(@ptrCast(&ca_buf));
+        const ssl_ctx = try tls_impl.clientCtx(config.ca, config.cert, config.key);
         errdefer tls_impl.freeCtx(ssl_ctx);
         // Bound the blocking handshake so a server that accepts the TCP
         // connection but never answers cannot hang the caller forever.

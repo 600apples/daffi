@@ -35,6 +35,13 @@ Run::
 """
 
 from __future__ import annotations
+import sys
+from pathlib import Path
+
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+from tests.conftest import active_runtime
 
 import asyncio
 import logging
@@ -106,12 +113,17 @@ def _msgpack_available() -> bool:
 # ── silence helpers ───────────────────────────────────────────────────────────
 
 
-def _silence_subprocess() -> None:
+def _silence_subprocess(runtime: str) -> None:
     devnull_fd = os.open(os.devnull, os.O_WRONLY)
     os.dup2(devnull_fd, 1)
     os.dup2(devnull_fd, 2)
     os.close(devnull_fd)
     logging.disable(logging.CRITICAL)
+
+    import tests.conftest as _runtime_state
+    _runtime_state.SELECTED_RUNTIME = runtime
+    from daffi import dfcore
+    dfcore.setRuntime(runtime)
 
 
 def _quiet_teardown(fn, *args, **kwargs) -> None:
@@ -155,8 +167,8 @@ def _wait_for_port(port: int, timeout: float = 15.0) -> None:
 # ── subprocess entry points ───────────────────────────────────────────────────
 
 
-def _proc_service(host: str, port: int) -> None:
-    _silence_subprocess()
+def _proc_service(runtime: str, host: str, port: int) -> None:
+    _silence_subprocess(runtime)
 
     async def _main():
         from daffi import callback, TCPTransport
@@ -167,7 +179,8 @@ def _proc_service(host: str, port: int) -> None:
             return payload
 
         svc = AsyncService(
-            app_name="bigmsg-svc-aio", transports=TCPTransport(host, port)
+            app_name="bigmsg-svc-aio", transport=TCPTransport(host, port),
+            runtime=runtime,
         )
         await svc.start()
         await svc.join()
@@ -175,15 +188,16 @@ def _proc_service(host: str, port: int) -> None:
     asyncio.run(_main())
 
 
-def _proc_router(host: str, port: int) -> None:
-    _silence_subprocess()
+def _proc_router(runtime: str, host: str, port: int) -> None:
+    _silence_subprocess(runtime)
 
     async def _main():
         from daffi.aio import AsyncRouter
         from daffi import TCPTransport
 
         r = AsyncRouter(
-            app_name="bigmsg-router-aio", transports=TCPTransport(host, port)
+            app_name="bigmsg-router-aio", transport=TCPTransport(host, port),
+            runtime=runtime,
         )
         await r.start()
         await r.join()
@@ -191,8 +205,8 @@ def _proc_router(host: str, port: int) -> None:
     asyncio.run(_main())
 
 
-def _proc_worker(host: str, port: int) -> None:
-    _silence_subprocess()
+def _proc_worker(runtime: str, host: str, port: int) -> None:
+    _silence_subprocess(runtime)
 
     async def _main():
         from daffi import callback, TCPTransport
@@ -203,7 +217,8 @@ def _proc_worker(host: str, port: int) -> None:
             return payload
 
         client = AsyncClient(
-            app_name="bigmsg-worker-aio", transport=TCPTransport(host, port)
+            app_name="bigmsg-worker-aio", transport=TCPTransport(host, port),
+            runtime=runtime,
         )
         await client.connect()
         await client.join()
@@ -315,14 +330,15 @@ async def bench_direct() -> None:
     from daffi import TCPTransport
 
     port = _free_port()
-    proc = mp.Process(target=_proc_service, args=(HOST, port), daemon=True)
+    proc = mp.Process(target=_proc_service, args=(active_runtime(), HOST, port), daemon=True)
     proc.start()
     try:
         _wait_for_port(port)
         await asyncio.sleep(0.15)
 
         client = AsyncClient(
-            app_name="bigmsg-direct-caller-aio", transport=TCPTransport(HOST, port)
+            app_name="bigmsg-direct-caller-aio", transport=TCPTransport(HOST, port),
+            runtime=active_runtime(),
         )
         conn = await client.connect()
         try:
@@ -339,8 +355,8 @@ async def bench_via_router() -> None:
     from daffi import TCPTransport
 
     port = _free_port()
-    rproc = mp.Process(target=_proc_router, args=(HOST, port), daemon=True)
-    wproc = mp.Process(target=_proc_worker, args=(HOST, port), daemon=True)
+    rproc = mp.Process(target=_proc_router, args=(active_runtime(), HOST, port), daemon=True)
+    wproc = mp.Process(target=_proc_worker, args=(active_runtime(), HOST, port), daemon=True)
 
     rproc.start()
     try:
@@ -349,7 +365,8 @@ async def bench_via_router() -> None:
         await asyncio.sleep(0.5)
 
         client = AsyncClient(
-            app_name="bigmsg-router-caller-aio", transport=TCPTransport(HOST, port)
+            app_name="bigmsg-router-caller-aio", transport=TCPTransport(HOST, port),
+            runtime=active_runtime(),
         )
         conn = await client.connect()
         try:

@@ -14,7 +14,7 @@ The Router has no callbacks of its own — it only forwards messages.
 from daffi import Router, TCPTransport
 
 if __name__ == "__main__":
-    router = Router(transports=TCPTransport("127.0.0.1", 6001))
+    router = Router(transport=TCPTransport("127.0.0.1", 6001))
     router.start()
     print("Router running on 127.0.0.1:6001 — press Ctrl+C to stop.")
     router.join()
@@ -24,8 +24,8 @@ if __name__ == "__main__":
 
 | Parameter | Type | Description |
 |---|---|---|
-| `transports` | transport or sequence | One `TCPTransport` or `UnixTransport`, or several. Every listener shares this router's membership. `start()` brings all of them up at once or none of them. |
-| `tls` | `bool` | Enable TLS (requires `cert_file` / `key_file`). |
+| `transport` | transport or sequence | One `TCPTransport` or `UnixTransport`, or several. Every listener shares this router's membership. `start()` brings all of them up at once or none of them. TLS (`tls`, `cert`, `key`) is set on each `TCPTransport`. |
+| `runtime` | `Runtime` | `THREADS` or `EVENTED` for this process. Omit for `threads`. One process, one choice. |
 
 ---
 

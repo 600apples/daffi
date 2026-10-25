@@ -32,6 +32,13 @@ Run::
 """
 
 from __future__ import annotations
+import sys
+from pathlib import Path
+
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+from tests.conftest import active_runtime
 
 import asyncio
 import logging
@@ -58,12 +65,17 @@ HOST = "127.0.0.1"
 # ── subprocess silence helpers ────────────────────────────────────────────────
 
 
-def _silence_subprocess() -> None:
+def _silence_subprocess(runtime: str) -> None:
     devnull_fd = os.open(os.devnull, os.O_WRONLY)
     os.dup2(devnull_fd, 1)
     os.dup2(devnull_fd, 2)
     os.close(devnull_fd)
     logging.disable(logging.CRITICAL)
+
+    import tests.conftest as _runtime_state
+    _runtime_state.SELECTED_RUNTIME = runtime
+    from daffi import dfcore
+    dfcore.setRuntime(runtime)
 
 
 def _quiet_kill(proc: mp.Process) -> None:
@@ -106,15 +118,16 @@ def _wait_for_port(port: int, timeout: float = 20.0) -> None:
 # ── subprocess entry points ───────────────────────────────────────────────────
 
 
-def _proc_router(port: int) -> None:
-    _silence_subprocess()
+def _proc_router(runtime: str, port: int) -> None:
+    _silence_subprocess(runtime)
 
     async def _main():
         from daffi.aio import AsyncRouter
         from daffi import TCPTransport
 
         router = AsyncRouter(
-            app_name="longtask-router-aio", transports=TCPTransport(HOST, port)
+            app_name="longtask-router-aio", transport=TCPTransport(HOST, port),
+            runtime=runtime,
         )
         await router.start()
         await router.join()
@@ -122,9 +135,9 @@ def _proc_router(port: int) -> None:
     asyncio.run(_main())
 
 
-def _proc_worker(port: int, sleep_s: float, n_workers: int) -> None:
+def _proc_worker(runtime: str, port: int, sleep_s: float, n_workers: int) -> None:
     """AsyncWorker with *n_workers* concurrent asyncio tasks and an async slow_job."""
-    _silence_subprocess()
+    _silence_subprocess(runtime)
 
     async def _main():
         from daffi import callback, TCPTransport
@@ -141,6 +154,7 @@ def _proc_worker(port: int, sleep_s: float, n_workers: int) -> None:
             app_name="longtask-worker-aio",
             workers=n_workers,
             transport=TCPTransport(HOST, port),
+            runtime=runtime,
         )
         await client.connect()
         await client.join()
@@ -156,7 +170,7 @@ def _wait_for_worker(port: int, timeout: float = 30.0) -> None:
     from daffi import Client, TCPTransport
     from daffi._bindings import get_available_members
 
-    probe = Client(app_name="longtask-probe-aio", transport=TCPTransport(HOST, port))
+    probe = Client(app_name="longtask-probe-aio", transport=TCPTransport(HOST, port), runtime=active_runtime())
     probe.connect()
     conn_num = probe._conn_num
 
@@ -196,7 +210,8 @@ async def _run_callers(port: int, n_tasks: int) -> float:
     callers: list[tuple] = []
     for i in range(n_tasks):
         c = AsyncClient(
-            app_name=f"longtask-caller-{i}-aio", transport=TCPTransport(HOST, port)
+            app_name=f"longtask-caller-{i}-aio", transport=TCPTransport(HOST, port),
+            runtime=active_runtime(),
         )
         conn = await c.connect()
         callers.append((c, conn))
@@ -257,10 +272,10 @@ async def run_scenario() -> None:
     print(sep, flush=True)
 
     port = _free_port()
-    router_proc = mp.Process(target=_proc_router, args=(port,), daemon=True)
+    router_proc = mp.Process(target=_proc_router, args=(active_runtime(), port,), daemon=True)
     worker_proc = mp.Process(
         target=_proc_worker,
-        args=(port, SLEEP_SECONDS, N_TASKS),
+        args=(active_runtime(), port, SLEEP_SECONDS, N_TASKS),
         daemon=True,
     )
 

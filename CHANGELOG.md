@@ -6,10 +6,10 @@ All notable changes to this project are documented in this file.
 
 ### Breaking
 
-- `Router` and `Service` take addresses through `transports`: one
-  `TCPTransport` or `UnixTransport`, or a sequence of them. Every listener
-  shares that node's membership. `Client` takes a single `transport`.
-  `host`, `port`, and `unix_sock_path` are gone.
+- `Router`, `Service`, and `Client` all take addresses through `transport`.
+  `Client` accepts a single `TCPTransport` or `UnixTransport`. `Router` and
+  `Service` accept one transport or a sequence of them; every listener shares
+  that node's membership. `host`, `port`, and `unix_sock_path` are gone.
 - `start()` binds every transport in parallel and starts accepting on all of
   them at once, under one native handle. All or nothing: if one transport
   cannot be bound, none stays bound and the error names that address; if a
@@ -23,13 +23,15 @@ All notable changes to this project are documented in this file.
 
 - Python 3.15 support (classifiers, CI test matrix and prebuilt wheels).
 - TLS client verifies the server host name (DNS name or IP address) against
-  the certificate when `ca_file` is given, and sends SNI.
-- Optional evented execution model for the native core, selected with
-  `DAFFI_EXECUTION_MODEL=evented` (default `threads`). Connections of
-  Routers, Services and Clients are multiplexed over a few kqueue/epoll
-  event-loop threads (`DAFFI_EVENT_LOOPS`, default: CPU count capped at 4)
-  instead of one OS thread each. `dfcore.getExecutionModel()` reports the
-  active model.
+  the certificate when `ca` is given, and sends SNI.
+- Optional evented runtime for the native core, selected with
+  `runtime=Runtime.EVENTED` (or `"evented"`) on a `Router`, `Service`,
+  or `Client`. The default, when `runtime` is omitted, is `threads`.
+  Connections are multiplexed over a few kqueue/epoll event-loop threads
+  (`DAFFI_EVENT_LOOPS`, default: CPU count capped at 4) instead of one OS
+  thread each. The choice is once per process and applies to clients as
+  well as servers; a later constructor that disagrees raises
+  `InitializationError`. `dfcore.getRuntime()` reports the active model.
 
 ### Changed
 

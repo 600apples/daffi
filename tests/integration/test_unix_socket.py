@@ -10,6 +10,7 @@ Regressions covered:
 """
 
 from __future__ import annotations
+from tests.conftest import active_runtime
 
 import asyncio
 import multiprocessing as mp
@@ -26,8 +27,8 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def _service(path: str) -> None:
-    silence_subprocess()
+def _service(runtime: str, path: str) -> None:
+    silence_subprocess(runtime)
     from daffi import Service, callback, UnixTransport, TCPTransport
 
     @callback
@@ -38,22 +39,22 @@ def _service(path: str) -> None:
     def add(a: int, b: int) -> int:
         return a + b
 
-    svc = Service(app_name="ux-service", workers=2, transports=UnixTransport(path))
+    svc = Service(app_name="ux-service", workers=2, transport=UnixTransport(path), runtime=runtime)
     svc.start()
     svc.join()
 
 
-def _router(path: str) -> None:
-    silence_subprocess()
+def _router(runtime: str, path: str) -> None:
+    silence_subprocess(runtime)
     from daffi import Router, UnixTransport, TCPTransport
 
-    r = Router(app_name="ux-router", transports=UnixTransport(path))
+    r = Router(app_name="ux-router", transport=UnixTransport(path), runtime=runtime)
     r.start()
     r.join()
 
 
-def _worker(path: str) -> None:
-    silence_subprocess()
+def _worker(runtime: str, path: str) -> None:
+    silence_subprocess(runtime)
     from daffi import Client, callback, UnixTransport, TCPTransport
 
     @callback
@@ -64,7 +65,7 @@ def _worker(path: str) -> None:
     def add(a: int, b: int) -> int:
         return a + b
 
-    c = Client(app_name="ux-service", workers=2, transport=UnixTransport(path))
+    c = Client(app_name="ux-service", workers=2, transport=UnixTransport(path), runtime=runtime)
     c.connect()
     while True:
         time.sleep(1)
@@ -93,7 +94,7 @@ def _sock_path(tmp_path, *, long: bool = False) -> str:
 @pytest.fixture
 def unix_service(tmp_path, request):
     path = _sock_path(tmp_path, long=getattr(request, "param", False))
-    proc = mp.Process(target=_service, args=(path,), daemon=True)
+    proc = mp.Process(target=_service, args=(active_runtime(), path,), daemon=True)
     proc.start()
     _wait_for_socket(path)
     yield path
@@ -107,7 +108,7 @@ def test_rpc_over_unix_socket(unix_service):
     from daffi import Client, UnixTransport, TCPTransport
 
     assert unix_service.count("/") >= 2
-    client = Client(app_name="ux-client", transport=UnixTransport(unix_service))
+    client = Client(app_name="ux-client", transport=UnixTransport(unix_service), runtime=active_runtime())
     conn = client.connect()
     try:
         conn.wait_for_members("ux-service", timeout=15)
@@ -123,13 +124,13 @@ def test_router_over_unix_socket(tmp_path):
     from daffi import Client, UnixTransport, TCPTransport
 
     path = _sock_path(tmp_path, long=True)
-    rproc = mp.Process(target=_router, args=(path,), daemon=True)
+    rproc = mp.Process(target=_router, args=(active_runtime(), path,), daemon=True)
     rproc.start()
     _wait_for_socket(path)
-    wproc = mp.Process(target=_worker, args=(path,), daemon=True)
+    wproc = mp.Process(target=_worker, args=(active_runtime(), path,), daemon=True)
     wproc.start()
     try:
-        client = Client(app_name="ux-client", transport=UnixTransport(path))
+        client = Client(app_name="ux-client", transport=UnixTransport(path), runtime=active_runtime())
         conn = client.connect()
         try:
             conn.wait_for_members("ux-service", timeout=20)
@@ -147,7 +148,8 @@ def test_async_client_over_unix_socket(unix_service):
 
     async def main():
         client = AsyncClient(
-            app_name="ux-aclient", transport=UnixTransport(unix_service)
+            app_name="ux-aclient", transport=UnixTransport(unix_service),
+            runtime=active_runtime(),
         )
         conn = await client.connect()
         try:
@@ -164,7 +166,7 @@ def test_stale_socket_file_is_replaced(tmp_path):
 
     path = _sock_path(tmp_path)
     open(path, "w").close()  # leftover from a crashed run
-    proc = mp.Process(target=_service, args=(path,), daemon=True)
+    proc = mp.Process(target=_service, args=(active_runtime(), path,), daemon=True)
     proc.start()
     try:
         deadline = time.monotonic() + 15
@@ -175,7 +177,7 @@ def test_stale_socket_file_is_replaced(tmp_path):
         assert stat.S_ISSOCK(
             os.stat(path).st_mode
         ), "stale file was not replaced by a socket"
-        client = Client(app_name="ux-client", transport=UnixTransport(path))
+        client = Client(app_name="ux-client", transport=UnixTransport(path), runtime=active_runtime())
         conn = client.connect()
         try:
             conn.wait_for_members("ux-service", timeout=15)
@@ -189,4 +191,4 @@ def test_missing_transport_is_rejected():
     from daffi import Client
 
     with pytest.raises(TypeError):
-        Client(app_name="bad")
+        Client(app_name="bad", runtime=active_runtime())

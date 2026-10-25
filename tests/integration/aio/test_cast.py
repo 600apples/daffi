@@ -7,6 +7,7 @@ Layout: AsyncClient → AsyncRouter → N AsyncWorkers
 """
 
 from __future__ import annotations
+from tests.conftest import active_runtime
 
 import asyncio
 import multiprocessing as mp
@@ -32,8 +33,8 @@ N_WORKERS = 5
 # ── subprocess entry points ───────────────────────────────────────────────────
 
 
-def _worker(port: int, worker_id: int) -> None:
-    silence_subprocess()
+def _worker(runtime: str, port: int, worker_id: int) -> None:
+    silence_subprocess(runtime)
 
     async def _main():
         from daffi import callback, TCPTransport
@@ -48,7 +49,8 @@ def _worker(port: int, worker_id: int) -> None:
             return value
 
         client = AsyncClient(
-            app_name=f"cast-worker-{worker_id:02d}", transport=TCPTransport(HOST, port)
+            app_name=f"cast-worker-{worker_id:02d}", transport=TCPTransport(HOST, port),
+            runtime=runtime,
         )
         await client.connect()
         await client.join()
@@ -62,13 +64,13 @@ def _worker(port: int, worker_id: int) -> None:
 @pytest.fixture
 def cast_setup(free_port):
     """Start AsyncRouter + N_WORKERS AsyncWorker subprocesses; yield the router port."""
-    rproc = mp.Process(target=proc_router, args=(free_port,), daemon=True)
+    rproc = mp.Process(target=proc_router, args=(active_runtime(), free_port,), daemon=True)
     rproc.start()
     wait_for_port(free_port)
 
     worker_procs = []
     for i in range(N_WORKERS):
-        p = mp.Process(target=_worker, args=(free_port, i), daemon=True)
+        p = mp.Process(target=_worker, args=(active_runtime(), free_port, i), daemon=True)
         p.start()
         worker_procs.append(p)
 
@@ -95,7 +97,7 @@ class TestCastBroadcastAsync:
         from daffi.aio import AsyncClient
         from daffi import TCPTransport
 
-        client = AsyncClient(app_name=name, transport=TCPTransport(HOST, port))
+        client = AsyncClient(app_name=name, transport=TCPTransport(HOST, port), runtime=active_runtime())
         conn = await client.connect()
         return client, conn
 
@@ -192,6 +194,7 @@ class TestCastBroadcastAsync:
                 client = __import__("daffi.aio", fromlist=["AsyncClient"]).AsyncClient(
                     app_name=f"cast-gather-{i}",
                     transport=TCPTransport(HOST, cast_setup),
+                    runtime=active_runtime(),
                 )
                 conn = await client.connect()
                 clients.append(client)

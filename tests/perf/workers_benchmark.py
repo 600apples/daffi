@@ -29,6 +29,13 @@ Run::
 """
 
 from __future__ import annotations
+import sys
+from pathlib import Path
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+from tests.conftest import active_runtime
 
 import json
 import logging
@@ -82,12 +89,17 @@ def _wait(port: int, timeout: float = 15.0) -> None:
     raise TimeoutError(f"port {HOST}:{port} not ready within {timeout}s")
 
 
-def _silence() -> None:
+def _silence(runtime: str) -> None:
     devnull = os.open(os.devnull, os.O_WRONLY)
     os.dup2(devnull, 1)
     os.dup2(devnull, 2)
     os.close(devnull)
     logging.disable(logging.CRITICAL)
+
+    import tests.conftest as _runtime_state
+    _runtime_state.SELECTED_RUNTIME = runtime
+    from daffi import dfcore
+    dfcore.setRuntime(runtime)
     from daffi.registry._executor_registry import EXECUTOR_REGISTRY
 
     EXECUTOR_REGISTRY.subscribers.clear()
@@ -112,8 +124,8 @@ def _quiet_stop(fn, *args) -> None:
 # ── subprocess targets ────────────────────────────────────────────────────────
 
 
-def _proc_service(port: int, workers: int) -> None:
-    _silence()
+def _proc_service(runtime: str, port: int, workers: int) -> None:
+    _silence(runtime)
     from daffi import Service, callback, TCPTransport
 
     @callback
@@ -125,23 +137,24 @@ def _proc_service(port: int, workers: int) -> None:
         return sum(i * i for i in range(n))
 
     svc = Service(
-        app_name="bench-svc", workers=workers, transports=TCPTransport(HOST, port)
+        app_name="bench-svc", workers=workers, transport=TCPTransport(HOST, port),
+        runtime=runtime,
     )
     svc.start()
     svc.join()
 
 
-def _proc_router(port: int) -> None:
-    _silence()
+def _proc_router(runtime: str, port: int) -> None:
+    _silence(runtime)
     from daffi import Router, TCPTransport
 
-    r = Router(app_name="bench-router", transports=TCPTransport(HOST, port))
+    r = Router(app_name="bench-router", transport=TCPTransport(HOST, port), runtime=runtime)
     r.start()
     r.join()
 
 
-def _proc_worker(port: int, workers: int) -> None:
-    _silence()
+def _proc_worker(runtime: str, port: int, workers: int) -> None:
+    _silence(runtime)
     import time as _t
     from daffi import Client, callback, TCPTransport
 
@@ -154,7 +167,8 @@ def _proc_worker(port: int, workers: int) -> None:
         return sum(i * i for i in range(n))
 
     client = Client(
-        app_name="bench-worker", workers=workers, transport=TCPTransport(HOST, port)
+        app_name="bench-worker", workers=workers, transport=TCPTransport(HOST, port),
+        runtime=runtime,
     )
     client.connect()
     try:
@@ -190,7 +204,8 @@ def _bench(
     arg = wire if cb_name == "echo" else cpu_arg
 
     client = Client(
-        app_name=f"bench-caller-{label}", transport=TCPTransport(HOST, port)
+        app_name=f"bench-caller-{label}", transport=TCPTransport(HOST, port),
+        runtime=active_runtime(),
     )
     conn = client.connect()
     proxy = conn.rpc(timeout=TIMEOUT, serde=serde_int)
@@ -254,7 +269,7 @@ def run_direct(
     port = _free_port()
     proc = mp.Process(
         target=_proc_service,
-        args=(port, workers),
+        args=(active_runtime(), port, workers),
         daemon=True,
     )
     proc.start()
@@ -277,11 +292,11 @@ def run_router(
     cb_name: str,
 ) -> BenchResult:
     port = _free_port()
-    rproc = mp.Process(target=_proc_router, args=(port,), daemon=True)
+    rproc = mp.Process(target=_proc_router, args=(active_runtime(), port,), daemon=True)
     rproc.start()
     wproc = mp.Process(
         target=_proc_worker,
-        args=(port, workers),
+        args=(active_runtime(), port, workers),
         daemon=True,
     )
     try:

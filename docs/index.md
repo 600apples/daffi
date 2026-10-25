@@ -39,7 +39,7 @@ from daffi import Service, callback, TCPTransport
 def add(a: int, b: int) -> int:
     return a + b
 
-svc = Service(app_name="calc", transports=TCPTransport("127.0.0.1", 5000))
+svc = Service(app_name="calc", transport=TCPTransport("127.0.0.1", 5000))
 svc.start()
 svc.join()
 ```

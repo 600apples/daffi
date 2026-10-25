@@ -22,7 +22,7 @@ def ping(msg: str) -> str:
     return f"pong: {msg}"
 
 if __name__ == "__main__":
-    svc = Service(app_name="unix-service", transports=UnixTransport(SOCK))
+    svc = Service(app_name="unix-service", transport=UnixTransport(SOCK))
     svc.start()
     print(f"Service listening on unix://{SOCK} — press Ctrl+C to stop.")
     svc.join()
@@ -57,7 +57,7 @@ The API is identical to TCP — only the constructor argument changes.
 The Router listens on a `UnixTransport` the same way:
 
 ```python
-router = Router(transports=UnixTransport("/tmp/my_router.sock"))
+router = Router(transport=UnixTransport("/tmp/my_router.sock"))
 router.start()
 router.join()
 ```

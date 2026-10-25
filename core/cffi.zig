@@ -10,7 +10,8 @@ pub const setServiceRequestFd       = @import("cffi/server.zig").setServiceReque
 
 // --- client functions ---
 pub const setLogLevel               = @import("cffi/client.zig").setLogLevel;
-pub const getExecutionModel         = @import("cffi/client.zig").getExecutionModel;
+pub const getRuntime         = @import("cffi/client.zig").getRuntime;
+pub const setRuntime         = @import("cffi/client.zig").setRuntime;
 pub const startClient               = @import("cffi/client.zig").startClient;
 pub const stopClient                = @import("cffi/client.zig").stopClient;
 pub const sendMessageFromClient     = @import("cffi/client.zig").sendMessageFromClient;

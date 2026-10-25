@@ -9,7 +9,8 @@ Topology
     N callers  →  Router  →  1 Worker
 
 Both the Router and the Worker (and the loader) are sampled for the whole run.
-Choose the native execution model with ``--model`` (or run ``both``).
+Choose the native runtime with ``--model`` (or run ``both``).
+When both models run, which one goes first is chosen at random.
 
 Examples
 --------
@@ -27,12 +28,12 @@ Exit code is non-zero if any sampled process trends above ``--leak-mb-per-min``
 """
 
 from __future__ import annotations
-
 import argparse
 import json
 import logging
 import multiprocessing as mp
 import os
+import random
 import socket
 import sys
 import threading
@@ -70,25 +71,30 @@ def _wait_for_port(port: int, timeout: float = 30.0) -> None:
     raise TimeoutError(f"{HOST}:{port} not ready")
 
 
-def _silence() -> None:
+def _silence(runtime: str) -> None:
     devnull = os.open(os.devnull, os.O_WRONLY)
     os.dup2(devnull, 1)
     os.dup2(devnull, 2)
     os.close(devnull)
     logging.disable(logging.CRITICAL)
 
+    import tests.conftest as _runtime_state
+    _runtime_state.SELECTED_RUNTIME = runtime
+    from daffi import dfcore
+    dfcore.setRuntime(runtime)
 
-def _proc_router(port: int) -> None:
-    _silence()
+
+def _proc_router(runtime: str, port: int) -> None:
+    _silence(runtime)
     from daffi import Router, TCPTransport
 
-    r = Router(app_name="soak-router", transports=TCPTransport(HOST, port))
+    r = Router(app_name="soak-router", transport=TCPTransport(HOST, port), runtime=runtime)
     r.start()
     r.join()
 
 
-def _proc_worker(port: int, workers: int) -> None:
-    _silence()
+def _proc_worker(runtime: str, port: int, workers: int) -> None:
+    _silence(runtime)
     from daffi import Client, callback, TCPTransport
 
     @callback
@@ -96,7 +102,8 @@ def _proc_worker(port: int, workers: int) -> None:
         return payload
 
     client = Client(
-        app_name="soak-worker", workers=workers, transport=TCPTransport(HOST, port)
+        app_name="soak-worker", workers=workers, transport=TCPTransport(HOST, port),
+        runtime=runtime,
     )
     client.connect()
     try:
@@ -106,7 +113,7 @@ def _proc_worker(port: int, workers: int) -> None:
         client.stop()
 
 
-def _proc_loader(
+def _proc_loader(runtime: str, 
     port: int,
     n_clients: int,
     duration_s: float,
@@ -114,14 +121,15 @@ def _proc_loader(
     q: "mp.Queue",
 ) -> None:
     """Sustain RPC load from *n_clients* for *duration_s* seconds."""
-    _silence()
+    _silence(runtime)
     from daffi import Client, TCPTransport
 
     connected = []
     for i in range(n_clients):
         try:
             client = Client(
-                app_name=f"soak-c{i:04d}", transport=TCPTransport(HOST, port)
+                app_name=f"soak-c{i:04d}", transport=TCPTransport(HOST, port),
+                runtime=runtime,
             )
             conn = client.connect()
             conn.wait_for_members("soak-worker", timeout=60)
@@ -186,6 +194,8 @@ def _proc_loader(
 
 
 def _quiet_kill(proc: mp.Process, timeout: float = 10.0) -> None:
+    if proc.pid is None:
+        return
     if proc.is_alive():
         proc.terminate()
     proc.join(timeout=timeout)
@@ -215,24 +225,29 @@ def run_soak(
     print(f"  leak threshold: {leak_mb_per_min:g} MB/min")
     print(f"{'=' * 72}", flush=True)
 
-    # Child processes must see the model; parent does not start native I/O.
-    env_model = model
-    os.environ["DAFFI_EXECUTION_MODEL"] = env_model
-
+    # Spawned children do not inherit an in-process lock. Pass the model in.
     port = _free_port()
     ctx = mp.get_context("spawn")
-    router = ctx.Process(target=_proc_router, args=(port,), daemon=True)
-    worker = ctx.Process(target=_proc_worker, args=(port, workers), daemon=True)
+    router = ctx.Process(target=_proc_router, args=(model, port,), daemon=True)
+    worker = ctx.Process(target=_proc_worker, args=(model, port, workers), daemon=True)
     q: mp.Queue = ctx.Queue()
     loader = ctx.Process(
         target=_proc_loader,
-        args=(port, clients, duration_s, call_delay_s, q),
+        args=(model, port, clients, duration_s, call_delay_s, q),
         daemon=True,
     )
 
     router.start()
     try:
-        _wait_for_port(port)
+        try:
+            _wait_for_port(port)
+        except TimeoutError:
+            print(
+                f"  [!] router did not listen on {HOST}:{port} "
+                f"(alive={router.is_alive()} exit={router.exitcode})",
+                flush=True,
+            )
+            return 2
         worker.start()
         time.sleep(1.0)
         loader.start()
@@ -377,7 +392,7 @@ def main() -> None:
         "--model",
         choices=("threads", "evented", "both"),
         default="both",
-        help="native execution model (default: both — run twice)",
+        help="native runtime (default: both — run twice)",
     )
     p.add_argument(
         "--json-dir",
@@ -387,14 +402,18 @@ def main() -> None:
     )
     args = p.parse_args()
 
-    models = MODELS if args.model == "both" else (args.model,)
+    if args.model == "both":
+        models = list(MODELS)
+        random.shuffle(models)
+        print(f"model order: {' then '.join(models)}", flush=True)
+    else:
+        models = (args.model,)
     rc = 0
     for model in models:
         json_out = None
         if args.json_dir is not None:
             json_out = args.json_dir / f"soak_{model}_{args.hours:g}h.json"
-        # Each model in a fresh interpreter so DAFFI_EXECUTION_MODEL locks correctly
-        # for every child (spawn inherits env from this process after we set it).
+        # Each model is passed into spawned children as an argument.
         code = run_soak(
             model=model,
             hours=args.hours,

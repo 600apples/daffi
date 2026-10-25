@@ -17,6 +17,7 @@ Key differences from the sync conftest
 """
 
 from __future__ import annotations
+from tests.conftest import active_runtime
 
 import asyncio
 import logging
@@ -70,7 +71,7 @@ def wait_for_members(
     """
     from daffi import Client, TCPTransport
 
-    client = Client(app_name=probe_name, transport=TCPTransport(HOST, port))
+    client = Client(app_name=probe_name, transport=TCPTransport(HOST, port), runtime=active_runtime())
     conn = client.connect()
     try:
         conn.wait_for_members(*expected, timeout=timeout)
@@ -89,7 +90,7 @@ async def async_wait_for_members(
     from daffi.aio import AsyncClient
     from daffi import TCPTransport
 
-    client = AsyncClient(app_name=probe_name, transport=TCPTransport(HOST, port))
+    client = AsyncClient(app_name=probe_name, transport=TCPTransport(HOST, port), runtime=active_runtime())
     conn = await client.connect()
     try:
         await conn.wait_for_members(*expected, timeout=timeout)
@@ -97,12 +98,17 @@ async def async_wait_for_members(
         await client.stop()
 
 
-def silence_subprocess() -> None:
+def silence_subprocess(runtime: str) -> None:
     devnull = os.open(os.devnull, os.O_WRONLY)
     os.dup2(devnull, 1)
     os.dup2(devnull, 2)
     os.close(devnull)
     logging.disable(logging.CRITICAL)
+
+    import tests.conftest as _runtime_state
+    _runtime_state.SELECTED_RUNTIME = runtime
+    from daffi import dfcore
+    dfcore.setRuntime(runtime)
 
     from daffi.registry._executor_registry import EXECUTOR_REGISTRY
 
@@ -129,11 +135,11 @@ def quiet_kill(proc: mp.Process, timeout: float = 5.0) -> None:
 # ── common subprocess entry points ────────────────────────────────────────────
 
 
-def proc_service(
+def proc_service(runtime: str, 
     port: int, app_name: str = "integ-aio-service", workers: int = 4
 ) -> None:
     """AsyncService subprocess: registers async echo + add callbacks, then joins."""
-    silence_subprocess()
+    silence_subprocess(runtime)
 
     async def _main():
         from daffi import callback, TCPTransport
@@ -148,7 +154,8 @@ def proc_service(
             return a + b
 
         svc = AsyncService(
-            app_name=app_name, workers=workers, transports=TCPTransport(HOST, port)
+            app_name=app_name, workers=workers, transport=TCPTransport(HOST, port),
+            runtime=runtime,
         )
         await svc.start()
         await svc.join()
@@ -156,24 +163,24 @@ def proc_service(
     asyncio.run(_main())
 
 
-def proc_router(port: int, app_name: str = "integ-aio-router") -> None:
+def proc_router(runtime: str, port: int, app_name: str = "integ-aio-router") -> None:
     """AsyncRouter subprocess: pure message broker."""
-    silence_subprocess()
+    silence_subprocess(runtime)
 
     async def _main():
         from daffi.aio import AsyncRouter
         from daffi import TCPTransport
 
-        r = AsyncRouter(app_name=app_name, transports=TCPTransport(HOST, port))
+        r = AsyncRouter(app_name=app_name, transport=TCPTransport(HOST, port), runtime=runtime)
         await r.start()
         await r.join()
 
     asyncio.run(_main())
 
 
-def proc_worker(port: int, app_name: str, workers: int = 4) -> None:
+def proc_worker(runtime: str, port: int, app_name: str, workers: int = 4) -> None:
     """AsyncClient+callback worker subprocess: registers echo + add, keeps running."""
-    silence_subprocess()
+    silence_subprocess(runtime)
 
     async def _main():
         from daffi import callback, TCPTransport
@@ -188,7 +195,8 @@ def proc_worker(port: int, app_name: str, workers: int = 4) -> None:
             return a + b
 
         client = AsyncClient(
-            app_name=app_name, workers=workers, transport=TCPTransport(HOST, port)
+            app_name=app_name, workers=workers, transport=TCPTransport(HOST, port),
+            runtime=runtime,
         )
         await client.connect()
         await client.join()
@@ -210,7 +218,7 @@ def free_port() -> int:
 @pytest.fixture
 def direct_service(free_port):
     """Start an AsyncService subprocess; yield its port; terminate on teardown."""
-    proc = mp.Process(target=proc_service, args=(free_port,), daemon=True)
+    proc = mp.Process(target=proc_service, args=(active_runtime(), free_port,), daemon=True)
     proc.start()
     wait_for_port(free_port, proc=proc)
     wait_for_members(free_port, {"integ-aio-service"})
@@ -221,12 +229,12 @@ def direct_service(free_port):
 @pytest.fixture
 def router_with_worker(free_port):
     """Start AsyncRouter + one AsyncWorker subprocess; yield the router port."""
-    rproc = mp.Process(target=proc_router, args=(free_port,), daemon=True)
+    rproc = mp.Process(target=proc_router, args=(active_runtime(), free_port,), daemon=True)
     rproc.start()
     wait_for_port(free_port, proc=rproc)
 
     wproc = mp.Process(
-        target=proc_worker, args=(free_port, "integ-aio-worker"), daemon=True
+        target=proc_worker, args=(active_runtime(), free_port, "integ-aio-worker"), daemon=True
     )
     wproc.start()
     wait_for_members(free_port, {"integ-aio-worker"})

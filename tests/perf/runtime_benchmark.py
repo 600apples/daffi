@@ -1,9 +1,9 @@
 """
-Compare daffi's native execution models: ``threads`` vs ``evented``.
+Compare daffi's native runtimes: ``threads`` vs ``evented``.
 
-Every scenario runs once per model in a fresh interpreter with
-``DAFFI_EXECUTION_MODEL`` set, so the client side and the spawned
-Service/Router/worker processes all use the same model.
+Every scenario runs once per model in a fresh interpreter. That
+interpreter locks the runtime with ``dfcore.setRuntime`` and passes the
+same value into every spawned Service, Router, and worker.
 
 Scenarios
 ---------
@@ -14,19 +14,28 @@ Scenarios
 
 Run::
 
-    python tests/perf/execution_model_benchmark.py [--calls 20000] [--clients 64] [--seconds 5] [--repeats 5]
+    python tests/perf/runtime_benchmark.py [--calls 20000] [--clients 64] [--seconds 5] [--repeats 5]
 
 Each scenario is repeated ``--repeats`` times; the table reports the **median**
 with ``[min–max]`` so run-to-run noise is visible instead of a lucky best run.
+Which model runs first is chosen at random.
 """
 
 from __future__ import annotations
+import sys
+from pathlib import Path
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+from tests.conftest import active_runtime
 
 import argparse
 import json
 import logging
 import multiprocessing as mp
 import os
+import random
 import socket
 import statistics
 import subprocess
@@ -59,12 +68,17 @@ def _wait_for_port(port: int, timeout: float = 15.0) -> None:
     raise TimeoutError(f"{HOST}:{port} not ready after {timeout}s")
 
 
-def _silence() -> None:
+def _silence(runtime: str) -> None:
     devnull = os.open(os.devnull, os.O_WRONLY)
     os.dup2(devnull, 1)
     os.dup2(devnull, 2)
     os.close(devnull)
     logging.disable(logging.CRITICAL)
+
+    import tests.conftest as _runtime_state
+    _runtime_state.SELECTED_RUNTIME = runtime
+    from daffi import dfcore
+    dfcore.setRuntime(runtime)
 
 
 def _thread_count(pid: int) -> int:
@@ -79,37 +93,37 @@ def _thread_count(pid: int) -> int:
 # ── subprocess entry points ───────────────────────────────────────────────────
 
 
-def _proc_service(port: int) -> None:
-    _silence()
+def _proc_service(runtime: str, port: int) -> None:
+    _silence(runtime)
     from daffi import Service, callback, TCPTransport
 
     @callback
     def echo(payload):
         return payload
 
-    svc = Service(app_name="bench-service", transports=TCPTransport(HOST, port))
+    svc = Service(app_name="bench-service", transport=TCPTransport(HOST, port), runtime=runtime)
     svc.start()
     svc.join()
 
 
-def _proc_router(port: int) -> None:
-    _silence()
+def _proc_router(runtime: str, port: int) -> None:
+    _silence(runtime)
     from daffi import Router, TCPTransport
 
-    router = Router(app_name="bench-router", transports=TCPTransport(HOST, port))
+    router = Router(app_name="bench-router", transport=TCPTransport(HOST, port), runtime=runtime)
     router.start()
     router.join()
 
 
-def _proc_worker(port: int) -> None:
-    _silence()
+def _proc_worker(runtime: str, port: int) -> None:
+    _silence(runtime)
     from daffi import Client, callback, TCPTransport
 
     @callback
     def echo(payload):
         return payload
 
-    client = Client(app_name="bench-worker", transport=TCPTransport(HOST, port))
+    client = Client(app_name="bench-worker", transport=TCPTransport(HOST, port), runtime=runtime)
     client.connect()
     while True:
         time.sleep(1)
@@ -145,11 +159,11 @@ def bench_direct(calls: int) -> dict:
     from daffi import Client, TCPTransport
 
     port = _free_port()
-    svc = mp.Process(target=_proc_service, args=(port,), daemon=True)
+    svc = mp.Process(target=_proc_service, args=(active_runtime(), port,), daemon=True)
     svc.start()
     try:
         _wait_for_port(port)
-        client = Client(app_name="bench-direct", transport=TCPTransport(HOST, port))
+        client = Client(app_name="bench-direct", transport=TCPTransport(HOST, port), runtime=active_runtime())
         conn = client.connect()
         conn.wait_for_members("bench-service", timeout=10)
         result = _sequential(conn, calls)
@@ -163,13 +177,13 @@ def bench_router(calls: int) -> dict:
     from daffi import Client, TCPTransport
 
     port = _free_port()
-    router = mp.Process(target=_proc_router, args=(port,), daemon=True)
+    router = mp.Process(target=_proc_router, args=(active_runtime(), port,), daemon=True)
     router.start()
-    worker = mp.Process(target=_proc_worker, args=(port,), daemon=True)
+    worker = mp.Process(target=_proc_worker, args=(active_runtime(), port,), daemon=True)
     try:
         _wait_for_port(port)
         worker.start()
-        client = Client(app_name="bench-caller", transport=TCPTransport(HOST, port))
+        client = Client(app_name="bench-caller", transport=TCPTransport(HOST, port), runtime=active_runtime())
         conn = client.connect()
         conn.wait_for_members("bench-worker", timeout=10)
         result = _sequential(conn, calls)
@@ -183,7 +197,7 @@ def bench_concurrent(n_clients: int, seconds: float) -> dict:
     from daffi import Client, TCPTransport
 
     port = _free_port()
-    svc = mp.Process(target=_proc_service, args=(port,), daemon=True)
+    svc = mp.Process(target=_proc_service, args=(active_runtime(), port,), daemon=True)
     svc.start()
     try:
         _wait_for_port(port)
@@ -192,7 +206,7 @@ def bench_concurrent(n_clients: int, seconds: float) -> dict:
 
         clients, conns = [], []
         for i in range(n_clients):
-            client = Client(app_name=f"bench-c{i}", transport=TCPTransport(HOST, port))
+            client = Client(app_name=f"bench-c{i}", transport=TCPTransport(HOST, port), runtime=active_runtime())
             conn = client.connect()
             conn.wait_for_members("bench-service", timeout=10)
             clients.append(client)
@@ -253,7 +267,7 @@ def _summarize(runs: list[dict]) -> dict:
 def run_model(calls: int, n_clients: int, seconds: float, repeats: int) -> dict:
     from daffi import dfcore, TCPTransport
 
-    model = dfcore.getExecutionModel()
+    model = dfcore.getRuntime()
 
     def repeated(fn, *args):
         return _summarize([fn(*args) for _ in range(repeats)])
@@ -376,23 +390,35 @@ def main() -> None:
         help="runs per scenario; table shows median [min–max] (default: 5)",
     )
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--runtime", choices=MODELS, help=argparse.SUPPRESS)
     args = parser.parse_args()
 
     if args.worker:
+        if args.runtime is None:
+            sys.exit("--runtime is required in worker mode")
+        import tests.conftest as _runtime_state
+        from daffi import dfcore
+
+        _runtime_state.SELECTED_RUNTIME = args.runtime
+        dfcore.setRuntime(args.runtime)
         logging.disable(logging.CRITICAL)
         result = run_model(args.calls, args.clients, args.seconds, args.repeats)
         print("RESULT " + json.dumps(result))
         return
 
+    order = list(MODELS)
+    random.shuffle(order)
+    print(f"model order: {' then '.join(order)}", flush=True)
     results = {}
-    for model in MODELS:
+    for model in order:
         print(f"running {model} model…", flush=True)
-        env = dict(os.environ, DAFFI_EXECUTION_MODEL=model)
         proc = subprocess.run(
             [
                 sys.executable,
                 __file__,
                 "--worker",
+                "--runtime",
+                model,
                 "--calls",
                 str(args.calls),
                 "--clients",
@@ -402,7 +428,6 @@ def main() -> None:
                 "--repeats",
                 str(args.repeats),
             ],
-            env=env,
             capture_output=True,
             text=True,
         )

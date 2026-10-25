@@ -31,15 +31,17 @@ const server_methods = [_]PyMethodDef{
         .ml_meth  = cffi.startServer,
         .ml_flags = 1,
         .ml_doc   =
-            \\startServer(listeners, mode, app_name, tls, cert_file, key_file) -> int
+            \\startServer(listeners, mode, app_name) -> int
             \\
             \\Bind every listener at once and start accepting on all of them.
             \\Returns one conn_num for the whole server.
             \\
-            \\  listeners - non-empty list of (host, port); a Unix socket is (path, 0)
-            \\  tls       - True to enable TLS on every listener (needs cert_file and key_file)
-            \\  cert_file - path to PEM server certificate (ignored when tls=False)
-            \\  key_file  - path to PEM server private key  (ignored when tls=False)
+            \\  listeners - non-empty list of address tuples.  Each entry is
+            \\              (host, port) for plaintext,
+            \\              (host, port, tls, cert, key), or
+            \\              (host, port, tls, cert, key, ca) for per-bind TLS.
+            \\              A non-empty ca enables mutual TLS (require client
+            \\              cert).  cert/key/ca are a path or PEM material.
             \\
             \\All or nothing: if a listener cannot be bound, none stays bound and
             \\ValueError.args is (reason, index of the failing listener).
@@ -114,13 +116,15 @@ const client_methods = [_]PyMethodDef{
         .ml_meth  = cffi.startClient,
         .ml_flags = 1,
         .ml_doc   =
-            \\startClient(host, port, app_name, tls, ca_file) -> int | None
+            \\startClient(host, port, app_name, tls, ca, cert, key) -> int | None
             \\
             \\Open a TCP connection and return a conn_num handle, or None on failure.
             \\
-            \\  tls     - True to enable TLS
-            \\  ca_file - path to PEM CA bundle for server cert verification;
-            \\            empty string disables verification
+            \\  tls  - True to enable TLS
+            \\  ca   - path or PEM for the CA used to verify the server; empty
+            \\         disables verification
+            \\  cert - optional client certificate (path or PEM) for mTLS
+            \\  key  - optional client private key (path or PEM) for mTLS
         ,
     },
     .{
@@ -259,17 +263,28 @@ const util_methods = [_]PyMethodDef{
         ,
     },
     .{
-        .ml_name  = "getExecutionModel",
-        .ml_meth  = cffi.getExecutionModel,
+        .ml_name  = "getRuntime",
+        .ml_meth  = cffi.getRuntime,
         .ml_flags = 4,
         .ml_doc   =
-            \\getExecutionModel() -> str
+            \\getRuntime() -> str
             \\
-            \\Execution model of the native core: "threads" (an OS thread per
+            \\Runtime of the native core: "threads" (an OS thread per
             \\connection) or "evented" (connections multiplexed over a few
-            \\event-loop threads).  Chosen once per process from the
-            \\DAFFI_EXECUTION_MODEL environment variable (default "threads");
+            \\event-loop threads).  Chosen once per process by setRuntime.
+            \\The default, when setRuntime was not called, is "threads".
             \\DAFFI_EVENT_LOOPS sets the number of loop threads.
+        ,
+    },
+    .{
+        .ml_name  = "setRuntime",
+        .ml_meth  = cffi.setRuntime,
+        .ml_flags = 1,
+        .ml_doc   =
+            \\setRuntime(name: str) -> None
+            \\
+            \\Lock the process to "threads" or "evented".  Must match a
+            \\runtime already locked in this process.
         ,
     },
 };

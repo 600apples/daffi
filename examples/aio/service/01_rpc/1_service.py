@@ -22,7 +22,7 @@ async def add(a: int, b: int) -> int:
 
 async def main():
     svc = AsyncService(
-        app_name="calc-service", transports=TCPTransport("0.0.0.0", 5001)
+        app_name="calc-service", transport=TCPTransport("0.0.0.0", 5001)
     )
     await svc.start()
     print("Service running on 0.0.0.0:5001 — press Ctrl+C to stop.")

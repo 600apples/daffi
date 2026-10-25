@@ -34,10 +34,12 @@ pub const Config = struct {
     host: ?[]const u8,
     port: u16,
     tls: bool = false,
-    /// PEM file containing the server certificate (required when tls = true).
-    cert_file: []const u8 = "",
-    /// PEM file containing the server private key (required when tls = true).
-    key_file: []const u8 = "",
+    /// Server certificate: filesystem path or PEM material (required when tls).
+    cert: []const u8 = "",
+    /// Server private key: filesystem path or PEM material (required when tls).
+    key: []const u8 = "",
+    /// When non-empty with tls, require and verify client certificates (mTLS).
+    ca: []const u8 = "",
 };
 
 pub fn init(allocator: Allocator, config: Config) !*ServerConnection {
@@ -79,25 +81,13 @@ pub fn init(allocator: Allocator, config: Config) !*ServerConnection {
     if (config.tls) {
         // Asking for TLS but providing no certificate must fail loudly, not
         // quietly fall back to serving plaintext.
-        if (config.cert_file.len == 0 or config.key_file.len == 0) {
+        if (config.cert.len == 0 or config.key.len == 0) {
             self.listener.deinit();
             allocator.destroy(self);
             return error.TlsCertRequired;
         }
         tls_impl.init();
-        // Build null-terminated copies for the C API (only needed during init).
-        var cert_buf: [512]u8 = undefined;
-        var key_buf: [512]u8 = undefined;
-        if (config.cert_file.len >= cert_buf.len or config.key_file.len >= key_buf.len) {
-            self.listener.deinit();
-            allocator.destroy(self);
-            return error.PathTooLong;
-        }
-        @memcpy(cert_buf[0..config.cert_file.len], config.cert_file);
-        cert_buf[config.cert_file.len] = 0;
-        @memcpy(key_buf[0..config.key_file.len], config.key_file);
-        key_buf[config.key_file.len] = 0;
-        self.ssl_ctx = tls_impl.serverCtx(@ptrCast(&cert_buf), @ptrCast(&key_buf)) catch |err| {
+        self.ssl_ctx = tls_impl.serverCtx(config.cert, config.key, config.ca) catch |err| {
             self.listener.deinit();
             allocator.destroy(self);
             return err;

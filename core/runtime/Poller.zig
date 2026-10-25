@@ -1,6 +1,6 @@
 //! Readiness notification for the event loop: kqueue on macOS/BSD, epoll on
 //! Linux.  Only read interest is needed — writes stay blocking in both
-//! execution models.  Level-triggered: a descriptor keeps being reported
+//! runtimes.  Level-triggered: a descriptor keeps being reported
 //! while it has unread data (or a pending EOF), so a callback may consume
 //! input in bounded chunks.
 
@@ -13,7 +13,7 @@ const use_kqueue = os_tag.isDarwin() or os_tag.isBSD();
 const use_epoll = os_tag == .linux;
 
 comptime {
-    if (!use_kqueue and !use_epoll) @compileError("the evented execution model needs kqueue or epoll");
+    if (!use_kqueue and !use_epoll) @compileError("the evented runtime needs kqueue or epoll");
 }
 
 const Poller = @This();

@@ -37,7 +37,7 @@ def echo(payload) -> object:
 
 if __name__ == "__main__":
     svc = Service(
-        app_name="msgpack-service", transports=TCPTransport("127.0.0.1", 5011)
+        app_name="msgpack-service", transport=TCPTransport("127.0.0.1", 5011)
     )
     svc.start()
     print("Service on ws://127.0.0.1:5011 — open index.html in a browser.")

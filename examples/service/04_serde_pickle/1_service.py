@@ -23,7 +23,7 @@ def process_order(order: Order) -> Order:
 
 
 if __name__ == "__main__":
-    svc = Service(app_name="order-service", transports=TCPTransport("0.0.0.0", 5004))
+    svc = Service(app_name="order-service", transport=TCPTransport("0.0.0.0", 5004))
     svc.start()
     print("Service running on 0.0.0.0:5004 — press Ctrl+C to stop.")
     svc.join()

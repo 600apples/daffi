@@ -28,7 +28,7 @@ async def process_order(order: Order) -> Order:
 
 async def main():
     svc = AsyncService(
-        app_name="order-service", transports=TCPTransport("0.0.0.0", 5004)
+        app_name="order-service", transport=TCPTransport("0.0.0.0", 5004)
     )
     await svc.start()
     print("Service running on 0.0.0.0:5004 — press Ctrl+C to stop.")

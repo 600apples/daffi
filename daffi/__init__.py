@@ -17,6 +17,8 @@ TCPTransport
     A TCP address.  Pass one, or a list of transports, to Router or Service.
 UnixTransport
     A Unix-domain socket address.
+Runtime
+    Process-wide native runtime: ``THREADS`` or ``EVENTED``.
 callback
     Decorator that registers a function or class as a remote executor.
 local
@@ -29,6 +31,7 @@ from daffi.app import (
     Router,
     Service,
     Client,
+    Runtime,
 )
 from daffi.transports import TCPTransport, UnixTransport
 from daffi._serialization import SerdeFormat
@@ -41,6 +44,7 @@ __all__ = [
     "Client",
     "TCPTransport",
     "UnixTransport",
+    "Runtime",
     "SerdeFormat",
     "callback",
     "local",

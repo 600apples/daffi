@@ -49,7 +49,7 @@ class TextProcessor:
 
 async def main():
     svc = AsyncService(
-        app_name="text-service", transports=TCPTransport("0.0.0.0", 5003)
+        app_name="text-service", transport=TCPTransport("0.0.0.0", 5003)
     )
     await svc.start()
     print("Service running on 0.0.0.0:5003 — press Ctrl+C to stop.")

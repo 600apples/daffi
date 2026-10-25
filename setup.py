@@ -46,6 +46,11 @@ cibuildwheel sets ``ARCHFLAGS`` (e.g. ``-arch x86_64``) when building a wheel
 for an architecture other than the runner's native one.  ``ZigBuilder`` reads
 that variable and passes the appropriate ``-target`` triple to ``zig
 build-lib`` so the emitted shared library has the correct architecture.
+
+WebAssembly
+-----------
+The same build also runs ``zig build``, which compiles ``core/wasm.zig`` and
+writes ``js-client/app.wasm``.  The browser client loads that file.
 """
 
 import os
@@ -728,7 +733,24 @@ class ZigTest(Command):
         subprocess.check_call(cmd, cwd=_HERE)
 
 
+def _build_js_wasm(zig: str, debug: bool) -> None:
+    """Compile ``core/wasm.zig`` and install ``js-client/app.wasm``.
+
+    ``build.zig`` owns the wasm32-freestanding target and the copy into
+    ``js-client/``.  This does not use the Python extension's ``-target``.
+    """
+    cmd = [zig, "build"]
+    if debug:
+        cmd.append("-Doptimize=Debug")
+    print("setup.py: building js-client/app.wasm")
+    subprocess.check_call(cmd, cwd=_HERE)
+
+
 class ZigBuilder(build_ext):
+    def run(self):
+        super().run()
+        _build_js_wasm(_ensure_zig(), debug=bool(self.debug))
+
     def build_extension(self, ext):
         out_dir = os.path.dirname(self.get_ext_fullpath(ext.name))
         os.makedirs(out_dir, exist_ok=True)

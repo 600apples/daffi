@@ -6,7 +6,7 @@ import socket
 import threading
 
 from abc import ABC
-from enum import IntEnum
+from enum import Enum, IntEnum
 from threading import Event
 from typing import Optional, List, Callable, Any
 
@@ -33,6 +33,31 @@ from daffi.transports import (
     UnixTransport,
     normalize_transports,
 )
+
+
+class Runtime(str, Enum):
+    """Process-wide native runtime.
+
+    ``threads`` serves every connection on its own OS thread. ``evented``
+    multiplexes connections over a few event-loop threads. A
+    :class:`Client` uses the same runtime as a :class:`Router` or
+    :class:`Service`: the native core locks it once per process.
+    """
+
+    THREADS = "threads"
+    EVENTED = "evented"
+
+
+def _coerce_runtime(value: "Runtime | str") -> Runtime:
+    if isinstance(value, Runtime):
+        return value
+    try:
+        return Runtime(value)
+    except ValueError:
+        raise InitializationError(
+            "runtime must be 'threads' or 'evented', "
+            f"got {value!r}"
+        ) from None
 
 
 class ServerMode(IntEnum):
@@ -103,7 +128,6 @@ class EventsMixin:
 class SingleTransportMixin:
     """Public single-address API used by Client and AsyncClient."""
 
-    transport: Transport
     _transports: list[Transport]
 
     def __init__(self, *, transport: Transport, **kwargs) -> None:
@@ -111,9 +135,13 @@ class SingleTransportMixin:
             raise InitializationError(
                 "transport must be a TCPTransport or UnixTransport"
             )
-        self.transport = transport
         self._transports = [transport]
         super().__init__(**kwargs)
+
+    @property
+    def transport(self) -> Transport:
+        """The one address this client connects to."""
+        return self._transports[0]
 
     @property
     def info(self) -> str:
@@ -122,20 +150,28 @@ class SingleTransportMixin:
 
 
 class MultipleTransportMixin:
-    """Public multi-address API used by Router and Service."""
+    """Public multi-address API used by Router and Service.
 
-    transports: list[Transport]
+    ``transport=`` accepts one :class:`TCPTransport` / :class:`UnixTransport`,
+    or a sequence of them.  Listeners live in :attr:`_transports`;
+    :attr:`transports` is a read-only view of that list.
+    """
+
     _transports: list[Transport]
 
-    def __init__(self, *, transports: TransportArg, **kwargs) -> None:
-        self.transports = normalize_transports(transports)
-        self._transports = self.transports
+    def __init__(self, *, transport: TransportArg, **kwargs) -> None:
+        self._transports = normalize_transports(transport)
         super().__init__(**kwargs)
+
+    @property
+    def transports(self) -> list[Transport]:
+        """Normalized listen addresses (always a list)."""
+        return self._transports
 
     @property
     def info(self) -> str:
         """Human-readable listen addresses."""
-        listed = ", ".join(item.describe() for item in self.transports)
+        listed = ", ".join(item.describe() for item in self._transports)
         return f"transports: [ {listed} ]"
 
 
@@ -173,10 +209,8 @@ class Application(EventsMixin, ABC):
         self,
         app_name: Optional[str] = None,
         workers: int = TaskDispatcher.DEFAULT_WORKERS,
-        tls: bool = False,
-        cert_file: str = "",
-        key_file: str = "",
-        ca_file: str = "",
+        runtime: Optional[Runtime | str] = None,
+        transport: TransportArg | None = None,
     ):
         """
         Args:
@@ -188,24 +222,35 @@ class Application(EventsMixin, ABC):
                            spawns a pool of N-1 threads.  Ignored by
                            :class:`Router` which never executes callbacks
                            itself.
-            tls:           Enable TLS encryption for the TCP connection.
-                           Servers require ``cert_file`` and ``key_file``.
-                           Clients may optionally supply ``ca_file``.
-            cert_file:     Path to a PEM server certificate
-                           (used by :class:`Router` and :class:`Service`).
-            key_file:      Path to a PEM server private key
-                           (used by :class:`Router` and :class:`Service`).
-            ca_file:       Path to a PEM CA bundle used by a :class:`Client`
-                           to verify the server certificate.  An empty string
-                           disables peer verification (connect without
-                           authenticating the server certificate).
+            runtime:       Native runtime for this process,
+                           :attr:`Runtime.THREADS` (default) or
+                           :attr:`Runtime.EVENTED`.  Omitting it, or passing
+                           ``None``, selects threads.  A Client, Router, and
+                           Service in one process share this choice; a
+                           conflicting value raises
+                           :class:`InitializationError`.
+            transport:     Listen/connect address(es).  Declared here so type
+                           checkers see it on :class:`Router`, :class:`Service`,
+                           and :class:`Client` (their ``Application[…]`` bases
+                           are built at runtime).  At runtime the transport
+                           mixin consumes this argument before this
+                           ``__init__`` runs and stores the result on
+                           ``_transports``.  TLS is configured on each
+                           :class:`~daffi.transports.TCPTransport`, not here.
         """
+        # Mixins set ``_transports`` before calling us; ``transport`` itself
+        # never arrives here when constructed via Router/Service/Client.
+        if not getattr(self, "_transports", None):
+            raise InitializationError("transport is required")
+        if runtime is None:
+            runtime = Runtime.THREADS
+        self.runtime = _coerce_runtime(runtime)
+        try:
+            dfcore.setRuntime(self.runtime.value)
+        except ValueError as exc:
+            raise InitializationError(str(exc)) from exc
         self.app_name = app_name
         self.workers = workers
-        self.tls = tls
-        self.cert_file = cert_file
-        self.key_file = key_file
-        self.ca_file = ca_file
         self._conn_num = None
         self._conn_type = None
         self._stop_event = Event()
@@ -214,6 +259,8 @@ class Application(EventsMixin, ABC):
         # teardown — without it both threads could read ``_conn_num`` as
         # non-None and both call ``dfcore.stopClient`` (double-free).
         self._stop_lock = threading.RLock()
+        # Serialises Client reconnect attempts (unused by Router / Service).
+        self._reconnect_lock = threading.Lock()
         self._stopping = False
         self._connection_error: Optional[Exception] = None
         # Set to True by the background lifecycle watcher when an unexpected
@@ -258,15 +305,12 @@ class Application(EventsMixin, ABC):
         on all of them together.  All or nothing: if one cannot be bound, none
         stays bound, and the error names that transport.
         """
-        listeners = [(t.native_host, t.native_port) for t in self._transports]
+        listeners = [t.native_listener() for t in self._transports]
         try:
             return dfcore.startServer(
                 listeners,
                 self.server_mode,
                 self.app_name,
-                self.tls,
-                self.cert_file,
-                self.key_file,
             )
         except ValueError as exc:
             reason, *where = exc.args
@@ -385,8 +429,8 @@ class ServerMixin:
         launch the task dispatcher and perform the initial handshake.
 
         Connection-level protection (encryption + peer authentication) is
-        delegated to TLS — pass ``tls=True`` together with ``cert_file`` /
-        ``key_file`` (server) and ``ca_file`` (client) on the constructor.
+        delegated to TLS — set ``tls=True`` with ``cert`` / ``key`` on each
+        listening :class:`~daffi.transports.TCPTransport`.
 
         All or nothing: if any step fails, every listener is closed, every
         peer that already connected is dropped, and the error is raised.
@@ -397,7 +441,7 @@ class ServerMixin:
 
         Example::
 
-            router = Router(transports=TCPTransport("127.0.0.1", 6000))
+            router = Router(transport=TCPTransport("127.0.0.1", 6000))
             router.start()
 
             client = Client(transport=TCPTransport("127.0.0.1", 6000))
@@ -476,7 +520,7 @@ class Router(Application[MultipleTransportMixin], ServerMixin):
     Example::
 
         router = Router(
-            transports=[
+            transport=[
                 TCPTransport(host="0.0.0.0", port=6001),
                 UnixTransport(path="/tmp/daffi.sock"),
             ]
@@ -502,7 +546,7 @@ class Service(Application[MultipleTransportMixin], ServerMixin):
         def add(a: int, b: int) -> int:
             return a + b
 
-        svc = Service(transports=TCPTransport("127.0.0.1", 5000))
+        svc = Service(transport=TCPTransport("127.0.0.1", 5000))
         svc.start()
         svc.join()
     """
@@ -522,30 +566,6 @@ class Client(Application[SingleTransportMixin]):
         client.stop()
     """
 
-    def __init__(
-        self,
-        app_name: Optional[str] = None,
-        *,
-        transport: Transport,
-        workers: int = TaskDispatcher.DEFAULT_WORKERS,
-        tls: bool = False,
-        cert_file: str = "",
-        key_file: str = "",
-        ca_file: str = "",
-    ):
-        super().__init__(
-            app_name=app_name,
-            transport=transport,
-            workers=workers,
-            tls=tls,
-            cert_file=cert_file,
-            key_file=key_file,
-            ca_file=ca_file,
-        )
-        # Serialises concurrent reconnect attempts so only one thread
-        # performs the reconnect while others wait and then reuse the result.
-        self._reconnect_lock = threading.Lock()
-
     @property
     def info(self) -> str:
         """Human-readable connection string (includes the connection type once
@@ -560,8 +580,8 @@ class Client(Application[SingleTransportMixin]):
         """Connect to the server, perform the handshake, and return a connection handle.
 
         Connection-level protection (encryption + peer authentication) is
-        delegated to TLS — pass ``tls=True`` together with ``ca_file`` on the
-        constructor to authenticate the server's certificate.
+        delegated to TLS — set ``tls=True`` (and optionally ``ca``) on the
+        :class:`~daffi.transports.TCPTransport` to authenticate the server.
 
         Returns:
             A :class:`~daffi.rpc_proxy.ClientConnection`.
@@ -588,12 +608,15 @@ class Client(Application[SingleTransportMixin]):
             self._task_dispatcher = TaskDispatcher(workers=self.workers)
         self._task_dispatcher._start_workers()
 
+        t = self.transport
         self._conn_num = dfcore.startClient(
-            self.transport.native_host,
-            self.transport.native_port,
+            t.native_host,
+            t.native_port,
             self.app_name,
-            self.tls,
-            self.ca_file,
+            t.tls,
+            t.ca,
+            t.cert,
+            t.key,
         )
         if self._conn_num is None:
             raise InitializationError(
@@ -606,16 +629,21 @@ class Client(Application[SingleTransportMixin]):
         ResponseNotifier.register(self._conn_num)
         try:
             handshake = RpcProxy._process_client_handshake(self._conn_num)
-        except Exception:
+        except Exception as exc:
             # Tear the native slot down so the caller can retry connect()
-            # without hitting the "already connected" guard.
+            # without hitting the "already connected" guard.  Remap to
+            # InitializationError so mTLS / TLS rejects look like a failed
+            # connect (TLS 1.3 can let startClient succeed before the server
+            # alert is visible).
             ResponseNotifier.unregister(self._conn_num)
             try:
                 dfcore.stopClient(self._conn_num)
             except Exception:
                 pass
             self._conn_num = None
-            raise
+            raise InitializationError(
+                f"Failed to connect to the server. connection info: {self.info}"
+            ) from exc
         self._conn_type = handshake["meta"]["type"]
         self.logger.debug(
             f"has been connected successfully. connection info: {self.info}"

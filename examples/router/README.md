@@ -48,7 +48,7 @@ from daffi import Router, Client, callback, TCPTransport
 from daffi import SerdeFormat
 
 # --- Router ---
-router = Router(transports=TCPTransport("127.0.0.1", 6000))
+router = Router(transport=TCPTransport("127.0.0.1", 6000))
 router.start()
 
 # --- Worker (Client with @callback) ---

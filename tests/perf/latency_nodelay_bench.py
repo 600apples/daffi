@@ -27,6 +27,13 @@ Run::
 """
 
 from __future__ import annotations
+import sys
+from pathlib import Path
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+from tests.conftest import active_runtime
 
 import logging
 import multiprocessing as mp
@@ -58,12 +65,17 @@ PAYLOADS: list[tuple[str, bytes]] = [
 # ── silence helpers ───────────────────────────────────────────────────────────
 
 
-def _silence() -> None:
+def _silence(runtime: str) -> None:
     fd = os.open(os.devnull, os.O_WRONLY)
     os.dup2(fd, 1)
     os.dup2(fd, 2)
     os.close(fd)
     logging.disable(logging.CRITICAL)
+
+    import tests.conftest as _runtime_state
+    _runtime_state.SELECTED_RUNTIME = runtime
+    from daffi import dfcore
+    dfcore.setRuntime(runtime)
 
 
 def _quiet(fn, *args, **kwargs) -> None:
@@ -105,30 +117,30 @@ def _wait(port: int, timeout: float = 15.0) -> None:
 # ── subprocess entry points ───────────────────────────────────────────────────
 
 
-def _proc_service(port: int) -> None:
-    _silence()
+def _proc_service(runtime: str, port: int) -> None:
+    _silence(runtime)
     from daffi import Service, callback, TCPTransport
 
     @callback
     def echo(payload: bytes) -> bytes:
         return payload
 
-    svc = Service(app_name="lat-service", transports=TCPTransport(HOST, port))
+    svc = Service(app_name="lat-service", transport=TCPTransport(HOST, port), runtime=runtime)
     svc.start()
     svc.join()
 
 
-def _proc_router(port: int) -> None:
-    _silence()
+def _proc_router(runtime: str, port: int) -> None:
+    _silence(runtime)
     from daffi import Router, TCPTransport
 
-    r = Router(app_name="lat-router", transports=TCPTransport(HOST, port))
+    r = Router(app_name="lat-router", transport=TCPTransport(HOST, port), runtime=runtime)
     r.start()
     r.join()
 
 
-def _proc_worker(port: int) -> None:
-    _silence()
+def _proc_worker(runtime: str, port: int) -> None:
+    _silence(runtime)
     from daffi import Client, callback, TCPTransport
     import time as _t
 
@@ -136,7 +148,7 @@ def _proc_worker(port: int) -> None:
     def echo(payload: bytes) -> bytes:
         return payload
 
-    c = Client(app_name="lat-worker", transport=TCPTransport(HOST, port))
+    c = Client(app_name="lat-worker", transport=TCPTransport(HOST, port), runtime=runtime)
     c.connect()
     try:
         while True:
@@ -191,14 +203,15 @@ def run_direct() -> dict[str, dict]:
     from daffi import Client, TCPTransport
 
     port = _free_port()
-    proc = mp.Process(target=_proc_service, args=(port,), daemon=True)
+    proc = mp.Process(target=_proc_service, args=(active_runtime(), port,), daemon=True)
     proc.start()
     results = {}
     try:
         _wait(port)
         time.sleep(0.15)
         client = Client(
-            app_name="lat-direct-caller", transport=TCPTransport(HOST, port)
+            app_name="lat-direct-caller", transport=TCPTransport(HOST, port),
+            runtime=active_runtime(),
         )
         conn = client.connect()
         proxy = conn.rpc(timeout=TIMEOUT)
@@ -218,8 +231,8 @@ def run_router() -> dict[str, dict]:
     from daffi import Client, TCPTransport
 
     rport = _free_port()
-    rproc = mp.Process(target=_proc_router, args=(rport,), daemon=True)
-    wproc = mp.Process(target=_proc_worker, args=(rport,), daemon=True)
+    rproc = mp.Process(target=_proc_router, args=(active_runtime(), rport,), daemon=True)
+    wproc = mp.Process(target=_proc_worker, args=(active_runtime(), rport,), daemon=True)
     rproc.start()
     results = {}
     try:
@@ -227,7 +240,8 @@ def run_router() -> dict[str, dict]:
         wproc.start()
         time.sleep(0.5)
         client = Client(
-            app_name="lat-router-caller", transport=TCPTransport(HOST, rport)
+            app_name="lat-router-caller", transport=TCPTransport(HOST, rport),
+            runtime=active_runtime(),
         )
         conn = client.connect()
         proxy = conn.rpc(timeout=TIMEOUT)

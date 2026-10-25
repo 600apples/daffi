@@ -27,7 +27,7 @@ def add(a: int, b: int) -> int:
     return a + b
 
 if __name__ == "__main__":
-    svc = Service(app_name="calc-service", transports=TCPTransport("127.0.0.1", 5001))
+    svc = Service(app_name="calc-service", transport=TCPTransport("127.0.0.1", 5001))
     svc.start()
     print("Service running on 127.0.0.1:5001 — press Ctrl+C to stop.")
     svc.join()

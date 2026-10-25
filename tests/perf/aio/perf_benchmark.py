@@ -34,6 +34,13 @@ Run::
 """
 
 from __future__ import annotations
+import sys
+from pathlib import Path
+
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+from tests.conftest import active_runtime
 
 import asyncio
 import json
@@ -102,12 +109,17 @@ def _wait_for_port(port: int, timeout: float = 15.0) -> None:
     )
 
 
-def _silence_subprocess() -> None:
+def _silence_subprocess(runtime: str) -> None:
     devnull_fd = os.open(os.devnull, os.O_WRONLY)
     os.dup2(devnull_fd, 1)
     os.dup2(devnull_fd, 2)
     os.close(devnull_fd)
     logging.disable(logging.CRITICAL)
+
+    import tests.conftest as _runtime_state
+    _runtime_state.SELECTED_RUNTIME = runtime
+    from daffi import dfcore
+    dfcore.setRuntime(runtime)
 
 
 def _quiet_teardown(fn, *args, **kwargs) -> None:
@@ -135,8 +147,8 @@ def _report(label: str, latencies_ms: list[float]) -> None:
 # Each subprocess runs its own asyncio event loop.
 
 
-def _proc_service(host: str, port: int) -> None:
-    _silence_subprocess()
+def _proc_service(runtime: str, host: str, port: int) -> None:
+    _silence_subprocess(runtime)
 
     async def _main():
         from daffi import callback, TCPTransport
@@ -146,22 +158,23 @@ def _proc_service(host: str, port: int) -> None:
         async def echo(payload):
             return payload
 
-        svc = AsyncService(app_name="perf-svc-aio", transports=TCPTransport(host, port))
+        svc = AsyncService(app_name="perf-svc-aio", transport=TCPTransport(host, port), runtime=runtime)
         await svc.start()
         await svc.join()
 
     asyncio.run(_main())
 
 
-def _proc_router(host: str, port: int) -> None:
-    _silence_subprocess()
+def _proc_router(runtime: str, host: str, port: int) -> None:
+    _silence_subprocess(runtime)
 
     async def _main():
         from daffi.aio import AsyncRouter
         from daffi import TCPTransport
 
         router = AsyncRouter(
-            app_name="perf-router-aio", transports=TCPTransport(host, port)
+            app_name="perf-router-aio", transport=TCPTransport(host, port),
+            runtime=runtime,
         )
         await router.start()
         await router.join()
@@ -169,8 +182,8 @@ def _proc_router(host: str, port: int) -> None:
     asyncio.run(_main())
 
 
-def _proc_worker(host: str, port: int) -> None:
-    _silence_subprocess()
+def _proc_worker(runtime: str, host: str, port: int) -> None:
+    _silence_subprocess(runtime)
 
     async def _main():
         from daffi import callback, TCPTransport
@@ -181,7 +194,8 @@ def _proc_worker(host: str, port: int) -> None:
             return payload
 
         client = AsyncClient(
-            app_name="perf-worker-aio", transport=TCPTransport(host, port)
+            app_name="perf-worker-aio", transport=TCPTransport(host, port),
+            runtime=runtime,
         )
         await client.connect()
         try:
@@ -206,14 +220,15 @@ async def bench_direct(serde: int, data: dict, label: str) -> list[float]:
     wire = json.dumps(data) if serde == SerdeFormat.OPAQUE else data
 
     port = _free_port()
-    proc = mp.Process(target=_proc_service, args=(HOST, port), daemon=True)
+    proc = mp.Process(target=_proc_service, args=(active_runtime(), HOST, port), daemon=True)
     proc.start()
     try:
         _wait_for_port(port)
         await asyncio.sleep(0.15)
 
         client = AsyncClient(
-            app_name="perf-direct-aio", transport=TCPTransport(HOST, port)
+            app_name="perf-direct-aio", transport=TCPTransport(HOST, port),
+            runtime=active_runtime(),
         )
         conn = await client.connect()
         c = conn.rpc(timeout=TIMEOUT, serde=serde)
@@ -247,8 +262,8 @@ async def bench_via_router(serde: int, data: dict, label: str) -> list[float]:
     wire = json.dumps(data) if serde == SerdeFormat.OPAQUE else data
 
     router_port = _free_port()
-    router_proc = mp.Process(target=_proc_router, args=(HOST, router_port), daemon=True)
-    worker_proc = mp.Process(target=_proc_worker, args=(HOST, router_port), daemon=True)
+    router_proc = mp.Process(target=_proc_router, args=(active_runtime(), HOST, router_port), daemon=True)
+    worker_proc = mp.Process(target=_proc_worker, args=(active_runtime(), HOST, router_port), daemon=True)
 
     router_proc.start()
     try:
@@ -257,7 +272,8 @@ async def bench_via_router(serde: int, data: dict, label: str) -> list[float]:
         await asyncio.sleep(0.4)
 
         client = AsyncClient(
-            app_name="perf-router-caller-aio", transport=TCPTransport(HOST, router_port)
+            app_name="perf-router-caller-aio", transport=TCPTransport(HOST, router_port),
+            runtime=active_runtime(),
         )
         conn = await client.connect()
         c = conn.rpc(timeout=TIMEOUT, serde=serde)

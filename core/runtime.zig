@@ -1,4 +1,4 @@
-//! Process-wide execution model of the native core.
+//! Process-wide runtime of the native core.
 //!
 //! `threads` (default): every connection — and every client dispatcher — owns
 //! an OS thread that blocks on reads.
@@ -9,9 +9,10 @@
 //! handshake, the protocol probe of an accepted socket, WebSocket sessions)
 //! runs on an elastic blocking pool instead.
 //!
-//! Selected once per process by `DAFFI_EXECUTION_MODEL=threads|evented`;
+//! Selected once per process by `runtime.configure` (the `runtime` constructor
+//! argument). The first use without a choice is `threads`.
 //! `DAFFI_EVENT_LOOPS` sets the number of loop threads (default: CPU count,
-//! capped at 4).
+//! capped at 4). A later choice that disagrees is rejected.
 
 const std = @import("std");
 const misc = @import("misc.zig");
@@ -38,6 +39,17 @@ pub fn model() Model {
     defer init_mutex.unlock();
     ensureInit();
     return selected;
+}
+
+/// Lock the process to `explicit`. A second call may only repeat that choice.
+pub fn configure(explicit: Model) error{RuntimeMismatch}!void {
+    init_mutex.lock();
+    defer init_mutex.unlock();
+    if (initialized) {
+        if (explicit != selected) return error.RuntimeMismatch;
+        return;
+    }
+    finishInit(explicit);
 }
 
 /// Event loop for a new source, chosen round-robin.  The whole set of loops
@@ -67,15 +79,13 @@ fn resetAfterFork() callconv(.c) void {
 
 fn ensureInit() void {
     if (initialized) return;
+    finishInit(.threads);
+}
+
+fn finishInit(chosen: Model) void {
+    selected = chosen;
     initialized = true;
     _ = std.c.pthread_atfork(null, null, resetAfterFork);
-    if (std.c.getenv("DAFFI_EXECUTION_MODEL")) |raw| {
-        const value = std.mem.span(raw);
-        selected = std.meta.stringToEnum(Model, value) orelse blk: {
-            log.warn("unknown DAFFI_EXECUTION_MODEL '{s}', using 'threads'", .{value});
-            break :blk .threads;
-        };
-    }
     const cpus = std.Thread.getCpuCount() catch 1;
     loop_count = @max(1, @min(cpus, default_max_loops));
     if (std.c.getenv("DAFFI_EVENT_LOOPS")) |raw| {

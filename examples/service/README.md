@@ -54,7 +54,7 @@ class MyClass:
     @local
     def internal(self): ...   # not exported
 
-svc = Service(app_name="my-svc", transports=TCPTransport("127.0.0.1", 5000))
+svc = Service(app_name="my-svc", transport=TCPTransport("127.0.0.1", 5000))
 svc.add_event_handler(lambda e: print(e))
 svc.start()
 svc.join()

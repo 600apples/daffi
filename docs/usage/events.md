@@ -55,7 +55,7 @@ if __name__ == "__main__":
             connected.discard(name)
             print(f"✦ {name!r} disconnected (total: {len(connected)})")
 
-    svc = Service(app_name="event-service", transports=TCPTransport("127.0.0.1", 5009))
+    svc = Service(app_name="event-service", transport=TCPTransport("127.0.0.1", 5009))
     svc.add_event_handler(on_event)
     svc.start()
     svc.join()
@@ -100,7 +100,7 @@ In the Router topology the Router itself fires events for every node that connec
 def on_event(event: dict) -> None:
     print(f"[router] {event['member']!r} {event['type']}")
 
-router = Router(transports=TCPTransport("127.0.0.1", 6008))
+router = Router(transport=TCPTransport("127.0.0.1", 6008))
 router.add_event_handler(on_event)
 router.start()
 router.join()

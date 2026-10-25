@@ -41,7 +41,7 @@ class TextProcessor:
 
 
 if __name__ == "__main__":
-    svc = Service(app_name="text-service", transports=TCPTransport("0.0.0.0", 5003))
+    svc = Service(app_name="text-service", transport=TCPTransport("0.0.0.0", 5003))
     svc.start()
     print("Service running on 0.0.0.0:5003 — press Ctrl+C to stop.")
     svc.join()

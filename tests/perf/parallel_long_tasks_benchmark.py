@@ -29,6 +29,13 @@ Run
 """
 
 from __future__ import annotations
+import sys
+from pathlib import Path
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+from tests.conftest import active_runtime
 
 import logging
 import multiprocessing as mp
@@ -49,12 +56,17 @@ HOST = "127.0.0.1"
 # ── subprocess silence helpers ────────────────────────────────────────────────
 
 
-def _silence_subprocess() -> None:
+def _silence_subprocess(runtime: str) -> None:
     devnull_fd = os.open(os.devnull, os.O_WRONLY)
     os.dup2(devnull_fd, 1)
     os.dup2(devnull_fd, 2)
     os.close(devnull_fd)
     logging.disable(logging.CRITICAL)
+
+    import tests.conftest as _runtime_state
+    _runtime_state.SELECTED_RUNTIME = runtime
+    from daffi import dfcore
+    dfcore.setRuntime(runtime)
 
 
 def _quiet_kill(proc: mp.Process) -> None:
@@ -97,18 +109,18 @@ def _wait_for_port(port: int, timeout: float = 20.0) -> None:
 # ── subprocess entry points ───────────────────────────────────────────────────
 
 
-def _proc_router(port: int) -> None:
-    _silence_subprocess()
+def _proc_router(runtime: str, port: int) -> None:
+    _silence_subprocess(runtime)
     from daffi import Router, TCPTransport
 
-    router = Router(app_name="longtask-router", transports=TCPTransport(HOST, port))
+    router = Router(app_name="longtask-router", transport=TCPTransport(HOST, port), runtime=runtime)
     router.start()
     router.join()
 
 
-def _proc_worker(port: int, sleep_s: float, n_workers: int) -> None:
+def _proc_worker(runtime: str, port: int, sleep_s: float, n_workers: int) -> None:
     """Worker with *n_workers* handler threads and a slow ``slow_job`` callback."""
-    _silence_subprocess()
+    _silence_subprocess(runtime)
     import time as _time
     from daffi import Client, callback, TCPTransport
 
@@ -121,6 +133,7 @@ def _proc_worker(port: int, sleep_s: float, n_workers: int) -> None:
         app_name="longtask-worker",
         workers=n_workers,
         transport=TCPTransport(HOST, port),
+        runtime=runtime,
     )
     client.connect()
     try:
@@ -140,7 +153,7 @@ def _wait_for_worker(port: int, timeout: float = 30.0) -> None:
     from daffi import Client, TCPTransport
     from daffi._bindings import get_available_members
 
-    probe = Client(app_name="longtask-probe", transport=TCPTransport(HOST, port))
+    probe = Client(app_name="longtask-probe", transport=TCPTransport(HOST, port), runtime=active_runtime())
     probe.connect()
     conn_num = probe._conn_num
 
@@ -176,7 +189,7 @@ def _run_callers(port: int, n_tasks: int) -> float:
     # Connect all callers before the measurement window.
     callers: list[tuple] = []
     for i in range(n_tasks):
-        c = Client(app_name=f"longtask-caller-{i}", transport=TCPTransport(HOST, port))
+        c = Client(app_name=f"longtask-caller-{i}", transport=TCPTransport(HOST, port), runtime=active_runtime())
         conn = c.connect()
         callers.append((c, conn))
 
@@ -245,10 +258,10 @@ def run_scenario() -> None:
     print(sep, flush=True)
 
     port = _free_port()
-    router_proc = mp.Process(target=_proc_router, args=(port,), daemon=True)
+    router_proc = mp.Process(target=_proc_router, args=(active_runtime(), port,), daemon=True)
     worker_proc = mp.Process(
         target=_proc_worker,
-        args=(port, SLEEP_SECONDS, N_TASKS),
+        args=(active_runtime(), port, SLEEP_SECONDS, N_TASKS),
         daemon=True,
     )
 

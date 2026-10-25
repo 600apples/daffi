@@ -233,9 +233,9 @@ auto-reconnect loop.
 ## Securing the connection
 
 Authentication and confidentiality are delegated to TLS — there is no
-application-level password. Run the Python backend with `tls=True`
-(plus `cert_file` / `key_file`) and connect from the browser using a
-`wss://` URL:
+application-level password. Run the Python backend with a TLS
+`TCPTransport` (`tls=True` plus `cert` / `key`) and connect from the
+browser using a `wss://` URL:
 
 ```javascript
 const client = new DaffiClient("my-app", { wsUrl: "wss://example.com:5000" });

@@ -22,7 +22,7 @@ def receive_chunk(data: bytes) -> None:
 
 
 if __name__ == "__main__":
-    svc = Service(app_name="stream-service", transports=TCPTransport("0.0.0.0", 5010))
+    svc = Service(app_name="stream-service", transport=TCPTransport("0.0.0.0", 5010))
     svc.start()
     print("Service running on 0.0.0.0:5010 — press Ctrl+C to stop.")
     svc.join()

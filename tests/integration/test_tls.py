@@ -8,6 +8,7 @@ name, and (d) refuse a server that asks for TLS without a certificate.
 """
 
 from __future__ import annotations
+from tests.conftest import active_runtime
 
 import multiprocessing as mp
 import shutil
@@ -71,8 +72,8 @@ def certs(tmp_path_factory):
 # ── subprocess servers ────────────────────────────────────────────────────────
 
 
-def _tls_service(port: int, cert: str, key: str) -> None:
-    silence_subprocess()
+def _tls_service(runtime: str, port: int, cert: str, key: str) -> None:
+    silence_subprocess(runtime)
     from daffi import Service, callback, TCPTransport
 
     @callback
@@ -86,22 +87,22 @@ def _tls_service(port: int, cert: str, key: str) -> None:
     svc = Service(
         app_name="tls-service",
         workers=4,
-        tls=True,
-        cert_file=cert,
-        key_file=key,
-        transports=TCPTransport(HOST, port),
+        transport=TCPTransport(HOST, port, tls=True, cert=cert, key=key),
+        runtime=runtime,
     )
     svc.start()
     svc.join()
 
 
-def _tls_service_without_cert(port: int, q) -> None:
-    silence_subprocess()
+def _tls_service_without_cert(runtime: str, port: int, q) -> None:
+    silence_subprocess(runtime)
     from daffi import Service, TCPTransport
 
     try:
         Service(
-            app_name="tls-nocert", tls=True, transports=TCPTransport(HOST, port)
+            app_name="tls-nocert",
+            transport=TCPTransport(HOST, port, tls=True),
+            runtime=runtime,
         ).start()
         q.put("started")
     except BaseException as exc:  # noqa: BLE001
@@ -109,7 +110,7 @@ def _tls_service_without_cert(port: int, q) -> None:
 
 
 def _start(port, cert, key):
-    proc = mp.Process(target=_tls_service, args=(port, cert, key), daemon=True)
+    proc = mp.Process(target=_tls_service, args=(active_runtime(), port, cert, key), daemon=True)
     proc.start()
     wait_for_port(port)
     return proc
@@ -123,11 +124,13 @@ def tls_service(free_port, certs):
     quiet_kill(proc)
 
 
-def _connect(port, ca_file, name="tls-client"):
+def _connect(port, ca, name="tls-client"):
     from daffi import Client, TCPTransport
 
     client = Client(
-        app_name=name, tls=True, ca_file=ca_file, transport=TCPTransport(HOST, port)
+        app_name=name,
+        transport=TCPTransport(HOST, port, tls=True, ca=ca),
+        runtime=active_runtime(),
     )
     conn = client.connect()
     return client, conn
@@ -251,7 +254,7 @@ def test_plaintext_and_garbage_do_not_hurt_tls_server(tls_service):
 def test_server_tls_without_certificate_is_an_error(free_port):
     q = mp.Queue()
     proc = mp.Process(
-        target=_tls_service_without_cert, args=(free_port, q), daemon=True
+        target=_tls_service_without_cert, args=(active_runtime(), free_port, q), daemon=True
     )
     proc.start()
     try:
@@ -259,3 +262,169 @@ def test_server_tls_without_certificate_is_an_error(free_port):
     finally:
         quiet_kill(proc)
     assert result.startswith("error:"), result
+
+
+def _tls_service_pem(runtime: str, port: int, cert_pem: str, key_pem: str) -> None:
+    silence_subprocess(runtime)
+    from daffi import Service, callback, TCPTransport
+
+    @callback
+    def add(a: int, b: int) -> int:
+        return a + b
+
+    svc = Service(
+        app_name="tls-pem-service",
+        workers=2,
+        transport=TCPTransport(HOST, port, tls=True, cert=cert_pem, key=key_pem),
+        runtime=runtime,
+    )
+    svc.start()
+    svc.join()
+
+
+def test_tls_from_pem_material(free_port, certs):
+    """Paths and inline PEM both work; Zig picks the loader from the armour."""
+    cert_path, key_path = certs["good"]
+    cert_pem = open(cert_path, encoding="utf-8").read()
+    key_pem = open(key_path, encoding="utf-8").read()
+    assert cert_pem.startswith("-----BEGIN ")
+    proc = mp.Process(
+        target=_tls_service_pem,
+        args=(active_runtime(), free_port, cert_pem, key_pem),
+        daemon=True,
+    )
+    proc.start()
+    try:
+        wait_for_port(free_port)
+        client, conn = _connect(free_port, cert_pem, name="tls-pem-client")
+        try:
+            conn.wait_for_members("tls-pem-service", timeout=15)
+            assert conn.rpc(timeout=TIMEOUT).add(3, 4) == 7
+        finally:
+            client.stop()
+    finally:
+        quiet_kill(proc)
+
+
+def _tls_unix_service(runtime: str, path: str, cert_pem: str, key_pem: str) -> None:
+    silence_subprocess(runtime)
+    from daffi import Service, callback, UnixTransport
+
+    @callback
+    def add(a: int, b: int) -> int:
+        return a + b
+
+    svc = Service(
+        app_name="tls-unix-service",
+        workers=2,
+        transport=UnixTransport(
+            path, tls=True, cert=cert_pem, key=key_pem,
+        ),
+        runtime=runtime,
+    )
+    svc.start()
+    svc.join()
+
+
+def test_tls_unix_socket_with_pem_material(certs):
+    """UnixTransport accepts the same TLS path/PEM API as TCPTransport."""
+    import os
+    import sys
+
+    if sys.platform == "win32":
+        pytest.skip("no Unix sockets on Windows")
+    from daffi import Client, UnixTransport
+
+    cert_path, key_path = certs["good"]
+    cert_pem = open(cert_path, encoding="utf-8").read()
+    key_pem = open(key_path, encoding="utf-8").read()
+    # pytest's tmp_path on a macOS runner is longer than sun_path (104 bytes),
+    # so the listener would fail with NameTooLong and never create the file.
+    path = os.path.join("/tmp", f"dftls{os.getpid()}-{time.monotonic_ns() % 10**8}.sock")
+    assert len(path) < 100
+    proc = mp.Process(
+        target=_tls_unix_service,
+        args=(active_runtime(), path, cert_pem, key_pem),
+        daemon=True,
+    )
+    proc.start()
+    try:
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline and not os.path.exists(path):
+            time.sleep(0.05)
+        assert os.path.exists(path), path
+        client = Client(
+            app_name="tls-unix-client",
+            transport=UnixTransport(path, tls=True, ca=cert_pem),
+            runtime=active_runtime(),
+        )
+        conn = client.connect()
+        try:
+            conn.wait_for_members("tls-unix-service", timeout=15)
+            assert conn.rpc(timeout=TIMEOUT).add(5, 6) == 11
+        finally:
+            client.stop()
+    finally:
+        quiet_kill(proc)
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
+def _mtls_service(runtime: str, port: int, cert: str, key: str) -> None:
+    silence_subprocess(runtime)
+    from daffi import Service, callback, TCPTransport
+
+    @callback
+    def add(a: int, b: int) -> int:
+        return a + b
+
+    # Same self-signed material as identity and as the client-trust CA.
+    svc = Service(
+        app_name="mtls-service",
+        workers=2,
+        transport=TCPTransport(
+            HOST, port, tls=True, cert=cert, key=key, ca=cert,
+        ),
+        runtime=runtime,
+    )
+    svc.start()
+    svc.join()
+
+
+def test_mtls_requires_client_certificate(free_port, certs):
+    """Listener with ``ca`` rejects clients that do not present a certificate."""
+    from daffi import Client, TCPTransport
+    from daffi.exceptions import InitializationError
+
+    cert, key = certs["good"]
+    proc = mp.Process(
+        target=_mtls_service, args=(active_runtime(), free_port, cert, key), daemon=True,
+    )
+    proc.start()
+    try:
+        wait_for_port(free_port)
+        bare = Client(
+            app_name="mtls-no-client-cert",
+            transport=TCPTransport(HOST, free_port, tls=True, ca=cert),
+            runtime=active_runtime(),
+        )
+        with pytest.raises(InitializationError):
+            bare.connect()
+
+        ok = Client(
+            app_name="mtls-with-client-cert",
+            transport=TCPTransport(
+                HOST, free_port, tls=True, ca=cert, cert=cert, key=key,
+            ),
+            runtime=active_runtime(),
+        )
+        conn = ok.connect()
+        try:
+            conn.wait_for_members("mtls-service", timeout=15)
+            assert conn.rpc(timeout=TIMEOUT).add(1, 2) == 3
+        finally:
+            ok.stop()
+    finally:
+        quiet_kill(proc)

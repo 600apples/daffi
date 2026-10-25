@@ -25,7 +25,7 @@ The event loop is never blocked.
         return a * b
 
     async def main():
-        svc = AsyncService(app_name="calc-service", transports=TCPTransport("127.0.0.1", 6001))
+        svc = AsyncService(app_name="calc-service", transport=TCPTransport("127.0.0.1", 6001))
         await svc.start()
         print("AsyncService running — press Ctrl+C to stop.")
         await svc.join()
@@ -60,7 +60,7 @@ The event loop is never blocked.
     from daffi.aio import AsyncRouter
 
     async def main():
-        router = AsyncRouter(app_name="calc-router", transports=TCPTransport("127.0.0.1", 6001))
+        router = AsyncRouter(app_name="calc-router", transport=TCPTransport("127.0.0.1", 6001))
         await router.start()
         print("AsyncRouter running — press Ctrl+C to stop.")
         await router.join()
@@ -162,7 +162,7 @@ from daffi.aio import AsyncService
 svc = AsyncService(
     app_name="my-service",
     workers=4,
-    transports=TCPTransport("0.0.0.0", 6001))
+    transport=TCPTransport("0.0.0.0", 6001))
 
 await svc.start()   # begin listening
 await svc.join()    # block until stopped (typically forever)
@@ -176,7 +176,7 @@ await svc.stop()    # graceful shutdown
 ```python
 from daffi.aio import AsyncRouter
 
-router = AsyncRouter(app_name="my-router", transports=TCPTransport("0.0.0.0", 6001))
+router = AsyncRouter(app_name="my-router", transport=TCPTransport("0.0.0.0", 6001))
 
 await router.start()
 await router.join()

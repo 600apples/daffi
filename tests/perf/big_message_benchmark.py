@@ -36,6 +36,13 @@ Run::
 """
 
 from __future__ import annotations
+import sys
+from pathlib import Path
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+from tests.conftest import active_runtime
 
 import logging
 import multiprocessing as mp
@@ -118,12 +125,17 @@ def _msgpack_available() -> bool:
 # ── silence helpers ───────────────────────────────────────────────────────────
 
 
-def _silence_subprocess() -> None:
+def _silence_subprocess(runtime: str) -> None:
     devnull_fd = os.open(os.devnull, os.O_WRONLY)
     os.dup2(devnull_fd, 1)
     os.dup2(devnull_fd, 2)
     os.close(devnull_fd)
     logging.disable(logging.CRITICAL)
+
+    import tests.conftest as _runtime_state
+    _runtime_state.SELECTED_RUNTIME = runtime
+    from daffi import dfcore
+    dfcore.setRuntime(runtime)
 
 
 def _quiet_teardown(fn, *args, **kwargs) -> None:
@@ -168,30 +180,30 @@ def _wait_for_port(port: int, timeout: float = 15.0) -> None:
 # ── subprocess entry points ───────────────────────────────────────────────────
 
 
-def _proc_service(host: str, port: int) -> None:
-    _silence_subprocess()
+def _proc_service(runtime: str, host: str, port: int) -> None:
+    _silence_subprocess(runtime)
     from daffi import Service, callback, TCPTransport
 
     @callback
     def echo(payload):
         return payload
 
-    svc = Service(app_name="bigmsg-service", transports=TCPTransport(host, port))
+    svc = Service(app_name="bigmsg-service", transport=TCPTransport(host, port), runtime=runtime)
     svc.start()
     svc.join()
 
 
-def _proc_router(host: str, port: int) -> None:
-    _silence_subprocess()
+def _proc_router(runtime: str, host: str, port: int) -> None:
+    _silence_subprocess(runtime)
     from daffi import Router, TCPTransport
 
-    r = Router(app_name="bigmsg-router", transports=TCPTransport(host, port))
+    r = Router(app_name="bigmsg-router", transport=TCPTransport(host, port), runtime=runtime)
     r.start()
     r.join()
 
 
-def _proc_worker(host: str, port: int) -> None:
-    _silence_subprocess()
+def _proc_worker(runtime: str, host: str, port: int) -> None:
+    _silence_subprocess(runtime)
     import time as _t
     from daffi import Client, callback, TCPTransport
 
@@ -199,7 +211,7 @@ def _proc_worker(host: str, port: int) -> None:
     def echo(payload):
         return payload
 
-    client = Client(app_name="bigmsg-worker", transport=TCPTransport(host, port))
+    client = Client(app_name="bigmsg-worker", transport=TCPTransport(host, port), runtime=runtime)
     client.connect()
     try:
         while True:
@@ -318,14 +330,15 @@ def bench_direct() -> None:
     from daffi import Client, TCPTransport
 
     port = _free_port()
-    proc = mp.Process(target=_proc_service, args=(HOST, port), daemon=True)
+    proc = mp.Process(target=_proc_service, args=(active_runtime(), HOST, port), daemon=True)
     proc.start()
     try:
         _wait_for_port(port)
         time.sleep(0.15)  # let Service fully initialise
 
         client = Client(
-            app_name="bigmsg-direct-caller", transport=TCPTransport(HOST, port)
+            app_name="bigmsg-direct-caller", transport=TCPTransport(HOST, port),
+            runtime=active_runtime(),
         )
         conn = client.connect()
         try:
@@ -342,8 +355,8 @@ def bench_via_router() -> None:
     from daffi import Client, TCPTransport
 
     port = _free_port()
-    rproc = mp.Process(target=_proc_router, args=(HOST, port), daemon=True)
-    wproc = mp.Process(target=_proc_worker, args=(HOST, port), daemon=True)
+    rproc = mp.Process(target=_proc_router, args=(active_runtime(), HOST, port), daemon=True)
+    wproc = mp.Process(target=_proc_worker, args=(active_runtime(), HOST, port), daemon=True)
 
     rproc.start()
     try:
@@ -352,7 +365,8 @@ def bench_via_router() -> None:
         time.sleep(0.5)  # let worker register its echo callback
 
         client = Client(
-            app_name="bigmsg-router-caller", transport=TCPTransport(HOST, port)
+            app_name="bigmsg-router-caller", transport=TCPTransport(HOST, port),
+            runtime=active_runtime(),
         )
         conn = client.connect()
         try:

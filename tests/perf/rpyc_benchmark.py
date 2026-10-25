@@ -20,6 +20,13 @@ Run::
 """
 
 from __future__ import annotations
+import sys
+from pathlib import Path
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+from tests.conftest import active_runtime
 
 import json
 import logging
@@ -62,12 +69,17 @@ def _wait_for_port(port: int, timeout: float = 15.0) -> None:
     )
 
 
-def _silence() -> None:
+def _silence(runtime: str) -> None:
     devnull = os.open(os.devnull, os.O_WRONLY)
     os.dup2(devnull, 1)
     os.dup2(devnull, 2)
     os.close(devnull)
     logging.disable(logging.CRITICAL)
+
+    import tests.conftest as _runtime_state
+    _runtime_state.SELECTED_RUNTIME = runtime
+    from daffi import dfcore
+    dfcore.setRuntime(runtime)
 
 
 def _report(label: str, latencies_ms: list[float]) -> None:
@@ -79,8 +91,8 @@ def _report(label: str, latencies_ms: list[float]) -> None:
 # ── subprocess entry points ────────────────────────────────────────────────────
 
 
-def _proc_rpyc_server(port: int) -> None:
-    _silence()
+def _proc_rpyc_server(runtime: str, port: int) -> None:
+    _silence(runtime)
     import rpyc
     from rpyc.utils.server import ThreadedServer
 
@@ -96,8 +108,8 @@ def _proc_rpyc_server(port: int) -> None:
     ).start()
 
 
-def _proc_rpyc_worker(port: int) -> None:
-    _silence()
+def _proc_rpyc_worker(runtime: str, port: int) -> None:
+    _silence(runtime)
     import rpyc
     from rpyc.utils.server import ThreadedServer
 
@@ -113,8 +125,8 @@ def _proc_rpyc_worker(port: int) -> None:
     ).start()
 
 
-def _proc_rpyc_proxy(proxy_port: int, worker_port: int) -> None:
-    _silence()
+def _proc_rpyc_proxy(runtime: str, proxy_port: int, worker_port: int) -> None:
+    _silence(runtime)
     import rpyc
     from rpyc.utils.server import ThreadedServer
 
@@ -145,7 +157,7 @@ def bench_rpyc_direct(data: dict) -> list[float]:
     import rpyc
 
     port = _free_port()
-    proc = mp.Process(target=_proc_rpyc_server, args=(port,), daemon=True)
+    proc = mp.Process(target=_proc_rpyc_server, args=(active_runtime(), port,), daemon=True)
     proc.start()
     try:
         _wait_for_port(port)
@@ -182,9 +194,9 @@ def bench_rpyc_via_proxy(data: dict) -> list[float]:
     worker_port = _free_port()
     proxy_port = _free_port()
 
-    worker_proc = mp.Process(target=_proc_rpyc_worker, args=(worker_port,), daemon=True)
+    worker_proc = mp.Process(target=_proc_rpyc_worker, args=(active_runtime(), worker_port,), daemon=True)
     proxy_proc = mp.Process(
-        target=_proc_rpyc_proxy, args=(proxy_port, worker_port), daemon=True
+        target=_proc_rpyc_proxy, args=(active_runtime(), proxy_port, worker_port), daemon=True
     )
 
     worker_proc.start()

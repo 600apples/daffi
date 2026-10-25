@@ -25,6 +25,7 @@ What this file pins down:
 """
 
 from __future__ import annotations
+from tests.conftest import active_runtime
 
 import multiprocessing as mp
 import time
@@ -42,27 +43,27 @@ from .conftest import (
 # ── subprocess targets (module-level so spawn can pickle them) ────────────────
 
 
-def _router_only(port: int, name: str = "dup-router") -> None:
-    silence_subprocess()
+def _router_only(runtime: str, port: int, name: str = "dup-router") -> None:
+    silence_subprocess(runtime)
     from daffi import Router, TCPTransport
 
-    r = Router(app_name=name, transports=TCPTransport(HOST, port))
+    r = Router(app_name=name, transport=TCPTransport(HOST, port), runtime=runtime)
     r.start()
     r.join()
 
 
-def _service_only(port: int, name: str = "dup-service") -> None:
+def _service_only(runtime: str, port: int, name: str = "dup-service") -> None:
     """Bare service with no callbacks — keeps the test focused on the
     handshake / channel-registration path rather than RPC dispatch."""
-    silence_subprocess()
+    silence_subprocess(runtime)
     from daffi import Service, TCPTransport
 
-    s = Service(app_name=name, workers=2, transports=TCPTransport(HOST, port))
+    s = Service(app_name=name, workers=2, transport=TCPTransport(HOST, port), runtime=runtime)
     s.start()
     s.join()
 
 
-def _holding_worker(
+def _holding_worker(runtime: str, 
     port: int,
     name: str,
     ready_evt,
@@ -70,14 +71,14 @@ def _holding_worker(
 ) -> None:
     """Connects with *name*, signals readiness, holds the connection until
     *release_evt* is set, then ``stop()``s cleanly."""
-    silence_subprocess()
+    silence_subprocess(runtime)
     from daffi import Client, callback, TCPTransport
 
     @callback
     def echo(payload):
         return payload
 
-    client = Client(app_name=name, workers=2, transport=TCPTransport(HOST, port))
+    client = Client(app_name=name, workers=2, transport=TCPTransport(HOST, port), runtime=runtime)
     client.connect()
     ready_evt.set()
     release_evt.wait(timeout=30)
@@ -89,7 +90,7 @@ def _holding_worker(
 
 @pytest.fixture
 def router_proc(free_port):
-    p = mp.Process(target=_router_only, args=(free_port,), daemon=True)
+    p = mp.Process(target=_router_only, args=(active_runtime(), free_port,), daemon=True)
     p.start()
     wait_for_port(free_port)
     yield free_port, p
@@ -98,7 +99,7 @@ def router_proc(free_port):
 
 @pytest.fixture
 def service_proc(free_port):
-    p = mp.Process(target=_service_only, args=(free_port,), daemon=True)
+    p = mp.Process(target=_service_only, args=(active_runtime(), free_port,), daemon=True)
     p.start()
     wait_for_port(free_port)
     time.sleep(0.1)
@@ -127,7 +128,7 @@ class TestLastConnectionWins:
 
         holder = mp.Process(
             target=_holding_worker,
-            args=(port, "twin", ready, release),
+            args=(active_runtime(), port, "twin", ready, release),
             daemon=True,
         )
         holder.start()
@@ -135,7 +136,7 @@ class TestLastConnectionWins:
             assert ready.wait(timeout=10), "holder failed to connect"
 
             # Newcomer claims the same name — must succeed by evicting the holder.
-            newcomer = Client(app_name="twin", transport=TCPTransport(HOST, port))
+            newcomer = Client(app_name="twin", transport=TCPTransport(HOST, port), runtime=active_runtime())
             newcomer.connect()
             assert newcomer._conn_num is not None, "newcomer should have connected"
 
@@ -158,14 +159,14 @@ class TestLastConnectionWins:
 
         holder = mp.Process(
             target=_holding_worker,
-            args=(port, "twin-svc", ready, release),
+            args=(active_runtime(), port, "twin-svc", ready, release),
             daemon=True,
         )
         holder.start()
         try:
             assert ready.wait(timeout=10), "holder failed to connect"
 
-            newcomer = Client(app_name="twin-svc", transport=TCPTransport(HOST, port))
+            newcomer = Client(app_name="twin-svc", transport=TCPTransport(HOST, port), runtime=active_runtime())
             newcomer.connect()
             assert newcomer._conn_num is not None
         finally:
@@ -190,7 +191,7 @@ class TestReconnectAfterStop:
         from daffi.exceptions import InitializationError
 
         port, _ = router_proc
-        client = Client(app_name="recyclable", transport=TCPTransport(HOST, port))
+        client = Client(app_name="recyclable", transport=TCPTransport(HOST, port), runtime=active_runtime())
         client.connect()
         assert client._conn_num is not None
         client.stop()
@@ -226,7 +227,7 @@ class TestReconnectAfterStop:
         first_release = mp.Event()
         first = mp.Process(
             target=_holding_worker,
-            args=(port, "shared-id", first_ready, first_release),
+            args=(active_runtime(), port, "shared-id", first_ready, first_release),
             daemon=True,
         )
         first.start()
@@ -241,7 +242,7 @@ class TestReconnectAfterStop:
 
         wait_for_members(port, set(), timeout=5.0, probe_name="_takeover-probe")
 
-        b = Client(app_name="shared-id", transport=TCPTransport(HOST, port))
+        b = Client(app_name="shared-id", transport=TCPTransport(HOST, port), runtime=active_runtime())
         b.connect()
         try:
             assert b._conn_num is not None
@@ -259,14 +260,14 @@ class TestReconnectAfterStop:
         release = mp.Event()
         holder = mp.Process(
             target=_holding_worker,
-            args=(port, "auto-id", ready, release),
+            args=(active_runtime(), port, "auto-id", ready, release),
             daemon=True,
         )
         holder.start()
         try:
             assert ready.wait(timeout=10)
 
-            client = Client(app_name="auto-id", transport=TCPTransport(HOST, port))
+            client = Client(app_name="auto-id", transport=TCPTransport(HOST, port), runtime=active_runtime())
             client.connect()
             assert client._conn_num is not None
 

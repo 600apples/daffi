@@ -5,6 +5,7 @@ Mirrors tests/integration/test_dynamic_cast.py using daffi.aio.
 """
 
 from __future__ import annotations
+from tests.conftest import active_runtime
 
 import asyncio
 import multiprocessing as mp
@@ -23,8 +24,8 @@ from .conftest import (
 )
 
 
-def _process_worker(port: int, worker_id: int) -> None:
-    silence_subprocess()
+def _process_worker(runtime: str, port: int, worker_id: int) -> None:
+    silence_subprocess(runtime)
 
     async def _main():
         from daffi import callback, TCPTransport
@@ -35,7 +36,8 @@ def _process_worker(port: int, worker_id: int) -> None:
             return {"result": data, "worker": worker_id}
 
         client = AsyncClient(
-            app_name=f"dyn-aio-worker-{worker_id}", transport=TCPTransport(HOST, port)
+            app_name=f"dyn-aio-worker-{worker_id}", transport=TCPTransport(HOST, port),
+            runtime=runtime,
         )
         await client.connect()
         await client.join()
@@ -45,7 +47,7 @@ def _process_worker(port: int, worker_id: int) -> None:
 
 @pytest.fixture
 def router_only(free_port):
-    proc = mp.Process(target=proc_router, args=(free_port,), daemon=True)
+    proc = mp.Process(target=proc_router, args=(active_runtime(), free_port,), daemon=True)
     proc.start()
     wait_for_port(free_port)
     time.sleep(0.1)
@@ -61,7 +63,8 @@ class TestDynamicCastAsync:
         from daffi import TCPTransport
 
         client = AsyncClient(
-            app_name="dyn-aio-caller", transport=TCPTransport(HOST, router_only)
+            app_name="dyn-aio-caller", transport=TCPTransport(HOST, router_only),
+            runtime=active_runtime(),
         )
         conn = await client.connect()
         worker_procs = []
@@ -69,7 +72,7 @@ class TestDynamicCastAsync:
         try:
             for i in range(3):
                 proc = mp.Process(
-                    target=_process_worker, args=(router_only, i), daemon=True
+                    target=_process_worker, args=(active_runtime(), router_only, i), daemon=True
                 )
                 proc.start()
                 worker_procs.append(proc)
@@ -95,7 +98,8 @@ class TestDynamicCastAsync:
         from daffi import TCPTransport
 
         client = AsyncClient(
-            app_name="dyn-aio-names", transport=TCPTransport(HOST, router_only)
+            app_name="dyn-aio-names", transport=TCPTransport(HOST, router_only),
+            runtime=active_runtime(),
         )
         conn = await client.connect()
         worker_procs = []
@@ -103,7 +107,7 @@ class TestDynamicCastAsync:
         try:
             for i in range(2):
                 proc = mp.Process(
-                    target=_process_worker, args=(router_only, i), daemon=True
+                    target=_process_worker, args=(active_runtime(), router_only, i), daemon=True
                 )
                 proc.start()
                 worker_procs.append(proc)

@@ -18,7 +18,7 @@ SOCK = "/tmp/daffi_router.sock"
 
 if __name__ == "__main__":
     router = Router(
-        transports=[
+        transport=[
             TCPTransport("127.0.0.1", PORT),
             UnixTransport(SOCK),
         ]

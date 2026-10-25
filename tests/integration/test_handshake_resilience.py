@@ -13,6 +13,7 @@ Covers two regressions from the perf-fixes / review follow-ups:
 """
 
 from __future__ import annotations
+from tests.conftest import active_runtime
 
 import multiprocessing as mp
 import threading
@@ -40,15 +41,15 @@ _BROADCAST_JOIN_TIMEOUT = 60.0
 # ── subprocess helpers ─────────────────────────────────────────────────────────
 
 
-def _echo_worker(port: int, name: str = "hs-echo-worker") -> None:
-    silence_subprocess()
+def _echo_worker(runtime: str, port: int, name: str = "hs-echo-worker") -> None:
+    silence_subprocess(runtime)
     from daffi import Client, callback, TCPTransport
 
     @callback
     def echo(payload):
         return payload
 
-    client = Client(app_name=name, workers=1, transport=TCPTransport(HOST, port))
+    client = Client(app_name=name, workers=1, transport=TCPTransport(HOST, port), runtime=runtime)
     client.connect()
     try:
         client.join()
@@ -61,7 +62,7 @@ def _echo_worker(port: int, name: str = "hs-echo-worker") -> None:
 
 @pytest.fixture
 def router_port(free_port):
-    proc = mp.Process(target=proc_router, args=(free_port,), daemon=True)
+    proc = mp.Process(target=proc_router, args=(active_runtime(), free_port,), daemon=True)
     proc.start()
     wait_for_port(free_port)
     yield free_port
@@ -71,7 +72,7 @@ def router_port(free_port):
 @pytest.fixture
 def router_with_echo(router_port):
     wproc = mp.Process(
-        target=_echo_worker, args=(router_port, "hs-echo-worker"), daemon=True
+        target=_echo_worker, args=(active_runtime(), router_port, "hs-echo-worker"), daemon=True
     )
     wproc.start()
     wait_for_members(router_port, {"hs-echo-worker"})
@@ -92,7 +93,8 @@ class TestMalformedHandshake:
 
         port = router_with_echo
         attacker = Client(
-            app_name="hs-attacker", workers=1, transport=TCPTransport(HOST, port)
+            app_name="hs-attacker", workers=1, transport=TCPTransport(HOST, port),
+            runtime=active_runtime(),
         )
         conn = attacker.connect()
         try:
@@ -116,7 +118,8 @@ class TestMalformedHandshake:
 
         # If the router mutex were still held, this connect / rpc would hang.
         survivor = Client(
-            app_name="hs-survivor", workers=1, transport=TCPTransport(HOST, port)
+            app_name="hs-survivor", workers=1, transport=TCPTransport(HOST, port),
+            runtime=active_runtime(),
         )
         conn = survivor.connect()
         try:
@@ -131,7 +134,8 @@ class TestMalformedHandshake:
 
         port = router_with_echo
         client = Client(
-            app_name="hs-rpc-client", workers=1, transport=TCPTransport(HOST, port)
+            app_name="hs-rpc-client", workers=1, transport=TCPTransport(HOST, port),
+            runtime=active_runtime(),
         )
         conn = client.connect()
         try:
@@ -175,6 +179,7 @@ class TestJoinBroadcastFanout:
                 app_name=f"bcast-peer-{idx}",
                 workers=1,
                 transport=TCPTransport(HOST, router_port),
+                runtime=active_runtime(),
             )
             conn = c.connect()
             if idx < n - 1:

@@ -18,8 +18,13 @@ const allocator = std.heap.c_allocator;
 
 /// Bind every listener at once, start accepting on all of them and return the
 /// server's single handle (conn_num).  `listeners` is a non-empty list of
-/// (host, port) tuples; a Unix socket is (path, 0).  mode: 0 = Router,
-/// 1 = Service.  TLS settings apply to every listener.
+/// address tuples; a Unix socket is (path, 0).  mode: 0 = Router, 1 = Service.
+///
+/// Each listener is either `(host, port)` (plaintext),
+/// `(host, port, tls, cert, key)`, or
+/// `(host, port, tls, cert, key, ca)`.  A non-empty `ca` on a TLS listener
+/// enables mutual TLS (clients must present a cert chaining to that CA).
+/// `cert` / `key` / `ca` are a filesystem path or PEM material.
 ///
 /// All or nothing: when a listener cannot be bound nothing stays bound, and
 /// the ValueError's args are (reason, index of that listener).
@@ -27,10 +32,7 @@ pub fn startServer(_: [*c]PyObject, args: [*c]PyObject) callconv(.c) [*c]PyObjec
     var listeners: *PyObject = undefined;
     var mode: c_short = undefined;
     var app_name: [*:0]u8 = undefined;
-    var tls_enabled: c_int = 0;
-    var cert_file: [*:0]u8 = undefined;
-    var key_file: [*:0]u8 = undefined;
-    if (PyArg_ParseTuple(args, "Ohspss", &listeners, &mode, &app_name, &tls_enabled, &cert_file, &key_file) == 0) return null;
+    if (PyArg_ParseTuple(args, "Ohs", &listeners, &mode, &app_name) == 0) return null;
     // Validate everything that comes from Python: an out-of-range value used to
     // hit `@intCast`/`unreachable`, i.e. abort the whole interpreter.
     const pmode: HandlerMode = switch (mode) {
@@ -42,7 +44,7 @@ pub fn startServer(_: [*c]PyObject, args: [*c]PyObject) callconv(.c) [*c]PyObjec
         },
     };
     if (py.PyList_Check(listeners) == 0) {
-        PyErr_SetString(py.PyExc_TypeError, "listeners must be a list of (host, port) tuples");
+        PyErr_SetString(py.PyExc_TypeError, "listeners must be a list of address tuples");
         return null;
     }
     const count: usize = @intCast(py.PyList_Size(listeners));
@@ -55,12 +57,26 @@ pub fn startServer(_: [*c]PyObject, args: [*c]PyObject) callconv(.c) [*c]PyObjec
     for (configs, 0..) |*cfg, i| {
         const item = py.PyList_GetItem(listeners, @intCast(i));
         if (py.PyTuple_Check(item) == 0) {
-            PyErr_SetString(py.PyExc_TypeError, "listeners must be a list of (host, port) tuples");
+            PyErr_SetString(py.PyExc_TypeError, "listeners must be a list of address tuples");
             return null;
         }
         var host: [*:0]u8 = undefined;
         var port: c_long = undefined;
-        if (PyArg_ParseTuple(item, "sl", &host, &port) == 0) return null;
+        var tls_enabled: c_int = 0;
+        var cert: [*:0]u8 = undefined;
+        var key: [*:0]u8 = undefined;
+        var ca: [*:0]u8 = undefined;
+        const nitems = py.PyTuple_Size(item);
+        if (nitems == 2) {
+            if (PyArg_ParseTuple(item, "sl", &host, &port) == 0) return null;
+        } else if (nitems == 5) {
+            if (PyArg_ParseTuple(item, "slpss", &host, &port, &tls_enabled, &cert, &key) == 0) return null;
+        } else if (nitems == 6) {
+            if (PyArg_ParseTuple(item, "slpsss", &host, &port, &tls_enabled, &cert, &key, &ca) == 0) return null;
+        } else {
+            PyErr_SetString(py.PyExc_TypeError, "listener must be (host, port), (host, port, tls, cert, key), or (host, port, tls, cert, key, ca)");
+            return null;
+        }
         if (port < 0 or port > std.math.maxInt(u16)) {
             raiseListenerError("port must be in range 0-65535", i);
             return null;
@@ -69,8 +85,9 @@ pub fn startServer(_: [*c]PyObject, args: [*c]PyObject) callconv(.c) [*c]PyObjec
             .host = std.mem.span(host),
             .port = @intCast(port),
             .tls = tls_enabled != 0,
-            .cert_file = std.mem.span(cert_file),
-            .key_file = std.mem.span(key_file),
+            .cert = if (nitems >= 5) std.mem.span(cert) else "",
+            .key = if (nitems >= 5) std.mem.span(key) else "",
+            .ca = if (nitems == 6) std.mem.span(ca) else "",
         };
     }
 

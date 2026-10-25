@@ -12,6 +12,7 @@ Scenarios
 """
 
 from __future__ import annotations
+from tests.conftest import active_runtime
 
 import asyncio
 import multiprocessing as mp
@@ -34,8 +35,8 @@ CALLS_PER_TASK = 20
 # ── subprocess entry points ───────────────────────────────────────────────────
 
 
-def _proc_service(port: int) -> None:
-    silence_subprocess()
+def _proc_service(runtime: str, port: int) -> None:
+    silence_subprocess(runtime)
 
     async def _main():
         from daffi import callback, TCPTransport
@@ -50,7 +51,8 @@ def _proc_service(port: int) -> None:
             return a + b
 
         svc = AsyncService(
-            app_name="conc-aio-service", workers=16, transports=TCPTransport(HOST, port)
+            app_name="conc-aio-service", workers=16, transport=TCPTransport(HOST, port),
+            runtime=runtime,
         )
         await svc.start()
         await svc.join()
@@ -58,22 +60,22 @@ def _proc_service(port: int) -> None:
     asyncio.run(_main())
 
 
-def _proc_router(port: int) -> None:
-    silence_subprocess()
+def _proc_router(runtime: str, port: int) -> None:
+    silence_subprocess(runtime)
 
     async def _main():
         from daffi.aio import AsyncRouter
         from daffi import TCPTransport
 
-        r = AsyncRouter(app_name="conc-aio-router", transports=TCPTransport(HOST, port))
+        r = AsyncRouter(app_name="conc-aio-router", transport=TCPTransport(HOST, port), runtime=runtime)
         await r.start()
         await r.join()
 
     asyncio.run(_main())
 
 
-def _proc_worker(port: int) -> None:
-    silence_subprocess()
+def _proc_worker(runtime: str, port: int) -> None:
+    silence_subprocess(runtime)
 
     async def _main():
         from daffi import callback, TCPTransport
@@ -88,7 +90,8 @@ def _proc_worker(port: int) -> None:
             return a + b
 
         client = AsyncClient(
-            app_name="conc-aio-worker", workers=16, transport=TCPTransport(HOST, port)
+            app_name="conc-aio-worker", workers=16, transport=TCPTransport(HOST, port),
+            runtime=runtime,
         )
         await client.connect()
         await client.join()
@@ -101,7 +104,7 @@ def _proc_worker(port: int) -> None:
 
 @pytest.fixture
 def direct_svc(free_port):
-    proc = mp.Process(target=_proc_service, args=(free_port,), daemon=True)
+    proc = mp.Process(target=_proc_service, args=(active_runtime(), free_port,), daemon=True)
     proc.start()
     wait_for_port(free_port)
     wait_for_members(free_port, {"conc-aio-service"})
@@ -111,11 +114,11 @@ def direct_svc(free_port):
 
 @pytest.fixture
 def router_worker(free_port):
-    rproc = mp.Process(target=_proc_router, args=(free_port,), daemon=True)
+    rproc = mp.Process(target=_proc_router, args=(active_runtime(), free_port,), daemon=True)
     rproc.start()
     wait_for_port(free_port)
 
-    wproc = mp.Process(target=_proc_worker, args=(free_port,), daemon=True)
+    wproc = mp.Process(target=_proc_worker, args=(active_runtime(), free_port,), daemon=True)
     wproc.start()
     wait_for_members(free_port, {"conc-aio-worker"})
     yield free_port
@@ -135,7 +138,8 @@ class TestSharedConnectionDirectAsync:
         from daffi import TCPTransport
 
         client = AsyncClient(
-            app_name="conc-shared-direct", transport=TCPTransport(HOST, direct_svc)
+            app_name="conc-shared-direct", transport=TCPTransport(HOST, direct_svc),
+            runtime=active_runtime(),
         )
         conn = await client.connect()
         proxy = conn.rpc(timeout=TIMEOUT)
@@ -155,7 +159,8 @@ class TestSharedConnectionDirectAsync:
         from daffi import TCPTransport
 
         client = AsyncClient(
-            app_name="conc-add-direct", transport=TCPTransport(HOST, direct_svc)
+            app_name="conc-add-direct", transport=TCPTransport(HOST, direct_svc),
+            runtime=active_runtime(),
         )
         conn = await client.connect()
         proxy = conn.rpc(timeout=TIMEOUT)
@@ -182,7 +187,8 @@ class TestIndependentConnectionsDirectAsync:
 
         clients = [
             AsyncClient(
-                app_name=f"conc-ind-{i}", transport=TCPTransport(HOST, direct_svc)
+                app_name=f"conc-ind-{i}", transport=TCPTransport(HOST, direct_svc),
+                runtime=active_runtime(),
             )
             for i in range(N_TASKS)
         ]
@@ -209,7 +215,8 @@ class TestSharedConnectionRouterAsync:
         from daffi import TCPTransport
 
         client = AsyncClient(
-            app_name="conc-shared-router", transport=TCPTransport(HOST, router_worker)
+            app_name="conc-shared-router", transport=TCPTransport(HOST, router_worker),
+            runtime=active_runtime(),
         )
         conn = await client.connect()
         proxy = conn.rpc(timeout=TIMEOUT)
@@ -229,7 +236,8 @@ class TestSharedConnectionRouterAsync:
         from daffi import TCPTransport
 
         client = AsyncClient(
-            app_name="conc-add-router", transport=TCPTransport(HOST, router_worker)
+            app_name="conc-add-router", transport=TCPTransport(HOST, router_worker),
+            runtime=active_runtime(),
         )
         conn = await client.connect()
         proxy = conn.rpc(timeout=TIMEOUT)
@@ -256,7 +264,8 @@ class TestIndependentConnectionsRouterAsync:
 
         clients = [
             AsyncClient(
-                app_name=f"conc-rind-{i}", transport=TCPTransport(HOST, router_worker)
+                app_name=f"conc-rind-{i}", transport=TCPTransport(HOST, router_worker),
+                runtime=active_runtime(),
             )
             for i in range(N_TASKS)
         ]

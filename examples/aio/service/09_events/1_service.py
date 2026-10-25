@@ -37,7 +37,7 @@ async def main():
             )
 
     svc = AsyncService(
-        app_name="event-service", transports=TCPTransport("0.0.0.0", 5009)
+        app_name="event-service", transport=TCPTransport("0.0.0.0", 5009)
     )
     svc.add_event_handler(on_event)
     await svc.start()

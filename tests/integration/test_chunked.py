@@ -36,6 +36,7 @@ Layouts tested
 """
 
 from __future__ import annotations
+from tests.conftest import active_runtime
 
 import multiprocessing as mp
 import pickle
@@ -101,9 +102,9 @@ def _round_trip(conn, obj, chunk_size: int = CHUNK_SIZE, *, nowait: bool = False
 # ── subprocess entry points ───────────────────────────────────────────────────
 
 
-def _proc_chunked_service(port: int, app_name: str = "chunk-svc") -> None:
+def _proc_chunked_service(runtime: str, port: int, app_name: str = "chunk-svc") -> None:
     """Service subprocess: accumulates OPAQUE chunks, returns on demand."""
-    silence_subprocess()
+    silence_subprocess(runtime)
     from daffi import Service, callback, TCPTransport
 
     _buf: bytearray = bytearray()
@@ -123,14 +124,14 @@ def _proc_chunked_service(port: int, app_name: str = "chunk-svc") -> None:
         """Clear the buffer so the service can accept a new transfer."""
         _buf.clear()
 
-    svc = Service(app_name=app_name, transports=TCPTransport(HOST, port))
+    svc = Service(app_name=app_name, transport=TCPTransport(HOST, port), runtime=runtime)
     svc.start()
     svc.join()
 
 
-def _proc_chunked_worker(port: int, app_name: str = "chunk-worker") -> None:
+def _proc_chunked_worker(runtime: str, port: int, app_name: str = "chunk-worker") -> None:
     """Worker subprocess for router-topology tests."""
-    silence_subprocess()
+    silence_subprocess(runtime)
     import time as _time
     from daffi import Client, callback, TCPTransport
 
@@ -148,7 +149,7 @@ def _proc_chunked_worker(port: int, app_name: str = "chunk-worker") -> None:
     def reset() -> None:
         _buf.clear()
 
-    client = Client(app_name=app_name, transport=TCPTransport(HOST, port))
+    client = Client(app_name=app_name, transport=TCPTransport(HOST, port), runtime=runtime)
     client.connect()
     try:
         while True:
@@ -159,11 +160,11 @@ def _proc_chunked_worker(port: int, app_name: str = "chunk-worker") -> None:
         client.stop()
 
 
-def _proc_router(port: int, app_name: str = "chunk-router") -> None:
-    silence_subprocess()
+def _proc_router(runtime: str, port: int, app_name: str = "chunk-router") -> None:
+    silence_subprocess(runtime)
     from daffi import Router, TCPTransport
 
-    r = Router(app_name=app_name, transports=TCPTransport(HOST, port))
+    r = Router(app_name=app_name, transport=TCPTransport(HOST, port), runtime=runtime)
     r.start()
     r.join()
 
@@ -174,7 +175,7 @@ def _proc_router(port: int, app_name: str = "chunk-router") -> None:
 @pytest.fixture
 def chunked_service(free_port):
     """Direct-layout: fresh Service subprocess with chunk callbacks."""
-    proc = mp.Process(target=_proc_chunked_service, args=(free_port,), daemon=True)
+    proc = mp.Process(target=_proc_chunked_service, args=(active_runtime(), free_port,), daemon=True)
     proc.start()
     wait_for_port(free_port)
     time.sleep(0.15)
@@ -185,11 +186,11 @@ def chunked_service(free_port):
 @pytest.fixture
 def chunked_router(free_port):
     """Router-layout: Router + Worker subprocess with chunk callbacks."""
-    rproc = mp.Process(target=_proc_router, args=(free_port,), daemon=True)
+    rproc = mp.Process(target=_proc_router, args=(active_runtime(), free_port,), daemon=True)
     rproc.start()
     wait_for_port(free_port)
 
-    wproc = mp.Process(target=_proc_chunked_worker, args=(free_port,), daemon=True)
+    wproc = mp.Process(target=_proc_chunked_worker, args=(active_runtime(), free_port,), daemon=True)
     wproc.start()
     wait_for_members(free_port, {"chunk-worker"})
     yield free_port
@@ -200,7 +201,7 @@ def chunked_router(free_port):
 def _connect(port: int, name: str):
     from daffi import Client, TCPTransport
 
-    client = Client(app_name=name, transport=TCPTransport(HOST, port))
+    client = Client(app_name=name, transport=TCPTransport(HOST, port), runtime=active_runtime())
     conn = client.connect()
     return client, conn
 

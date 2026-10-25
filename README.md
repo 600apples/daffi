@@ -52,7 +52,7 @@ def add(a: float, b: float) -> float:
 def greet(name: str) -> str:
     return f"Hello, {name}!"
 
-svc = Service(app_name="my-service", transports=TCPTransport("127.0.0.1", 5000))
+svc = Service(app_name="my-service", transport=TCPTransport("127.0.0.1", 5000))
 svc.start()
 svc.join()          # block until svc.stop() is called
 ```
@@ -83,7 +83,7 @@ load-balanced / broadcast calls.
 ```python
 from daffi import Router, TCPTransport
 
-router = Router(transports=TCPTransport("127.0.0.1", 6000))
+router = Router(transport=TCPTransport("127.0.0.1", 6000))
 router.start()
 router.join()
 ```
@@ -248,10 +248,10 @@ def slow_task(n: int) -> int:
     return n * n
 
 # workers=1 (default) — three concurrent callers would each wait ~1 s
-svc = Service( workers=1,transports=TCPTransport("127.0.0.1", 5000))
+svc = Service( workers=1,transport=TCPTransport("127.0.0.1", 5000))
 
 # workers=4 — three concurrent callers all finish in ~1 s
-svc = Service( workers=4,transports=TCPTransport("127.0.0.1", 5000))
+svc = Service( workers=4,transport=TCPTransport("127.0.0.1", 5000))
 
 svc.start()
 svc.join()
@@ -283,10 +283,10 @@ client.join()
 
 ---
 
-## Native execution model (`threads` vs `evented`)
+## Native runtime (`threads` vs `evented`)
 
-The native core can serve connections in two ways, chosen per process with an
-environment variable:
+The native core can serve connections in two ways, chosen per process with
+the `runtime` argument:
 
 - `threads` (default): one OS thread per connection.
 - `evented`: all connections are multiplexed over a few event-loop threads
@@ -299,17 +299,17 @@ in the [Zig 0.16.0 release notes](https://ziglang.org/download/0.16.0/release-no
 (daffi’s native core follows that idea with its own epoll/kqueue loops; it does
 not use `std.Io.Evented` yet.)
 
-```bash
-DAFFI_EXECUTION_MODEL=evented python my_router.py
-```
-
 ```python
-import os
-os.environ["DAFFI_EXECUTION_MODEL"] = "evented"   # before any node starts
+from daffi import Runtime, Router, TCPTransport
 
-from daffi import dfcore
-print(dfcore.getExecutionModel())                 # "evented"
+router = Router(
+    transport=TCPTransport("127.0.0.1", 6000),
+    runtime=Runtime.EVENTED,
+)
 ```
+
+Omit `runtime` and that node selects `threads`. One process cannot mix the
+two models: a later constructor that disagrees raises `InitializationError`.
 
 `DAFFI_EVENT_LOOPS` sets the number of loop threads (default: CPU count,
 capped at 4). Nothing else in your code changes. This is independent of
@@ -323,23 +323,31 @@ Measured with daffi's benchmark suite (release build, localhost):
 | 200 concurrent clients → Service, calls/s | 14,559 | 15,272 |
 | Native threads with 64 clients connected | 67 | 7 |
 
-Speed is comparable in both models (run-to-run noise dominates small %). What
-differs under load is resources: with `threads` RSS and thread count grow with
-connections; with `evented` they stay nearly flat.
+One caller sending calls one after another is faster with `threads`, both
+Client → Service and Client → Router → one worker. Many clients calling one
+Service at the same time are faster with `evented`. That concurrent case has
+no Router: every client connects straight to the Service. With `threads` the
+Service then uses about one native thread per client (203 threads for 200
+clients); with `evented` it stays at a handful (7 in that run).
 
 > **When to use `evented`:**
-> - A Router or Service with **many connections** (hundreds or more), especially
->   mostly idle ones such as many workers waiting for tasks.
-> - Processes under **thread or memory limits** (e.g. containers).
+> - Many clients call the **same Service at the same time**.
+> - A Router or Service holds **many connections** (hundreds or more), especially
+>   mostly idle ones such as workers waiting for tasks.
+> - The process is under a **thread or memory limit** (for example a container).
 >
 > **Keep `threads` (default):**
-> - **Few connections**, or you want the long-standing default.
+> - **One caller**, or only a few connections, sending calls one after another.
+>   That includes a caller that reaches a worker through a Router.
 > - Peers that may be **slow to read** large messages or streams. In the evented
 >   model a stalled peer can briefly hold up other connections on the same loop.
 > - Mostly **WebSocket (browser)** clients. They keep a thread each in both
 >   models.
 
-See the [execution model guide](https://600apples.github.io/daffi/usage/execution-model/)
+Compare both on your machine with `python tests/perf/runtime_benchmark.py`.
+The `concurrent` rows are the many-clients → one Service case.
+
+See the [runtime guide](https://600apples.github.io/daffi/usage/runtime/)
 for details and full measurements, and the Zig docs linked above for the
 `Io.Threaded` / `Io.Evented` background.
 
@@ -357,7 +365,7 @@ def on_event(event: dict):
     # event["member"] → app_name of the node that changed state
     print(f"[{event['type']}] {event['member']}")
 
-svc = Service(transports=TCPTransport("127.0.0.1", 5000))
+svc = Service(transport=TCPTransport("127.0.0.1", 5000))
 svc.add_event_handler(on_event)
 svc.start()
 ```
@@ -372,7 +380,7 @@ Use a `UnixTransport` for inter-process communication on the same machine.
 
 ```python
 from daffi import Service, Client, UnixTransport
-svc = Service(transports=UnixTransport("/tmp/daffi.sock"))
+svc = Service(transport=UnixTransport("/tmp/daffi.sock"))
 svc.start()
 
 client = Client(transport=UnixTransport("/tmp/daffi.sock"))
@@ -385,19 +393,28 @@ conn = client.connect()
 
 ```python
 from daffi import Router, Client, TCPTransport
-# Server (Router or Service)
+# Server (Router or Service) — TLS is configured on the transport.
+# cert/key/ca accept a filesystem path or PEM material.
 router = Router(
-    tls=True,
-    cert_file="/path/to/server.crt",
-    key_file="/path/to/server.key",
-    transports=TCPTransport("127.0.0.1", 6000))
+    transport=TCPTransport(
+        "127.0.0.1",
+        6000,
+        tls=True,
+        cert="/path/to/server.crt",
+        key="/path/to/server.key",
+    ),
+)
 router.start()
 
-# Client — supply ca_file to verify the server certificate,
+# Client — supply ca to verify the server certificate,
 # or leave it empty to skip verification
 client = Client(
-    tls=True,
-    ca_file="/path/to/ca.crt",
-    transport=TCPTransport("127.0.0.1", 6000))
+    transport=TCPTransport(
+        "127.0.0.1",
+        6000,
+        tls=True,
+        ca="/path/to/ca.crt",
+    ),
+)
 conn = client.connect()
 ```

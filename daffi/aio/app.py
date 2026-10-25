@@ -28,6 +28,7 @@ from .. import dfcore
 
 from daffi.app import (
     Application,
+    Runtime,
     MultipleTransportMixin,
     ServerMode,
     SingleTransportMixin,
@@ -64,6 +65,7 @@ class AsyncApplication(Application):
         # Replace threading.Event / threading.Lock with asyncio equivalents.
         self._stop_event: asyncio.Event = asyncio.Event()
         self._stop_lock: asyncio.Lock = asyncio.Lock()
+        self._reconnect_lock: asyncio.Lock = asyncio.Lock()
         # Application.__init__ registered `self.stop` (the sync method) via
         # atexit/signal.  Remove it and replace with a sync wrapper that
         # safely schedules stop() on the event loop.
@@ -170,7 +172,7 @@ class AsyncRouter(AsyncApplication[MultipleTransportMixin], AsyncServerMixin):
     Example::
 
         async def main():
-            router = Router(transports=TCPTransport("127.0.0.1", 6000))
+            router = Router(transport=TCPTransport("127.0.0.1", 6000))
             await router.start()
             await router.join()
     """
@@ -196,7 +198,7 @@ class AsyncService(AsyncApplication[MultipleTransportMixin], AsyncServerMixin):
             return a + b
 
         async def main():
-            svc = Service(transports=TCPTransport("127.0.0.1", 5000))
+            svc = Service(transport=TCPTransport("127.0.0.1", 5000))
             await svc.start()
             await svc.join()
     """
@@ -223,28 +225,6 @@ class AsyncClient(AsyncApplication[SingleTransportMixin]):
 
             await client.stop()
     """
-
-    def __init__(
-        self,
-        app_name: str | None = None,
-        *,
-        transport: TCPTransport | UnixTransport,
-        workers: int = TaskDispatcher.DEFAULT_WORKERS,
-        tls: bool = False,
-        cert_file: str = "",
-        key_file: str = "",
-        ca_file: str = "",
-    ) -> None:
-        super().__init__(
-            app_name=app_name,
-            transport=transport,
-            workers=workers,
-            tls=tls,
-            cert_file=cert_file,
-            key_file=key_file,
-            ca_file=ca_file,
-        )
-        self._reconnect_lock: asyncio.Lock = asyncio.Lock()
 
     # ------------------------------------------------------------------
     # Public lifecycle
@@ -324,12 +304,15 @@ class AsyncClient(AsyncApplication[SingleTransportMixin]):
             self._task_dispatcher = AsyncTaskDispatcher(workers=self.workers)
         self._task_dispatcher._start_workers()
 
+        t = self.transport
         self._conn_num = dfcore.startClient(
-            self.transport.native_host,
-            self.transport.native_port,
+            t.native_host,
+            t.native_port,
             self.app_name,
-            self.tls,
-            self.ca_file,
+            t.tls,
+            t.ca,
+            t.cert,
+            t.key,
         )
         if self._conn_num is None:
             raise InitializationError(
@@ -350,14 +333,16 @@ class AsyncClient(AsyncApplication[SingleTransportMixin]):
             handshake = await loop.run_in_executor(
                 None, AsyncRpcProxy._process_client_handshake, self._conn_num
             )
-        except Exception:
+        except Exception as exc:
             AsyncResponseNotifier.unregister(self._conn_num)
             try:
                 dfcore.stopClient(self._conn_num)
             except Exception:
                 pass
             self._conn_num = None
-            raise
+            raise InitializationError(
+                f"Failed to connect to the server. connection info: {self.info}"
+            ) from exc
 
         self._conn_type = handshake["meta"]["type"]
         self.logger.debug(

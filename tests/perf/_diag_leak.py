@@ -14,6 +14,13 @@ Log files:
     /tmp/dafi_worker.log   — worker process (Zig native log + faulthandler)
     /tmp/dafi_callers.log  — callers process (Zig native log)
 """
+import sys
+from pathlib import Path
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+from tests.conftest import active_runtime
 
 import multiprocessing as mp
 
@@ -47,7 +54,7 @@ def _redirect_native_log(log_path: str, native_level: int = 0) -> None:
 # ─── subprocesses ─────────────────────────────────────────────────────────────
 
 
-def proc_router(port):
+def proc_router(runtime: str, port):
     _redirect_native_log(ROUTER_LOG, native_level=0)
 
     # Python logging → same file so we see both Python and Zig events together
@@ -60,12 +67,12 @@ def proc_router(port):
 
     from daffi import Router, TCPTransport
 
-    r = Router(app_name="diag-router", transports=TCPTransport(HOST, port))
+    r = Router(app_name="diag-router", transport=TCPTransport(HOST, port), runtime=runtime)
     r.start()
     r.join()
 
 
-def proc_worker(port, n_workers):
+def proc_worker(runtime: str, port, n_workers):
     _redirect_native_log(WORKER_LOG, native_level=0)
 
     # Enable faulthandler on fd-2 (now the log file) so SIGSEGV/SIGABRT dumps
@@ -89,7 +96,8 @@ def proc_worker(port, n_workers):
 
     logging.info(f"worker starting  n_workers={n_workers}")
     c = Client(
-        app_name="diag-worker", workers=n_workers, transport=TCPTransport(HOST, port)
+        app_name="diag-worker", workers=n_workers, transport=TCPTransport(HOST, port),
+        runtime=runtime,
     )
     c.connect()
     logging.info("worker connected and ready")
@@ -107,7 +115,7 @@ def proc_worker(port, n_workers):
     logging.info("worker done")
 
 
-def proc_callers(port, n_callers, delay_s):
+def proc_callers(runtime: str, port, n_callers, delay_s):
     _redirect_native_log(CALLERS_LOG, native_level=1)  # INFO only — callers are noisy
 
     logging.basicConfig(
@@ -123,7 +131,7 @@ def proc_callers(port, n_callers, delay_s):
     clients = []
     for i in range(n_callers):
         try:
-            cl = Client(app_name=f"dc-{i:03d}", transport=TCPTransport(HOST, port))
+            cl = Client(app_name=f"dc-{i:03d}", transport=TCPTransport(HOST, port), runtime=runtime)
             clients.append((cl, cl.connect()))
         except Exception as e:
             if i < 5:
@@ -202,8 +210,8 @@ if __name__ == "__main__":
     )
 
     port = _free_port()
-    router = mp.Process(target=proc_router, args=(port,), daemon=True)
-    worker = mp.Process(target=proc_worker, args=(port, N_WORKERS), daemon=True)
+    router = mp.Process(target=proc_router, args=(active_runtime(), port,), daemon=True)
+    worker = mp.Process(target=proc_worker, args=(active_runtime(), port, N_WORKERS), daemon=True)
 
     router.start()
     time.sleep(0.5)
@@ -211,7 +219,7 @@ if __name__ == "__main__":
     time.sleep(2.5)  # wait for worker to connect + handshake
 
     callers = mp.Process(
-        target=proc_callers, args=(port, N_CALLERS, DELAY), daemon=True
+        target=proc_callers, args=(active_runtime(), port, N_CALLERS, DELAY), daemon=True
     )
     callers.start()
 

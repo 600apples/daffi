@@ -16,7 +16,7 @@ if __name__ == "__main__":
 
     router = Router(
         app_name="daffi-controller",
-        transports=TCPTransport("0.0.0.0", port),
+        transport=TCPTransport("0.0.0.0", port),
     )
     router.start()
     print(f"Router running on 0.0.0.0:{port} — press Ctrl+C to stop.")

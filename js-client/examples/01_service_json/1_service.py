@@ -29,7 +29,7 @@ def greet(name: str) -> str:
 
 
 if __name__ == "__main__":
-    svc = Service(app_name="json-service", transports=TCPTransport("127.0.0.1", 5010))
+    svc = Service(app_name="json-service", transport=TCPTransport("127.0.0.1", 5010))
     svc.start()
     print("Service on ws://127.0.0.1:5010 — open index.html in a browser.")
     svc.join()

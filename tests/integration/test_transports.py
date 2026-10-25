@@ -8,6 +8,7 @@ listener comes up or none stays bound, and stopping releases all of them.
 """
 
 from __future__ import annotations
+from tests.conftest import active_runtime
 
 import asyncio
 import multiprocessing as mp
@@ -80,13 +81,24 @@ def _wait_spec(spec) -> None:
             _wait_unix(host)
 
 
-def _materialize(spec, *, bare: bool = False):
+def _materialize(
+    spec,
+    *,
+    bare: bool = False,
+    tls: tuple | None = None,
+    ca: str | None = None,
+):
     from daffi import TCPTransport, UnixTransport
 
     items = []
     for kind, host, port in spec:
         if kind == "tcp":
-            items.append(TCPTransport(host, port))
+            kwargs = {}
+            if tls is not None:
+                kwargs = {"tls": True, "cert": tls[0], "key": tls[1]}
+            elif ca is not None:
+                kwargs = {"tls": True, "ca": ca}
+            items.append(TCPTransport(host, port, **kwargs))
         else:
             items.append(UnixTransport(host))
     if bare:
@@ -115,36 +127,33 @@ def _callbacks():
         return seconds
 
 
-def _service_proc(spec, app_name: str, bare: bool, tls: tuple | None) -> None:
-    silence_subprocess()
+def _service_proc(runtime: str, spec, app_name: str, bare: bool, tls: tuple | None) -> None:
+    silence_subprocess(runtime)
     os.environ["DAFFI_WHO"] = app_name
     from daffi import Service
 
     _callbacks()
-    kwargs = {}
-    if tls is not None:
-        kwargs = {"tls": True, "cert_file": tls[0], "key_file": tls[1]}
     svc = Service(
         app_name=app_name,
-        transports=_materialize(spec, bare=bare),
+        transport=_materialize(spec, bare=bare, tls=tls),
         workers=2,
-        **kwargs,
+        runtime=runtime,
     )
     svc.start()
     svc.join()
 
 
-def _router_proc(spec, app_name: str) -> None:
-    silence_subprocess()
+def _router_proc(runtime: str, spec, app_name: str) -> None:
+    silence_subprocess(runtime)
     from daffi import Router
 
-    router = Router(app_name=app_name, transports=_materialize(spec))
+    router = Router(app_name=app_name, transport=_materialize(spec), runtime=runtime)
     router.start()
     router.join()
 
 
-def _async_service_proc(spec, app_name: str) -> None:
-    silence_subprocess()
+def _async_service_proc(runtime: str, spec, app_name: str) -> None:
+    silence_subprocess(runtime)
     os.environ["DAFFI_WHO"] = app_name
 
     async def main():
@@ -153,8 +162,9 @@ def _async_service_proc(spec, app_name: str) -> None:
         _callbacks()
         svc = AsyncService(
             app_name=app_name,
-            transports=_materialize(spec),
+            transport=_materialize(spec),
             workers=2,
+            runtime=runtime,
         )
         await svc.start()
         await svc.join()
@@ -162,42 +172,41 @@ def _async_service_proc(spec, app_name: str) -> None:
     asyncio.run(main())
 
 
-def _async_router_proc(spec, app_name: str) -> None:
-    silence_subprocess()
+def _async_router_proc(runtime: str, spec, app_name: str) -> None:
+    silence_subprocess(runtime)
 
     async def main():
         from daffi.aio import AsyncRouter
 
-        router = AsyncRouter(app_name=app_name, transports=_materialize(spec))
+        router = AsyncRouter(app_name=app_name, transport=_materialize(spec), runtime=runtime)
         await router.start()
         await router.join()
 
     asyncio.run(main())
 
 
-def _router_until(spec, started, stop) -> None:
-    silence_subprocess()
+def _router_until(runtime: str, spec, started, stop) -> None:
+    silence_subprocess(runtime)
     from daffi import Router
 
-    router = Router(app_name="rt-until", transports=_materialize(spec))
+    router = Router(app_name="rt-until", transport=_materialize(spec), runtime=runtime)
     router.start()
     started.set()
     stop.wait()
     router.stop()
 
 
-def _worker_proc(endpoint, app_name: str, tls_ca: str | None) -> None:
-    silence_subprocess()
+def _worker_proc(runtime: str, endpoint, app_name: str, tls_ca: str | None) -> None:
+    silence_subprocess(runtime)
     os.environ["DAFFI_WHO"] = app_name
     from daffi import Client
 
     _callbacks()
-    kwargs = {"tls": True, "ca_file": tls_ca} if tls_ca else {}
     client = Client(
         app_name=app_name,
-        transport=_materialize([endpoint], bare=True),
+        transport=_materialize([endpoint], bare=True, ca=tls_ca),
         workers=2,
-        **kwargs,
+        runtime=runtime,
     )
     client.connect()
     while True:
@@ -205,7 +214,9 @@ def _worker_proc(endpoint, app_name: str, tls_ca: str | None) -> None:
 
 
 def _spawn(target, args):
-    proc = mp.Process(target=target, args=args, daemon=True)
+    proc = mp.Process(
+        target=target, args=(active_runtime(), *args), daemon=True
+    )
     proc.start()
     return proc
 
@@ -220,11 +231,10 @@ def _rpc(
 ):
     from daffi import Client
 
-    kwargs = {"tls": True, "ca_file": tls_ca} if tls_ca else {}
     client = Client(
         app_name=app_name,
-        transport=_materialize([endpoint], bare=True),
-        **kwargs,
+        transport=_materialize([endpoint], bare=True, ca=tls_ca),
+        runtime=active_runtime(),
     )
     conn = client.connect()
     try:
@@ -234,12 +244,12 @@ def _rpc(
         client.stop()
 
 
-def _caller_proc(endpoint, receiver: str, calling) -> None:
+def _caller_proc(runtime: str, endpoint, receiver: str, calling) -> None:
     """Keep one slow call in flight until killed."""
-    silence_subprocess()
+    silence_subprocess(runtime)
     from daffi import Client
 
-    client = Client(app_name="doomed-caller", transport=_materialize([endpoint], bare=True))
+    client = Client(app_name="doomed-caller", transport=_materialize([endpoint], bare=True), runtime=runtime)
     conn = client.connect()
     conn.wait_for_members(receiver, timeout=20)
     calling.set()
@@ -314,7 +324,7 @@ def _wait_gone(conn, name: str, timeout: float = 20.0) -> None:
 def _connect(endpoint, app_name: str):
     from daffi import Client
 
-    client = Client(app_name=app_name, transport=_materialize([endpoint], bare=True))
+    client = Client(app_name=app_name, transport=_materialize([endpoint], bare=True), runtime=active_runtime())
     return client, client.connect()
 
 
@@ -325,7 +335,7 @@ def _isolated(target, *args, timeout: float = 90.0):
     nodes are never started inside the pytest process itself.
     """
     queue = mp.Queue()
-    proc = mp.Process(target=_run_isolated, args=(queue, target, args), daemon=True)
+    proc = mp.Process(target=_run_isolated, args=(active_runtime(), queue, target, args), daemon=True)
     proc.start()
     try:
         ok, value = queue.get(timeout=timeout)
@@ -336,8 +346,8 @@ def _isolated(target, *args, timeout: float = 90.0):
     return value
 
 
-def _run_isolated(queue, target, args) -> None:
-    silence_subprocess()
+def _run_isolated(runtime: str, queue, target, args) -> None:
+    silence_subprocess(runtime)
     try:
         queue.put((True, target(*args)))
     except BaseException:
@@ -366,7 +376,11 @@ def _start_stop_once(spec, node: str) -> dict:
     from daffi import Router, Service
 
     cls = Router if node == "router" else Service
-    app = cls(app_name=f"iso-{node}", transports=_materialize(spec))
+    app = cls(
+        app_name=f"iso-{node}",
+        transport=_materialize(spec),
+        runtime=active_runtime(),
+    )
     app.start()
     conn_num = app._conn_num
     # Every listener must accept as soon as start() returns, without waiting.
@@ -389,7 +403,11 @@ def _start_with_one_bad_listener(spec, bad: int, node: str) -> dict:
 
     blocker = _occupy(spec[bad]) if spec[bad][0] == "tcp" else None
     cls = Router if node == "router" else Service
-    app = cls(app_name=f"iso-bad-{node}", transports=_materialize(spec))
+    app = cls(
+        app_name=f"iso-bad-{node}",
+        transport=_materialize(spec),
+        runtime=active_runtime(),
+    )
     try:
         app.start()
     except InitError as exc:
@@ -429,7 +447,7 @@ def _start_failing_after_peers_connected(spec, node: str, sync: bool = True) -> 
 
     def connect_everyone_then_fail(*_):
         for i, endpoint in enumerate(spec):
-            client = Client(app_name=f"peer-{i}", transport=_materialize([endpoint], bare=True))
+            client = Client(app_name=f"peer-{i}", transport=_materialize([endpoint], bare=True), runtime=active_runtime())
             client.connect()
             peers.append(client)
         raise RuntimeError("late start failure")
@@ -439,7 +457,12 @@ def _start_failing_after_peers_connected(spec, node: str, sync: bool = True) -> 
         cls = Router if node == "router" else Service
     else:
         cls = AsyncRouter if node == "router" else AsyncService
-    app = cls(app_name=f"iso-late-{node}", transports=_materialize(spec), **kwargs)
+    app = cls(
+        app_name=f"iso-late-{node}",
+        transport=_materialize(spec),
+        runtime=active_runtime(),
+        **kwargs,
+    )
 
     # Routers fail while registering executors; Services one step later, in
     # the handshake, after their dispatcher has started polling.
@@ -505,7 +528,7 @@ def _failed_service_start_threads(spec) -> dict:
     from daffi.exceptions import InitializationError as InitError
 
     blocker = _occupy(spec[-1])
-    svc = Service(app_name="iso-threads", transports=_materialize(spec), workers=3)
+    svc = Service(app_name="iso-threads", transport=_materialize(spec), workers=3, runtime=active_runtime())
     try:
         svc.start()
     except InitError as exc:
@@ -527,7 +550,7 @@ def _restart_cycles(spec, rounds: int) -> list[list[bool]]:
 
     seen = []
     for i in range(rounds):
-        router = Router(app_name=f"iso-cycle-{i}", transports=_materialize(spec))
+        router = Router(app_name=f"iso-cycle-{i}", transport=_materialize(spec), runtime=active_runtime())
         router.start()
         seen.append([_accepts(endpoint) for endpoint in spec])
         router.stop()
@@ -540,7 +563,7 @@ def _native_start(listeners, busy_port: int | None) -> dict:
 
     blocker = _occupy(_tcp(busy_port)) if busy_port else None
     try:
-        dfcore.startServer(listeners, 0, "iso-native", False, "", "")
+        dfcore.startServer(listeners, 0, "iso-native")
     except ValueError as exc:
         return {"args": exc.args}
     finally:
@@ -557,7 +580,7 @@ def _async_start_with_one_bad_listener(spec, bad: int) -> dict:
     blocker = _occupy(spec[bad])
 
     async def main():
-        router = AsyncRouter(app_name="iso-async-bad", transports=_materialize(spec))
+        router = AsyncRouter(app_name="iso-async-bad", transport=_materialize(spec), runtime=active_runtime())
         try:
             await router.start()
         except InitError as exc:
@@ -578,19 +601,19 @@ class TestConstruction:
         from daffi import Router, TCPTransport, UnixTransport
 
         tcp = TCPTransport(HOST, 1)
-        router = Router(app_name="one-tcp", transports=tcp)
+        router = Router(app_name="one-tcp", transport=tcp, runtime=active_runtime())
         assert router.transports == [tcp]
 
         path = "/tmp/daffi-annotation.sock"
         unix = UnixTransport(path)
-        router = Router(app_name="one-unix", transports=unix)
+        router = Router(app_name="one-unix", transport=unix, runtime=active_runtime())
         assert router.transports == [unix]
 
     def test_list_and_tuple_are_sequences(self):
         from daffi import Service, TCPTransport
 
         a, b = TCPTransport(HOST, 2), TCPTransport(HOST, 3)
-        svc = Service(app_name="seq", transports=(a, b))
+        svc = Service(app_name="seq", transport=(a, b), runtime=active_runtime())
         assert [t.port for t in svc.transports] == [2, 3]
         assert "tcp://127.0.0.1:2" in svc.info and "tcp://127.0.0.1:3" in svc.info
 
@@ -598,25 +621,25 @@ class TestConstruction:
         from daffi import Router
 
         with pytest.raises(InitializationError):
-            Router(transports=[])
+            Router(transport=[], runtime=active_runtime())
 
     def test_a_string_is_not_a_sequence_of_transports(self):
         from daffi import Service
 
         with pytest.raises(InitializationError):
-            Service(transports="/tmp/daffi.sock")
+            Service(transport="/tmp/daffi.sock", runtime=active_runtime())
 
     def test_unknown_item_is_rejected(self):
         from daffi import Router, TCPTransport
 
         with pytest.raises(InitializationError):
-            Router(transports=[TCPTransport(HOST, 1), object()])
+            Router(transport=[TCPTransport(HOST, 1), object()], runtime=active_runtime())
 
     def test_duplicate_tcp_transport_is_rejected(self):
         from daffi import Router, TCPTransport
 
         with pytest.raises(InitializationError, match="duplicate transport tcp://"):
-            Router(transports=[TCPTransport(HOST, 7001), TCPTransport(HOST, 7001)])
+            Router(transport=[TCPTransport(HOST, 7001), TCPTransport(HOST, 7001)], runtime=active_runtime())
 
     def test_duplicate_unix_transport_is_rejected(self):
         from daffi import Service, UnixTransport
@@ -624,27 +647,27 @@ class TestConstruction:
         path = "/tmp/daffi-dup.sock"
         relative = os.path.relpath(path)
         with pytest.raises(InitializationError, match="duplicate transport unix://"):
-            Service(transports=[UnixTransport(path), UnixTransport(relative)])
+            Service(transport=[UnixTransport(path), UnixTransport(relative)], runtime=active_runtime())
 
     def test_same_port_on_different_hosts_or_ephemeral_ports_are_distinct(self):
         from daffi import Router, TCPTransport
 
-        Router(transports=[TCPTransport(HOST, 7002), TCPTransport("localhost", 7002)])
-        Router(transports=[TCPTransport(HOST, 0), TCPTransport(HOST, 0)])
+        Router(transport=[TCPTransport(HOST, 7002), TCPTransport("localhost", 7002)], runtime=active_runtime())
+        Router(transport=[TCPTransport(HOST, 0), TCPTransport(HOST, 0)], runtime=active_runtime())
 
     def test_client_takes_one_transport(self):
         from daffi import Client, Router, TCPTransport, UnixTransport
 
         tcp = TCPTransport(HOST, 1)
-        client = Client(app_name="one", transport=tcp)
+        client = Client(app_name="one", transport=tcp, runtime=active_runtime())
         assert client.transport is tcp
 
         with pytest.raises(TypeError):
-            Client(app_name="named-wrong", transports=tcp)
+            Client(app_name="named-wrong", transports=tcp, runtime=active_runtime())
         with pytest.raises(InitializationError):
-            Client(transport=[tcp, UnixTransport("/tmp/daffi-client.sock")])
+            Client(transport=[tcp, UnixTransport("/tmp/daffi-client.sock")], runtime=active_runtime())
         with pytest.raises(TypeError):
-            Router(transport=tcp)
+            Router(transports=tcp, runtime=active_runtime())
 
     def test_bad_port_is_rejected(self):
         from daffi import TCPTransport
@@ -893,21 +916,21 @@ class TestNativeStart:
         from daffi import dfcore
 
         with pytest.raises(ValueError, match="at least one listener"):
-            dfcore.startServer([], 0, "empty", False, "", "")
+            dfcore.startServer([], 0, "empty")
 
     def test_listeners_must_be_a_list_of_pairs(self):
         from daffi import dfcore
 
         with pytest.raises(TypeError):
-            dfcore.startServer((HOST, 1), 0, "not-a-list", False, "", "")
+            dfcore.startServer((HOST, 1), 0, "not-a-list")
         with pytest.raises(TypeError):
-            dfcore.startServer([HOST], 0, "not-a-pair", False, "", "")
+            dfcore.startServer([HOST], 0, "not-a-pair")
 
     def test_bad_port_names_its_listener(self):
         from daffi import dfcore
 
         with pytest.raises(ValueError) as info:
-            dfcore.startServer([(HOST, 1), (HOST, 70000)], 0, "bad-port", False, "", "")
+            dfcore.startServer([(HOST, 1), (HOST, 70000)], 0, "bad-port")
         assert info.value.args == ("port must be in range 0-65535", 1)
 
     def test_duplicate_listener_names_its_index(self):
@@ -1266,6 +1289,7 @@ class TestAsync:
                     client = AsyncClient(
                         app_name="aio-caller",
                         transport=UnixTransport(path),
+                        runtime=active_runtime(),
                     )
                     conn = await client.connect()
                     try:
@@ -1297,7 +1321,8 @@ class TestAsync:
                 from daffi.aio import AsyncClient
 
                 client = AsyncClient(
-                    app_name="aio-svc", transport=TCPTransport(HOST, b)
+                    app_name="aio-svc", transport=TCPTransport(HOST, b),
+                    runtime=active_runtime(),
                 )
                 conn = await client.connect()
                 try:

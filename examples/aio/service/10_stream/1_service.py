@@ -27,7 +27,7 @@ async def receive_chunk(data: bytes) -> None:
 
 async def main():
     svc = AsyncService(
-        app_name="stream-service", transports=TCPTransport("0.0.0.0", 5010)
+        app_name="stream-service", transport=TCPTransport("0.0.0.0", 5010)
     )
     await svc.start()
     print("Service running on 0.0.0.0:5010 — press Ctrl+C to stop.")

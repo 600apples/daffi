@@ -20,7 +20,7 @@ def summarise(data: dict) -> dict:
 
 
 if __name__ == "__main__":
-    svc = Service(app_name="json-service", transports=TCPTransport("0.0.0.0", 5005))
+    svc = Service(app_name="json-service", transport=TCPTransport("0.0.0.0", 5005))
     svc.start()
     print("Service running on 0.0.0.0:5005 — press Ctrl+C to stop.")
     svc.join()

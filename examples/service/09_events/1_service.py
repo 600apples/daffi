@@ -36,7 +36,7 @@ if __name__ == "__main__":
                 f"[service] ✦ {name!r} disconnected (total: {len(connected_clients)})"
             )
 
-    svc = Service(app_name="event-service", transports=TCPTransport("0.0.0.0", 5009))
+    svc = Service(app_name="event-service", transport=TCPTransport("0.0.0.0", 5009))
     svc.add_event_handler(on_event)
     svc.start()
     print("Service running on 0.0.0.0:5009 — press Ctrl+C to stop.")

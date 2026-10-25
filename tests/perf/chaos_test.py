@@ -23,6 +23,13 @@ Usage
 """
 
 from __future__ import annotations
+import sys
+from pathlib import Path
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+from tests.conftest import active_runtime
 
 import argparse
 import logging
@@ -86,7 +93,7 @@ def _wait_for_port(port: int, timeout: float = 20.0) -> None:
     raise TimeoutError(f"{HOST}:{port} did not open within {timeout}s")
 
 
-def _silence() -> None:
+def _silence(runtime: str) -> None:
     """Redirect stdout/stderr to /dev/null and kill logging.  Called in every
     subprocess at startup so Zig native prints don't pollute the terminal."""
     devnull = os.open(os.devnull, os.O_WRONLY)
@@ -94,6 +101,11 @@ def _silence() -> None:
     os.dup2(devnull, 2)
     os.close(devnull)
     logging.disable(logging.CRITICAL)
+
+    import tests.conftest as _runtime_state
+    _runtime_state.SELECTED_RUNTIME = runtime
+    from daffi import dfcore
+    dfcore.setRuntime(runtime)
     try:
         from daffi.registry._executor_registry import EXECUTOR_REGISTRY
 
@@ -126,6 +138,7 @@ def _probe_wait(port: int, members: set[str], timeout: float = 30.0) -> None:
     c = Client(
         app_name=f"chaos-probe-{os.getpid()}-{id(members)}",
         transport=TCPTransport(HOST, port),
+        runtime=active_runtime(),
     )
     conn = c.connect()
     try:
@@ -137,18 +150,18 @@ def _probe_wait(port: int, members: set[str], timeout: float = 30.0) -> None:
 # ─── subprocess entry points (must import daffi lazily after _silence) ────────
 
 
-def _proc_router(port: int) -> None:
-    _silence()
+def _proc_router(runtime: str, port: int) -> None:
+    _silence(runtime)
     from daffi import Router, TCPTransport
 
-    r = Router(app_name="chaos-router", transports=TCPTransport(HOST, port))
+    r = Router(app_name="chaos-router", transport=TCPTransport(HOST, port), runtime=runtime)
     r.start()
     r.join()
 
 
-def _proc_worker(port: int, worker_id: int) -> None:
+def _proc_worker(runtime: str, port: int, worker_id: int) -> None:
     """Client-worker subprocess: registers callbacks and keeps running."""
-    _silence()
+    _silence(runtime)
     import time as _t
     from daffi import Client, callback, TCPTransport
 
@@ -168,6 +181,7 @@ def _proc_worker(port: int, worker_id: int) -> None:
         app_name=f"chaos-worker-{worker_id}",
         workers=4,
         transport=TCPTransport(HOST, port),
+        runtime=runtime,
     )
     client.connect()
     try:
@@ -179,8 +193,8 @@ def _proc_worker(port: int, worker_id: int) -> None:
         client.stop()
 
 
-def _proc_service(port: int, service_id: int) -> None:
-    _silence()
+def _proc_service(runtime: str, port: int, service_id: int) -> None:
+    _silence(runtime)
     from daffi import Service, callback, TCPTransport
 
     @callback
@@ -194,7 +208,8 @@ def _proc_service(port: int, service_id: int) -> None:
     svc = Service(
         app_name=f"chaos-service-{service_id}",
         workers=4,
-        transports=TCPTransport(HOST, port),
+        transport=TCPTransport(HOST, port),
+        runtime=runtime,
     )
     svc.start()
     svc.join()
@@ -312,7 +327,7 @@ def _do_cast_nowait(conn, rng: random.Random) -> None:
 # ─── caller thread loops ──────────────────────────────────────────────────────
 
 
-def _router_caller_loop(
+def _router_caller_loop(runtime: str, 
     caller_id: int,
     router_port: int,
     worker_names: list[str],
@@ -338,6 +353,7 @@ def _router_caller_loop(
         c = Client(
             app_name=f"chaos-rcaller-{caller_id}-r{attempt}",
             transport=TCPTransport(HOST, router_port),
+            runtime=runtime,
         )
         conn = c.connect()
         conn.wait_for_members(*worker_names, timeout=30)
@@ -412,7 +428,7 @@ def _router_caller_loop(
             pass
 
 
-def _service_caller_loop(
+def _service_caller_loop(runtime: str, 
     caller_id: int,
     service_port: int,
     service_name: str,
@@ -438,6 +454,7 @@ def _service_caller_loop(
         c = Client(
             app_name=f"chaos-scaller-{caller_id}-r{attempt}",
             transport=TCPTransport(HOST, service_port),
+            runtime=runtime,
         )
         conn = c.connect()
         conn.wait_for_members(service_name, timeout=30)
@@ -582,7 +599,7 @@ def _run() -> None:
 
     try:
         # ── router ────────────────────────────────────────────────────────────
-        rproc = mp.Process(target=_proc_router, args=(router_port,), daemon=True)
+        rproc = mp.Process(target=_proc_router, args=(active_runtime(), router_port,), daemon=True)
         rproc.start()
         procs.append(rproc)
         _wait_for_port(router_port)
@@ -590,7 +607,7 @@ def _run() -> None:
 
         # ── workers ───────────────────────────────────────────────────────────
         for i in range(N_WORKERS):
-            p = mp.Process(target=_proc_worker, args=(router_port, i), daemon=True)
+            p = mp.Process(target=_proc_worker, args=(active_runtime(), router_port, i), daemon=True)
             p.start()
             procs.append(p)
 
@@ -601,7 +618,7 @@ def _run() -> None:
         # ── services ──────────────────────────────────────────────────────────
         for i in range(N_SERVICES):
             p = mp.Process(
-                target=_proc_service, args=(service_ports[i], i), daemon=True
+                target=_proc_service, args=(active_runtime(), service_ports[i], i), daemon=True
             )
             p.start()
             procs.append(p)
@@ -612,7 +629,7 @@ def _run() -> None:
         for i in range(N_ROUTER_CALLERS):
             t = threading.Thread(
                 target=_router_caller_loop,
-                args=(i, router_port, worker_names),
+                args=(active_runtime(), i, router_port, worker_names),
                 name=f"RouterCaller-{i}",
                 daemon=True,
             )
@@ -623,7 +640,7 @@ def _run() -> None:
             svc_idx = i % N_SERVICES
             t = threading.Thread(
                 target=_service_caller_loop,
-                args=(i, service_ports[svc_idx], service_names[svc_idx]),
+                args=(active_runtime(), i, service_ports[svc_idx], service_names[svc_idx]),
                 name=f"ServiceCaller-{i}",
                 daemon=True,
             )

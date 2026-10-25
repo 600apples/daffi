@@ -19,7 +19,6 @@ Run these short tests::
 
 from __future__ import annotations
 
-import os
 import subprocess
 import sys
 import textwrap
@@ -31,8 +30,8 @@ from tests._resource_metrics import KiB, MiB
 pytestmark = [
     pytest.mark.memleak,
     # Already parametrizes threads + evented via subprocesses; do not run twice
-    # under --execution-model=both.
-    pytest.mark.execution_models_self_managed,
+    # under --runtime=both.
+    pytest.mark.runtimes_self_managed,
     pytest.mark.skipif(sys.platform == "win32", reason="POSIX-only"),
 ]
 
@@ -42,10 +41,21 @@ MODELS = ("threads", "evented")
 def _run_in_model(
     model: str, code: str, timeout: float = 180
 ) -> subprocess.CompletedProcess:
-    env = dict(os.environ, DAFFI_EXECUTION_MODEL=model)
+    """Run *code* in a fresh interpreter locked to *model*.
+
+    Spawned grandchildren read ``tests.conftest.SELECTED_RUNTIME``, so the prelude sets
+    that before the scenario starts.
+    """
+    prelude = textwrap.dedent(
+        f"""
+        import tests.conftest as _runtime_state
+        from daffi import dfcore as _dfcore
+        _runtime_state.SELECTED_RUNTIME = {model!r}
+        _dfcore.setRuntime({model!r})
+        """
+    )
     return subprocess.run(
-        [sys.executable, "-c", code],
-        env=env,
+        [sys.executable, "-c", prelude + "\n" + code],
         capture_output=True,
         text=True,
         timeout=timeout,
@@ -90,13 +100,14 @@ def test_service_rss_steady_under_connection_churn(model):
 
 _SUSTAINED = textwrap.dedent("""
     import json, multiprocessing as mp, time
+    from tests.conftest import active_runtime
     from tests._resource_metrics import (
         assert_rss_steady_state, free_port, proc_service, rss_kb,
         stop, wait_for_port, _connect_clients, _rpc_burst, _stop_clients,
     )
 
     port = free_port()
-    svc = mp.Process(target=proc_service, args=(port,), daemon=True)
+    svc = mp.Process(target=proc_service, args=(active_runtime(), port,), daemon=True)
     svc.start()
     try:
         wait_for_port(port)
@@ -138,7 +149,7 @@ _COMPARE = textwrap.dedent("""
     many = scenario_many_clients(n_clients=48, calls_per_client=100, sample_s=0.8)
     router = scenario_router(n_clients=24, calls_per_client=100, sample_s=0.8)
     print("RESULT " + json.dumps({
-        "model": dfcore.getExecutionModel(),
+        "model": dfcore.getRuntime(),
         "many_clients": {
             "idle_rss_kb": many.idle.rss_kb,
             "load_rss_kb": many.under_load.rss_kb,

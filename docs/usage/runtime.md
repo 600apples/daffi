@@ -1,7 +1,7 @@
-# Native Execution Model (threads vs evented)
+# Native Runtime (threads vs evented)
 
 daffi's native core, the part written in Zig that owns the sockets of every
-`Router`, `Service` and `Client`, can run in one of two execution models:
+`Router`, `Service` and `Client`, can run in one of two runtimes:
 
 | Model | How connections are served | Native threads |
 |---|---|---|
@@ -13,8 +13,8 @@ threads) vs **`Io.Evented`** (multiplexed / userspace scheduling) in
 [I/O as an Interface](https://ziglang.org/download/0.16.0/release-notes.html#IO-as-an-Interface)
 ([Zig 0.16.0 release notes](https://ziglang.org/download/0.16.0/release-notes.html)).
 daffi’s `threads` / `evented` models follow that idea for the native networking
-core (custom epoll/kqueue loops); they are selected with
-`DAFFI_EXECUTION_MODEL` and are **not** the same as plugging in `std.Io.Evented`
+core (custom epoll/kqueue loops). They are selected with the `runtime`
+argument and are **not** the same as plugging in `std.Io.Evented`
 (Zig’s evented backend is still experimental and does not implement networking
 yet).
 
@@ -24,7 +24,7 @@ the same in both models.
 
 !!! note "Not the same thing as `daffi.aio`"
     [`daffi.aio`](aio.md) is the Python **asyncio** interface: it decides how
-    *your Python code* waits for results. The execution model decides how the
+    *your Python code* waits for results. The runtime decides how the
     *native core* waits for sockets. The two are independent. `daffi.aio`
     works with either model.
 
@@ -32,64 +32,63 @@ the same in both models.
 
 ## Enabling it
 
-The model is selected with an environment variable, read **once per process**
-when the first `Router`, `Service` or `Client` starts:
-
-```bash
-DAFFI_EXECUTION_MODEL=evented python my_service.py
-```
-
-or from Python, before any daffi node is started:
+The runtime is selected **once per process**, by the `runtime` argument of
+any `Router`, `Service`, or `Client`. A client uses the same runtime as a
+server. Omit it, or pass `None`, and that node selects `threads`. A later
+node that asks for the other runtime raises `InitializationError`.
 
 ```python
-import os
-os.environ["DAFFI_EXECUTION_MODEL"] = "evented"
-
-from daffi import Service, callback, TCPTransport
+from daffi import Runtime, Service, callback, TCPTransport
 
 @callback
 def echo(x):
     return x
 
-svc = Service(app_name="echo", transports=TCPTransport("0.0.0.0", 6000))
+svc = Service(
+    app_name="echo",
+    transport=TCPTransport("0.0.0.0", 6000),
+    runtime=Runtime.EVENTED,
+)
 svc.start()
 svc.join()
 ```
 
-Check which model is active:
+`"evented"` is accepted in place of `Runtime.EVENTED`. Check which runtime
+is active:
 
 ```python
 from daffi import dfcore
-print(dfcore.getExecutionModel())   # "threads" or "evented"
+print(dfcore.getRuntime())   # "threads" or "evented"
 ```
 
-| Variable | Values | Default |
+| Argument | Values | Default |
 |---|---|---|
-| `DAFFI_EXECUTION_MODEL` | `threads`, `evented` | `threads` |
+| `runtime` | `Runtime.THREADS`, `Runtime.EVENTED` (or `"threads"`, `"evented"`) | `threads` |
 | `DAFFI_EVENT_LOOPS` | number of event-loop threads, 1–64 | CPU count, capped at 4 |
 
-An unknown value logs a warning and falls back to the default. Child
-processes inherit the variable. Processes created with `fork` after daffi has
-started get their own event loops.
+A value other than those two strings raises `InitializationError`. A process
+started with `spawn` does not inherit the parent's lock, so pass `runtime`
+into that process too. A child created with `fork` after daffi has started
+keeps the runtime the parent already chose and builds its own event loops.
 
 ### Running the test suite against both models
 
 The model is fixed for the life of a process, so pytest cannot flip mid-session.
 The root conftest therefore supports::
 
-    pytest --execution-model=both      # default: threads pass, then evented pass
-    pytest --execution-model=threads   # faster local loop
-    pytest --execution-model=evented
+    pytest --runtime=both      # default: threads pass, then evented pass
+    pytest --runtime=threads   # faster local loop
+    pytest --runtime=evented
 
 `both` starts two fresh interpreters. Perf scripts that already loop over both
-models (`tests/perf/execution_model_*.py`) need no flag.
+models (`tests/perf/runtime_*.py`) need no flag.
 
 ### Long soak / memory-leak run
 
 For a multi-hour load with periodic RSS and CPU sampling (same idea as
 vast-csi's `ResourceSampler`), use::
 
-    python tests/perf/soak_leak_test.py                     # 3 h, threads then evented
+    python tests/perf/soak_leak_test.py                     # 3 h, both models, random order
     python tests/perf/soak_leak_test.py --model evented
     python tests/perf/soak_leak_test.py --hours 0.25 --clients 64   # shorter smoke
 
@@ -105,7 +104,16 @@ The numbers below come from daffi's own benchmark suite
 localhost). Absolute numbers depend on the machine; the comparison between the
 two columns is what matters.
 
-### Speed: the same
+### Speed
+
+One caller, sending calls one after another, is faster with `threads`. That
+covers Client → Service and Client → Router → one worker. Many clients calling
+**one Service at the same time** are faster with `evented`. There is no Router
+in that scenario: every client connects straight to the Service.
+
+`python tests/perf/runtime_benchmark.py` prints this split. Its `direct` and
+`via router` rows are the single sequential caller. Its `concurrent` rows are
+N clients → one Service.
 
 | Benchmark | threads | evented |
 |---|---|---|
@@ -117,9 +125,10 @@ two columns is what matters.
 | Average latency of a small call | 0.088 ms | 0.082 ms |
 | 28 MiB messages, MiB/s | 1,781 | 1,690 |
 
-Differences are within run-to-run noise. A daffi call spends most of its time
-in Python (serialization, the GIL, your callback), not waiting on the socket,
-so the native execution model does not make individual calls faster or slower.
+Absolute numbers move from machine to machine. A daffi call still spends most
+of its time in Python (serialization, the GIL, your callback). The runtime
+shows up when many connections are active together, and in how many native
+threads that takes.
 
 ### Native threads: very different
 
@@ -143,6 +152,9 @@ idle threaded one.
 
 **Use `evented` when:**
 
+- Many clients call the **same Service at the same time**. Throughput is
+  higher, and the Service stays at a few native threads instead of one per
+  client.
 - A `Router` or `Service` serves **many connections at once**: hundreds or
   thousands of clients or workers.
 - Most connections are **idle most of the time**, e.g. many workers waiting
@@ -154,8 +166,9 @@ idle threaded one.
 
 **Keep `threads` (the default) when:**
 
-- There are only a **few connections**. Both models perform about the same,
-  and `threads` is the long-standing default.
+- **One caller** sends calls one after another, either straight to a Service
+  or through a Router to a worker. That path is faster with `threads`.
+- There are only a **few connections**.
 - Peers may be **slow to read what they are sent**, e.g. large messages or
   streams to clients on slow or distant networks. In the evented model a
   Router forwards messages from its event-loop thread, and writes still block.
@@ -196,7 +209,7 @@ The evented model is available on macOS and Linux.
 ## Measuring on your own machine
 
 ```bash
-python tests/perf/execution_model_benchmark.py --clients 64 --seconds 5
+python tests/perf/runtime_benchmark.py --clients 64 --seconds 5
 ```
 
 The script runs the same scenarios once per model and prints the throughput,

@@ -10,6 +10,7 @@ Regression tests for the robustness fixes in the native core.
 """
 
 from __future__ import annotations
+from tests.conftest import active_runtime
 
 import base64
 import multiprocessing as mp
@@ -120,7 +121,7 @@ def _poke(port: int, payload: bytes, *, linger: float = 0.15) -> None:
 
 @pytest.fixture
 def service_proc(free_port):
-    proc = mp.Process(target=proc_service, args=(free_port,), daemon=True)
+    proc = mp.Process(target=proc_service, args=(active_runtime(), free_port,), daemon=True)
     proc.start()
     wait_for_port(free_port)
     wait_for_members(free_port, {"integ-service"})
@@ -130,7 +131,7 @@ def service_proc(free_port):
 
 @pytest.fixture
 def router_proc(free_port):
-    proc = mp.Process(target=proc_router, args=(free_port,), daemon=True)
+    proc = mp.Process(target=proc_router, args=(active_runtime(), free_port,), daemon=True)
     proc.start()
     wait_for_port(free_port)
     yield proc, free_port
@@ -162,7 +163,7 @@ def test_service_still_serves_after_all_malformed_input(service_proc):
         _poke(port, payload, linger=0.02)
     assert proc.is_alive()
 
-    client = Client(app_name="after-garbage", transport=TCPTransport(HOST, port))
+    client = Client(app_name="after-garbage", transport=TCPTransport(HOST, port), runtime=active_runtime())
     conn = client.connect()
     try:
         conn.wait_for_members("integ-service", timeout=10)
@@ -179,7 +180,7 @@ def test_silent_peer_does_not_block_accept(service_proc):
     silent = [socket.create_connection((HOST, port)) for _ in range(5)]
     try:
         t0 = time.monotonic()
-        client = Client(app_name="behind-silent", transport=TCPTransport(HOST, port))
+        client = Client(app_name="behind-silent", transport=TCPTransport(HOST, port), runtime=active_runtime())
         conn = client.connect()
         try:
             conn.wait_for_members("integ-service", timeout=10)
@@ -220,7 +221,7 @@ def test_disconnected_clients_do_not_leak_sockets(service_proc):
     baseline = _open_fd_count(proc.pid)
 
     for i in range(15):
-        client = Client(app_name=f"leak-probe-{i}", transport=TCPTransport(HOST, port))
+        client = Client(app_name=f"leak-probe-{i}", transport=TCPTransport(HOST, port), runtime=active_runtime())
         conn = client.connect()
         conn.wait_for_members("integ-service", timeout=10)
         client.stop()
@@ -246,8 +247,8 @@ def test_disconnected_clients_do_not_leak_sockets(service_proc):
 # ── 3. stop() ─────────────────────────────────────────────────────────────────
 
 
-def _stop_restart_target(port: int, q) -> None:
-    silence_subprocess()
+def _stop_restart_target(runtime: str, port: int, q) -> None:
+    silence_subprocess(runtime)
     import threading
 
     from daffi import Router, Service, callback, TCPTransport
@@ -259,7 +260,8 @@ def _stop_restart_target(port: int, q) -> None:
     try:
         for _ in range(2):  # second round proves the port was released
             svc = Service(
-                app_name="stop-svc", workers=2, transports=TCPTransport(HOST, port)
+                app_name="stop-svc", workers=2, transport=TCPTransport(HOST, port),
+                runtime=runtime,
             )
             svc.start()
             done = threading.Event()
@@ -275,7 +277,7 @@ def _stop_restart_target(port: int, q) -> None:
                 return
 
         for _ in range(2):
-            r = Router(app_name="stop-router", transports=TCPTransport(HOST, port))
+            r = Router(app_name="stop-router", transport=TCPTransport(HOST, port), runtime=runtime)
             r.start()
             done = threading.Event()
 
@@ -294,7 +296,7 @@ def _stop_restart_target(port: int, q) -> None:
 
 def test_server_stop_returns_and_releases_port(free_port):
     q = mp.Queue()
-    proc = mp.Process(target=_stop_restart_target, args=(free_port, q), daemon=True)
+    proc = mp.Process(target=_stop_restart_target, args=(active_runtime(), free_port, q), daemon=True)
     proc.start()
     try:
         result = q.get(timeout=90)
@@ -307,12 +309,12 @@ def test_server_stop_with_connected_client(free_port):
     """stop() must also tear down live connections instead of waiting on them."""
     from daffi import Client, TCPTransport
 
-    proc = mp.Process(target=proc_service, args=(free_port,), daemon=True)
+    proc = mp.Process(target=proc_service, args=(active_runtime(), free_port,), daemon=True)
     proc.start()
     try:
         wait_for_port(free_port)
         wait_for_members(free_port, {"integ-service"})
-        client = Client(app_name="stop-victim", transport=TCPTransport(HOST, free_port))
+        client = Client(app_name="stop-victim", transport=TCPTransport(HOST, free_port), runtime=active_runtime())
         conn = client.connect()
         conn.wait_for_members("integ-service", timeout=10)
         proc.terminate()  # SIGTERM -> native handler / atexit stop

@@ -17,6 +17,7 @@ responses.  The tests below verify:
 """
 
 from __future__ import annotations
+from tests.conftest import active_runtime
 
 import multiprocessing as mp
 import threading
@@ -29,14 +30,14 @@ from .conftest import HOST, TIMEOUT, wait_for_port, silence_subprocess, quiet_ki
 # ── subprocess entry points ────────────────────────────────────────────────────
 
 
-def _proc_service_overflow(port: int) -> None:
+def _proc_service_overflow(runtime: str, port: int) -> None:
     """Service with two callbacks:
 
     * ``hold_echo`` — waits on a 2-party barrier so that exactly two calls are
       released simultaneously, ensuring both responses arrive close together.
     * ``fast_echo`` — returns immediately; used for no-wait calls.
     """
-    silence_subprocess()
+    silence_subprocess(runtime)
     from daffi import Service, callback, TCPTransport
 
     _barrier = threading.Barrier(2)
@@ -51,7 +52,8 @@ def _proc_service_overflow(port: int) -> None:
         return payload
 
     svc = Service(
-        app_name="overflow-svc", workers=40, transports=TCPTransport(HOST, port)
+        app_name="overflow-svc", workers=40, transport=TCPTransport(HOST, port),
+        runtime=runtime,
     )
     svc.start()
     svc.join()
@@ -62,7 +64,7 @@ def _proc_service_overflow(port: int) -> None:
 
 @pytest.fixture
 def overflow_service(free_port):
-    proc = mp.Process(target=_proc_service_overflow, args=(free_port,), daemon=True)
+    proc = mp.Process(target=_proc_service_overflow, args=(active_runtime(), free_port,), daemon=True)
     proc.start()
     wait_for_port(free_port)
     time.sleep(0.2)
@@ -90,7 +92,8 @@ class TestStoreOverflow:
         from daffi._serialization import Serializer, SerdeFormat
 
         client = Client(
-            app_name="overflow-cli", transport=TCPTransport(HOST, overflow_service)
+            app_name="overflow-cli", transport=TCPTransport(HOST, overflow_service),
+            runtime=active_runtime(),
         )
         conn = client.connect()
         conn_num = client._conn_num
@@ -179,6 +182,7 @@ class TestStoreOverflow:
         client = Client(
             app_name="overflow-nowait-cli",
             transport=TCPTransport(HOST, overflow_service),
+            runtime=active_runtime(),
         )
         conn = client.connect()
 
@@ -206,6 +210,7 @@ class TestStoreOverflow:
         client = Client(
             app_name="overflow-heavy-cli",
             transport=TCPTransport(HOST, overflow_service),
+            runtime=active_runtime(),
         )
         conn = client.connect()
         proxy = conn.rpc(timeout=TIMEOUT)

@@ -15,6 +15,7 @@ This test:
 """
 
 from __future__ import annotations
+from tests.conftest import active_runtime
 
 import asyncio
 import multiprocessing as mp
@@ -45,8 +46,8 @@ class _AsyncBarrier2:
         await self._event.wait()
 
 
-def _proc_service_overflow(port: int) -> None:
-    silence_subprocess()
+def _proc_service_overflow(runtime: str, port: int) -> None:
+    silence_subprocess(runtime)
 
     async def _main():
         from daffi import callback, TCPTransport
@@ -65,7 +66,8 @@ def _proc_service_overflow(port: int) -> None:
             return payload
 
         svc = AsyncService(
-            app_name="overflow-aio-svc", workers=4, transports=TCPTransport(HOST, port)
+            app_name="overflow-aio-svc", workers=4, transport=TCPTransport(HOST, port),
+            runtime=runtime,
         )
         await svc.start()
         await svc.join()
@@ -75,7 +77,7 @@ def _proc_service_overflow(port: int) -> None:
 
 @pytest.fixture
 def overflow_service(free_port):
-    proc = mp.Process(target=_proc_service_overflow, args=(free_port,), daemon=True)
+    proc = mp.Process(target=_proc_service_overflow, args=(active_runtime(), free_port,), daemon=True)
     proc.start()
     wait_for_port(free_port, proc=proc)
     time.sleep(0.2)
@@ -102,6 +104,7 @@ class TestStoreOverflowAsync:
         client = AsyncClient(
             app_name="overflow-aio-caller",
             transport=TCPTransport(HOST, overflow_service),
+            runtime=active_runtime(),
         )
         conn = await client.connect()
         conn_num = client._conn_num
