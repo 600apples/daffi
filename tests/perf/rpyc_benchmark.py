@@ -34,12 +34,13 @@ from pathlib import Path
 
 _DATA_FILE = Path(__file__).parent / "data.json"
 
-N      = 100_000  # measured calls per layout — same as perf_benchmark.py
+N = 100_000  # measured calls per layout — same as perf_benchmark.py
 WARMUP = 20
 TIMEOUT = 30
-HOST   = "127.0.0.1"
+HOST = "127.0.0.1"
 
 # ── helpers ───────────────────────────────────────────────────────────────────
+
 
 def _free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -56,7 +57,9 @@ def _wait_for_port(port: int, timeout: float = 15.0) -> None:
                 return
         except OSError:
             time.sleep(0.05)
-    raise TimeoutError(f"Server on {HOST}:{port} did not become ready within {timeout}s")
+    raise TimeoutError(
+        f"Server on {HOST}:{port} did not become ready within {timeout}s"
+    )
 
 
 def _silence() -> None:
@@ -74,6 +77,7 @@ def _report(label: str, latencies_ms: list[float]) -> None:
 
 
 # ── subprocess entry points ────────────────────────────────────────────────────
+
 
 def _proc_rpyc_server(port: int) -> None:
     _silence()
@@ -136,6 +140,7 @@ def _proc_rpyc_proxy(proxy_port: int, worker_port: int) -> None:
 
 # ── benchmark functions ────────────────────────────────────────────────────────
 
+
 def bench_rpyc_direct(data: dict) -> list[float]:
     import rpyc
 
@@ -144,7 +149,11 @@ def bench_rpyc_direct(data: dict) -> list[float]:
     proc.start()
     try:
         _wait_for_port(port)
-        conn = rpyc.connect(HOST, port, config={"allow_public_attrs": True, "sync_request_timeout": TIMEOUT})
+        conn = rpyc.connect(
+            HOST,
+            port,
+            config={"allow_public_attrs": True, "sync_request_timeout": TIMEOUT},
+        )
         svc = conn.root
 
         print(f"  [rpyc-direct] warming up ({WARMUP} calls)…", end="", flush=True)
@@ -171,10 +180,12 @@ def bench_rpyc_via_proxy(data: dict) -> list[float]:
     import rpyc
 
     worker_port = _free_port()
-    proxy_port  = _free_port()
+    proxy_port = _free_port()
 
     worker_proc = mp.Process(target=_proc_rpyc_worker, args=(worker_port,), daemon=True)
-    proxy_proc  = mp.Process(target=_proc_rpyc_proxy,  args=(proxy_port, worker_port), daemon=True)
+    proxy_proc = mp.Process(
+        target=_proc_rpyc_proxy, args=(proxy_port, worker_port), daemon=True
+    )
 
     worker_proc.start()
     try:
@@ -183,7 +194,11 @@ def bench_rpyc_via_proxy(data: dict) -> list[float]:
         _wait_for_port(proxy_port)
         time.sleep(0.1)
 
-        conn = rpyc.connect(HOST, proxy_port, config={"allow_public_attrs": True, "sync_request_timeout": TIMEOUT})
+        conn = rpyc.connect(
+            HOST,
+            proxy_port,
+            config={"allow_public_attrs": True, "sync_request_timeout": TIMEOUT},
+        )
         svc = conn.root
 
         print(f"  [rpyc-proxy] warming up ({WARMUP} calls)…", end="", flush=True)
@@ -210,6 +225,7 @@ def bench_rpyc_via_proxy(data: dict) -> list[float]:
 
 # ── main ───────────────────────────────────────────────────────────────────────
 
+
 def main() -> None:
     logging.disable(logging.INFO)
 
@@ -218,7 +234,9 @@ def main() -> None:
     data: dict = json.loads(_DATA_FILE.read_text())
     payload_bytes = len(json.dumps(data).encode())
 
-    print(f"\nRPyC {_rpyc.__version__} performance benchmark  —  {N} sequential calls per layout")
+    print(
+        f"\nRPyC {_rpyc.__version__} performance benchmark  —  {N} sequential calls per layout"
+    )
     print(f"host: {HOST}   warmup: {WARMUP} calls   timeout: {TIMEOUT}s")
     print(f"payload: {_DATA_FILE.name}  ({payload_bytes} bytes JSON)\n")
 
@@ -231,8 +249,10 @@ def main() -> None:
     _report("Via Proxy: Client → Proxy → Worker", proxy_lat)
 
     d_avg_s = sum(direct_lat) / len(direct_lat) / 1_000
-    r_avg_s = sum(proxy_lat)  / len(proxy_lat)  / 1_000
-    print(f"\n  Proxy overhead vs direct: {(r_avg_s - d_avg_s) * 1000:+.3f} ms / call\n")
+    r_avg_s = sum(proxy_lat) / len(proxy_lat) / 1_000
+    print(
+        f"\n  Proxy overhead vs direct: {(r_avg_s - d_avg_s) * 1000:+.3f} ms / call\n"
+    )
 
 
 if __name__ == "__main__":

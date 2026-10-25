@@ -6,6 +6,7 @@ The native TLS layer was reworked to (a) serialise access to each ``SSL*``
 cannot stall the accept loop, (c) verify the server certificate *and* host
 name, and (d) refuse a server that asks for TLS without a certificate.
 """
+
 from __future__ import annotations
 
 import multiprocessing as mp
@@ -25,16 +26,32 @@ pytestmark = pytest.mark.skipif(OPENSSL is None, reason="openssl CLI not availab
 
 # ── certificates ──────────────────────────────────────────────────────────────
 
+
 def _make_cert(directory, name: str, san: str):
     cert = directory / f"{name}.crt"
     key = directory / f"{name}.key"
     subprocess.run(
         [
-            OPENSSL, "req", "-x509", "-newkey", "rsa:2048", "-nodes",
-            "-keyout", str(key), "-out", str(cert), "-days", "2",
-            "-subj", "/CN=daffi-test", "-addext", f"subjectAltName={san}",
+            OPENSSL,
+            "req",
+            "-x509",
+            "-newkey",
+            "rsa:2048",
+            "-nodes",
+            "-keyout",
+            str(key),
+            "-out",
+            str(cert),
+            "-days",
+            "2",
+            "-subj",
+            "/CN=daffi-test",
+            "-addext",
+            f"subjectAltName={san}",
         ],
-        check=True, capture_output=True, timeout=60,
+        check=True,
+        capture_output=True,
+        timeout=60,
     )
     return str(cert), str(key)
 
@@ -53,9 +70,10 @@ def certs(tmp_path_factory):
 
 # ── subprocess servers ────────────────────────────────────────────────────────
 
+
 def _tls_service(port: int, cert: str, key: str) -> None:
     silence_subprocess()
-    from daffi import Service, callback
+    from daffi import Service, callback, TCPTransport
 
     @callback
     def echo(payload):
@@ -66,8 +84,12 @@ def _tls_service(port: int, cert: str, key: str) -> None:
         return a + b
 
     svc = Service(
-        app_name="tls-service", host=HOST, port=port, workers=4,
-        tls=True, cert_file=cert, key_file=key,
+        app_name="tls-service",
+        workers=4,
+        tls=True,
+        cert_file=cert,
+        key_file=key,
+        transports=TCPTransport(HOST, port),
     )
     svc.start()
     svc.join()
@@ -75,10 +97,12 @@ def _tls_service(port: int, cert: str, key: str) -> None:
 
 def _tls_service_without_cert(port: int, q) -> None:
     silence_subprocess()
-    from daffi import Service
+    from daffi import Service, TCPTransport
 
     try:
-        Service(app_name="tls-nocert", host=HOST, port=port, tls=True).start()
+        Service(
+            app_name="tls-nocert", tls=True, transports=TCPTransport(HOST, port)
+        ).start()
         q.put("started")
     except BaseException as exc:  # noqa: BLE001
         q.put(f"error:{type(exc).__name__}")
@@ -100,14 +124,17 @@ def tls_service(free_port, certs):
 
 
 def _connect(port, ca_file, name="tls-client"):
-    from daffi import Client
+    from daffi import Client, TCPTransport
 
-    client = Client(app_name=name, host=HOST, port=port, tls=True, ca_file=ca_file)
+    client = Client(
+        app_name=name, tls=True, ca_file=ca_file, transport=TCPTransport(HOST, port)
+    )
     conn = client.connect()
     return client, conn
 
 
 # ── tests ─────────────────────────────────────────────────────────────────────
+
 
 def test_tls_round_trip(tls_service):
     _, port, ca = tls_service
@@ -189,7 +216,11 @@ def test_client_rejects_certificate_for_other_host(free_port, certs):
 def test_plaintext_and_garbage_do_not_hurt_tls_server(tls_service):
     proc, port, ca = tls_service
 
-    for payload in (b"GET / HTTP/1.1\r\n\r\n", b"\x16\x03\x01\x00\x05garbage", b"\x00" * 64):
+    for payload in (
+        b"GET / HTTP/1.1\r\n\r\n",
+        b"\x16\x03\x01\x00\x05garbage",
+        b"\x00" * 64,
+    ):
         with socket.create_connection((HOST, port), timeout=2) as s:
             s.settimeout(0.5)
             s.sendall(payload)
@@ -219,7 +250,9 @@ def test_plaintext_and_garbage_do_not_hurt_tls_server(tls_service):
 
 def test_server_tls_without_certificate_is_an_error(free_port):
     q = mp.Queue()
-    proc = mp.Process(target=_tls_service_without_cert, args=(free_port, q), daemon=True)
+    proc = mp.Process(
+        target=_tls_service_without_cert, args=(free_port, q), daemon=True
+    )
     proc.start()
     try:
         result = q.get(timeout=30)

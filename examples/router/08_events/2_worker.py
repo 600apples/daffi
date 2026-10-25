@@ -7,7 +7,8 @@ connected node whenever the membership changes.
 
 Start 1_router.py first, then this, then 3_caller.py.
 """
-from daffi import Client, callback
+
+from daffi import Client, callback, TCPTransport
 
 
 @callback
@@ -27,7 +28,7 @@ if __name__ == "__main__":
             online_nodes.discard(name)
             print(f"[worker] ✦ {name!r} left    — online: {sorted(online_nodes)}")
 
-    worker = Client(app_name="event-worker", host="0.0.0.0", port=6008)
+    worker = Client(app_name="event-worker", transport=TCPTransport("0.0.0.0", 6008))
     worker.add_event_handler(on_event)
     conn = worker.connect()
     print("Worker connected — press Ctrl+C to stop.")

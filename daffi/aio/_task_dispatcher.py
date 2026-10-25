@@ -52,6 +52,7 @@ if TYPE_CHECKING:
 # Async callback executor
 # ---------------------------------------------------------------------------
 
+
 async def _execute_task_async(
     func_name: str,
     serde: SerdeFormat,
@@ -94,6 +95,7 @@ async def _execute_task_async(
 # ---------------------------------------------------------------------------
 # Lifecycle signal handler (async version)
 # ---------------------------------------------------------------------------
+
 
 async def _handle_lifecycle_signal_async(
     conn: Any,
@@ -146,6 +148,7 @@ async def _handle_lifecycle_signal_async(
 # AsyncTaskDispatcher
 # ---------------------------------------------------------------------------
 
+
 class AsyncTaskDispatcher:
     """Async counterpart of :class:`~daffi._task_dispatcher.TaskDispatcher`.
 
@@ -191,9 +194,7 @@ class AsyncTaskDispatcher:
             return
         loop = asyncio.get_event_loop()
         for i in range(self.workers):
-            t = loop.create_task(
-                self._worker_loop(), name=f"daffi-aio-worker-{i}"
-            )
+            t = loop.create_task(self._worker_loop(), name=f"daffi-aio-worker-{i}")
             self._workers.append(t)
 
     async def _worker_loop(self) -> None:
@@ -272,13 +273,13 @@ class AsyncTaskDispatcher:
         wakeup = WakeupFd()
         lc = WakeupFd(pipe=True)
 
-        self._conns[conn_num] = _ConnEntry(
-            conn=connection, wakeup=wakeup, lifecycle=lc
-        )
+        self._conns[conn_num] = _ConnEntry(conn=connection, wakeup=wakeup, lifecycle=lc)
         self._rfd_to_conn_num[wakeup.read_fd] = conn_num
         self._rfd_to_conn_num[lc.read_fd] = conn_num
 
-        set_request_fd(conn_num, wakeup.write_fd, server_mode=bool(connection.server_mode))
+        set_request_fd(
+            conn_num, wakeup.write_fd, server_mode=bool(connection.server_mode)
+        )
         if connection.server_mode is None:
             set_lifecycle_fd(conn_num, lc.write_fd)
 
@@ -356,6 +357,7 @@ class AsyncTaskDispatcher:
                 def _cb() -> None:
                     if not f.done():
                         f.set_result(None)
+
                 return _cb
 
             registered: list[int] = []

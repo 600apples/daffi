@@ -7,8 +7,9 @@ dedicated server.
 
 Start 1_router.py first, then this, then 3_node_a.py.
 """
+
 import asyncio
-from daffi import callback
+from daffi import callback, TCPTransport
 from daffi.aio import AsyncClient
 
 
@@ -20,7 +21,7 @@ async def greet(name: str) -> str:
 
 
 async def main():
-    node = AsyncClient(app_name="node-b", host="0.0.0.0", port=6003)
+    node = AsyncClient(app_name="node-b", transport=TCPTransport("0.0.0.0", 6003))
     conn = await node.connect()
     print("node-b connected — waiting for node-a…")
 

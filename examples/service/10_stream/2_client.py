@@ -11,8 +11,9 @@ Demonstrates two streaming modes:
 
 Run 1_service.py first.
 """
+
 import time
-from daffi import Client
+from daffi import Client, TCPTransport
 
 CHUNKS = [
     b"The quick brown fox",
@@ -29,8 +30,9 @@ def data_source():
         print(f"[client] -> {chunk!r}")
         yield chunk
 
+
 if __name__ == "__main__":
-    client = Client(app_name="stream-client", host="0.0.0.0", port=5010)
+    client = Client(app_name="stream-client", transport=TCPTransport("0.0.0.0", 5010))
     conn = client.connect()
 
     print("\n── stream() — blocking, backpressure ──")

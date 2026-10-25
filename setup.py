@@ -47,6 +47,7 @@ for an architecture other than the runner's native one.  ``ZigBuilder`` reads
 that variable and passes the appropriate ``-target`` triple to ``zig
 build-lib`` so the emitted shared library has the correct architecture.
 """
+
 import os
 import sys
 import shutil
@@ -58,7 +59,6 @@ import urllib.request
 from setuptools import setup, Extension, Command
 from setuptools.command.build_ext import build_ext
 
-
 _ZIG_VERSION = "0.17.0"
 _OPENSSL_VERSION = os.environ.get("DAFFI_OPENSSL_VERSION", "3.4.1")
 
@@ -67,11 +67,26 @@ _OPENSSL_VERSION = os.environ.get("DAFFI_OPENSSL_VERSION", "3.4.1")
 # ``.tar.gz.sha256`` files published with each OpenSSL GitHub release.
 # Bump these together with the versions above.
 _ZIG_SHA256 = {
-    ("aarch64", "macos"):   "b607e9b9234790a008116ae5bdb71c6243b84b9fb42a53a9e70fde41c06c536a",
-    ("x86_64",  "macos"):   "4f9a1c5269aa17ebda5e6d3c2b89d6cbf36f7d2b22a0306e9ab98f25f95529c6",
-    ("aarch64", "linux"):   "9e8d11661d4ae3bd57702a3832781e23ad151dde5798e16a5ccd503f65234ff8",
-    ("x86_64",  "linux"):   "1cbe9df9f27e6b78d14ccbca43b6703a404ef79ef1c463de901d7f088d4e2026",
-    ("x86_64",  "windows"): "b5663f69581dcf391293fbf16c06cb80d81d806545ce618b4d0bab7f0eb8c428",
+    (
+        "aarch64",
+        "macos",
+    ): "b607e9b9234790a008116ae5bdb71c6243b84b9fb42a53a9e70fde41c06c536a",
+    (
+        "x86_64",
+        "macos",
+    ): "4f9a1c5269aa17ebda5e6d3c2b89d6cbf36f7d2b22a0306e9ab98f25f95529c6",
+    (
+        "aarch64",
+        "linux",
+    ): "9e8d11661d4ae3bd57702a3832781e23ad151dde5798e16a5ccd503f65234ff8",
+    (
+        "x86_64",
+        "linux",
+    ): "1cbe9df9f27e6b78d14ccbca43b6703a404ef79ef1c463de901d7f088d4e2026",
+    (
+        "x86_64",
+        "windows",
+    ): "b5663f69581dcf391293fbf16c06cb80d81d806545ce618b4d0bab7f0eb8c428",
 }
 _OPENSSL_SHA256 = {
     "3.4.1": "002a2d6b30b58bf4bea46c43bdd96365aaf8daa6c428782aa4feee06da197df3",
@@ -127,10 +142,14 @@ def _ensure_zig() -> str:
     """
     zig = shutil.which("zig")
     if zig:
-        found = subprocess.run([zig, "version"], capture_output=True, text=True).stdout.strip()
+        found = subprocess.run(
+            [zig, "version"], capture_output=True, text=True
+        ).stdout.strip()
         if found == _ZIG_VERSION:
             return zig
-        print(f"setup.py: ignoring {zig!r} (Zig {found or 'unknown'}, need {_ZIG_VERSION})")
+        print(
+            f"setup.py: ignoring {zig!r} (Zig {found or 'unknown'}, need {_ZIG_VERSION})"
+        )
 
     machine = platform.machine().lower()
     arch = "aarch64" if machine in ("aarch64", "arm64") else "x86_64"
@@ -149,8 +168,8 @@ def _ensure_zig() -> str:
         )
 
     dir_name = f"zig-{arch}-{os_name}-{_ZIG_VERSION}"
-    zig_dir  = os.path.join(tempfile.gettempdir(), dir_name)
-    zig_exe  = os.path.join(zig_dir, "zig.exe" if sys.platform == "win32" else "zig")
+    zig_dir = os.path.join(tempfile.gettempdir(), dir_name)
+    zig_exe = os.path.join(zig_dir, "zig.exe" if sys.platform == "win32" else "zig")
 
     if os.path.isfile(zig_exe):
         print(f"setup.py: reusing cached Zig at {zig_exe!r}")
@@ -160,7 +179,7 @@ def _ensure_zig() -> str:
 
     if sys.platform == "win32":
         archive_name = f"{dir_name}.zip"
-        url     = f"https://ziglang.org/download/{_ZIG_VERSION}/{archive_name}"
+        url = f"https://ziglang.org/download/{_ZIG_VERSION}/{archive_name}"
         archive = os.path.join(tempfile.gettempdir(), archive_name)
 
         print(f"setup.py: downloading Zig {_ZIG_VERSION} from {url!r} …")
@@ -172,12 +191,13 @@ def _ensure_zig() -> str:
         _verify_sha256(archive, zig_sha, f"Zig {_ZIG_VERSION} ({arch}-{os_name})")
         print(f"setup.py: extracting {archive!r} …")
         import zipfile
+
         with zipfile.ZipFile(archive, "r") as zf:
             zf.extractall(tempfile.gettempdir())
     else:
-        tarball  = f"{dir_name}.tar.xz"
-        url      = f"https://ziglang.org/download/{_ZIG_VERSION}/{tarball}"
-        archive  = os.path.join(tempfile.gettempdir(), tarball)
+        tarball = f"{dir_name}.tar.xz"
+        url = f"https://ziglang.org/download/{_ZIG_VERSION}/{tarball}"
+        archive = os.path.join(tempfile.gettempdir(), tarball)
 
         print(f"setup.py: downloading Zig {_ZIG_VERSION} from {url!r} …")
         try:
@@ -291,16 +311,14 @@ def _dir_has_openssl_libs(lib_dir: str) -> bool:
 
 def _dir_has_openssl_headers(include_dir: str) -> bool:
     return bool(
-        include_dir
-        and os.path.isfile(os.path.join(include_dir, "openssl", "ssl.h"))
+        include_dir and os.path.isfile(os.path.join(include_dir, "openssl", "ssl.h"))
     )
 
 
 def _system_openssl_ok() -> bool:
     """True when Zig can compile/link against the OS OpenSSL without help."""
     include_ok = any(
-        _dir_has_openssl_headers(d)
-        for d in ("/usr/include", "/usr/local/include")
+        _dir_has_openssl_headers(d) for d in ("/usr/include", "/usr/local/include")
     )
     if not include_ok:
         return False
@@ -335,9 +353,7 @@ def _openssl_prefix_paths(prefix: str):
 def _ensure_openssl_unix():
     """Download and build a static OpenSSL into ``/tmp``, reusing the cache."""
     arch = _openssl_host_arch()
-    prefix = os.path.join(
-        tempfile.gettempdir(), f"openssl-{_OPENSSL_VERSION}-{arch}"
-    )
+    prefix = os.path.join(tempfile.gettempdir(), f"openssl-{_OPENSSL_VERSION}-{arch}")
     cached = _openssl_prefix_paths(prefix)
     if cached[0]:
         print(f"setup.py: reusing cached OpenSSL at {prefix!r}")
@@ -355,9 +371,7 @@ def _ensure_openssl_unix():
         tempfile.gettempdir(), f"openssl-{_OPENSSL_VERSION}-src-{arch}"
     )
     src_dir = os.path.join(src_root, f"openssl-{_OPENSSL_VERSION}")
-    tarball = os.path.join(
-        tempfile.gettempdir(), f"openssl-{_OPENSSL_VERSION}.tar.gz"
-    )
+    tarball = os.path.join(tempfile.gettempdir(), f"openssl-{_OPENSSL_VERSION}.tar.gz")
     url = (
         "https://github.com/openssl/openssl/releases/download/"
         f"openssl-{_OPENSSL_VERSION}/openssl-{_OPENSSL_VERSION}.tar.gz"
@@ -368,7 +382,8 @@ def _ensure_openssl_unix():
             _download_file(url, tarball)
         _verify_sha256(
             tarball,
-            os.environ.get("DAFFI_OPENSSL_SHA256") or _OPENSSL_SHA256.get(_OPENSSL_VERSION),
+            os.environ.get("DAFFI_OPENSSL_SHA256")
+            or _OPENSSL_SHA256.get(_OPENSSL_VERSION),
             f"OpenSSL {_OPENSSL_VERSION} source tarball "
             "(set DAFFI_OPENSSL_SHA256 when overriding DAFFI_OPENSSL_VERSION)",
         )
@@ -405,12 +420,8 @@ def _ensure_openssl_unix():
         cwd=src_dir,
         stdout=build_out,
     )
-    subprocess.check_call(
-        ["make", f"-j{jobs}"], cwd=src_dir, stdout=build_out
-    )
-    subprocess.check_call(
-        ["make", "install_sw"], cwd=src_dir, stdout=build_out
-    )
+    subprocess.check_call(["make", f"-j{jobs}"], cwd=src_dir, stdout=build_out)
+    subprocess.check_call(["make", "install_sw"], cwd=src_dir, stdout=build_out)
 
     result = _openssl_prefix_paths(prefix)
     if not result[0]:
@@ -472,9 +483,7 @@ def _ensure_openssl_windows():
             except OSError:
                 shutil.copy2(src, dst)
 
-    if not (
-        _dir_has_openssl_headers(include_dir) and _dir_has_openssl_libs(amd64)
-    ):
+    if not (_dir_has_openssl_headers(include_dir) and _dir_has_openssl_libs(amd64)):
         raise RuntimeError(f"Windows OpenSSL cache incomplete under {amd64!r}")
 
     print(f"setup.py: OpenSSL ({branch}) ready at {amd64!r}")
@@ -525,7 +534,9 @@ def _find_openssl():
         # /usr/local     → x86_64 Homebrew (Intel / Rosetta)
         machine = platform.machine()
         brew_prefix = "/opt/homebrew" if machine == "arm64" else "/usr/local"
-        print(f"setup.py: macOS machine={machine!r}, using Homebrew prefix {brew_prefix!r}")
+        print(
+            f"setup.py: macOS machine={machine!r}, using Homebrew prefix {brew_prefix!r}"
+        )
 
         for pkg in ("openssl@3", "openssl@1.1", "openssl"):
             candidate = os.path.join(brew_prefix, "opt", pkg)
@@ -539,9 +550,13 @@ def _find_openssl():
         # Fallback: try the brew command (e.g. non-standard installations).
         for pkg in ("openssl@3", "openssl@1.1", "openssl"):
             try:
-                prefix = subprocess.check_output(
-                    ["brew", "--prefix", pkg], stderr=subprocess.DEVNULL
-                ).decode().strip()
+                prefix = (
+                    subprocess.check_output(
+                        ["brew", "--prefix", pkg], stderr=subprocess.DEVNULL
+                    )
+                    .decode()
+                    .strip()
+                )
                 if prefix and os.path.isdir(prefix):
                     print(f"setup.py: OpenSSL via brew at {prefix!r}")
                     return (
@@ -698,11 +713,17 @@ class ZigTest(Command):
         libdir = sysconfig.get_config_var("LIBDIR")
         ldversion = sysconfig.get_config_var("LDVERSION")
         cmd = [
-            zig, "test",
+            zig,
+            "test",
             "-lc",
-            f"-L{libdir}", f"-lpython{ldversion}", "-rpath", libdir,
+            f"-L{libdir}",
+            f"-lpython{ldversion}",
+            "-rpath",
+            libdir,
             *_openssl_link_args(openssl_lib),
-            *zig_c_module_args(zig, os.path.join(_HERE, "build", "zig_test"), include_dirs),
+            *zig_c_module_args(
+                zig, os.path.join(_HERE, "build", "zig_test"), include_dirs
+            ),
         ]
         subprocess.check_call(cmd, cwd=_HERE)
 
@@ -726,7 +747,8 @@ class ZigBuilder(build_ext):
         cmd = [
             zig,
             "build-lib",
-            "-O", mode,
+            "-O",
+            mode,
             "-lc",
             f"-femit-bin={self.get_ext_fullpath(ext.name)}",
             "-fallow-shlib-undefined",
@@ -750,16 +772,16 @@ class ZigBuilder(build_ext):
         else:
             cmd.extend(_openssl_link_args(openssl_lib))
 
-        cmd += zig_c_module_args(zig, os.path.join(self.build_temp, "zig_c"), include_dirs, target)
+        cmd += zig_c_module_args(
+            zig, os.path.join(self.build_temp, "zig_c"), include_dirs, target
+        )
         self.spawn(cmd)
 
         # Local Windows installs need OpenSSL DLLs next to the extension.
         if sys.platform == "win32" and openssl_lib and os.path.isdir(openssl_lib):
             for name in os.listdir(openssl_lib):
                 lower = name.lower()
-                if lower.endswith(".dll") and (
-                    "ssl" in lower or "crypto" in lower
-                ):
+                if lower.endswith(".dll") and ("ssl" in lower or "crypto" in lower):
                     src = os.path.join(openssl_lib, name)
                     dst = os.path.join(out_dir, name)
                     if not os.path.isfile(dst):

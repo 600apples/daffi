@@ -5,6 +5,7 @@ Mirrors tests/integration/test_cast.py using daffi.aio.
 
 Layout: AsyncClient → AsyncRouter → N AsyncWorkers
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -14,8 +15,13 @@ import time
 import pytest
 
 from .conftest import (
-    HOST, TIMEOUT, wait_for_port, wait_for_members,
-    silence_subprocess, quiet_kill, proc_router,
+    HOST,
+    TIMEOUT,
+    wait_for_port,
+    wait_for_members,
+    silence_subprocess,
+    quiet_kill,
+    proc_router,
 )
 
 N_WORKERS = 5
@@ -23,11 +29,12 @@ N_WORKERS = 5
 
 # ── subprocess entry points ───────────────────────────────────────────────────
 
+
 def _worker(port: int, worker_id: int) -> None:
     silence_subprocess()
 
     async def _main():
-        from daffi import callback
+        from daffi import callback, TCPTransport
         from daffi.aio import AsyncClient
 
         @callback
@@ -39,9 +46,7 @@ def _worker(port: int, worker_id: int) -> None:
             return value
 
         client = AsyncClient(
-            app_name=f"cast-worker-{worker_id:02d}",
-            host=HOST,
-            port=port,
+            app_name=f"cast-worker-{worker_id:02d}", transport=TCPTransport(HOST, port)
         )
         await client.connect()
         await client.join()
@@ -50,6 +55,7 @@ def _worker(port: int, worker_id: int) -> None:
 
 
 # ── fixtures ──────────────────────────────────────────────────────────────────
+
 
 @pytest.fixture
 def cast_setup(free_port):
@@ -65,7 +71,9 @@ def cast_setup(free_port):
         worker_procs.append(p)
 
     expected = {f"cast-worker-{i:02d}" for i in range(N_WORKERS)}
-    wait_for_members(free_port, expected, timeout=15.0, probe_name="cast-setup-aio-probe")
+    wait_for_members(
+        free_port, expected, timeout=15.0, probe_name="cast-setup-aio-probe"
+    )
 
     yield free_port
 
@@ -76,13 +84,16 @@ def cast_setup(free_port):
 
 # ── tests ─────────────────────────────────────────────────────────────────────
 
+
 @pytest.mark.asyncio
 class TestCastBroadcastAsync:
     """await conn.cast() fan-out tests via AsyncRouter → N AsyncWorkers."""
 
     async def _connect(self, port: int, name: str):
         from daffi.aio import AsyncClient
-        client = AsyncClient(app_name=name, host=HOST, port=port)
+        from daffi import TCPTransport
+
+        client = AsyncClient(app_name=name, transport=TCPTransport(HOST, port))
         conn = await client.connect()
         return client, conn
 
@@ -177,16 +188,16 @@ class TestCastBroadcastAsync:
             conns = []
             for i in range(5):
                 client = __import__("daffi.aio", fromlist=["AsyncClient"]).AsyncClient(
-                    app_name=f"cast-gather-{i}", host=HOST, port=cast_setup
+                    app_name=f"cast-gather-{i}",
+                    transport=TCPTransport(HOST, cast_setup),
                 )
                 conn = await client.connect()
                 clients.append(client)
                 conns.append(conn)
 
-            results_list = await asyncio.gather(*[
-                conn.cast(timeout=TIMEOUT).echo(i)
-                for i, conn in enumerate(conns)
-            ])
+            results_list = await asyncio.gather(
+                *[conn.cast(timeout=TIMEOUT).echo(i) for i, conn in enumerate(conns)]
+            )
             for i, results in enumerate(results_list):
                 assert len(results) == N_WORKERS
                 assert all(v == i for v in results.values())

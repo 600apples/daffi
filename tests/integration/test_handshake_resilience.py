@@ -11,6 +11,7 @@ Covers two regressions from the perf-fixes / review follow-ups:
    cap).  When the N-th peer joins with N-1 > 512 existing members, every
    existing peer must receive ``on_member_added`` for the newcomer.
 """
+
 from __future__ import annotations
 
 import multiprocessing as mp
@@ -38,15 +39,16 @@ _BROADCAST_JOIN_TIMEOUT = 60.0
 
 # ── subprocess helpers ─────────────────────────────────────────────────────────
 
+
 def _echo_worker(port: int, name: str = "hs-echo-worker") -> None:
     silence_subprocess()
-    from daffi import Client, callback
+    from daffi import Client, callback, TCPTransport
 
     @callback
     def echo(payload):
         return payload
 
-    client = Client(app_name=name, host=HOST, port=port, workers=1)
+    client = Client(app_name=name, workers=1, transport=TCPTransport(HOST, port))
     client.connect()
     try:
         client.join()
@@ -55,6 +57,7 @@ def _echo_worker(port: int, name: str = "hs-echo-worker") -> None:
 
 
 # ── fixtures ───────────────────────────────────────────────────────────────────
+
 
 @pytest.fixture
 def router_port(free_port):
@@ -78,16 +81,19 @@ def router_with_echo(router_port):
 
 # ── malformed handshake ────────────────────────────────────────────────────────
 
+
 class TestMalformedHandshake:
     """Router must keep serving after a HANDSHAKE body that fails JSON parse."""
 
     def test_router_accepts_new_client_after_bad_handshake(self, router_with_echo):
-        from daffi import Client
+        from daffi import Client, TCPTransport
         from daffi._bindings import send_message_from_client, MessageFlag
         from daffi._serialization import SerdeFormat
 
         port = router_with_echo
-        attacker = Client(app_name="hs-attacker", host=HOST, port=port, workers=1)
+        attacker = Client(
+            app_name="hs-attacker", workers=1, transport=TCPTransport(HOST, port)
+        )
         conn = attacker.connect()
         try:
             # Already-connected client sends a second HANDSHAKE with garbage
@@ -109,7 +115,9 @@ class TestMalformedHandshake:
             attacker.stop()
 
         # If the router mutex were still held, this connect / rpc would hang.
-        survivor = Client(app_name="hs-survivor", host=HOST, port=port, workers=1)
+        survivor = Client(
+            app_name="hs-survivor", workers=1, transport=TCPTransport(HOST, port)
+        )
         conn = survivor.connect()
         try:
             assert conn.rpc(timeout=TIMEOUT).echo("still-alive") == "still-alive"
@@ -117,12 +125,14 @@ class TestMalformedHandshake:
             survivor.stop()
 
     def test_existing_rpc_path_still_works_after_bad_handshake(self, router_with_echo):
-        from daffi import Client
+        from daffi import Client, TCPTransport
         from daffi._bindings import send_message_from_client, MessageFlag
         from daffi._serialization import SerdeFormat
 
         port = router_with_echo
-        client = Client(app_name="hs-rpc-client", host=HOST, port=port, workers=1)
+        client = Client(
+            app_name="hs-rpc-client", workers=1, transport=TCPTransport(HOST, port)
+        )
         conn = client.connect()
         try:
             assert conn.rpc(timeout=TIMEOUT).echo("before") == "before"
@@ -147,11 +157,12 @@ class TestMalformedHandshake:
 
 # ── join broadcast fan-out ─────────────────────────────────────────────────────
 
+
 class TestJoinBroadcastFanout:
     """Every existing peer must see on_member_added for a new joiner."""
 
     def test_join_notifies_all_existing_peers_beyond_old_512_cap(self, router_port):
-        from daffi import Client
+        from daffi import Client, TCPTransport
 
         n = N_BROADCAST_PEERS
         last_name = f"bcast-peer-{n - 1}"
@@ -162,12 +173,12 @@ class TestJoinBroadcastFanout:
         def _start_peer(idx: int) -> None:
             c = Client(
                 app_name=f"bcast-peer-{idx}",
-                host=HOST,
-                port=router_port,
                 workers=1,
+                transport=TCPTransport(HOST, router_port),
             )
             conn = c.connect()
             if idx < n - 1:
+
                 def _on_added(name: str, _idx=idx) -> None:
                     if name == last_name:
                         seen_last[_idx].set()
@@ -197,6 +208,7 @@ class TestJoinBroadcastFanout:
                 f"First missing indices: {missing[:20]}"
             )
         finally:
+
             def _stop(c):
                 if c is not None:
                     try:

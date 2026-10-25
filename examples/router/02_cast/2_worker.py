@@ -9,9 +9,10 @@ Run this script in 3 separate terminals:
 
 Start 1_router.py first, then the workers, then 3_caller.py.
 """
+
 import random
 
-from daffi import Client, callback
+from daffi import Client, callback, TCPTransport
 
 TAG = random.choice(["🔵", "🟢", "🟡", "🔴", "🟣", "🟠"])
 
@@ -22,7 +23,7 @@ def process(item: str) -> str:
 
 
 if __name__ == "__main__":
-    worker = Client(host="0.0.0.0", port=6002)
+    worker = Client(transport=TCPTransport("0.0.0.0", 6002))
     worker.connect()
     print(f"{TAG}  worker connected — press Ctrl+C to stop.")
     worker.join()

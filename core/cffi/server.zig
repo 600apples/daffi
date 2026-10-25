@@ -68,6 +68,39 @@ pub fn startServer(_: [*c]PyObject, args: [*c]PyObject) callconv(.c) [*c]PyObjec
     return Py_BuildValue("k", @as(c_ulong, conn_num));
 }
 
+/// Bind another transport on a server that is already running.  The new
+/// listener shares that server's handler, so peers are not isolated by the
+/// socket they arrived on.
+pub fn addListener(_: [*c]PyObject, args: [*c]PyObject) callconv(.c) [*c]PyObject {
+    var conn_num: usize = undefined;
+    var host: [*:0]u8 = undefined;
+    var port: c_long = undefined;
+    var tls_enabled: c_int = 0;
+    var cert_file: [*:0]u8 = undefined;
+    var key_file: [*:0]u8 = undefined;
+    if (!(py.PyArg_ParseTuple(args, "kslpss", &conn_num, &host, &port, &tls_enabled, &cert_file, &key_file) != 0)) return Py_BuildValue("");
+    if (port < 0 or port > std.math.maxInt(u16)) {
+        PyErr_SetString(py.PyExc_ValueError, "port must be in range 0-65535");
+        return null;
+    }
+    const cfg = @import("../network/ServerConnection.zig").Config{
+        .host = std.mem.span(host),
+        .port = @intCast(port),
+        .mode = .Router,
+        .tls = tls_enabled != 0,
+        .cert_file = std.mem.span(cert_file),
+        .key_file = std.mem.span(key_file),
+    };
+    const py_state = py.PyEval_SaveThread();
+    const added = Server.addListener(conn_num, cfg);
+    py.PyEval_RestoreThread(py_state);
+    added catch |err| {
+        PyErr_SetString(py.PyExc_ValueError, @errorName(err));
+        return null;
+    };
+    return Py_BuildValue("");
+}
+
 /// Stop the server identified by conn_num and release every native resource
 /// it owns: the listening socket, all accepted connections, their threads and
 /// the message pool.  Blocks (with the GIL released) until that is done, so

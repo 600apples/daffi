@@ -27,7 +27,12 @@ if TYPE_CHECKING:
     from daffi.app import Client
 
 from daffi._serialization import SerdeFormat, Serializer
-from daffi.exceptions import InitializationError, CallTimeout, TransmissionFailure, RemoteCallError
+from daffi.exceptions import (
+    InitializationError,
+    CallTimeout,
+    TransmissionFailure,
+    RemoteCallError,
+)
 from daffi.utils.misc import iterable
 from daffi._wakeup import WakeupFd
 from daffi.registry._executor_registry import EXECUTOR_REGISTRY
@@ -80,7 +85,6 @@ class ResponseNotifier:
         # RpcResult.result() loop iteration.
         self._lifecycle_error: Optional[Exception] = None
         set_response_fd(conn_num, self._wakeup.write_fd)
-
 
     @classmethod
     def register(cls, conn_num: int) -> "ResponseNotifier":
@@ -163,7 +167,6 @@ class ResponseNotifier:
         self._wakeup.drain()
 
 
-
 @contextmanager
 def system_exception_handler(
     msg_template: str,
@@ -200,9 +203,13 @@ def system_exception_handler(
                     methods = m.get("methods") or []
                     if methods:
                         cb_list = ", ".join(methods)
-                        peer_parts.append(f"      • {m['name']}\n          callbacks: [{cb_list}]")
+                        peer_parts.append(
+                            f"      • {m['name']}\n          callbacks: [{cb_list}]"
+                        )
                     else:
-                        peer_parts.append(f"      • {m['name']}\n          callbacks: (none)")
+                        peer_parts.append(
+                            f"      • {m['name']}\n          callbacks: (none)"
+                        )
                 peer_lines = "\n".join(peer_parts)
             else:
                 peer_lines = "      (none connected)"
@@ -216,6 +223,7 @@ def system_exception_handler(
 
         elif "ConnectionRefused" in origin and conn_info:
             import socket as _socket
+
             host, port, unix_sock_path = conn_info
             if unix_sock_path:
                 addr = f"unix://{unix_sock_path}"
@@ -233,9 +241,7 @@ def system_exception_handler(
                     except OSError:
                         pass
                 if in_use:
-                    hint = (
-                        f"\n  Port {port} on {host} is already occupied by another process."
-                    )
+                    hint = f"\n  Port {port} on {host} is already occupied by another process."
                 else:
                     hint = (
                         f"\n  The server could not bind to {addr}.\n"
@@ -548,9 +554,10 @@ class RpcResult:
             # same conn_num after a reconnect).  Multiple threads that woke
             # simultaneously each capture the non-None value before any one
             # of them clears it, so all of them still raise the correct error.
-            if notifier is not None and (
-                _lifecycle_err := notifier._lifecycle_error
-            ) is not None:
+            if (
+                notifier is not None
+                and (_lifecycle_err := notifier._lifecycle_error) is not None
+            ):
                 notifier._lifecycle_error = None
                 raise _lifecycle_err
 
@@ -559,7 +566,11 @@ class RpcResult:
                 if remaining <= 0:
                     mark_message_as_expired(self.uuid, self.conn_num)
                     raise CallTimeout(
-                        call=str(self.proxy) if self.proxy is not None else f"(uuid: {self.uuid})",
+                        call=(
+                            str(self.proxy)
+                            if self.proxy is not None
+                            else f"(uuid: {self.uuid})"
+                        ),
                         timeout=self.timeout,
                         elapsed=time.time() - self.send_ts,
                         receivers=self.receivers or None,
@@ -620,9 +631,7 @@ class RpcResult:
                         f" All receivers: {self.receivers}"
                     )
 
-    def _unpack_response(
-        self, res: Tuple
-    ) -> Tuple[bytes, int, int]:
+    def _unpack_response(self, res: Tuple) -> Tuple[bytes, int, int]:
         """Decode a ``get_message_from_client_store`` tuple into a result.
 
         Mirrors the original inline logic from ``result()``: a 1-tuple is an
@@ -870,7 +879,9 @@ class _BoundStreamNowait(_BoundStream):
         conn_num = self._proxy.conn.client._conn_num
         chunks = gen if iterable(gen) else [gen]
         for chunk in chunks:
-            self._proxy._send_chunk(self._func_name, conn_num, chunk, return_result=False)
+            self._proxy._send_chunk(
+                self._func_name, conn_num, chunk, return_result=False
+            )
 
 
 class _StreamBase:

@@ -36,11 +36,13 @@ throughput up to **~1.2 GiB/s** for large binary payloads.
 pip install daffi
 ```
 
+Requires Python 3.10 or newer.
+
 ## Quick start — direct layout (Client → Service)
 
 `service.py`:
 ```python
-from daffi import Service, callback
+from daffi import Service, callback, TCPTransport
 
 @callback
 def add(a: float, b: float) -> float:
@@ -50,16 +52,16 @@ def add(a: float, b: float) -> float:
 def greet(name: str) -> str:
     return f"Hello, {name}!"
 
-svc = Service(app_name="my-service", host="127.0.0.1", port=5000)
+svc = Service(app_name="my-service", transports=TCPTransport("127.0.0.1", 5000))
 svc.start()
 svc.join()          # block until svc.stop() is called
 ```
 
 `client.py`:
 ```python
-from daffi import Client
+from daffi import Client, TCPTransport
 
-client = Client(app_name="my-client", host="127.0.0.1", port=5000)
+client = Client(app_name="my-client", transport=TCPTransport("127.0.0.1", 5000))
 conn = client.connect()
 
 result = conn.rpc(timeout=5).add(1, 2)     # → 3.0
@@ -79,31 +81,31 @@ load-balanced / broadcast calls.
 
 `router.py`:
 ```python
-from daffi import Router
+from daffi import Router, TCPTransport
 
-router = Router(host="127.0.0.1", port=6000)
+router = Router(transports=TCPTransport("127.0.0.1", 6000))
 router.start()
 router.join()
 ```
 
 `worker.py`:
 ```python
-from daffi import Client, callback
+from daffi import Client, callback, TCPTransport
 
 @callback
 def process(task: str) -> str:
     return f"done: {task}"
 
-client = Client(app_name="worker-1", host="127.0.0.1", port=6000)
+client = Client(app_name="worker-1", transport=TCPTransport("127.0.0.1", 6000))
 client.connect()
 client.join()   # block until Ctrl+C / SIGTERM
 ```
 
 `caller.py`:
 ```python
-from daffi import Client
+from daffi import Client, TCPTransport
 
-client = Client(app_name="caller", host="127.0.0.1", port=6000)
+client = Client(app_name="caller", transport=TCPTransport("127.0.0.1", 6000))
 conn = client.connect()
 
 # RPC — routed to one worker (round-robin)
@@ -238,7 +240,7 @@ run in parallel:
 
 ```python
 import time
-from daffi import Service, callback
+from daffi import Service, callback, TCPTransport
 
 @callback
 def slow_task(n: int) -> int:
@@ -246,10 +248,10 @@ def slow_task(n: int) -> int:
     return n * n
 
 # workers=1 (default) — three concurrent callers would each wait ~1 s
-svc = Service(host="127.0.0.1", port=5000, workers=1)
+svc = Service( workers=1,transports=TCPTransport("127.0.0.1", 5000))
 
 # workers=4 — three concurrent callers all finish in ~1 s
-svc = Service(host="127.0.0.1", port=5000, workers=4)
+svc = Service( workers=4,transports=TCPTransport("127.0.0.1", 5000))
 
 svc.start()
 svc.join()
@@ -258,7 +260,7 @@ svc.join()
 The same parameter works on a `Client` acting as a worker in the Router topology:
 
 ```python
-from daffi import Client, callback
+from daffi import Client, callback, TCPTransport
 
 @callback
 def process(task: str) -> str:
@@ -266,7 +268,7 @@ def process(task: str) -> str:
     return f"done: {task}"
 
 # This single Client instance can now handle up to 8 concurrent incoming calls
-client = Client(app_name="worker-1", host="127.0.0.1", port=6000, workers=8)
+client = Client(app_name="worker-1", workers=8, transport=TCPTransport("127.0.0.1", 6000))
 client.connect()
 client.join()
 ```
@@ -349,12 +351,13 @@ Receive `connected` / `disconnected` notifications for nodes joining or
 leaving the network.
 
 ```python
+from daffi import Service, TCPTransport
 def on_event(event: dict):
     # event["type"]   → "connected" or "disconnected"
     # event["member"] → app_name of the node that changed state
     print(f"[{event['type']}] {event['member']}")
 
-svc = Service(host="127.0.0.1", port=5000)
+svc = Service(transports=TCPTransport("127.0.0.1", 5000))
 svc.add_event_handler(on_event)
 svc.start()
 ```
@@ -365,14 +368,14 @@ Both `Service` and `Client` support `add_event_handler`.
 
 ## Unix sockets
 
-Use `unix_sock_path` instead of `host`/`port` for inter-process communication
-on the same machine.
+Use a `UnixTransport` for inter-process communication on the same machine.
 
 ```python
-svc = Service(unix_sock_path="/tmp/daffi.sock")
+from daffi import Service, Client, UnixTransport
+svc = Service(transports=UnixTransport("/tmp/daffi.sock"))
 svc.start()
 
-client = Client(unix_sock_path="/tmp/daffi.sock")
+client = Client(transport=UnixTransport("/tmp/daffi.sock"))
 conn = client.connect()
 ```
 
@@ -381,21 +384,20 @@ conn = client.connect()
 ## TLS
 
 ```python
+from daffi import Router, Client, TCPTransport
 # Server (Router or Service)
 router = Router(
-    host="127.0.0.1", port=6000,
     tls=True,
     cert_file="/path/to/server.crt",
     key_file="/path/to/server.key",
-)
+    transports=TCPTransport("127.0.0.1", 6000))
 router.start()
 
 # Client — supply ca_file to verify the server certificate,
 # or leave it empty to skip verification
 client = Client(
-    host="127.0.0.1", port=6000,
     tls=True,
     ca_file="/path/to/ca.crt",
-)
+    transport=TCPTransport("127.0.0.1", 6000))
 conn = client.connect()
 ```

@@ -13,6 +13,7 @@ The test verifies that:
   * When a new worker joins, the next cast() sees it immediately.
   * Result keys are exactly the app_names of the connected workers.
 """
+
 from __future__ import annotations
 
 import multiprocessing as mp
@@ -21,28 +22,30 @@ import time
 import pytest
 
 from .conftest import (
-    HOST, TIMEOUT,
-    wait_for_port, wait_for_members,
-    silence_subprocess, quiet_kill, proc_router,
+    HOST,
+    TIMEOUT,
+    wait_for_port,
+    wait_for_members,
+    silence_subprocess,
+    quiet_kill,
+    proc_router,
 )
 
-
 # ── worker subprocess ─────────────────────────────────────────────────────────
+
 
 def _process_worker(port: int, worker_id: int) -> None:
     """Worker that exposes a single 'process' callback."""
     silence_subprocess()
     import time as _time
-    from daffi import Client, callback
+    from daffi import Client, callback, TCPTransport
 
     @callback
     def process(data):
         return {"result": data, "worker": worker_id}
 
     client = Client(
-        app_name=f"dyn-worker-{worker_id}",
-        host=HOST,
-        port=port,
+        app_name=f"dyn-worker-{worker_id}", transport=TCPTransport(HOST, port)
     )
     client.connect()
     try:
@@ -56,6 +59,7 @@ def _process_worker(port: int, worker_id: int) -> None:
 
 # ── fixture ───────────────────────────────────────────────────────────────────
 
+
 @pytest.fixture
 def router_only(free_port):
     """Start only the Router; workers are spawned inside the test body."""
@@ -68,6 +72,7 @@ def router_only(free_port):
 
 # ── helpers ───────────────────────────────────────────────────────────────────
 
+
 def _spawn_worker(port: int, worker_id: int) -> mp.Process:
     p = mp.Process(target=_process_worker, args=(port, worker_id), daemon=True)
     p.start()
@@ -75,6 +80,7 @@ def _spawn_worker(port: int, worker_id: int) -> mp.Process:
 
 
 # ── tests ─────────────────────────────────────────────────────────────────────
+
 
 class TestDynamicCast:
     """cast() fan-out grows as workers join one at a time."""
@@ -86,9 +92,11 @@ class TestDynamicCast:
         Add a 3rd worker, verify 3 keys.
         Keys must be exactly the worker app_names.
         """
-        from daffi import Client
+        from daffi import Client, TCPTransport
 
-        client = Client(app_name="dyn-caller", host=HOST, port=router_only)
+        client = Client(
+            app_name="dyn-caller", transport=TCPTransport(HOST, router_only)
+        )
         conn = client.connect()
         workers: list[mp.Process] = []
 
@@ -101,18 +109,19 @@ class TestDynamicCast:
 
             results = conn.cast(timeout=TIMEOUT).process(payload)
             assert isinstance(results, dict), "cast must return a dict"
-            assert set(results.keys()) == {"dyn-worker-1"}, (
-                f"expected 1 key, got: {set(results.keys())}"
-            )
+            assert set(results.keys()) == {
+                "dyn-worker-1"
+            }, f"expected 1 key, got: {set(results.keys())}"
 
             # ── 2 workers ─────────────────────────────────────────────────────
             workers.append(_spawn_worker(router_only, 2))
             conn.wait_for_members("dyn-worker-2", timeout=15)
 
             results = conn.cast(timeout=TIMEOUT).process(payload)
-            assert set(results.keys()) == {"dyn-worker-1", "dyn-worker-2"}, (
-                f"expected 2 keys, got: {set(results.keys())}"
-            )
+            assert set(results.keys()) == {
+                "dyn-worker-1",
+                "dyn-worker-2",
+            }, f"expected 2 keys, got: {set(results.keys())}"
 
             # ── 3 workers ─────────────────────────────────────────────────────
             workers.append(_spawn_worker(router_only, 3))
@@ -120,7 +129,9 @@ class TestDynamicCast:
 
             results = conn.cast(timeout=TIMEOUT).process(payload)
             assert set(results.keys()) == {
-                "dyn-worker-1", "dyn-worker-2", "dyn-worker-3"
+                "dyn-worker-1",
+                "dyn-worker-2",
+                "dyn-worker-3",
             }, f"expected 3 keys, got: {set(results.keys())}"
 
         finally:
@@ -130,9 +141,11 @@ class TestDynamicCast:
 
     def test_cast_result_values_correct(self, router_only):
         """Every worker's response contains the right worker id in the value."""
-        from daffi import Client
+        from daffi import Client, TCPTransport
 
-        client = Client(app_name="dyn-caller-vals", host=HOST, port=router_only)
+        client = Client(
+            app_name="dyn-caller-vals", transport=TCPTransport(HOST, router_only)
+        )
         conn = client.connect()
         workers: list[mp.Process] = []
 
@@ -146,9 +159,9 @@ class TestDynamicCast:
 
             for name, val in results.items():
                 expected_id = int(name.split("-")[-1])
-                assert val["worker"] == expected_id, (
-                    f"{name}: expected worker={expected_id}, got {val}"
-                )
+                assert (
+                    val["worker"] == expected_id
+                ), f"{name}: expected worker={expected_id}, got {val}"
                 assert val["result"] == "hello"
 
         finally:

@@ -36,36 +36,47 @@ fn HandlerOf(comptime mode: HandlerMode) type {
     return @typeInfo(@TypeOf(H.handler)).@"fn".return_type.?;
 }
 
-/// Per-server state shared between the accept side and every connection.
+/// One listening socket of a logical server.  Allocated individually so its
+/// address stays stable (the event loop holds a pointer into `listener_source`).
+const Listener = struct {
+    connection: *ServerConnection,
+    accept_thread: ?std.Thread = null,
+    listener_source: EventLoop.Source = undefined,
+    listener_loop: ?*EventLoop = null,
+    runtime: *Runtime,
+};
+
+/// Per-server state shared between every listener and every accepted connection.
 const Runtime = struct {
     allocator: Allocator,
     mode: HandlerMode,
     app_name: []const u8,
-    connection: *ServerConnection,
     msgpool: *MessagePool,
     server_handler: *ServerHandler,
+    /// Listening sockets.  They all admit into this one runtime, so peers that
+    /// arrive on different TCP ports or a Unix socket share one membership.
+    listeners: std.ArrayList(*Listener) = .empty,
     /// Accepted connections currently being served.  Used to interrupt them
     /// (by shutting their sockets down) when the server stops.
     live_mutex: Mutex = .{},
     live: std.ArrayList(*ServerHandler.ConnectionT) = .empty,
+    /// Set under `live_mutex` before listeners are closed.  Accept paths that
+    /// already passed `accept` refuse the connection instead of joining a
+    /// server that is going away.
+    stopping: bool = false,
     /// Accepted connections whose thread or event source may still touch this
     /// struct.  `stop` waits for it to reach zero before freeing anything.
     active_connections: std.atomic.Value(usize) = .init(0),
-    /// Threads model: the accept-loop thread.
-    accept_thread: ?std.Thread = null,
-    /// Evented model: the listening socket registered on `listener_loop`.
-    listener_source: EventLoop.Source = undefined,
-    listener_loop: ?*EventLoop = null,
 
     /// Remember `conn` so shutdown can interrupt it.  Fails if the server is
     /// already stopping, in which case the caller must drop the connection.
     fn registerLive(self: *Runtime, conn: *ServerHandler.ConnectionT) !void {
         self.live_mutex.lock();
         defer self.live_mutex.unlock();
-        // Checked under the lock: shutdown sets `suspended` first and then walks
+        // Checked under the lock: shutdown sets `stopping` first and then walks
         // `live` under this same lock, so a connection either gets registered
         // before the walk (and is closed by it) or is refused here.
-        if (self.connection.isSuspended()) return error.ServerStopping;
+        if (self.stopping) return error.ServerStopping;
         try self.live.append(self.allocator, conn);
     }
 
@@ -91,8 +102,12 @@ const Runtime = struct {
     }
 
     fn deinit(self: *Runtime) void {
+        for (self.listeners.items) |listener| {
+            listener.connection.destroy();
+            self.allocator.destroy(listener);
+        }
+        self.listeners.deinit(self.allocator);
         self.server_handler.deinit();
-        self.connection.destroy();
         self.msgpool.deinit();
         self.live.deinit(self.allocator);
         self.allocator.free(self.app_name);
@@ -225,49 +240,103 @@ fn startImpl(allocator: Allocator, app_name_arg: []const u8, config: ServerConne
 
     // The caller's strings (Python str buffers) are only guaranteed to live until
     // start() returns; the handler keeps `app_name` for the server's lifetime.
-    const app_name = try allocator.dupe(u8, app_name_arg);
-    errdefer allocator.free(app_name);
-    const msgpool = try MessagePool.init(allocator);
-    errdefer msgpool.deinit();
-    const conn = try ServerConnection.init(allocator, config);
-    errdefer conn.destroy();
-    const server_handler = try ServerHandler.init(config.mode, allocator, app_name);
-    errdefer server_handler.deinit();
-    const rt = try allocator.create(Runtime);
-    errdefer allocator.destroy(rt);
-    rt.* = .{
-        .allocator = allocator,
-        .mode = config.mode,
-        .app_name = app_name,
-        .connection = conn,
-        .msgpool = msgpool,
-        .server_handler = server_handler,
+    // A successful block transfers those allocations to the runtime: its errdefers
+    // do not run, and `rt.deinit` is the single owner afterwards.
+    const rt = blk: {
+        const app_name = try allocator.dupe(u8, app_name_arg);
+        errdefer allocator.free(app_name);
+        const msgpool = try MessagePool.init(allocator);
+        errdefer msgpool.deinit();
+        const server_handler = try ServerHandler.init(config.mode, allocator, app_name);
+        errdefer server_handler.deinit();
+        const created = try allocator.create(Runtime);
+        created.* = .{
+            .allocator = allocator,
+            .mode = config.mode,
+            .app_name = app_name,
+            .msgpool = msgpool,
+            .server_handler = server_handler,
+        };
+        break :blk created;
     };
-
-    switch (runtime.model()) {
-        .threads => rt.accept_thread = try std.Thread.spawn(.{}, acceptLoop, .{rt}),
-        .evented => {
-            const loop = try runtime.loop();
-            rt.listener_source = .{ .fd = conn.handle(), .onReadable = onListenerReadable, .onRemoved = onListenerRemoved };
-            try loop.register(&rt.listener_source);
-            rt.listener_loop = loop;
-        },
-    }
+    errdefer rt.deinit();
+    try attachListener(rt, config);
 
     {
         slots_mutex.lock();
         defer slots_mutex.unlock();
-        slot_entries[conn_num] = .{ .connection = conn, .msgpool = msgpool, .server_handler = server_handler, .runtime = rt };
+        slot_entries[conn_num] = .{ .connection = rt.listeners.items[0].connection, .msgpool = rt.msgpool, .server_handler = rt.server_handler, .runtime = rt };
     }
-    log.debug("{s}[{s}] listening on {s}:{d} conn_num={d} model={s}", .{
+    log.debug("{s}[{s}] listening on {s}:{d} conn_num={d} model={s} listeners=1", .{
         @tagName(config.mode),
-        app_name,
+        rt.app_name,
         config.host orelse "0.0.0.0",
         config.port,
         conn_num,
         @tagName(runtime.model()),
     });
     return conn_num;
+}
+
+/// Bind another socket on an already-running server.  Accepted peers join the
+/// same handler, so a client on this transport can reach peers that connected
+/// through any of the server's other transports.
+pub fn addListener(conn_num: usize, config: ServerConnection.Config) !void {
+    const entry = try getEntry(conn_num);
+    const rt = entry.runtime;
+    rt.live_mutex.lock();
+    const stopping = rt.stopping;
+    rt.live_mutex.unlock();
+    if (stopping) return error.ServerStopping;
+    var cfg = config;
+    cfg.mode = rt.mode;
+    try attachListener(rt, cfg);
+    log.debug("{s}[{s}] added listener {s}:{d} conn_num={d} listeners={d}", .{
+        @tagName(rt.mode),
+        rt.app_name,
+        config.host orelse "0.0.0.0",
+        config.port,
+        conn_num,
+        rt.listeners.items.len,
+    });
+}
+
+fn attachListener(rt: *Runtime, config: ServerConnection.Config) !void {
+    const conn = try ServerConnection.init(rt.allocator, config);
+    const listener = rt.allocator.create(Listener) catch |err| {
+        conn.destroy();
+        return err;
+    };
+    listener.* = .{ .connection = conn, .runtime = rt };
+    switch (runtime.model()) {
+        .threads => listener.accept_thread = std.Thread.spawn(.{}, acceptLoop, .{listener}) catch |err| {
+            conn.destroy();
+            rt.allocator.destroy(listener);
+            return err;
+        },
+        .evented => {
+            const loop = runtime.loop() catch |err| {
+                conn.destroy();
+                rt.allocator.destroy(listener);
+                return err;
+            };
+            listener.listener_source = .{ .fd = conn.handle(), .onReadable = onListenerReadable, .onRemoved = onListenerRemoved };
+            loop.register(&listener.listener_source) catch |err| {
+                conn.destroy();
+                rt.allocator.destroy(listener);
+                return err;
+            };
+            listener.listener_loop = loop;
+        },
+    }
+    rt.listeners.append(rt.allocator, listener) catch |err| {
+        listener.connection.close();
+        if (listener.accept_thread) |thread| thread.join();
+        if (listener.listener_loop) |loop| loop.detach(&listener.listener_source);
+        listener.connection.destroy();
+        rt.allocator.destroy(listener);
+        return err;
+    };
 }
 
 /// Stop the server: stop accepting, interrupt every connection, wait until
@@ -285,9 +354,14 @@ pub fn stop(conn_num: usize) void {
     };
     defer releaseSlot(conn_num);
 
-    rt.connection.close();
-    if (rt.accept_thread) |t| t.join();
-    if (rt.listener_loop) |loop| loop.detach(&rt.listener_source);
+    rt.live_mutex.lock();
+    rt.stopping = true;
+    rt.live_mutex.unlock();
+    for (rt.listeners.items) |listener| listener.connection.close();
+    for (rt.listeners.items) |listener| {
+        if (listener.accept_thread) |thread| thread.join();
+        if (listener.listener_loop) |loop| loop.detach(&listener.listener_source);
+    }
     log.debug("{s}[{s}] stopped accepting conn_num={d}", .{ @tagName(rt.mode), rt.app_name, conn_num });
 
     rt.interruptAllLive();
@@ -311,9 +385,10 @@ fn sleepMs(ms: u32) void {
 }
 
 /// Threads model: accept until the server is stopped.
-fn acceptLoop(rt: *Runtime) void {
-    while (!rt.connection.isSuspended()) {
-        const raw = rt.connection.acceptRaw(ACCEPT_POLL_MS) catch |err| {
+fn acceptLoop(listener: *Listener) void {
+    const rt = listener.runtime;
+    while (!listener.connection.isSuspended()) {
+        const raw = listener.connection.acceptRaw(ACCEPT_POLL_MS) catch |err| {
             switch (err) {
                 // Periodic wake-up to re-check the shutdown flag.
                 error.Timeout => {},
@@ -325,19 +400,20 @@ fn acceptLoop(rt: *Runtime) void {
             }
             continue;
         };
-        admit(rt, raw);
+        admit(rt, listener.connection, raw);
     }
 }
 
 /// Evented model: drain the pending connections of a readable listener.
 fn onListenerReadable(source: *EventLoop.Source, _: []u8) EventLoop.Action {
-    const rt: *Runtime = @alignCast(@fieldParentPtr("listener_source", source));
+    const listener: *Listener = @alignCast(@fieldParentPtr("listener_source", source));
+    const rt = listener.runtime;
     while (true) {
-        const raw = rt.connection.acceptRaw(0) catch |err| {
+        const raw = listener.connection.acceptRaw(0) catch |err| {
             if (err != error.Timeout) log.warn("failed to accept connection: {}", .{err});
             return .keep;
         };
-        admit(rt, raw);
+        admit(rt, listener.connection, raw);
     }
 }
 
@@ -347,12 +423,12 @@ fn onListenerRemoved(_: *EventLoop.Source) void {}
 /// Hand an accepted descriptor to its own thread (threads model) or to the
 /// blocking pool (evented model) for the protocol probe / TLS handshake, so a
 /// silent peer cannot stall accepting.
-fn admit(rt: *Runtime, raw: AcceptedConnection) void {
+fn admit(rt: *Runtime, listener: *ServerConnection, raw: AcceptedConnection) void {
     // Counted first so stop never frees `rt` while the connection starts up.
     _ = rt.active_connections.fetchAdd(1, .acq_rel);
     const started = switch (rt.mode) {
-        .Service => startConnection(.Service, rt, raw),
-        .Router => startConnection(.Router, rt, raw),
+        .Service => startConnection(.Service, rt, listener, raw),
+        .Router => startConnection(.Router, rt, listener, raw),
     };
     started catch |err| {
         log.warn("failed to start connection: {}", .{err});
@@ -361,23 +437,23 @@ fn admit(rt: *Runtime, raw: AcceptedConnection) void {
     };
 }
 
-fn startConnection(comptime mode: HandlerMode, rt: *Runtime, raw: AcceptedConnection) !void {
+fn startConnection(comptime mode: HandlerMode, rt: *Runtime, listener: *ServerConnection, raw: AcceptedConnection) !void {
     const main = struct {
-        fn main(r: *Runtime, a: AcceptedConnection) void {
-            connectionMain(mode, r, a);
+        fn main(r: *Runtime, server: *ServerConnection, a: AcceptedConnection) void {
+            connectionMain(mode, r, server, a);
         }
     }.main;
     switch (runtime.model()) {
-        .threads => (try std.Thread.spawn(.{}, main, .{ rt, raw })).detach(),
-        .evented => try runtime.spawnBlocking(main, .{ rt, raw }),
+        .threads => (try std.Thread.spawn(.{}, main, .{ rt, listener, raw })).detach(),
+        .evented => try runtime.spawnBlocking(main, .{ rt, listener, raw }),
     }
 }
 
 /// Finish the accept (TLS + protocol detection), then serve the connection:
 /// on this thread in the threads model, and also for WebSocket sessions;
 /// otherwise as an event-loop source.
-fn connectionMain(comptime mode: HandlerMode, rt: *Runtime, raw: AcceptedConnection) void {
-    const client = rt.connection.upgradeAccepted(raw) catch |err| {
+fn connectionMain(comptime mode: HandlerMode, rt: *Runtime, listener: *ServerConnection, raw: AcceptedConnection) void {
+    const client = listener.upgradeAccepted(raw) catch |err| {
         // upgradeAccepted already closed the descriptor.
         log.debug("rejected incoming connection: {}", .{err});
         _ = rt.active_connections.fetchSub(1, .release);

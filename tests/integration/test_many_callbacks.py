@@ -9,6 +9,7 @@ returns its own index.  Tests exercise:
   • Argument passing (echo + arithmetic)
   • Mixed concurrent calls interleaved across all callback names
 """
+
 from __future__ import annotations
 
 import multiprocessing as mp
@@ -17,40 +18,50 @@ import time
 
 import pytest
 
-from .conftest import HOST, TIMEOUT, wait_for_port, wait_for_members, silence_subprocess, quiet_kill
+from .conftest import (
+    HOST,
+    TIMEOUT,
+    wait_for_port,
+    wait_for_members,
+    silence_subprocess,
+    quiet_kill,
+)
 
-N_CALLBACKS = 10   # must match the number defined in _proc_service_many
+N_CALLBACKS = 10  # must match the number defined in _proc_service_many
 
 
 # ── subprocess: service with many named callbacks ──────────────────────────────
 
+
 def _proc_service_many(port: int) -> None:
     """Start a Service that exposes cb_0 … cb_9, each returning its index."""
     silence_subprocess()
-    from daffi import Service, callback
+    from daffi import Service, callback, TCPTransport
 
     # Define each callback with a unique __name__ so the registry records it
     # under the right key.  Using a factory avoids the late-binding closure trap.
     def _make_cb(idx: int):
         def fn():
             return idx
-        fn.__name__     = f"cb_{idx}"
+
+        fn.__name__ = f"cb_{idx}"
         fn.__qualname__ = f"cb_{idx}"
         return fn
 
     registered = [callback(_make_cb(i)) for i in range(N_CALLBACKS)]  # noqa: F841
 
-    svc = Service(app_name="many-cb-svc", host=HOST, port=port)
+    svc = Service(app_name="many-cb-svc", transports=TCPTransport(HOST, port))
     svc.start()
     svc.join()
 
 
 # ── subprocess: service with argument-taking callbacks ─────────────────────────
 
+
 def _proc_service_args(port: int) -> None:
     """Service with callbacks that take and transform arguments."""
     silence_subprocess()
-    from daffi import Service, callback
+    from daffi import Service, callback, TCPTransport
 
     @callback
     def echo(payload):
@@ -68,12 +79,15 @@ def _proc_service_args(port: int) -> None:
     def sum_list(items: list) -> int:
         return sum(items)
 
-    svc = Service(app_name="args-cb-svc", host=HOST, port=port, workers=8)
+    svc = Service(
+        app_name="args-cb-svc", workers=8, transports=TCPTransport(HOST, port)
+    )
     svc.start()
     svc.join()
 
 
 # ── fixtures ──────────────────────────────────────────────────────────────────
+
 
 @pytest.fixture
 def many_cb_service(free_port):
@@ -97,13 +111,15 @@ def args_cb_service(free_port):
 
 # ── tests: named callbacks ─────────────────────────────────────────────────────
 
+
 class TestManyNamedCallbacks:
     """Sequential and concurrent invocations of cb_0 … cb_N-1."""
 
     def _connect(self, port: int, name: str):
-        from daffi import Client
-        client = Client(app_name=name, host=HOST, port=port)
-        conn   = client.connect()
+        from daffi import Client, TCPTransport
+
+        client = Client(app_name=name, transport=TCPTransport(HOST, port))
+        conn = client.connect()
         return client, conn
 
     def test_each_callback_sequential(self, many_cb_service):
@@ -131,9 +147,9 @@ class TestManyNamedCallbacks:
     def test_concurrent_calls_same_connection(self, many_cb_service):
         """N threads share one connection, each fires one callback per thread."""
         client, conn = self._connect(many_cb_service, "mc-conc-single")
-        proxy  = conn.rpc(timeout=TIMEOUT)
+        proxy = conn.rpc(timeout=TIMEOUT)
         errors: list[Exception] = []
-        lock   = threading.Lock()
+        lock = threading.Lock()
 
         def _call(idx: int) -> None:
             try:
@@ -156,13 +172,14 @@ class TestManyNamedCallbacks:
     def test_concurrent_calls_separate_clients(self, many_cb_service):
         """Multiple independent clients concurrently call different callbacks."""
         results: list = [None] * N_CALLBACKS
-        errors:  list[Exception] = []
+        errors: list[Exception] = []
         lock = threading.Lock()
 
         def _task(idx: int) -> None:
-            from daffi import Client
+            from daffi import Client, TCPTransport
+
             client = Client(
-                app_name=f"mc-sep-{idx}", host=HOST, port=many_cb_service
+                app_name=f"mc-sep-{idx}", transport=TCPTransport(HOST, many_cb_service)
             )
             conn = client.connect()
             try:
@@ -175,7 +192,9 @@ class TestManyNamedCallbacks:
             finally:
                 client.stop()
 
-        threads = [threading.Thread(target=_task, args=(i,)) for i in range(N_CALLBACKS)]
+        threads = [
+            threading.Thread(target=_task, args=(i,)) for i in range(N_CALLBACKS)
+        ]
         for t in threads:
             t.start()
         for t in threads:
@@ -190,11 +209,13 @@ class TestManyNamedCallbacks:
         lock = threading.Lock()
 
         def _task(thread_id: int) -> None:
-            from daffi import Client
+            from daffi import Client, TCPTransport
+
             client = Client(
-                app_name=f"mc-intl-{thread_id}", host=HOST, port=many_cb_service
+                app_name=f"mc-intl-{thread_id}",
+                transport=TCPTransport(HOST, many_cb_service),
             )
-            conn  = client.connect()
+            conn = client.connect()
             proxy = conn.rpc(timeout=TIMEOUT)
             try:
                 for i in range(N_CALLBACKS):
@@ -217,13 +238,15 @@ class TestManyNamedCallbacks:
 
 # ── tests: argument-taking callbacks ──────────────────────────────────────────
 
+
 class TestCallbacksWithArguments:
     """Callbacks that take arguments and perform simple transformations."""
 
     def _proxy(self, port: int, name: str):
-        from daffi import Client
-        client = Client(app_name=name, host=HOST, port=port)
-        conn   = client.connect()
+        from daffi import Client, TCPTransport
+
+        client = Client(app_name=name, transport=TCPTransport(HOST, port))
+        conn = client.connect()
         return client, conn.rpc(timeout=TIMEOUT)
 
     def test_multiply(self, args_cb_service):
@@ -258,11 +281,13 @@ class TestCallbacksWithArguments:
         lock = threading.Lock()
 
         def _task(tid: int) -> None:
-            from daffi import Client
+            from daffi import Client, TCPTransport
+
             client = Client(
-                app_name=f"args-conc-{tid}", host=HOST, port=args_cb_service
+                app_name=f"args-conc-{tid}",
+                transport=TCPTransport(HOST, args_cb_service),
             )
-            conn  = client.connect()
+            conn = client.connect()
             proxy = conn.rpc(timeout=TIMEOUT)
             try:
                 assert proxy.multiply(tid, 2) == tid * 2

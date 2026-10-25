@@ -9,6 +9,7 @@ Layout
 ------
 Client → Router → N Workers
 """
+
 from __future__ import annotations
 
 import multiprocessing as mp
@@ -17,19 +18,25 @@ import time
 import pytest
 
 from .conftest import (
-    HOST, TIMEOUT, wait_for_port, wait_for_members,
-    silence_subprocess, quiet_kill, proc_router,
+    HOST,
+    TIMEOUT,
+    wait_for_port,
+    wait_for_members,
+    silence_subprocess,
+    quiet_kill,
+    proc_router,
 )
 
-N_WORKERS = 5   # number of worker processes for cast tests
+N_WORKERS = 5  # number of worker processes for cast tests
 
 
 # ── subprocess entry points ───────────────────────────────────────────────────
 
+
 def _worker(port: int, worker_id: int) -> None:
     silence_subprocess()
     import time as _time
-    from daffi import Client, callback
+    from daffi import Client, callback, TCPTransport
 
     @callback
     def echo(payload):
@@ -40,9 +47,7 @@ def _worker(port: int, worker_id: int) -> None:
         return value
 
     client = Client(
-        app_name=f"cast-worker-{worker_id:02d}",
-        host=HOST,
-        port=port,
+        app_name=f"cast-worker-{worker_id:02d}", transport=TCPTransport(HOST, port)
     )
     client.connect()
     try:
@@ -55,6 +60,7 @@ def _worker(port: int, worker_id: int) -> None:
 
 
 # ── fixtures ──────────────────────────────────────────────────────────────────
+
 
 @pytest.fixture
 def cast_setup(free_port):
@@ -81,12 +87,14 @@ def cast_setup(free_port):
 
 # ── tests ─────────────────────────────────────────────────────────────────────
 
+
 class TestCastBroadcast:
     """cast() fan-out tests via Router → N Workers."""
 
     def _connect(self, port: int, name: str):
-        from daffi import Client
-        client = Client(app_name=name, host=HOST, port=port)
+        from daffi import Client, TCPTransport
+
+        client = Client(app_name=name, transport=TCPTransport(HOST, port))
         conn = client.connect()
         return client, conn
 

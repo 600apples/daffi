@@ -8,6 +8,7 @@ Regression tests for the robustness fixes in the native core.
 2. Disconnected peers must release their socket (no ``CLOSE_WAIT`` pile-up).
 3. ``stop()`` on a server must return, release the port, and be re-startable.
 """
+
 from __future__ import annotations
 
 import base64
@@ -116,6 +117,7 @@ def _poke(port: int, payload: bytes, *, linger: float = 0.15) -> None:
 
 # ── fixtures ──────────────────────────────────────────────────────────────────
 
+
 @pytest.fixture
 def service_proc(free_port):
     proc = mp.Process(target=proc_service, args=(free_port,), daemon=True)
@@ -137,6 +139,7 @@ def router_proc(free_port):
 
 # ── 1. malformed input ────────────────────────────────────────────────────────
 
+
 @pytest.mark.parametrize("name", sorted(MALFORMED))
 def test_service_survives_malformed_input(service_proc, name):
     proc, port = service_proc
@@ -152,14 +155,14 @@ def test_router_survives_malformed_input(router_proc, name):
 
 
 def test_service_still_serves_after_all_malformed_input(service_proc):
-    from daffi import Client
+    from daffi import Client, TCPTransport
 
     proc, port = service_proc
     for payload in MALFORMED.values():
         _poke(port, payload, linger=0.02)
     assert proc.is_alive()
 
-    client = Client(app_name="after-garbage", host=HOST, port=port)
+    client = Client(app_name="after-garbage", transport=TCPTransport(HOST, port))
     conn = client.connect()
     try:
         conn.wait_for_members("integ-service", timeout=10)
@@ -170,13 +173,13 @@ def test_service_still_serves_after_all_malformed_input(service_proc):
 
 def test_silent_peer_does_not_block_accept(service_proc):
     """A peer that connects and sends nothing must not stall other peers."""
-    from daffi import Client
+    from daffi import Client, TCPTransport
 
     _, port = service_proc
     silent = [socket.create_connection((HOST, port)) for _ in range(5)]
     try:
         t0 = time.monotonic()
-        client = Client(app_name="behind-silent", host=HOST, port=port)
+        client = Client(app_name="behind-silent", transport=TCPTransport(HOST, port))
         conn = client.connect()
         try:
             conn.wait_for_members("integ-service", timeout=10)
@@ -191,10 +194,13 @@ def test_silent_peer_does_not_block_accept(service_proc):
 
 # ── 2. socket / fd leak ───────────────────────────────────────────────────────
 
+
 def _close_wait_count(pid: int) -> int:
     out = subprocess.run(
         ["lsof", "-nP", "-a", "-p", str(pid), "-iTCP"],
-        capture_output=True, text=True, timeout=20,
+        capture_output=True,
+        text=True,
+        timeout=20,
     ).stdout
     return sum(1 for line in out.splitlines() if "CLOSE_WAIT" in line)
 
@@ -208,13 +214,13 @@ def _open_fd_count(pid: int) -> int:
 
 @pytest.mark.skipif(shutil.which("lsof") is None, reason="lsof not available")
 def test_disconnected_clients_do_not_leak_sockets(service_proc):
-    from daffi import Client
+    from daffi import Client, TCPTransport
 
     proc, port = service_proc
     baseline = _open_fd_count(proc.pid)
 
     for i in range(15):
-        client = Client(app_name=f"leak-probe-{i}", host=HOST, port=port)
+        client = Client(app_name=f"leak-probe-{i}", transport=TCPTransport(HOST, port))
         conn = client.connect()
         conn.wait_for_members("integ-service", timeout=10)
         client.stop()
@@ -225,7 +231,10 @@ def test_disconnected_clients_do_not_leak_sockets(service_proc):
 
     deadline = time.monotonic() + 10
     while time.monotonic() < deadline:
-        if _close_wait_count(proc.pid) == 0 and _open_fd_count(proc.pid) <= baseline + 3:
+        if (
+            _close_wait_count(proc.pid) == 0
+            and _open_fd_count(proc.pid) <= baseline + 3
+        ):
             break
         time.sleep(0.25)
 
@@ -236,11 +245,12 @@ def test_disconnected_clients_do_not_leak_sockets(service_proc):
 
 # ── 3. stop() ─────────────────────────────────────────────────────────────────
 
+
 def _stop_restart_target(port: int, q) -> None:
     silence_subprocess()
     import threading
 
-    from daffi import Router, Service, callback
+    from daffi import Router, Service, callback, TCPTransport
 
     @callback
     def ping():
@@ -248,7 +258,9 @@ def _stop_restart_target(port: int, q) -> None:
 
     try:
         for _ in range(2):  # second round proves the port was released
-            svc = Service(app_name="stop-svc", host=HOST, port=port, workers=2)
+            svc = Service(
+                app_name="stop-svc", workers=2, transports=TCPTransport(HOST, port)
+            )
             svc.start()
             done = threading.Event()
 
@@ -263,7 +275,7 @@ def _stop_restart_target(port: int, q) -> None:
                 return
 
         for _ in range(2):
-            r = Router(app_name="stop-router", host=HOST, port=port)
+            r = Router(app_name="stop-router", transports=TCPTransport(HOST, port))
             r.start()
             done = threading.Event()
 
@@ -293,14 +305,14 @@ def test_server_stop_returns_and_releases_port(free_port):
 
 def test_server_stop_with_connected_client(free_port):
     """stop() must also tear down live connections instead of waiting on them."""
-    from daffi import Client
+    from daffi import Client, TCPTransport
 
     proc = mp.Process(target=proc_service, args=(free_port,), daemon=True)
     proc.start()
     try:
         wait_for_port(free_port)
         wait_for_members(free_port, {"integ-service"})
-        client = Client(app_name="stop-victim", host=HOST, port=free_port)
+        client = Client(app_name="stop-victim", transport=TCPTransport(HOST, free_port))
         conn = client.connect()
         conn.wait_for_members("integ-service", timeout=10)
         proc.terminate()  # SIGTERM -> native handler / atexit stop

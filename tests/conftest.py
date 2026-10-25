@@ -17,6 +17,7 @@ cannot switch ``threads`` ↔ ``evented`` mid-session.  Use::
 correct lock).  A session-scoped autouse fixture sets the env var and prints
 which model is active.
 """
+
 from __future__ import annotations
 
 import os
@@ -46,6 +47,7 @@ _RUNNER_ENV = "_DAFFI_EXEC_MODEL_RUNNER"
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
+
 def pytest_addoption(parser: pytest.Parser) -> None:
     group = parser.getgroup("daffi")
     group.addoption(
@@ -74,6 +76,7 @@ def pytest_configure(config: pytest.Config) -> None:
 
 
 # ── both → two fresh pytest processes ─────────────────────────────────────────
+
 
 def _strip_execution_model_args(argv: list[str]) -> list[str]:
     out: list[str] = []
@@ -124,6 +127,7 @@ def pytest_cmdline_main(config: pytest.Config):
 
 # ── session fixture + collection tweaks ───────────────────────────────────────
 
+
 @pytest.fixture(scope="session", autouse=True)
 def execution_model(pytestconfig: pytest.Config) -> str:
     """Pin ``DAFFI_EXECUTION_MODEL`` for this interpreter before any native node starts.
@@ -140,7 +144,9 @@ def execution_model(pytestconfig: pytest.Config) -> str:
     return model
 
 
-def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
+def pytest_collection_modifyitems(
+    config: pytest.Config, items: list[pytest.Item]
+) -> None:
     """Drop self-managed matrix tests from the evented pass (they already cover both)."""
     model = config.getoption("--execution-model")
     if model not in _EXEC_MODELS:

@@ -39,24 +39,27 @@ pytestmark = [
 MODELS = ("threads", "evented")
 
 
-def _run_in_model(model: str, code: str, timeout: float = 180) -> subprocess.CompletedProcess:
+def _run_in_model(
+    model: str, code: str, timeout: float = 180
+) -> subprocess.CompletedProcess:
     env = dict(os.environ, DAFFI_EXECUTION_MODEL=model)
     return subprocess.run(
         [sys.executable, "-c", code],
-        env=env, capture_output=True, text=True, timeout=timeout,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
     )
 
 
 # ── connection churn: RSS must plateau ────────────────────────────────────────
 
-_CHURN = textwrap.dedent(
-    """
+_CHURN = textwrap.dedent("""
     import json, sys
     from tests._resource_metrics import scenario_connection_churn
     samples = scenario_connection_churn(rounds=8, clients_per_round=16)
     print("SAMPLES " + json.dumps(samples))
-    """
-)
+    """)
 
 
 @pytest.mark.parametrize("model", MODELS)
@@ -66,7 +69,8 @@ def test_service_rss_steady_under_connection_churn(model):
     assert result.returncode == 0, result.stdout + result.stderr
     line = next(l for l in result.stdout.splitlines() if l.startswith("SAMPLES "))
     import json
-    samples = json.loads(line[len("SAMPLES "):])
+
+    samples = json.loads(line[len("SAMPLES ") :])
     assert len(samples) >= 6
 
     # vast-csi style: last three round-to-round deltas must not all exceed tolerance.
@@ -84,8 +88,7 @@ def test_service_rss_steady_under_connection_churn(model):
 
 # ── sustained RPC on a fixed set of clients ───────────────────────────────────
 
-_SUSTAINED = textwrap.dedent(
-    """
+_SUSTAINED = textwrap.dedent("""
     import json, multiprocessing as mp, time
     from tests._resource_metrics import (
         assert_rss_steady_state, free_port, proc_service, rss_kb,
@@ -114,8 +117,7 @@ _SUSTAINED = textwrap.dedent(
         print("OK " + json.dumps(deltas))
     finally:
         stop(svc)
-    """
-)
+    """)
 
 
 @pytest.mark.parametrize("model", MODELS)
@@ -128,8 +130,7 @@ def test_service_rss_steady_under_sustained_rpc(model):
 
 # ── threads vs evented snapshot (informational + sanity bounds) ───────────────
 
-_COMPARE = textwrap.dedent(
-    """
+_COMPARE = textwrap.dedent("""
     import json
     from tests._resource_metrics import scenario_many_clients, scenario_router
     from daffi import dfcore
@@ -153,8 +154,7 @@ _COMPARE = textwrap.dedent(
             "load_cpu_pct": router.under_load.cpu_pct,
         },
     }))
-    """
-)
+    """)
 
 
 def test_compare_threads_vs_evented_resources():
@@ -166,7 +166,7 @@ def test_compare_threads_vs_evented_resources():
         result = _run_in_model(model, _COMPARE, timeout=300)
         assert result.returncode == 0, result.stdout + result.stderr
         line = next(l for l in result.stdout.splitlines() if l.startswith("RESULT "))
-        by_model[model] = json.loads(line[len("RESULT "):])
+        by_model[model] = json.loads(line[len("RESULT ") :])
 
     t, e = by_model["threads"], by_model["evented"]
 
@@ -183,12 +183,19 @@ def test_compare_threads_vs_evented_resources():
         row("idle native threads", t[key]["idle_threads"], e[key]["idle_threads"])
         row("load native threads", t[key]["load_threads"], e[key]["load_threads"])
         if t[key]["load_cpu_pct"] is not None:
-            row("load CPU% (1 core)", t[key]["load_cpu_pct"], e[key]["load_cpu_pct"], "{:.0f}")
+            row(
+                "load CPU% (1 core)",
+                t[key]["load_cpu_pct"],
+                e[key]["load_cpu_pct"],
+                "{:.0f}",
+            )
 
     # Soft sanity: under many clients, evented must not grow one-thread-per-conn.
     assert e["many_clients"]["load_threads"] < t["many_clients"]["load_threads"]
     assert e["many_clients"]["load_threads"] < 32  # fixed loop pool, not 48+
     # Neither model should be absurdly large for this smoke load.
     for model, data in by_model.items():
-        assert data["many_clients"]["load_rss_kb"] < 512 * KiB, f"{model} Service RSS too high"
+        assert (
+            data["many_clients"]["load_rss_kb"] < 512 * KiB
+        ), f"{model} Service RSS too high"
         assert data["router"]["load_rss_kb"] < 512 * KiB, f"{model} Router RSS too high"

@@ -15,6 +15,7 @@ responses.  The tests below verify:
   2. rpc_nowait never pollutes the store.
   3. Heavy concurrent usage from many threads stays correct.
 """
+
 from __future__ import annotations
 
 import multiprocessing as mp
@@ -25,8 +26,8 @@ import pytest
 
 from .conftest import HOST, TIMEOUT, wait_for_port, silence_subprocess, quiet_kill
 
-
 # ── subprocess entry points ────────────────────────────────────────────────────
+
 
 def _proc_service_overflow(port: int) -> None:
     """Service with two callbacks:
@@ -36,7 +37,7 @@ def _proc_service_overflow(port: int) -> None:
     * ``fast_echo`` — returns immediately; used for no-wait calls.
     """
     silence_subprocess()
-    from daffi import Service, callback
+    from daffi import Service, callback, TCPTransport
 
     _barrier = threading.Barrier(2)
 
@@ -49,12 +50,15 @@ def _proc_service_overflow(port: int) -> None:
     def fast_echo(payload):
         return payload
 
-    svc = Service(app_name="overflow-svc", host=HOST, port=port, workers=40)
+    svc = Service(
+        app_name="overflow-svc", workers=40, transports=TCPTransport(HOST, port)
+    )
     svc.start()
     svc.join()
 
 
 # ── fixtures ──────────────────────────────────────────────────────────────────
+
 
 @pytest.fixture
 def overflow_service(free_port):
@@ -68,6 +72,7 @@ def overflow_service(free_port):
 
 # ── tests ─────────────────────────────────────────────────────────────────────
 
+
 class TestStoreOverflow:
     """Verify correct concurrent behaviour of the AutoHashMap-backed store."""
 
@@ -79,12 +84,14 @@ class TestStoreOverflow:
         new AutoHashMap every UUID is a distinct key — both responses must
         arrive successfully.
         """
-        from daffi import Client
+        from daffi import Client, TCPTransport
         from daffi._bindings import send_message_from_client, MessageFlag
         from daffi._rpc_proxy import RpcResult
         from daffi._serialization import Serializer, SerdeFormat
 
-        client = Client(app_name="overflow-cli", host=HOST, port=overflow_service)
+        client = Client(
+            app_name="overflow-cli", transport=TCPTransport(HOST, overflow_service)
+        )
         conn = client.connect()
         conn_num = client._conn_num
 
@@ -93,17 +100,27 @@ class TestStoreOverflow:
             # waiters so neither is fetched until we poll below.
             data_a, ib_a = Serializer.serialize(SerdeFormat.PICKLE, "payload-a")
             uuid_a, ts_a, found_a = send_message_from_client(
-                data=data_a, flag=MessageFlag.REQUEST, serde=SerdeFormat.PICKLE,
-                receiver="", func_name="hold_echo", return_result=True,
-                conn_num=conn_num, is_bytes=ib_a,
+                data=data_a,
+                flag=MessageFlag.REQUEST,
+                serde=SerdeFormat.PICKLE,
+                receiver="",
+                func_name="hold_echo",
+                return_result=True,
+                conn_num=conn_num,
+                is_bytes=ib_a,
             )
             assert found_a, "No receiver found for hold_echo"
 
             data_b, ib_b = Serializer.serialize(SerdeFormat.PICKLE, "payload-b")
             uuid_b, ts_b, found_b = send_message_from_client(
-                data=data_b, flag=MessageFlag.REQUEST, serde=SerdeFormat.PICKLE,
-                receiver="", func_name="hold_echo", return_result=True,
-                conn_num=conn_num, is_bytes=ib_b,
+                data=data_b,
+                flag=MessageFlag.REQUEST,
+                serde=SerdeFormat.PICKLE,
+                receiver="",
+                func_name="hold_echo",
+                return_result=True,
+                conn_num=conn_num,
+                is_bytes=ib_b,
             )
             assert found_b, "No receiver found for hold_echo"
 
@@ -115,13 +132,17 @@ class TestStoreOverflow:
 
             # Poll both UUIDs concurrently — both must succeed.
             results: list = [None, None]
-            errors:  list = [None, None]
+            errors: list = [None, None]
 
             def _poll(idx, uuid, ts):
                 try:
                     data, _, serde = RpcResult(
-                        conn_num=conn_num, uuid=uuid, ts=ts,
-                        timeout=5, receivers=None, proxy=None,
+                        conn_num=conn_num,
+                        uuid=uuid,
+                        ts=ts,
+                        timeout=5,
+                        receivers=None,
+                        proxy=None,
                     ).result()
                     results[idx] = Serializer.deserialize(serde, data)[0][0]
                 except Exception as exc:
@@ -129,15 +150,16 @@ class TestStoreOverflow:
 
             t_a = threading.Thread(target=_poll, args=(0, uuid_a, ts_a), daemon=True)
             t_b = threading.Thread(target=_poll, args=(1, uuid_b, ts_b), daemon=True)
-            t_a.start(); t_b.start()
-            t_a.join(timeout=15); t_b.join(timeout=10)
+            t_a.start()
+            t_b.start()
+            t_a.join(timeout=15)
+            t_b.join(timeout=10)
 
-            assert errors == [None, None], (
-                f"One or both requests failed: {errors}"
-            )
-            assert set(results) == {"payload-a", "payload-b"}, (
-                f"Expected both payloads delivered, got: {results}"
-            )
+            assert errors == [None, None], f"One or both requests failed: {errors}"
+            assert set(results) == {
+                "payload-a",
+                "payload-b",
+            }, f"Expected both payloads delivered, got: {results}"
 
             # Connection must still be alive.
             ping = conn.rpc(timeout=TIMEOUT).fast_echo("ping-after-concurrent")
@@ -152,9 +174,12 @@ class TestStoreOverflow:
         client message store.  Fire a large burst, then verify that a normal
         blocking rpc() still works perfectly on the same connection.
         """
-        from daffi import Client
+        from daffi import Client, TCPTransport
 
-        client = Client(app_name="overflow-nowait-cli", host=HOST, port=overflow_service)
+        client = Client(
+            app_name="overflow-nowait-cli",
+            transport=TCPTransport(HOST, overflow_service),
+        )
         conn = client.connect()
 
         try:
@@ -173,12 +198,15 @@ class TestStoreOverflow:
         All results must be correct — the HashMap handles concurrent inserts
         without false collisions.
         """
-        from daffi import Client
+        from daffi import Client, TCPTransport
 
         N_THREADS = 50
         CALLS = 10
 
-        client = Client(app_name="overflow-heavy-cli", host=HOST, port=overflow_service)
+        client = Client(
+            app_name="overflow-heavy-cli",
+            transport=TCPTransport(HOST, overflow_service),
+        )
         conn = client.connect()
         proxy = conn.rpc(timeout=TIMEOUT)
 
@@ -192,9 +220,9 @@ class TestStoreOverflow:
                 for k in range(CALLS):
                     payload = (tid, k)
                     result = proxy.fast_echo(payload)
-                    assert list(result) == list(payload), (
-                        f"tid={tid} k={k}: expected {payload!r} got {result!r}"
-                    )
+                    assert list(result) == list(
+                        payload
+                    ), f"tid={tid} k={k}: expected {payload!r} got {result!r}"
             except Exception as exc:
                 with lock:
                     errors.append(exc)

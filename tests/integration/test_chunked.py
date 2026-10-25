@@ -34,6 +34,7 @@ Layouts tested
 * Direct: Client  →  Service
 * Router: Client  →  Router  →  Worker
 """
+
 from __future__ import annotations
 
 import multiprocessing as mp
@@ -55,13 +56,14 @@ from .conftest import (
 
 # Chunk size used in multi-chunk tests.  Small enough to force several messages
 # even for modest payloads, large enough not to be pathologically slow.
-CHUNK_SIZE = 64 * 1024   # 64 KiB
+CHUNK_SIZE = 64 * 1024  # 64 KiB
 
 # Size of the "large" pickled payload (list of ints before pickling).
 LARGE_LIST_LEN = 50_000
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
+
 
 def _chunked(data: bytes, size: int):
     """Yield successive *size*-byte slices of *data*."""
@@ -74,7 +76,7 @@ def _round_trip(conn, obj, chunk_size: int = CHUNK_SIZE, *, nowait: bool = False
 
     Returns the recovered object so the caller can assert equality.
     """
-    from daffi import SerdeFormat
+    from daffi import SerdeFormat, TCPTransport
 
     raw = pickle.dumps(obj)
     chunks = list(_chunked(raw, chunk_size))
@@ -90,18 +92,19 @@ def _round_trip(conn, obj, chunk_size: int = CHUNK_SIZE, *, nowait: bool = False
     # guarantees it is processed last even for stream_nowait.
     assembled = conn.rpc(timeout=TIMEOUT).get_result()
     assert isinstance(assembled, bytes), "service must return bytes"
-    assert assembled == raw, (
-        f"assembled {len(assembled)} bytes != original {len(raw)} bytes"
-    )
+    assert (
+        assembled == raw
+    ), f"assembled {len(assembled)} bytes != original {len(raw)} bytes"
     return pickle.loads(assembled)
 
 
 # ── subprocess entry points ───────────────────────────────────────────────────
 
+
 def _proc_chunked_service(port: int, app_name: str = "chunk-svc") -> None:
     """Service subprocess: accumulates OPAQUE chunks, returns on demand."""
     silence_subprocess()
-    from daffi import Service, callback
+    from daffi import Service, callback, TCPTransport
 
     _buf: bytearray = bytearray()
 
@@ -120,7 +123,7 @@ def _proc_chunked_service(port: int, app_name: str = "chunk-svc") -> None:
         """Clear the buffer so the service can accept a new transfer."""
         _buf.clear()
 
-    svc = Service(app_name=app_name, host=HOST, port=port)
+    svc = Service(app_name=app_name, transports=TCPTransport(HOST, port))
     svc.start()
     svc.join()
 
@@ -129,7 +132,7 @@ def _proc_chunked_worker(port: int, app_name: str = "chunk-worker") -> None:
     """Worker subprocess for router-topology tests."""
     silence_subprocess()
     import time as _time
-    from daffi import Client, callback
+    from daffi import Client, callback, TCPTransport
 
     _buf: bytearray = bytearray()
 
@@ -145,7 +148,7 @@ def _proc_chunked_worker(port: int, app_name: str = "chunk-worker") -> None:
     def reset() -> None:
         _buf.clear()
 
-    client = Client(app_name=app_name, host=HOST, port=port)
+    client = Client(app_name=app_name, transport=TCPTransport(HOST, port))
     client.connect()
     try:
         while True:
@@ -158,21 +161,20 @@ def _proc_chunked_worker(port: int, app_name: str = "chunk-worker") -> None:
 
 def _proc_router(port: int, app_name: str = "chunk-router") -> None:
     silence_subprocess()
-    from daffi import Router
+    from daffi import Router, TCPTransport
 
-    r = Router(app_name=app_name, host=HOST, port=port)
+    r = Router(app_name=app_name, transports=TCPTransport(HOST, port))
     r.start()
     r.join()
 
 
 # ── fixtures ──────────────────────────────────────────────────────────────────
 
+
 @pytest.fixture
 def chunked_service(free_port):
     """Direct-layout: fresh Service subprocess with chunk callbacks."""
-    proc = mp.Process(
-        target=_proc_chunked_service, args=(free_port,), daemon=True
-    )
+    proc = mp.Process(target=_proc_chunked_service, args=(free_port,), daemon=True)
     proc.start()
     wait_for_port(free_port)
     time.sleep(0.15)
@@ -187,9 +189,7 @@ def chunked_router(free_port):
     rproc.start()
     wait_for_port(free_port)
 
-    wproc = mp.Process(
-        target=_proc_chunked_worker, args=(free_port,), daemon=True
-    )
+    wproc = mp.Process(target=_proc_chunked_worker, args=(free_port,), daemon=True)
     wproc.start()
     wait_for_members(free_port, {"chunk-worker"})
     yield free_port
@@ -198,9 +198,9 @@ def chunked_router(free_port):
 
 
 def _connect(port: int, name: str):
-    from daffi import Client
+    from daffi import Client, TCPTransport
 
-    client = Client(app_name=name, host=HOST, port=port)
+    client = Client(app_name=name, transport=TCPTransport(HOST, port))
     conn = client.connect()
     return client, conn
 
@@ -208,6 +208,7 @@ def _connect(port: int, name: str):
 # ══════════════════════════════════════════════════════════════════════════════
 # Scenario 1 — stream() with backpressure (direct layout)
 # ══════════════════════════════════════════════════════════════════════════════
+
 
 class TestStreamBackpressure:
     """conn.stream() sends one chunk at a time and waits for an ack before
@@ -217,7 +218,7 @@ class TestStreamBackpressure:
         """A bytes object small enough to fit in one chunk is reassembled intact."""
         client, conn = _connect(chunked_service, "cs-bytes-1")
         try:
-            original = bytes(range(256)) * 4   # 1 KiB
+            original = bytes(range(256)) * 4  # 1 KiB
             recovered = _round_trip(conn, original, chunk_size=CHUNK_SIZE)
             assert recovered == original
         finally:
@@ -227,7 +228,7 @@ class TestStreamBackpressure:
         """A bytes object split across multiple 64 KiB chunks is reassembled."""
         client, conn = _connect(chunked_service, "cs-bytes-n")
         try:
-            original = bytes(range(256)) * 1024   # 256 KiB → 4 chunks of 64 KiB
+            original = bytes(range(256)) * 1024  # 256 KiB → 4 chunks of 64 KiB
             recovered = _round_trip(conn, original, chunk_size=CHUNK_SIZE)
             assert recovered == original
         finally:
@@ -248,11 +249,11 @@ class TestStreamBackpressure:
         client, conn = _connect(chunked_service, "cs-dict")
         try:
             original = {
-                "ints":    list(range(5_000)),
-                "floats":  [i * 0.001 for i in range(1_000)],
+                "ints": list(range(5_000)),
+                "floats": [i * 0.001 for i in range(1_000)],
                 "strings": [f"item-{i}" for i in range(500)],
-                "bytes":   bytes(range(256)) * 8,
-                "nested":  {"a": {"b": {"c": [True, False, None]}}},
+                "bytes": bytes(range(256)) * 8,
+                "nested": {"a": {"b": {"c": [True, False, None]}}},
                 "unicode": "日本語テスト 🐍 " * 100,
             }
             recovered = _round_trip(conn, original, chunk_size=CHUNK_SIZE)
@@ -274,7 +275,7 @@ class TestStreamBackpressure:
         """Payload fits in one chunk of 1 MiB (tests single-message large transfer)."""
         client, conn = _connect(chunked_service, "cs-1mib")
         try:
-            original = bytes(range(256)) * 4096   # 1 MiB of cyclic bytes
+            original = bytes(range(256)) * 4096  # 1 MiB of cyclic bytes
             recovered = _round_trip(conn, original, chunk_size=1 << 20)
             assert recovered == original
         finally:
@@ -285,12 +286,12 @@ class TestStreamBackpressure:
         client, conn = _connect(chunked_service, "cs-types")
         try:
             original = {
-                "tuple":  (1, "two", 3.0),
-                "set":    {10, 20, 30},
+                "tuple": (1, "two", 3.0),
+                "set": {10, 20, 30},
                 "bool_t": True,
                 "bool_f": False,
-                "none":   None,
-                "bytes":  b"\x00\xde\xad\xbe\xef",
+                "none": None,
+                "bytes": b"\x00\xde\xad\xbe\xef",
             }
             recovered = _round_trip(conn, original, chunk_size=CHUNK_SIZE)
             assert recovered == original
@@ -304,9 +305,9 @@ class TestStreamBackpressure:
         client, conn = _connect(chunked_service, "cs-unicode")
         try:
             original = {
-                "cjk":   "你好世界" * 500,
+                "cjk": "你好世界" * 500,
                 "emoji": "🐍🦊🎉" * 300,
-                "rtl":   "مرحبا بالعالم" * 200,
+                "rtl": "مرحبا بالعالم" * 200,
             }
             recovered = _round_trip(conn, original, chunk_size=8 * 1024)
             assert recovered == original
@@ -317,12 +318,16 @@ class TestStreamBackpressure:
         """The same payload chunked at 1 KiB, 64 KiB, and 256 KiB all round-trip
         correctly — verifying the service accumulation is chunk-size agnostic."""
         original = list(range(20_000))
-        for cs_label, chunk_size in [("1k", 1024), ("64k", CHUNK_SIZE), ("256k", 256 * 1024)]:
+        for cs_label, chunk_size in [
+            ("1k", 1024),
+            ("64k", CHUNK_SIZE),
+            ("256k", 256 * 1024),
+        ]:
             client, conn = _connect(chunked_service, f"cs-vary-{cs_label}")
             try:
                 recovered = _round_trip(conn, original, chunk_size=chunk_size)
                 assert recovered == original, f"mismatch at chunk_size={chunk_size}"
-                conn.rpc(timeout=TIMEOUT).reset()   # clear buffer for next iteration
+                conn.rpc(timeout=TIMEOUT).reset()  # clear buffer for next iteration
             finally:
                 client.stop()
 
@@ -330,6 +335,7 @@ class TestStreamBackpressure:
 # ══════════════════════════════════════════════════════════════════════════════
 # Scenario 2 — stream_nowait() fire-and-forget (direct layout)
 # ══════════════════════════════════════════════════════════════════════════════
+
 
 class TestStreamNowait:
     """conn.stream_nowait() enqueues all chunks without waiting for acks.
@@ -365,7 +371,7 @@ class TestStreamNowait:
         """Raw bytes (non-ASCII) transferred nowait arrive byte-perfect."""
         client, conn = _connect(chunked_service, "cnw-bytes")
         try:
-            original = bytes(range(256)) * 256   # 64 KiB of every byte value
+            original = bytes(range(256)) * 256  # 64 KiB of every byte value
             recovered = _round_trip(conn, original, chunk_size=8 * 1024, nowait=True)
             assert recovered == original
         finally:
@@ -376,8 +382,8 @@ class TestStreamNowait:
         client, conn = _connect(chunked_service, "cnw-dict")
         try:
             original = {
-                "data":    list(range(10_000)),
-                "meta":    {"version": 42, "flag": True},
+                "data": list(range(10_000)),
+                "meta": {"version": 42, "flag": True},
                 "payload": bytes(range(256)) * 32,
             }
             recovered = _round_trip(conn, original, chunk_size=CHUNK_SIZE, nowait=True)
@@ -390,6 +396,7 @@ class TestStreamNowait:
 # Scenario 3 — stream() via Router (two-hop layout)
 # ══════════════════════════════════════════════════════════════════════════════
 
+
 class TestStreamViaRouter:
     """Same data-integrity checks through the Router → Worker hop."""
 
@@ -397,7 +404,7 @@ class TestStreamViaRouter:
         """Multi-chunk bytes transfer via Router reassembles correctly."""
         client, conn = _connect(chunked_router, "cr-bytes")
         try:
-            original = bytes(range(256)) * 1024   # 256 KiB
+            original = bytes(range(256)) * 1024  # 256 KiB
             recovered = _round_trip(conn, original, chunk_size=CHUNK_SIZE)
             assert recovered == original
         finally:
@@ -427,6 +434,7 @@ class TestStreamViaRouter:
 # ══════════════════════════════════════════════════════════════════════════════
 # Scenario 4 — edge cases
 # ══════════════════════════════════════════════════════════════════════════════
+
 
 class TestEdgeCases:
     """Boundary conditions that stress the chunking and reassembly logic."""

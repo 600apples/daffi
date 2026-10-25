@@ -3,7 +3,8 @@ js/06_cast_nowait — Worker A.
 
 Start after 1_router.py.
 """
-from daffi import Client, callback
+
+from daffi import Client, callback, TCPTransport
 
 NAME = "worker-A"
 
@@ -19,7 +20,7 @@ def process(payload: dict) -> None:
 
 
 if __name__ == "__main__":
-    client = Client(app_name=NAME, host="127.0.0.1", port=6021)
+    client = Client(app_name=NAME, transport=TCPTransport("127.0.0.1", 6021))
     client.connect()
     print(f"'{NAME}' connected — press Ctrl+C to stop.")
     client.join()

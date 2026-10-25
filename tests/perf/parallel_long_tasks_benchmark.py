@@ -40,13 +40,14 @@ import time
 
 # ── tunables ──────────────────────────────────────────────────────────────────
 
-N_TASKS        = 5           # number of concurrent calls / worker threads
-SLEEP_SECONDS  = 120.0       # simulated long job duration (seconds)
-SLACK_SECONDS  = 2.0         # acceptable overshoot beyond SLEEP_SECONDS
-RPC_TIMEOUT    = SLEEP_SECONDS + 60   # per-call timeout — generous headroom
-HOST           = "127.0.0.1"
+N_TASKS = 5  # number of concurrent calls / worker threads
+SLEEP_SECONDS = 120.0  # simulated long job duration (seconds)
+SLACK_SECONDS = 2.0  # acceptable overshoot beyond SLEEP_SECONDS
+RPC_TIMEOUT = SLEEP_SECONDS + 60  # per-call timeout — generous headroom
+HOST = "127.0.0.1"
 
 # ── subprocess silence helpers ────────────────────────────────────────────────
+
 
 def _silence_subprocess() -> None:
     devnull_fd = os.open(os.devnull, os.O_WRONLY)
@@ -71,7 +72,9 @@ def _quiet_kill(proc: mp.Process) -> None:
         os.close(saved[1])
     proc.join(timeout=10)
 
+
 # ── port helpers ──────────────────────────────────────────────────────────────
+
 
 def _free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -90,13 +93,15 @@ def _wait_for_port(port: int, timeout: float = 20.0) -> None:
             time.sleep(0.05)
     raise TimeoutError(f"Server {HOST}:{port} did not become ready in {timeout}s")
 
+
 # ── subprocess entry points ───────────────────────────────────────────────────
+
 
 def _proc_router(port: int) -> None:
     _silence_subprocess()
-    from daffi import Router
+    from daffi import Router, TCPTransport
 
-    router = Router(app_name="longtask-router", host=HOST, port=port)
+    router = Router(app_name="longtask-router", transports=TCPTransport(HOST, port))
     router.start()
     router.join()
 
@@ -105,7 +110,7 @@ def _proc_worker(port: int, sleep_s: float, n_workers: int) -> None:
     """Worker with *n_workers* handler threads and a slow ``slow_job`` callback."""
     _silence_subprocess()
     import time as _time
-    from daffi import Client, callback
+    from daffi import Client, callback, TCPTransport
 
     @callback
     def slow_job(task_id: int) -> dict:
@@ -114,9 +119,8 @@ def _proc_worker(port: int, sleep_s: float, n_workers: int) -> None:
 
     client = Client(
         app_name="longtask-worker",
-        host=HOST,
-        port=port,
         workers=n_workers,
+        transport=TCPTransport(HOST, port),
     )
     client.connect()
     try:
@@ -127,14 +131,16 @@ def _proc_worker(port: int, sleep_s: float, n_workers: int) -> None:
     finally:
         client.stop()
 
+
 # ── worker readiness probe ────────────────────────────────────────────────────
+
 
 def _wait_for_worker(port: int, timeout: float = 30.0) -> None:
     """Block until the longtask-worker is visible with its 'slow_job' callback."""
-    from daffi import Client
+    from daffi import Client, TCPTransport
     from daffi._bindings import get_available_members
 
-    probe = Client(app_name="longtask-probe", host=HOST, port=port)
+    probe = Client(app_name="longtask-probe", transport=TCPTransport(HOST, port))
     probe.connect()
     conn_num = probe._conn_num
 
@@ -155,7 +161,9 @@ def _wait_for_worker(port: int, timeout: float = 30.0) -> None:
     probe.stop()
     raise TimeoutError(f"longtask-worker did not register 'slow_job' within {timeout}s")
 
+
 # ── caller load (runs in-process) ─────────────────────────────────────────────
+
 
 def _run_callers(port: int, n_tasks: int) -> float:
     """Connect *n_tasks* clients, fire one slow_job each simultaneously.
@@ -163,23 +171,23 @@ def _run_callers(port: int, n_tasks: int) -> float:
     Returns the wall-clock seconds from releasing all threads to the last
     response arriving.
     """
-    from daffi import Client
+    from daffi import Client, TCPTransport
 
     # Connect all callers before the measurement window.
     callers: list[tuple] = []
     for i in range(n_tasks):
-        c = Client(app_name=f"longtask-caller-{i}", host=HOST, port=port)
+        c = Client(app_name=f"longtask-caller-{i}", transport=TCPTransport(HOST, port))
         conn = c.connect()
         callers.append((c, conn))
 
     results: list = [None] * n_tasks
-    errors:  list = []
-    barrier = threading.Barrier(n_tasks)          # synchronise all threads at start
-    lock    = threading.Lock()
+    errors: list = []
+    barrier = threading.Barrier(n_tasks)  # synchronise all threads at start
+    lock = threading.Lock()
 
     def _call(idx: int, client, conn) -> None:
         try:
-            barrier.wait(timeout=30)              # all threads start together
+            barrier.wait(timeout=30)  # all threads start together
             rpc = conn.rpc(timeout=RPC_TIMEOUT)
             result = rpc.slow_job(idx)
             with lock:
@@ -219,7 +227,9 @@ def _run_callers(port: int, n_tasks: int) -> float:
 
     return wall
 
+
 # ── scenario ──────────────────────────────────────────────────────────────────
+
 
 def run_scenario() -> None:
     label = (
@@ -229,10 +239,12 @@ def run_scenario() -> None:
     sep = "=" * 68
     print(f"\n{sep}")
     print(f"  {label}")
-    print(f"  Expected wall time: ~{SLEEP_SECONDS:.0f}s  (max: {SLEEP_SECONDS + SLACK_SECONDS:.0f}s)")
+    print(
+        f"  Expected wall time: ~{SLEEP_SECONDS:.0f}s  (max: {SLEEP_SECONDS + SLACK_SECONDS:.0f}s)"
+    )
     print(sep, flush=True)
 
-    port        = _free_port()
+    port = _free_port()
     router_proc = mp.Process(target=_proc_router, args=(port,), daemon=True)
     worker_proc = mp.Process(
         target=_proc_worker,
@@ -249,7 +261,10 @@ def run_scenario() -> None:
         _wait_for_worker(port)
         print(" done")
 
-        print(f"  Connecting {N_TASKS} callers and firing jobs simultaneously…", flush=True)
+        print(
+            f"  Connecting {N_TASKS} callers and firing jobs simultaneously…",
+            flush=True,
+        )
         wall = _run_callers(port, N_TASKS)
 
         lo = SLEEP_SECONDS
@@ -281,18 +296,21 @@ def run_scenario() -> None:
 
 # ── main ──────────────────────────────────────────────────────────────────────
 
+
 def main() -> None:
     logging.disable(logging.CRITICAL)
 
     # Suppress Zig native teardown noise on stderr.
-    devnull    = os.open(os.devnull, os.O_WRONLY)
+    devnull = os.open(os.devnull, os.O_WRONLY)
     saved_stderr = os.dup(2)
     os.dup2(devnull, 2)
     os.close(devnull)
 
     try:
         print("\ndaffi — parallel long-tasks benchmark")
-        print(f"host: {HOST}  tasks: {N_TASKS}  sleep: {SLEEP_SECONDS:.0f}s  slack: {SLACK_SECONDS:.1f}s")
+        print(
+            f"host: {HOST}  tasks: {N_TASKS}  sleep: {SLEEP_SECONDS:.0f}s  slack: {SLACK_SECONDS:.1f}s"
+        )
         run_scenario()
         print("\n── Done ─────────────────────────────────────────────\n")
     finally:

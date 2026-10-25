@@ -41,6 +41,7 @@ PAYLOAD = {"order": 42, "items": [{"sku": f"item-{i}", "qty": i} for i in range(
 
 # ── helpers ───────────────────────────────────────────────────────────────────
 
+
 def _free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.bind((HOST, 0))
@@ -69,43 +70,46 @@ def _silence() -> None:
 def _thread_count(pid: int) -> int:
     if sys.platform.startswith("linux"):
         return len(os.listdir(f"/proc/{pid}/task"))
-    out = subprocess.run(["ps", "-M", "-p", str(pid)], capture_output=True, text=True).stdout
+    out = subprocess.run(
+        ["ps", "-M", "-p", str(pid)], capture_output=True, text=True
+    ).stdout
     return max(0, len(out.strip().splitlines()) - 1)
 
 
 # ── subprocess entry points ───────────────────────────────────────────────────
 
+
 def _proc_service(port: int) -> None:
     _silence()
-    from daffi import Service, callback
+    from daffi import Service, callback, TCPTransport
 
     @callback
     def echo(payload):
         return payload
 
-    svc = Service(app_name="bench-service", host=HOST, port=port)
+    svc = Service(app_name="bench-service", transports=TCPTransport(HOST, port))
     svc.start()
     svc.join()
 
 
 def _proc_router(port: int) -> None:
     _silence()
-    from daffi import Router
+    from daffi import Router, TCPTransport
 
-    router = Router(app_name="bench-router", host=HOST, port=port)
+    router = Router(app_name="bench-router", transports=TCPTransport(HOST, port))
     router.start()
     router.join()
 
 
 def _proc_worker(port: int) -> None:
     _silence()
-    from daffi import Client, callback
+    from daffi import Client, callback, TCPTransport
 
     @callback
     def echo(payload):
         return payload
 
-    client = Client(app_name="bench-worker", host=HOST, port=port)
+    client = Client(app_name="bench-worker", transport=TCPTransport(HOST, port))
     client.connect()
     while True:
         time.sleep(1)
@@ -118,6 +122,7 @@ def _stop(*procs: mp.Process) -> None:
 
 
 # ── scenarios (run inside the per-model interpreter) ──────────────────────────
+
 
 def _sequential(conn, calls: int) -> dict:
     rpc = conn.rpc(timeout=30)
@@ -137,14 +142,14 @@ def _sequential(conn, calls: int) -> dict:
 
 
 def bench_direct(calls: int) -> dict:
-    from daffi import Client
+    from daffi import Client, TCPTransport
 
     port = _free_port()
     svc = mp.Process(target=_proc_service, args=(port,), daemon=True)
     svc.start()
     try:
         _wait_for_port(port)
-        client = Client(app_name="bench-direct", host=HOST, port=port)
+        client = Client(app_name="bench-direct", transport=TCPTransport(HOST, port))
         conn = client.connect()
         conn.wait_for_members("bench-service", timeout=10)
         result = _sequential(conn, calls)
@@ -155,7 +160,7 @@ def bench_direct(calls: int) -> dict:
 
 
 def bench_router(calls: int) -> dict:
-    from daffi import Client
+    from daffi import Client, TCPTransport
 
     port = _free_port()
     router = mp.Process(target=_proc_router, args=(port,), daemon=True)
@@ -164,7 +169,7 @@ def bench_router(calls: int) -> dict:
     try:
         _wait_for_port(port)
         worker.start()
-        client = Client(app_name="bench-caller", host=HOST, port=port)
+        client = Client(app_name="bench-caller", transport=TCPTransport(HOST, port))
         conn = client.connect()
         conn.wait_for_members("bench-worker", timeout=10)
         result = _sequential(conn, calls)
@@ -175,7 +180,7 @@ def bench_router(calls: int) -> dict:
 
 
 def bench_concurrent(n_clients: int, seconds: float) -> dict:
-    from daffi import Client
+    from daffi import Client, TCPTransport
 
     port = _free_port()
     svc = mp.Process(target=_proc_service, args=(port,), daemon=True)
@@ -187,7 +192,7 @@ def bench_concurrent(n_clients: int, seconds: float) -> dict:
 
         clients, conns = [], []
         for i in range(n_clients):
-            client = Client(app_name=f"bench-c{i}", host=HOST, port=port)
+            client = Client(app_name=f"bench-c{i}", transport=TCPTransport(HOST, port))
             conn = client.connect()
             conn.wait_for_members("bench-service", timeout=10)
             clients.append(client)
@@ -246,7 +251,7 @@ def _summarize(runs: list[dict]) -> dict:
 
 
 def run_model(calls: int, n_clients: int, seconds: float, repeats: int) -> dict:
-    from daffi import dfcore
+    from daffi import dfcore, TCPTransport
 
     model = dfcore.getExecutionModel()
 
@@ -263,6 +268,7 @@ def run_model(calls: int, n_clients: int, seconds: float, repeats: int) -> dict:
 
 
 # ── driver ────────────────────────────────────────────────────────────────────
+
 
 def _print_table(results: dict) -> None:
     t, e = results["threads"], results["evented"]
@@ -288,7 +294,9 @@ def _print_table(results: dict) -> None:
             return med
         return f"{med} [{lo}–{hi}]"
 
-    def row(label, a: dict, b: dict, fmt="{:,.0f}", *, higher_is_better=True, compare=True):
+    def row(
+        label, a: dict, b: dict, fmt="{:,.0f}", *, higher_is_better=True, compare=True
+    ):
         cmp = (
             _faster(a["median"], b["median"], higher_is_better=higher_is_better)
             if compare
@@ -303,41 +311,68 @@ def _print_table(results: dict) -> None:
         row(f"{title}: calls/s", t[scenario]["calls_per_s"], e[scenario]["calls_per_s"])
         row(
             f"{title}: p50 latency (µs)",
-            t[scenario]["p50_us"], e[scenario]["p50_us"], "{:,.1f}",
+            t[scenario]["p50_us"],
+            e[scenario]["p50_us"],
+            "{:,.1f}",
             higher_is_better=False,
         )
         row(
             f"{title}: p99 latency (µs)",
-            t[scenario]["p99_us"], e[scenario]["p99_us"], "{:,.1f}",
+            t[scenario]["p99_us"],
+            e[scenario]["p99_us"],
+            "{:,.1f}",
             higher_is_better=False,
         )
     c_t, c_e = t["concurrent"], e["concurrent"]
     row("concurrent: calls/s", c_t["calls_per_s"], c_e["calls_per_s"])
     row(
         "concurrent: fairness (min/max client)",
-        c_t["fairness_min_max"], c_e["fairness_min_max"], "{:.2f}",
+        c_t["fairness_min_max"],
+        c_e["fairness_min_max"],
+        "{:.2f}",
     )
     # Thread counts are a resource metric, not speed — no "faster" label.
-    row("service threads, idle", c_t["service_threads_idle"], c_e["service_threads_idle"], "{:.0f}", compare=False)
+    row(
+        "service threads, idle",
+        c_t["service_threads_idle"],
+        c_e["service_threads_idle"],
+        "{:.0f}",
+        compare=False,
+    )
     row(
         "service threads, clients connected",
-        c_t["service_threads_connected"], c_e["service_threads_connected"], "{:.0f}",
+        c_t["service_threads_connected"],
+        c_e["service_threads_connected"],
+        "{:.0f}",
         compare=False,
     )
     row(
         "service threads, under load",
-        c_t["service_threads_busy"], c_e["service_threads_busy"], "{:.0f}",
+        c_t["service_threads_busy"],
+        c_e["service_threads_busy"],
+        "{:.0f}",
         compare=False,
     )
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--calls", type=int, default=20_000, help="sequential calls per latency scenario")
-    parser.add_argument("--clients", type=int, default=64, help="concurrent clients")
-    parser.add_argument("--seconds", type=float, default=5.0, help="duration of the concurrent scenario")
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
     parser.add_argument(
-        "--repeats", type=int, default=5,
+        "--calls",
+        type=int,
+        default=20_000,
+        help="sequential calls per latency scenario",
+    )
+    parser.add_argument("--clients", type=int, default=64, help="concurrent clients")
+    parser.add_argument(
+        "--seconds", type=float, default=5.0, help="duration of the concurrent scenario"
+    )
+    parser.add_argument(
+        "--repeats",
+        type=int,
+        default=5,
         help="runs per scenario; table shows median [min–max] (default: 5)",
     )
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
@@ -354,15 +389,32 @@ def main() -> None:
         print(f"running {model} model…", flush=True)
         env = dict(os.environ, DAFFI_EXECUTION_MODEL=model)
         proc = subprocess.run(
-            [sys.executable, __file__, "--worker", "--calls", str(args.calls), "--clients", str(args.clients),
-             "--seconds", str(args.seconds), "--repeats", str(args.repeats)],
-            env=env, capture_output=True, text=True,
+            [
+                sys.executable,
+                __file__,
+                "--worker",
+                "--calls",
+                str(args.calls),
+                "--clients",
+                str(args.clients),
+                "--seconds",
+                str(args.seconds),
+                "--repeats",
+                str(args.repeats),
+            ],
+            env=env,
+            capture_output=True,
+            text=True,
         )
-        line = next((l for l in proc.stdout.splitlines() if l.startswith("RESULT ")), None)
+        line = next(
+            (l for l in proc.stdout.splitlines() if l.startswith("RESULT ")), None
+        )
         if line is None:
             sys.exit(f"{model} run failed:\n{proc.stdout}\n{proc.stderr}")
-        result = json.loads(line[len("RESULT "):])
-        assert result["model"] == model, f"expected {model}, core reports {result['model']}"
+        result = json.loads(line[len("RESULT ") :])
+        assert (
+            result["model"] == model
+        ), f"expected {model}, core reports {result['model']}"
         results[model] = result
     _print_table(results)
 

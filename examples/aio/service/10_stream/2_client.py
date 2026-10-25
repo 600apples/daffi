@@ -14,8 +14,10 @@ The data source is an async generator, composing naturally with asyncio I/O.
 
 Run 1_service.py first.
 """
+
 import asyncio
 from daffi.aio import AsyncClient
+from daffi import TCPTransport
 
 CHUNKS = [
     b"The quick brown fox",
@@ -36,7 +38,9 @@ async def data_source():
 
 
 async def main():
-    client = AsyncClient(app_name="stream-client", host="0.0.0.0", port=5010)
+    client = AsyncClient(
+        app_name="stream-client", transport=TCPTransport("0.0.0.0", 5010)
+    )
     conn = await client.connect()
 
     print("\n── stream() — backpressure ──")

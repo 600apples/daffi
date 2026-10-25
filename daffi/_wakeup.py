@@ -21,7 +21,6 @@ import fcntl
 import os
 from enum import Enum
 
-
 _HAS_EVENTFD = hasattr(os, "eventfd")
 
 

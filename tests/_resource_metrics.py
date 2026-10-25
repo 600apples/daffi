@@ -36,6 +36,7 @@ except (AttributeError, ValueError, KeyError):
 
 # ── process metrics ───────────────────────────────────────────────────────────
 
+
 def rss_kb(pid: int) -> Optional[int]:
     """Resident set size in KiB, or None if the process is gone."""
     try:
@@ -102,6 +103,7 @@ def sample_window(pid: int, seconds: float = 1.0) -> Sample:
 
 # ── topology helpers ──────────────────────────────────────────────────────────
 
+
 def free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.bind((HOST, 0))
@@ -129,35 +131,35 @@ def _silence() -> None:
 
 def proc_service(port: int) -> None:
     _silence()
-    from daffi import Service, callback
+    from daffi import Service, callback, TCPTransport
 
     @callback
     def echo(payload):
         return payload
 
-    svc = Service(app_name="res-service", host=HOST, port=port)
+    svc = Service(app_name="res-service", transports=TCPTransport(HOST, port))
     svc.start()
     svc.join()
 
 
 def proc_router(port: int) -> None:
     _silence()
-    from daffi import Router
+    from daffi import Router, TCPTransport
 
-    router = Router(app_name="res-router", host=HOST, port=port)
+    router = Router(app_name="res-router", transports=TCPTransport(HOST, port))
     router.start()
     router.join()
 
 
 def proc_worker(port: int) -> None:
     _silence()
-    from daffi import Client, callback
+    from daffi import Client, callback, TCPTransport
 
     @callback
     def echo(payload):
         return payload
 
-    client = Client(app_name="res-worker", host=HOST, port=port)
+    client = Client(app_name="res-worker", transport=TCPTransport(HOST, port))
     client.connect()
     while True:
         time.sleep(1)
@@ -172,12 +174,13 @@ def stop(*procs: mp.Process) -> None:
 
 # ── load generators ───────────────────────────────────────────────────────────
 
+
 def _connect_clients(port: int, n: int, peer: str) -> tuple[list, list]:
-    from daffi import Client
+    from daffi import Client, TCPTransport
 
     clients, conns = [], []
     for i in range(n):
-        client = Client(app_name=f"res-c{i}", host=HOST, port=port)
+        client = Client(app_name=f"res-c{i}", transport=TCPTransport(HOST, port))
         conn = client.connect()
         conn.wait_for_members(peer, timeout=15)
         clients.append(client)
@@ -227,13 +230,14 @@ def _stop_clients(clients: list) -> None:
 
 # ── scenarios ─────────────────────────────────────────────────────────────────
 
+
 @dataclass
 class ScenarioResult:
     name: str
-    target: str          # which process was measured ("service" | "router")
+    target: str  # which process was measured ("service" | "router")
     idle: Sample
     under_load: Sample
-    after: Sample        # after clients disconnected / load stopped
+    after: Sample  # after clients disconnected / load stopped
 
 
 def scenario_many_clients(
@@ -337,6 +341,7 @@ def scenario_connection_churn(
 
 
 # ── steady-state assert (vast-csi style) ──────────────────────────────────────
+
 
 def assert_rss_steady_state(
     step: Callable[[], None],

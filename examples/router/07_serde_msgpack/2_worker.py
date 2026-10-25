@@ -7,8 +7,9 @@ Requires:  pip install 'daffi[msgpack]'
 
 Start 1_router.py first, then this, then 3_caller.py.
 """
+
 import os
-from daffi import Client, callback
+from daffi import Client, callback, TCPTransport
 
 WORKER_NAME = os.environ.get("WORKER_NAME", "mp-worker-1")
 
@@ -23,7 +24,7 @@ def enrich(record: dict) -> dict:
 
 
 if __name__ == "__main__":
-    worker = Client(app_name=WORKER_NAME, host="0.0.0.0", port=6007)
+    worker = Client(app_name=WORKER_NAME, transport=TCPTransport("0.0.0.0", 6007))
     worker.connect()
     print(f"Worker {WORKER_NAME!r} connected — press Ctrl+C to stop.")
     worker.join()

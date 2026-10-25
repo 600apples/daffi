@@ -6,7 +6,7 @@ Usage::
     from daffi.aio import Client, Service, Router
 
     async def main():
-        client = Client(app_name="caller", host="127.0.0.1", port=6000)
+        client = Client(app_name="caller", transport=TCPTransport("127.0.0.1", 6000))
         conn = await client.connect()
 
         result = await conn.rpc(timeout=5).multiply(6, 7)
@@ -26,11 +26,18 @@ import asyncio
 
 from .. import dfcore
 
-from daffi.app import Application, ServerMode
+from daffi.app import (
+    Application,
+    MultipleTransportMixin,
+    ServerMode,
+    SingleTransportMixin,
+)
 from daffi.exceptions import InitializationError
 from daffi._bindings import set_lifecycle_fd, set_response_fd
 from daffi._rpc_proxy import RpcProxy, system_exception_handler
 from daffi._signals import set_signal_handler
+from daffi._task_dispatcher import TaskDispatcher
+from daffi.transports import TCPTransport, UnixTransport
 
 from daffi.aio._rpc_proxy import (
     AsyncRpcProxy,
@@ -39,10 +46,10 @@ from daffi.aio._rpc_proxy import (
 )
 from daffi.aio._task_dispatcher import AsyncTaskDispatcher
 
-
 # ---------------------------------------------------------------------------
 # AsyncApplication — base with asyncio primitives
 # ---------------------------------------------------------------------------
+
 
 class AsyncApplication(Application):
     """Base for async Router, Service, and Client.
@@ -61,6 +68,7 @@ class AsyncApplication(Application):
         # atexit/signal.  Remove it and replace with a sync wrapper that
         # safely schedules stop() on the event loop.
         import atexit as _atexit
+
         _atexit.unregister(self.stop)
         set_signal_handler(self._sync_signal_stop)
 
@@ -91,6 +99,7 @@ class AsyncApplication(Application):
 # AsyncServerMixin — async start / stop for Router and Service
 # ---------------------------------------------------------------------------
 
+
 class AsyncServerMixin:
     """Async counterpart of :class:`~daffi.app.ServerMixin`."""
 
@@ -102,20 +111,7 @@ class AsyncServerMixin:
             if not self._task_dispatcher:
                 self._task_dispatcher = AsyncTaskDispatcher(workers=self.workers)
             self._task_dispatcher._start_workers()
-        with system_exception_handler(
-            "{}",
-            InitializationError,
-            conn_info=(self.host, self.port, self.unix_sock_path),
-        ):
-            self._conn_num = dfcore.startServer(
-                self._native_host,
-                self._native_port,
-                self.server_mode,
-                self.app_name,
-                self.tls,
-                self.cert_file,
-                self.key_file,
-            )
+        self._conn_num = self._bind_native_listeners()
         self.logger.debug(
             f"has been started successfully. connection info: {self.info}"
         )
@@ -147,13 +143,14 @@ class AsyncServerMixin:
 # AsyncRouter
 # ---------------------------------------------------------------------------
 
-class AsyncRouter(AsyncApplication, AsyncServerMixin):
+
+class AsyncRouter(AsyncApplication[MultipleTransportMixin], AsyncServerMixin):
     """Async routing server.
 
     Example::
 
         async def main():
-            router = Router(host="127.0.0.1", port=6000)
+            router = Router(transports=TCPTransport("127.0.0.1", 6000))
             await router.start()
             await router.join()
     """
@@ -165,12 +162,13 @@ class AsyncRouter(AsyncApplication, AsyncServerMixin):
 # AsyncService
 # ---------------------------------------------------------------------------
 
-class AsyncService(AsyncApplication, AsyncServerMixin):
+
+class AsyncService(AsyncApplication[MultipleTransportMixin], AsyncServerMixin):
     """Async service that exposes ``@callback`` functions.
 
     Example::
 
-        from daffi import callback
+        from daffi import callback, TCPTransport
         from daffi.aio import Service
 
         @callback
@@ -178,7 +176,7 @@ class AsyncService(AsyncApplication, AsyncServerMixin):
             return a + b
 
         async def main():
-            svc = Service(host="127.0.0.1", port=5000)
+            svc = Service(transports=TCPTransport("127.0.0.1", 5000))
             await svc.start()
             await svc.join()
     """
@@ -190,13 +188,14 @@ class AsyncService(AsyncApplication, AsyncServerMixin):
 # AsyncClient
 # ---------------------------------------------------------------------------
 
-class AsyncClient(AsyncApplication):
+
+class AsyncClient(AsyncApplication[SingleTransportMixin]):
     """Async client that connects to a Router or Service.
 
     Example::
 
         async def main():
-            client = Client(app_name="caller", host="127.0.0.1", port=6000)
+            client = Client(app_name="caller", transport=TCPTransport("127.0.0.1", 6000))
             conn = await client.connect()
 
             result = await conn.rpc(timeout=5).multiply(6, 7)
@@ -205,8 +204,26 @@ class AsyncClient(AsyncApplication):
             await client.stop()
     """
 
-    def __init__(self, *args, **kwargs) -> None:
-        super().__init__(*args, **kwargs)
+    def __init__(
+        self,
+        app_name: str | None = None,
+        *,
+        transport: TCPTransport | UnixTransport,
+        workers: int = TaskDispatcher.DEFAULT_WORKERS,
+        tls: bool = False,
+        cert_file: str = "",
+        key_file: str = "",
+        ca_file: str = "",
+    ) -> None:
+        super().__init__(
+            app_name=app_name,
+            transport=transport,
+            workers=workers,
+            tls=tls,
+            cert_file=cert_file,
+            key_file=key_file,
+            ca_file=ca_file,
+        )
         self._reconnect_lock: asyncio.Lock = asyncio.Lock()
 
     # ------------------------------------------------------------------
@@ -288,8 +305,8 @@ class AsyncClient(AsyncApplication):
         self._task_dispatcher._start_workers()
 
         self._conn_num = dfcore.startClient(
-            self._native_host,
-            self._native_port,
+            self.transport.native_host,
+            self.transport.native_port,
             self.app_name,
             self.tls,
             self.ca_file,

@@ -30,6 +30,9 @@ jobs:
         uses: pypa/cibuildwheel@v3.4.1
         env:
           CIBW_BUILD_VERBOSITY: 1
+          # Publish CPython 3.10–3.15 only. 3.9 and older are not built.
+          CIBW_BUILD: "cp310-* cp311-* cp312-* cp313-* cp314-* cp315-*"
+          CIBW_SKIP: "pp* *i686* cp36-* cp37-* cp38-* cp39-*"
 
       # cibuildwheel silently skips build identifiers it does not know, so a
       # too-old pin would drop the newest Python without any error.  Fail the

@@ -2,8 +2,6 @@
 User-facing application classes: Router, Service, and Client.
 """
 
-import os
-import sys
 import socket
 import threading
 
@@ -28,6 +26,13 @@ from daffi._rpc_proxy import (
 from daffi._signals import set_signal_handler
 from daffi._task_dispatcher import TaskDispatcher
 from daffi.registry._executor_registry import EXECUTOR_REGISTRY
+from daffi.transports import (
+    TCPTransport,
+    Transport,
+    TransportArg,
+    UnixTransport,
+    normalize_transports,
+)
 
 
 class ServerMode(IntEnum):
@@ -47,7 +52,7 @@ class EventsMixin:
 
     Both can be used as plain method calls **or** as decorators::
 
-        client = Client(app_name="watcher", host="127.0.0.1", port=6000)
+        client = Client(app_name="watcher", transport=TCPTransport("127.0.0.1", 6000))
 
         @client.on_member_added
         def handle_join(member: str) -> None:
@@ -95,14 +100,71 @@ class EventsMixin:
         return handler
 
 
+class SingleTransportMixin:
+    """Public single-address API used by Client and AsyncClient."""
+
+    transport: Transport
+    _transports: list[Transport]
+
+    def __init__(self, *, transport: Transport, **kwargs) -> None:
+        if not isinstance(transport, (TCPTransport, UnixTransport)):
+            raise InitializationError(
+                "transport must be a TCPTransport or UnixTransport"
+            )
+        self.transport = transport
+        self._transports = [transport]
+        super().__init__(**kwargs)
+
+    @property
+    def info(self) -> str:
+        """Human-readable connect address."""
+        return f"transport: {self.transport.describe()}"
+
+
+class MultipleTransportMixin:
+    """Public multi-address API used by Router and Service."""
+
+    transports: list[Transport]
+    _transports: list[Transport]
+
+    def __init__(self, *, transports: TransportArg, **kwargs) -> None:
+        self.transports = normalize_transports(transports)
+        self._transports = self.transports
+        super().__init__(**kwargs)
+
+    @property
+    def info(self) -> str:
+        """Human-readable listen addresses."""
+        listed = ", ".join(item.describe() for item in self.transports)
+        return f"transports: [ {listed} ]"
+
+
 class Application(EventsMixin, ABC):
     """Abstract base shared by :class:`Router`, :class:`Service`, and
     :class:`Client`.
 
-    Handles common initialisation: name generation, logger setup, signal
-    handler registration, and transport selection (TCP vs Unix socket).
-    Inherits typed event-handler registration from :class:`EventsMixin`.
+    Owns common lifecycle state only. Subscribe it with a transport mixin,
+    ``Application[SingleTransportMixin]`` or
+    ``Application[MultipleTransportMixin]``. That subscription is a real base
+    class: the mixin is placed ahead of ``Application`` and normalizes
+    addresses before this initializer runs.
     """
+
+    _transport_specializations: dict[tuple[type, type], type] = {}
+
+    def __class_getitem__(cls, transport_api: type) -> type:
+        if not isinstance(transport_api, type):
+            raise TypeError("transport API must be a mixin class")
+        key = (cls, transport_api)
+        specialized = Application._transport_specializations.get(key)
+        if specialized is None:
+            specialized = type(
+                f"{cls.__name__}[{transport_api.__name__}]",
+                (transport_api, cls),
+                {"__module__": cls.__module__},
+            )
+            Application._transport_specializations[key] = specialized
+        return specialized
 
     server_mode: ServerMode = None
     _task_dispatcher: TaskDispatcher = None
@@ -110,9 +172,6 @@ class Application(EventsMixin, ABC):
     def __init__(
         self,
         app_name: Optional[str] = None,
-        host: Optional[str] = None,
-        port: Optional[int] = None,
-        unix_sock_path: Optional[os.PathLike] = None,
         workers: int = TaskDispatcher.DEFAULT_WORKERS,
         tls: bool = False,
         cert_file: str = "",
@@ -123,10 +182,6 @@ class Application(EventsMixin, ABC):
         Args:
             app_name:      Human-readable identifier for this node. A random
                            hex UUID is used when omitted.
-            host:          TCP hostname or IP address.
-            port:          TCP port number.
-            unix_sock_path: Path to a Unix-domain socket (mutually exclusive
-                           with *host*/*port*).
             workers:       Number of concurrent worker **threads** for executing
                            incoming ``@callback`` calls.  ``1`` (default) runs
                            callbacks inline with zero overhead.  ``N >= 2``
@@ -146,9 +201,6 @@ class Application(EventsMixin, ABC):
                            authenticating the server certificate).
         """
         self.app_name = app_name
-        self.host = host
-        self.port = port
-        self.unix_sock_path = str(unix_sock_path or "")
         self.workers = workers
         self.tls = tls
         self.cert_file = cert_file
@@ -192,17 +244,6 @@ class Application(EventsMixin, ABC):
             color = colors.magenta
         self.logger = get_daffi_logger(process_ident, color)
 
-        if self.unix_sock_path and self.host:
-            raise InitializationError(
-                "Provide either 'unix_sock_path' argument or combination "
-                "of 'host' and 'port' to connect via unix socket or via tcp respectively"
-            )
-
-        if not self.host and sys.platform == "win32":
-            raise InitializationError(
-                "Windows platform doesn't support unix sockets. Provide host and port to use TCP"
-            )
-
         # Propagate Python's current log level to the native Zig layer so that
         # std.log.debug / .info / .warn calls in the extension respect whatever
         # level the caller configured (e.g. logging.basicConfig(level=DEBUG)).
@@ -210,26 +251,51 @@ class Application(EventsMixin, ABC):
 
         set_signal_handler(self.stop)
 
-    @property
-    def _native_host(self) -> str:
-        """What the native layer receives as ``host``: the Unix-socket path when
-        one was given (the core treats a host that is not an IP/hostname as a
-        socket path), otherwise the TCP host."""
-        return self.unix_sock_path or self.host or ""
+    def _bind_native_listeners(self) -> int:
+        """Start the node on its first transport and attach every other one.
 
-    @property
-    def _native_port(self) -> int:
-        """Port for the native layer; ``0`` is passed for Unix sockets."""
-        return 0 if self.unix_sock_path else (self.port or 0)
-
-    @property
-    def info(self) -> str:
-        """Human-readable connection string shown in log messages."""
-        if self.unix_sock_path:
-            sock = "unix:///" + self.unix_sock_path.strip("unix:///")
-            return f"unix socket: [ {sock!r} ]"
-        else:
-            return f"tcp: [ host {self.host!r}, port: {self.port!r} ]"
+        All listeners belong to the one native server this returns, so peers
+        are not split by the socket they used.
+        """
+        if not self._transports:
+            raise InitializationError("at least one transport is required")
+        first, *extra = self._transports
+        with system_exception_handler(
+            "{}",
+            InitializationError,
+            conn_info=first.conn_info(),
+        ):
+            conn_num = dfcore.startServer(
+                first.native_host,
+                first.native_port,
+                self.server_mode,
+                self.app_name,
+                self.tls,
+                self.cert_file,
+                self.key_file,
+            )
+        try:
+            for transport in extra:
+                with system_exception_handler(
+                    "{}",
+                    InitializationError,
+                    conn_info=transport.conn_info(),
+                ):
+                    dfcore.addListener(
+                        conn_num,
+                        transport.native_host,
+                        transport.native_port,
+                        self.tls,
+                        self.cert_file,
+                        self.key_file,
+                    )
+        except BaseException as bind_err:
+            try:
+                dfcore.stopServer(conn_num)
+            except BaseException as stop_err:
+                raise bind_err from stop_err
+            raise
+        return conn_num
 
     def _register_executors(self):
         """Log all currently registered callbacks and subscribe for future ones.
@@ -293,7 +359,7 @@ class Application(EventsMixin, ABC):
         :class:`Client` alike.  This is the idiomatic way to keep a process
         alive without importing ``signal``::
 
-            client = Client(app_name="worker", host="127.0.0.1", port=6001)
+            client = Client(app_name="worker", transport=TCPTransport("127.0.0.1", 6001))
             client.connect()
             client.join()   # blocks until Ctrl+C (SIGINT/SIGTERM → stop())
 
@@ -347,10 +413,10 @@ class ServerMixin:
 
         Example::
 
-            router = Router(host="127.0.0.1", port=6000)
+            router = Router(transports=TCPTransport("127.0.0.1", 6000))
             router.start()
 
-            client = Client(host="127.0.0.1", port=6000)
+            client = Client(transport=TCPTransport("127.0.0.1", 6000))
             conn = client.connect()
         """
         if self._conn_num is not None:
@@ -361,20 +427,7 @@ class ServerMixin:
             if not self._task_dispatcher:
                 self._task_dispatcher = TaskDispatcher(workers=self.workers)
             self._task_dispatcher._start_workers()
-        with system_exception_handler(
-            "{}",
-            InitializationError,
-            conn_info=(self.host, self.port, self.unix_sock_path),
-        ):
-            self._conn_num = dfcore.startServer(
-                self._native_host,
-                self._native_port,
-                self.server_mode,
-                self.app_name,
-                self.tls,
-                self.cert_file,
-                self.key_file,
-            )
+        self._conn_num = self._bind_native_listeners()
         self.logger.debug(
             f"has been started successfully. connection info: {self.info}"
         )
@@ -408,7 +461,7 @@ class ServerMixin:
                 self._stop_event.set()
 
 
-class Router(Application, ServerMixin):
+class Router(Application[MultipleTransportMixin], ServerMixin):
     """A routing server that forwards RPC calls between connected clients and
     services.
 
@@ -417,15 +470,23 @@ class Router(Application, ServerMixin):
 
     Example::
 
-        router = Router(host="127.0.0.1", port=6000)
+        router = Router(
+            transports=[
+                TCPTransport(host="0.0.0.0", port=6001),
+                UnixTransport(path="/tmp/daffi.sock"),
+            ]
+        )
         router.start()
         router.join()
+
+    A single transport may be passed without a list.  Every transport of one
+    Router or Service shares that node's membership.
     """
 
     server_mode = ServerMode.ROUTER
 
 
-class Service(Application, ServerMixin):
+class Service(Application[MultipleTransportMixin], ServerMixin):
     """A server that exposes ``@callback``-decorated functions to remote callers.
 
     Example::
@@ -436,7 +497,7 @@ class Service(Application, ServerMixin):
         def add(a: int, b: int) -> int:
             return a + b
 
-        svc = Service(host="127.0.0.1", port=5000)
+        svc = Service(transports=TCPTransport("127.0.0.1", 5000))
         svc.start()
         svc.join()
     """
@@ -444,13 +505,13 @@ class Service(Application, ServerMixin):
     server_mode = ServerMode.SERVICE
 
 
-class Client(Application):
+class Client(Application[SingleTransportMixin]):
     """A client that connects to a :class:`Router` or :class:`Service` and
     issues RPC calls.
 
     Example::
 
-        client = Client(app_name="my-client", host="127.0.0.1", port=5000)
+        client = Client(app_name="my-client", transport=TCPTransport("127.0.0.1", 5000))
         conn = client.connect()
         result = conn.rpc(timeout=5).add(1, 2)
         client.stop()
@@ -459,9 +520,8 @@ class Client(Application):
     def __init__(
         self,
         app_name: Optional[str] = None,
-        host: Optional[str] = None,
-        port: Optional[int] = None,
-        unix_sock_path: Optional[os.PathLike] = None,
+        *,
+        transport: Transport,
         workers: int = TaskDispatcher.DEFAULT_WORKERS,
         tls: bool = False,
         cert_file: str = "",
@@ -470,9 +530,7 @@ class Client(Application):
     ):
         super().__init__(
             app_name=app_name,
-            host=host,
-            port=port,
-            unix_sock_path=unix_sock_path,
+            transport=transport,
             workers=workers,
             tls=tls,
             cert_file=cert_file,
@@ -487,14 +545,11 @@ class Client(Application):
     def info(self) -> str:
         """Human-readable connection string (includes the connection type once
         the handshake has completed)."""
-        if self.unix_sock_path:
-            sock = "unix:///" + self.unix_sock_path.strip("unix:///")
-            return f"unix socket: [ {sock!r} ]"
-        else:
-            type_part = (
-                f", type: {self._conn_type!r}" if self._conn_type is not None else ""
-            )
-            return f"tcp: [ host {self.host!r}, port: {self.port!r}{type_part} ]"
+        described = self.transport.describe()
+        type_part = (
+            f", type: {self._conn_type!r}" if self._conn_type is not None else ""
+        )
+        return f"transport: {described}{type_part}"
 
     def connect(self) -> "ClientConnection":
         """Connect to the server, perform the handshake, and return a connection handle.
@@ -529,8 +584,8 @@ class Client(Application):
         self._task_dispatcher._start_workers()
 
         self._conn_num = dfcore.startClient(
-            self._native_host,
-            self._native_port,
+            self.transport.native_host,
+            self.transport.native_port,
             self.app_name,
             self.tls,
             self.ca_file,

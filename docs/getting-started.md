@@ -19,7 +19,7 @@ Create two files:
 
 **`1_service.py`**
 ```python
-from daffi import Service, callback
+from daffi import Service, callback, TCPTransport
 
 @callback
 def add(a: int, b: int) -> int:
@@ -27,7 +27,7 @@ def add(a: int, b: int) -> int:
     return a + b
 
 if __name__ == "__main__":
-    svc = Service(app_name="calc-service", host="127.0.0.1", port=5001)
+    svc = Service(app_name="calc-service", transports=TCPTransport("127.0.0.1", 5001))
     svc.start()
     print("Service running on 127.0.0.1:5001 — press Ctrl+C to stop.")
     svc.join()
@@ -35,10 +35,10 @@ if __name__ == "__main__":
 
 **`2_client.py`**
 ```python
-from daffi import Client
+from daffi import Client, TCPTransport
 
 if __name__ == "__main__":
-    client = Client(app_name="calc-client", host="127.0.0.1", port=5001)
+    client = Client(app_name="calc-client", transport=TCPTransport("127.0.0.1", 5001))
     conn = client.connect()
 
     result = conn.rpc(timeout=5).add(3, 4)

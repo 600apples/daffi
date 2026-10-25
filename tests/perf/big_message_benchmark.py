@@ -34,6 +34,7 @@ Run::
 
     python3 tests/perf/big_message_benchmark.py
 """
+
 from __future__ import annotations
 
 import logging
@@ -55,20 +56,20 @@ if _PROJECT_ROOT not in sys.path:
 
 # ── constants ──────────────────────────────────────────────────────────────────
 
-HOST    = "127.0.0.1"
-TIMEOUT = 120   # generous: transferring 28 MiB can take several seconds
+HOST = "127.0.0.1"
+TIMEOUT = 120  # generous: transferring 28 MiB can take several seconds
 
-MAX_BYTES_MESSAGE = (1 << 25) - 1   # 33_554_431
+MAX_BYTES_MESSAGE = (1 << 25) - 1  # 33_554_431
 
 # Full sweep for binary-efficient formats (OPAQUE, PICKLE, MSGPACK).
 SIZES: list[tuple[str, int]] = [
-    ("1 KiB",   1 << 10),           #  1_024
-    ("64 KiB",  1 << 16),           # 65_536
-    ("1 MiB",   1 << 20),           #  1_048_576
-    ("4 MiB",   1 << 22),           #  4_194_304
-    ("8 MiB",   8 * (1 << 20)),     #  8_388_608
-    ("16 MiB", 16 * (1 << 20)),     # 16_777_216
-    ("28 MiB", 28 * (1 << 20)),     # 29_360_128  (safety margin below 32 MiB)
+    ("1 KiB", 1 << 10),  #  1_024
+    ("64 KiB", 1 << 16),  # 65_536
+    ("1 MiB", 1 << 20),  #  1_048_576
+    ("4 MiB", 1 << 22),  #  4_194_304
+    ("8 MiB", 8 * (1 << 20)),  #  8_388_608
+    ("16 MiB", 16 * (1 << 20)),  # 16_777_216
+    ("28 MiB", 28 * (1 << 20)),  # 29_360_128  (safety margin below 32 MiB)
 ]
 
 # JSON is Python-slow for large strings; cap to keep total benchmark time sane.
@@ -76,36 +77,46 @@ JSON_SIZES: list[tuple[str, int]] = [s for s in SIZES if s[1] <= 4 * (1 << 20)]
 
 # Number of measured round-trips per (format × layout × size).
 N_CALLS = 5
-WARMUP  = 2
+WARMUP = 2
 
 
 # ── serde configs ─────────────────────────────────────────────────────────────
 # Each entry: (display_name, SerdeFormat attr, payload_factory, sizes, note)
 # payload_factory(n_bytes: int) → payload  (what gets passed to echo())
 
+
 def _json_payload(n: int) -> str:
     return "x" * n
 
 
 SERDE_CONFIGS: list[tuple[str, str, Callable[[int], object], list, str]] = [
-    ("OPAQUE",  "OPAQUE",  bytes,         SIZES,      "bytes, zero-copy pass-through"),
-    ("PICKLE",  "PICKLE",  bytes,         SIZES,      "bytes object via pickle"),
-    ("MSGPACK", "MSGPACK", bytes,         SIZES,      "bytes via msgpack (bin type)"),
-    ("JSON",    "JSON",    _json_payload, JSON_SIZES, "str of N chars (bytes unsupported by JSON)"),
+    ("OPAQUE", "OPAQUE", bytes, SIZES, "bytes, zero-copy pass-through"),
+    ("PICKLE", "PICKLE", bytes, SIZES, "bytes object via pickle"),
+    ("MSGPACK", "MSGPACK", bytes, SIZES, "bytes via msgpack (bin type)"),
+    (
+        "JSON",
+        "JSON",
+        _json_payload,
+        JSON_SIZES,
+        "str of N chars (bytes unsupported by JSON)",
+    ),
 ]
 
 
 # ── msgpack availability ───────────────────────────────────────────────────────
 
+
 def _msgpack_available() -> bool:
     try:
         import msgpack  # noqa: F401
+
         return True
     except ImportError:
         return False
 
 
 # ── silence helpers ───────────────────────────────────────────────────────────
+
 
 def _silence_subprocess() -> None:
     devnull_fd = os.open(os.devnull, os.O_WRONLY)
@@ -118,7 +129,7 @@ def _silence_subprocess() -> None:
 def _quiet_teardown(fn, *args, **kwargs) -> None:
     """Call *fn* with stdout/stderr silenced."""
     devnull = os.open(os.devnull, os.O_WRONLY)
-    saved   = (os.dup(1), os.dup(2))
+    saved = (os.dup(1), os.dup(2))
     os.dup2(devnull, 1)
     os.dup2(devnull, 2)
     os.close(devnull)
@@ -132,6 +143,7 @@ def _quiet_teardown(fn, *args, **kwargs) -> None:
 
 
 # ── port helpers ──────────────────────────────────────────────────────────────
+
 
 def _free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -148,29 +160,32 @@ def _wait_for_port(port: int, timeout: float = 15.0) -> None:
                 return
         except OSError:
             time.sleep(0.05)
-    raise TimeoutError(f"Server on {HOST}:{port} did not become ready within {timeout}s")
+    raise TimeoutError(
+        f"Server on {HOST}:{port} did not become ready within {timeout}s"
+    )
 
 
 # ── subprocess entry points ───────────────────────────────────────────────────
 
+
 def _proc_service(host: str, port: int) -> None:
     _silence_subprocess()
-    from daffi import Service, callback
+    from daffi import Service, callback, TCPTransport
 
     @callback
     def echo(payload):
         return payload
 
-    svc = Service(app_name="bigmsg-service", host=host, port=port)
+    svc = Service(app_name="bigmsg-service", transports=TCPTransport(host, port))
     svc.start()
     svc.join()
 
 
 def _proc_router(host: str, port: int) -> None:
     _silence_subprocess()
-    from daffi import Router
+    from daffi import Router, TCPTransport
 
-    r = Router(app_name="bigmsg-router", host=host, port=port)
+    r = Router(app_name="bigmsg-router", transports=TCPTransport(host, port))
     r.start()
     r.join()
 
@@ -178,13 +193,13 @@ def _proc_router(host: str, port: int) -> None:
 def _proc_worker(host: str, port: int) -> None:
     _silence_subprocess()
     import time as _t
-    from daffi import Client, callback
+    from daffi import Client, callback, TCPTransport
 
     @callback
     def echo(payload):
         return payload
 
-    client = Client(app_name="bigmsg-worker", host=host, port=port)
+    client = Client(app_name="bigmsg-worker", transport=TCPTransport(host, port))
     client.connect()
     try:
         while True:
@@ -196,6 +211,7 @@ def _proc_worker(host: str, port: int) -> None:
 
 
 # ── measurement helpers ───────────────────────────────────────────────────────
+
 
 def _mib(n_bytes: int) -> str:
     return f"{n_bytes / (1 << 20):.2f} MiB"
@@ -236,10 +252,13 @@ def _bench_size(proxy, payload, n_bytes: int) -> dict[str, float | str]:
 
 _COL_W = 82
 
+
 def _print_layout_header(layout_name: str) -> None:
     print(f"\n  Layout: {layout_name}")
-    print(f"  {'format':<8}  {'size':<8}  "
-          f"{'avg':>14}  {'min':>14}  {'max':>14}  {'throughput':>14}")
+    print(
+        f"  {'format':<8}  {'size':<8}  "
+        f"{'avg':>14}  {'min':>14}  {'max':>14}  {'throughput':>14}"
+    )
     print("  " + "─" * _COL_W)
 
 
@@ -259,17 +278,20 @@ def _print_row(fmt_label: str, size_label: str, stats: dict) -> None:
 
 # ── core benchmark loop ───────────────────────────────────────────────────────
 
+
 def _run_all_formats(conn, layout_name: str) -> None:
     """Benchmark every serde format using *conn* (already connected)."""
-    from daffi import SerdeFormat
+    from daffi import SerdeFormat, TCPTransport
 
     _print_layout_header(layout_name)
 
     first_format = True
     for fmt_name, serde_attr, payload_fn, sizes, _note in SERDE_CONFIGS:
         if fmt_name == "MSGPACK" and not _msgpack_available():
-            print(f"  {'msgpack':<8}  (skipped — msgpack not installed; "
-                  "run: pip install 'daffi[msgpack]')")
+            print(
+                f"  {'msgpack':<8}  (skipped — msgpack not installed; "
+                "run: pip install 'daffi[msgpack]')"
+            )
             continue
 
         if not first_format:
@@ -290,19 +312,22 @@ def _run_all_formats(conn, layout_name: str) -> None:
 
 # ── layout entry points ───────────────────────────────────────────────────────
 
+
 def bench_direct() -> None:
     """Direct layout: Client → Service."""
-    from daffi import Client
+    from daffi import Client, TCPTransport
 
     port = _free_port()
     proc = mp.Process(target=_proc_service, args=(HOST, port), daemon=True)
     proc.start()
     try:
         _wait_for_port(port)
-        time.sleep(0.15)   # let Service fully initialise
+        time.sleep(0.15)  # let Service fully initialise
 
-        client = Client(app_name="bigmsg-direct-caller", host=HOST, port=port)
-        conn   = client.connect()
+        client = Client(
+            app_name="bigmsg-direct-caller", transport=TCPTransport(HOST, port)
+        )
+        conn = client.connect()
         try:
             _run_all_formats(conn, "Direct (Client → Service)")
         finally:
@@ -314,9 +339,9 @@ def bench_direct() -> None:
 
 def bench_via_router() -> None:
     """Router layout: Client → Router → Worker."""
-    from daffi import Client
+    from daffi import Client, TCPTransport
 
-    port  = _free_port()
+    port = _free_port()
     rproc = mp.Process(target=_proc_router, args=(HOST, port), daemon=True)
     wproc = mp.Process(target=_proc_worker, args=(HOST, port), daemon=True)
 
@@ -324,10 +349,12 @@ def bench_via_router() -> None:
     try:
         _wait_for_port(port)
         wproc.start()
-        time.sleep(0.5)   # let worker register its echo callback
+        time.sleep(0.5)  # let worker register its echo callback
 
-        client = Client(app_name="bigmsg-router-caller", host=HOST, port=port)
-        conn   = client.connect()
+        client = Client(
+            app_name="bigmsg-router-caller", transport=TCPTransport(HOST, port)
+        )
+        conn = client.connect()
         try:
             _run_all_formats(conn, "Via Router (Client → Router → Worker)")
         finally:
@@ -341,6 +368,7 @@ def bench_via_router() -> None:
 
 # ── main ──────────────────────────────────────────────────────────────────────
 
+
 def main() -> None:
     logging.disable(logging.CRITICAL)
 
@@ -353,9 +381,13 @@ def main() -> None:
     try:
         print("\ndaffi big-message benchmark — serde format comparison")
         print(f"host      : {HOST}")
-        print(f"max legal : {_mib(MAX_BYTES_MESSAGE)}"
-              f"  (u25 field = 2²⁵ − 1 = {MAX_BYTES_MESSAGE:,} bytes)")
-        print(f"calls     : {N_CALLS} measured + {WARMUP} warmup per (format × layout × size)")
+        print(
+            f"max legal : {_mib(MAX_BYTES_MESSAGE)}"
+            f"  (u25 field = 2²⁵ − 1 = {MAX_BYTES_MESSAGE:,} bytes)"
+        )
+        print(
+            f"calls     : {N_CALLS} measured + {WARMUP} warmup per (format × layout × size)"
+        )
         print(f"throughput: (payload × 2) / avg_latency  (request + response)")
         print()
         print(f"  {'Format':<8}  {'Payload type':<38}  Max size")
@@ -369,7 +401,9 @@ def main() -> None:
         bench_direct()
         bench_via_router()
 
-        print("\n── Done ──────────────────────────────────────────────────────────────\n")
+        print(
+            "\n── Done ──────────────────────────────────────────────────────────────\n"
+        )
     finally:
         os.dup2(saved_stderr, 2)
         os.close(saved_stderr)

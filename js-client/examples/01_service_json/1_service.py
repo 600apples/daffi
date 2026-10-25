@@ -10,7 +10,8 @@ Run this first, then open index.html in a browser (via an HTTP server).
 NOTE: the daffi server accepts both native TCP connections AND browser
 WebSocket connections on the same port — no extra gateway needed.
 """
-from daffi import Service, callback
+
+from daffi import Service, callback, TCPTransport
 
 
 @callback
@@ -28,7 +29,7 @@ def greet(name: str) -> str:
 
 
 if __name__ == "__main__":
-    svc = Service(app_name="json-service", host="127.0.0.1", port=5010)
+    svc = Service(app_name="json-service", transports=TCPTransport("127.0.0.1", 5010))
     svc.start()
     print("Service on ws://127.0.0.1:5010 — open index.html in a browser.")
     svc.join()

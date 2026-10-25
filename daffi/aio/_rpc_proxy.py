@@ -58,13 +58,13 @@ from daffi._bindings import (
 from daffi._rpc_proxy import (
     METADATA_SEPARATOR,
     system_exception_handler,
-    RpcResult,          # _unpack_response is reused as a classmethod
+    RpcResult,  # _unpack_response is reused as a classmethod
 )
-
 
 # ---------------------------------------------------------------------------
 # AsyncResponseNotifier
 # ---------------------------------------------------------------------------
+
 
 class AsyncResponseNotifier:
     """Per-connection async response notifier.
@@ -198,6 +198,7 @@ class AsyncResponseNotifier:
 # AsyncRpcResult
 # ---------------------------------------------------------------------------
 
+
 class AsyncRpcResult:
     """Async counterpart of :class:`~daffi._rpc_proxy.RpcResult`.
 
@@ -235,9 +236,7 @@ class AsyncRpcResult:
                 return self._unpack_response(res)
 
             # 2. Raise lifecycle error when there is nothing waiting in store.
-            if notifier is not None and (
-                _err := notifier._lifecycle_error
-            ) is not None:
+            if notifier is not None and (_err := notifier._lifecycle_error) is not None:
                 notifier._lifecycle_error = None
                 raise _err
 
@@ -314,6 +313,7 @@ class AsyncRpcResult:
 # _AsyncBoundRpc — immutable single-call object returned by AsyncRpcProxy.__getattr__
 # ---------------------------------------------------------------------------
 
+
 class _AsyncBoundRpc:
     """Immutable callable that wraps one (proxy, func_name) pair.
 
@@ -352,6 +352,7 @@ class _AsyncBoundRpc:
 # ---------------------------------------------------------------------------
 # AsyncRpcProxy
 # ---------------------------------------------------------------------------
+
 
 class AsyncRpcProxy:
     """Async lazy call builder returned by :meth:`~AsyncClientConnection.rpc`
@@ -494,12 +495,14 @@ class AsyncRpcProxy:
         ``run_in_executor`` runs in a thread separate from the event loop.
         """
         from daffi._rpc_proxy import RpcProxy as _SyncRpcProxy
+
         return _SyncRpcProxy._process_client_handshake(conn_num)
 
 
 # ---------------------------------------------------------------------------
 # _AsyncBoundBroadcast — immutable callable returned by AsyncBroadcastProxy.__getattr__
 # ---------------------------------------------------------------------------
+
 
 class _AsyncBoundBroadcast:
     """Immutable callable that wraps one (broadcast_proxy, func_name) pair.
@@ -530,6 +533,7 @@ class _AsyncBoundBroadcast:
 # ---------------------------------------------------------------------------
 # AsyncBroadcastProxy
 # ---------------------------------------------------------------------------
+
 
 class AsyncBroadcastProxy:
     """Async counterpart of :class:`~daffi._rpc_proxy.BroadcastProxy`.
@@ -656,6 +660,7 @@ class AsyncBroadcastProxy:
 # Async stream proxies
 # ---------------------------------------------------------------------------
 
+
 class _AsyncStreamBase:
     """Shared init for the two async stream variants.
 
@@ -745,7 +750,7 @@ class _AsyncBoundStream:
 class AsyncStreamProxy(_AsyncStreamBase):
     """Async backpressure stream — waits for ack before sending next chunk::
 
-        await conn.stream().receive_chunk(data_source())
+    await conn.stream().receive_chunk(data_source())
     """
 
     def __getattr__(self, item: str) -> "_AsyncBoundStreamBlocking":
@@ -776,7 +781,7 @@ class _AsyncBoundStreamBlocking(_AsyncBoundStream):
 class AsyncStreamNowaitProxy(_AsyncStreamBase):
     """Async fire-and-forget stream — sends each chunk without waiting::
 
-        await conn.stream_nowait().receive_chunk(data_source())
+    await conn.stream_nowait().receive_chunk(data_source())
     """
 
     def __getattr__(self, item: str) -> "_AsyncBoundStreamNowait":
@@ -799,6 +804,7 @@ class _AsyncBoundStreamNowait(_AsyncBoundStream):
 # ---------------------------------------------------------------------------
 # AsyncClientConnection
 # ---------------------------------------------------------------------------
+
 
 class AsyncClientConnection:
     """Async proxy returned by :meth:`~daffi.aio.app.AsyncClient.connect`.
@@ -985,6 +991,7 @@ class AsyncClientConnection:
             return
         needed = set(members)
         import time as _time
+
         start = _time.monotonic()
         while True:
             current = {m["name"] for m in get_available_members(self.client._conn_num)}

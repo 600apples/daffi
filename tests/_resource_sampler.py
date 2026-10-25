@@ -22,7 +22,7 @@ from tests._resource_metrics import _CLK_TCK, _cpu_jiffies, rss_kb, thread_count
 
 @dataclass(frozen=True)
 class ProcSample:
-    ts: float          # monotonic seconds
+    ts: float  # monotonic seconds
     name: str
     pid: int
     rss_kb: int
@@ -39,12 +39,18 @@ class ProcessResourceSampler:
     line_writer: Callable[[str], None] | None = None
 
     _samples: list[ProcSample] = field(default_factory=list, init=False, repr=False)
-    _stop: threading.Event = field(default_factory=threading.Event, init=False, repr=False)
+    _stop: threading.Event = field(
+        default_factory=threading.Event, init=False, repr=False
+    )
     _thread: threading.Thread | None = field(default=None, init=False, repr=False)
     _live_thread: threading.Thread | None = field(default=None, init=False, repr=False)
     _live_interval_sec: float | None = field(default=None, init=False, repr=False)
-    _lock: threading.RLock = field(default_factory=threading.RLock, init=False, repr=False)
-    _prev_cpu: dict[int, tuple[float, int]] = field(default_factory=dict, init=False, repr=False)
+    _lock: threading.RLock = field(
+        default_factory=threading.RLock, init=False, repr=False
+    )
+    _prev_cpu: dict[int, tuple[float, int]] = field(
+        default_factory=dict, init=False, repr=False
+    )
     _baseline_rss: dict[str, int] = field(default_factory=dict, init=False, repr=False)
     _t0: float = field(default=0.0, init=False, repr=False)
 
@@ -140,7 +146,9 @@ class ProcessResourceSampler:
                 self._sample_once()
             except Exception as exc:
                 writer = self.line_writer or print
-                writer(f"ProcessResourceSampler: sample failed: {type(exc).__name__}: {exc}")
+                writer(
+                    f"ProcessResourceSampler: sample failed: {type(exc).__name__}: {exc}"
+                )
             self._stop.wait(self.interval_sec)
 
     def _sample_once(self) -> None:
@@ -154,8 +162,12 @@ class ProcessResourceSampler:
             thr = thread_count(pid)
             cpu_pct = self._cpu_pct(pid, now)
             sample = ProcSample(
-                ts=now, name=name, pid=pid,
-                rss_kb=rss, threads=thr, cpu_pct=cpu_pct,
+                ts=now,
+                name=name,
+                pid=pid,
+                rss_kb=rss,
+                threads=thr,
+                cpu_pct=cpu_pct,
             )
             with self._lock:
                 if name not in self._baseline_rss:

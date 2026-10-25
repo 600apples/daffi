@@ -54,6 +54,17 @@ const server_methods = [_]PyMethodDef{
         ,
     },
     .{
+        .ml_name  = "addListener",
+        .ml_meth  = cffi.addListener,
+        .ml_flags = 1,
+        .ml_doc   =
+            \\addListener(conn_num, host, port, tls, cert_file, key_file)
+            \\
+            \\Bind another transport on a running Router or Service.  Accepted
+            \\peers share that node's membership with every other transport.
+        ,
+    },
+    .{
         .ml_name  = "sendMessageFromServer",
         .ml_meth  = cffi.sendMessageFromServer,
         .ml_flags = 1,

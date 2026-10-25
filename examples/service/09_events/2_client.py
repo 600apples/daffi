@@ -7,17 +7,18 @@ from the client's perspective.
 
 Run 1_service.py first.
 """
-import time
-from daffi import Client
 
+import time
+from daffi import Client, TCPTransport
 
 if __name__ == "__main__":
+
     def on_event(event: dict) -> None:
         name = event["member"]
-        status = event["type"]     # "connected" or "disconnected"
+        status = event["type"]  # "connected" or "disconnected"
         print(f"[client] event: {name!r} → {status}")
 
-    client = Client(app_name="event-client", host="0.0.0.0", port=5009)
+    client = Client(app_name="event-client", transport=TCPTransport("0.0.0.0", 5009))
     client.add_event_handler(on_event)
 
     conn = client.connect()

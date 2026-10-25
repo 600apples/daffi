@@ -6,7 +6,6 @@ import json
 import pickle
 from typing import Union, Tuple, Dict, Callable
 
-
 # Lazy import — msgpack is an optional extra (``pip install daffi[msgpack]``).
 # We import on first use so users without the extra installed can still use
 # OPAQUE / JSON / PICKLE without any import errors at module load time.

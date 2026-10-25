@@ -4,6 +4,7 @@ Unit tests for TaskDispatcher / AsyncTaskDispatcher worker-pool sizing.
 Regression: workers=N must spawn N pool workers (not N-1).  workers=1 stays
 inline (no pool threads / tasks).
 """
+
 from __future__ import annotations
 
 import asyncio

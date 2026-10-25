@@ -52,6 +52,7 @@ MODELS = ("threads", "evented")
 
 # ── process helpers ───────────────────────────────────────────────────────────
 
+
 def _free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.bind((HOST, 0))
@@ -79,22 +80,24 @@ def _silence() -> None:
 
 def _proc_router(port: int) -> None:
     _silence()
-    from daffi import Router
+    from daffi import Router, TCPTransport
 
-    r = Router(app_name="soak-router", host=HOST, port=port)
+    r = Router(app_name="soak-router", transports=TCPTransport(HOST, port))
     r.start()
     r.join()
 
 
 def _proc_worker(port: int, workers: int) -> None:
     _silence()
-    from daffi import Client, callback
+    from daffi import Client, callback, TCPTransport
 
     @callback
     def echo(payload):
         return payload
 
-    client = Client(app_name="soak-worker", host=HOST, port=port, workers=workers)
+    client = Client(
+        app_name="soak-worker", workers=workers, transport=TCPTransport(HOST, port)
+    )
     client.connect()
     try:
         while True:
@@ -112,12 +115,14 @@ def _proc_loader(
 ) -> None:
     """Sustain RPC load from *n_clients* for *duration_s* seconds."""
     _silence()
-    from daffi import Client
+    from daffi import Client, TCPTransport
 
     connected = []
     for i in range(n_clients):
         try:
-            client = Client(app_name=f"soak-c{i:04d}", host=HOST, port=port)
+            client = Client(
+                app_name=f"soak-c{i:04d}", transport=TCPTransport(HOST, port)
+            )
             conn = client.connect()
             conn.wait_for_members("soak-worker", timeout=60)
             connected.append((client, conn))
@@ -171,11 +176,13 @@ def _proc_loader(
     stop.set()
     for t in threads:
         t.join(timeout=120)
-    q.put({
-        "calls": total_calls[0],
-        "errors": total_errors[0],
-        "n_connected": len(connected),
-    })
+    q.put(
+        {
+            "calls": total_calls[0],
+            "errors": total_errors[0],
+            "n_connected": len(connected),
+        }
+    )
 
 
 def _quiet_kill(proc: mp.Process, timeout: float = 10.0) -> None:
@@ -185,6 +192,7 @@ def _quiet_kill(proc: mp.Process, timeout: float = 10.0) -> None:
 
 
 # ── one model soak ────────────────────────────────────────────────────────────
+
 
 def run_soak(
     *,
@@ -273,8 +281,10 @@ def run_soak(
         n_conn = stats.get("n_connected", 0)
         cps = calls / duration_s if duration_s else 0
         print(f"\n── Throughput")
-        print(f"  connected={n_conn}  calls={calls:,}  errors={errors:,}  "
-              f"avg={cps:,.1f} calls/s")
+        print(
+            f"  connected={n_conn}  calls={calls:,}  errors={errors:,}  "
+            f"avg={cps:,.1f} calls/s"
+        )
 
         if json_out is not None:
             payload = {
@@ -304,8 +314,10 @@ def run_soak(
             rate = info.get("trend_mb_per_min", 0.0)
             if rate > leak_mb_per_min:
                 leak = True
-                print(f"  ⚠  {name}: trend {rate:+.3f} MB/min exceeds "
-                      f"{leak_mb_per_min:g} MB/min")
+                print(
+                    f"  ⚠  {name}: trend {rate:+.3f} MB/min exceeds "
+                    f"{leak_mb_per_min:g} MB/min"
+                )
         if leak:
             print("\n  FAIL: sustained memory growth detected.")
             return 1
@@ -322,20 +334,45 @@ def main() -> None:
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    p.add_argument("--hours", type=float, default=3.0,
-                   help="soak duration in hours (default: 3)")
-    p.add_argument("--clients", type=int, default=100,
-                   help="concurrent caller clients (default: 100)")
-    p.add_argument("--workers", type=int, default=8,
-                   help="Python worker threads on the worker process (default: 8)")
-    p.add_argument("--sample-interval", type=float, default=30.0,
-                   help="RSS/CPU sample period seconds (default: 30)")
-    p.add_argument("--live-interval", type=float, default=60.0,
-                   help="live console report period seconds (default: 60)")
-    p.add_argument("--call-delay", type=float, default=0.01,
-                   help="sleep between RPCs per caller (default: 0.01 s)")
-    p.add_argument("--leak-mb-per-min", type=float, default=1.0,
-                   help="fail if any process trends above this MB/min (default: 1.0)")
+    p.add_argument(
+        "--hours", type=float, default=3.0, help="soak duration in hours (default: 3)"
+    )
+    p.add_argument(
+        "--clients",
+        type=int,
+        default=100,
+        help="concurrent caller clients (default: 100)",
+    )
+    p.add_argument(
+        "--workers",
+        type=int,
+        default=8,
+        help="Python worker threads on the worker process (default: 8)",
+    )
+    p.add_argument(
+        "--sample-interval",
+        type=float,
+        default=30.0,
+        help="RSS/CPU sample period seconds (default: 30)",
+    )
+    p.add_argument(
+        "--live-interval",
+        type=float,
+        default=60.0,
+        help="live console report period seconds (default: 60)",
+    )
+    p.add_argument(
+        "--call-delay",
+        type=float,
+        default=0.01,
+        help="sleep between RPCs per caller (default: 0.01 s)",
+    )
+    p.add_argument(
+        "--leak-mb-per-min",
+        type=float,
+        default=1.0,
+        help="fail if any process trends above this MB/min (default: 1.0)",
+    )
     p.add_argument(
         "--model",
         choices=("threads", "evented", "both"),

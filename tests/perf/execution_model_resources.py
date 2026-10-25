@@ -44,7 +44,9 @@ def _run_worker(calls: int, clients: int, sample_s: float) -> dict:
     from daffi import dfcore
 
     model = dfcore.getExecutionModel()
-    many = scenario_many_clients(n_clients=clients, calls_per_client=calls, sample_s=sample_s)
+    many = scenario_many_clients(
+        n_clients=clients, calls_per_client=calls, sample_s=sample_s
+    )
     router = scenario_router(
         n_clients=max(8, clients // 2),
         calls_per_client=calls,
@@ -108,7 +110,10 @@ def _print_table(results: dict) -> None:
     print(header)
     print("  " + "-" * 90)
 
-    for key, title in (("many_clients", "many_clients → Service"), ("router", "clients → Router")):
+    for key, title in (
+        ("many_clients", "many_clients → Service"),
+        ("router", "clients → Router"),
+    ):
         tt, ee = t[key], e[key]
         print(f"  --- {title} (target={tt['target']}) ---")
         for phase in ("idle", "under_load", "after"):
@@ -131,15 +136,25 @@ def _print_table(results: dict) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--clients", type=int, default=64, help="clients for many_clients scenario")
-    parser.add_argument("--calls", type=int, default=200, help="RPC calls per client under load")
-    parser.add_argument("--sample", type=float, default=1.0, help="CPU sample window seconds")
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    parser.add_argument(
+        "--clients", type=int, default=64, help="clients for many_clients scenario"
+    )
+    parser.add_argument(
+        "--calls", type=int, default=200, help="RPC calls per client under load"
+    )
+    parser.add_argument(
+        "--sample", type=float, default=1.0, help="CPU sample window seconds"
+    )
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
 
     if args.worker:
-        print("RESULT " + json.dumps(_run_worker(args.calls, args.clients, args.sample)))
+        print(
+            "RESULT " + json.dumps(_run_worker(args.calls, args.clients, args.sample))
+        )
         return
 
     results = {}
@@ -148,17 +163,27 @@ def main() -> None:
         env = dict(os.environ, DAFFI_EXECUTION_MODEL=model)
         proc = subprocess.run(
             [
-                sys.executable, __file__, "--worker",
-                "--clients", str(args.clients),
-                "--calls", str(args.calls),
-                "--sample", str(args.sample),
+                sys.executable,
+                __file__,
+                "--worker",
+                "--clients",
+                str(args.clients),
+                "--calls",
+                str(args.calls),
+                "--sample",
+                str(args.sample),
             ],
-            env=env, capture_output=True, text=True, cwd=str(ROOT),
+            env=env,
+            capture_output=True,
+            text=True,
+            cwd=str(ROOT),
         )
-        line = next((l for l in proc.stdout.splitlines() if l.startswith("RESULT ")), None)
+        line = next(
+            (l for l in proc.stdout.splitlines() if l.startswith("RESULT ")), None
+        )
         if line is None:
             sys.exit(f"{model} run failed:\n{proc.stdout}\n{proc.stderr}")
-        result = json.loads(line[len("RESULT "):])
+        result = json.loads(line[len("RESULT ") :])
         assert result["model"] == model, f"expected {model}, got {result['model']}"
         results[model] = result
     _print_table(results)

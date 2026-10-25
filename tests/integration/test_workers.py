@@ -15,6 +15,7 @@ Tested aspects
   4. Exception propagation — server-side errors reach the caller
   5. Multiple serde formats work correctly
 """
+
 from __future__ import annotations
 
 import threading
@@ -33,17 +34,18 @@ from .conftest import (
     proc_router,
 )
 
-N_CONCURRENT = 30       # threads firing calls simultaneously
-CALLS_PER_THREAD = 10   # sequential calls per thread inside concurrent tests
+N_CONCURRENT = 30  # threads firing calls simultaneously
+CALLS_PER_THREAD = 10  # sequential calls per thread inside concurrent tests
 
 
 # ── subprocess entry points ────────────────────────────────────────────────────
 # Each target is a module-level function so the ``spawn`` start method can
 # pickle it by (module, qualname) and re-import it in the fresh child.
 
+
 def _svc_thread_workers(port: int) -> None:
     silence_subprocess()
-    from daffi import Service, callback
+    from daffi import Service, callback, TCPTransport
 
     @callback
     def echo(payload):
@@ -63,11 +65,7 @@ def _svc_thread_workers(port: int) -> None:
             raise ValueError(f"negative: {x}")
         return x
 
-    svc = Service(
-        app_name="svc-thread",
-        host=HOST, port=port,
-        workers=4,
-    )
+    svc = Service(app_name="svc-thread", workers=4, transports=TCPTransport(HOST, port))
     svc.start()
     svc.join()
 
@@ -75,7 +73,7 @@ def _svc_thread_workers(port: int) -> None:
 def _router_worker_thread(port: int, name: str) -> None:
     silence_subprocess()
     import time as _t
-    from daffi import Client, callback
+    from daffi import Client, callback, TCPTransport
 
     @callback
     def echo(payload):
@@ -95,11 +93,7 @@ def _router_worker_thread(port: int, name: str) -> None:
             raise ValueError(f"negative: {x}")
         return x
 
-    client = Client(
-        app_name=name,
-        host=HOST, port=port,
-        workers=4,
-    )
+    client = Client(app_name=name, workers=4, transport=TCPTransport(HOST, port))
     client.connect()
     try:
         while True:
@@ -115,13 +109,13 @@ def _ping_worker(port: int, name: str) -> None:
     picklable by the ``spawn`` start method."""
     silence_subprocess()
     import time as _t
-    from daffi import Client, callback
+    from daffi import Client, callback, TCPTransport
 
     @callback
     def ping():
         return name
 
-    c = Client(app_name=name, host=HOST, port=port, workers=4)
+    c = Client(app_name=name, workers=4, transport=TCPTransport(HOST, port))
     c.connect()
     try:
         while True:
@@ -133,6 +127,7 @@ def _ping_worker(port: int, name: str) -> None:
 
 
 # ── fixtures ───────────────────────────────────────────────────────────────────
+
 
 @pytest.fixture
 def svc_thread(free_port):
@@ -165,10 +160,12 @@ def router_thread(free_port):
 
 # ── shared helper ──────────────────────────────────────────────────────────────
 
+
 def _connect(port: int, name: str):
     """Create a Client, connect, and return (client, conn)."""
-    from daffi import Client
-    client = Client(app_name=name, host=HOST, port=port)
+    from daffi import Client, TCPTransport
+
+    client = Client(app_name=name, transport=TCPTransport(HOST, port))
     return client, client.connect()
 
 
@@ -185,14 +182,17 @@ def _concurrent_calls(proxy, fn_name: str, arg_factory, result_fn):
                 args = arg_factory(tid, k)
                 result = getattr(proxy, fn_name)(*args)
                 expected = result_fn(tid, k)
-                assert result == expected, (
-                    f"tid={tid} k={k}: {fn_name}({args}) → {result!r}, expected {expected!r}"
-                )
+                assert (
+                    result == expected
+                ), f"tid={tid} k={k}: {fn_name}({args}) → {result!r}, expected {expected!r}"
         except Exception as exc:
             with lock:
                 errors.append(exc)
 
-    threads = [threading.Thread(target=_task, args=(i,), daemon=True) for i in range(N_CONCURRENT)]
+    threads = [
+        threading.Thread(target=_task, args=(i,), daemon=True)
+        for i in range(N_CONCURRENT)
+    ]
     for t in threads:
         t.start()
     for t in threads:
@@ -201,6 +201,7 @@ def _concurrent_calls(proxy, fn_name: str, arg_factory, result_fn):
 
 
 # ── Direct: Client → Service, thread workers ──────────────────────────────────
+
 
 class TestDirectThreadWorkers:
     """Client → Service with workers=4."""
@@ -255,6 +256,7 @@ class TestDirectThreadWorkers:
     def test_serde_formats(self, svc_thread, serde_name):
         import json
         from daffi._serialization import SerdeFormat
+
         serde = getattr(SerdeFormat, serde_name, None)
         if serde is None:
             pytest.skip(f"{serde_name} not available")
@@ -266,9 +268,7 @@ class TestDirectThreadWorkers:
 
     def test_workers_count_inline_baseline(self, free_port):
         """workers=1 (inline) still processes requests correctly."""
-        proc = mp.Process(
-            target=_svc_thread_workers, args=(free_port,), daemon=True
-        )
+        proc = mp.Process(target=_svc_thread_workers, args=(free_port,), daemon=True)
         proc.start()
         wait_for_port(free_port)
         time.sleep(0.15)
@@ -281,6 +281,7 @@ class TestDirectThreadWorkers:
 
 
 # ── Router topology, thread workers ───────────────────────────────────────────
+
 
 class TestRouterThreadWorkers:
     """Client → Router → Worker(Client, workers=4)."""

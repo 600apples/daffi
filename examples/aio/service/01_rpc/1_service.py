@@ -7,8 +7,9 @@ and will be awaited directly by the AsyncTaskDispatcher.
 
 Run first, then run 2_client.py.
 """
+
 import asyncio
-from daffi import callback
+from daffi import callback, TCPTransport
 from daffi.aio import AsyncService
 
 
@@ -20,7 +21,9 @@ async def add(a: int, b: int) -> int:
 
 
 async def main():
-    svc = AsyncService(app_name="calc-service", host="0.0.0.0", port=5001)
+    svc = AsyncService(
+        app_name="calc-service", transports=TCPTransport("0.0.0.0", 5001)
+    )
     await svc.start()
     print("Service running on 0.0.0.0:5001 — press Ctrl+C to stop.")
     await svc.join()

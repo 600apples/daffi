@@ -15,6 +15,7 @@ Key differences from the sync conftest
   configured in ``pytest.ini`` / ``pyproject.toml``; individual test files
   can also mark classes with ``@pytest.mark.asyncio``.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -29,13 +30,16 @@ import pytest_asyncio
 
 mp.set_start_method("spawn", force=True)
 
-HOST    = "127.0.0.1"
+HOST = "127.0.0.1"
 TIMEOUT = 30
 
 
 # ── low-level helpers ─────────────────────────────────────────────────────────
 
-def wait_for_port(port: int, timeout: float = 15.0, proc: mp.Process | None = None) -> None:
+
+def wait_for_port(
+    port: int, timeout: float = 15.0, proc: mp.Process | None = None
+) -> None:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if proc is not None and proc.exitcode is not None:
@@ -64,8 +68,9 @@ def wait_for_members(
     Used in fixture setup code that runs before any asyncio event loop is
     active on the test-process side.
     """
-    from daffi import Client
-    client = Client(app_name=probe_name, host=HOST, port=port)
+    from daffi import Client, TCPTransport
+
+    client = Client(app_name=probe_name, transport=TCPTransport(HOST, port))
     conn = client.connect()
     try:
         conn.wait_for_members(*expected, timeout=timeout)
@@ -82,7 +87,9 @@ async def async_wait_for_members(
 ) -> None:
     """Async helper: open a throw-away AsyncClient inside an async test body."""
     from daffi.aio import AsyncClient
-    client = AsyncClient(app_name=probe_name, host=HOST, port=port)
+    from daffi import TCPTransport
+
+    client = AsyncClient(app_name=probe_name, transport=TCPTransport(HOST, port))
     conn = await client.connect()
     try:
         await conn.wait_for_members(*expected, timeout=timeout)
@@ -98,6 +105,7 @@ def silence_subprocess() -> None:
     logging.disable(logging.CRITICAL)
 
     from daffi.registry._executor_registry import EXECUTOR_REGISTRY
+
     EXECUTOR_REGISTRY.subscribers.clear()
     EXECUTOR_REGISTRY.registry.clear()
 
@@ -120,12 +128,15 @@ def quiet_kill(proc: mp.Process, timeout: float = 5.0) -> None:
 
 # ── common subprocess entry points ────────────────────────────────────────────
 
-def proc_service(port: int, app_name: str = "integ-aio-service", workers: int = 4) -> None:
+
+def proc_service(
+    port: int, app_name: str = "integ-aio-service", workers: int = 4
+) -> None:
     """AsyncService subprocess: registers async echo + add callbacks, then joins."""
     silence_subprocess()
 
     async def _main():
-        from daffi import callback
+        from daffi import callback, TCPTransport
         from daffi.aio import AsyncService
 
         @callback
@@ -136,7 +147,9 @@ def proc_service(port: int, app_name: str = "integ-aio-service", workers: int = 
         async def add(a: int, b: int) -> int:
             return a + b
 
-        svc = AsyncService(app_name=app_name, host=HOST, port=port, workers=workers)
+        svc = AsyncService(
+            app_name=app_name, workers=workers, transports=TCPTransport(HOST, port)
+        )
         await svc.start()
         await svc.join()
 
@@ -149,8 +162,9 @@ def proc_router(port: int, app_name: str = "integ-aio-router") -> None:
 
     async def _main():
         from daffi.aio import AsyncRouter
+        from daffi import TCPTransport
 
-        r = AsyncRouter(app_name=app_name, host=HOST, port=port)
+        r = AsyncRouter(app_name=app_name, transports=TCPTransport(HOST, port))
         await r.start()
         await r.join()
 
@@ -162,7 +176,7 @@ def proc_worker(port: int, app_name: str, workers: int = 4) -> None:
     silence_subprocess()
 
     async def _main():
-        from daffi import callback
+        from daffi import callback, TCPTransport
         from daffi.aio import AsyncClient
 
         @callback
@@ -173,7 +187,9 @@ def proc_worker(port: int, app_name: str, workers: int = 4) -> None:
         async def add(a: int, b: int) -> int:
             return a + b
 
-        client = AsyncClient(app_name=app_name, host=HOST, port=port, workers=workers)
+        client = AsyncClient(
+            app_name=app_name, workers=workers, transport=TCPTransport(HOST, port)
+        )
         await client.connect()
         await client.join()
 
@@ -181,6 +197,7 @@ def proc_worker(port: int, app_name: str, workers: int = 4) -> None:
 
 
 # ── pytest fixtures ───────────────────────────────────────────────────────────
+
 
 @pytest.fixture
 def free_port() -> int:

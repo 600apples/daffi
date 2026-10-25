@@ -33,13 +33,13 @@ pip install "daffi[msgpack]"
 **Service** — expose a function:
 
 ```python
-from daffi import Service, callback
+from daffi import Service, callback, TCPTransport
 
 @callback
 def add(a: int, b: int) -> int:
     return a + b
 
-svc = Service(app_name="calc", host="127.0.0.1", port=5000)
+svc = Service(app_name="calc", transports=TCPTransport("127.0.0.1", 5000))
 svc.start()
 svc.join()
 ```
@@ -47,9 +47,9 @@ svc.join()
 **Client** — call it:
 
 ```python
-from daffi import Client
+from daffi import Client, TCPTransport
 
-client = Client(app_name="my-client", host="127.0.0.1", port=5000)
+client = Client(app_name="my-client", transport=TCPTransport("127.0.0.1", 5000))
 conn = client.connect()
 
 result = conn.rpc(timeout=5).add(3, 4)   # → 7

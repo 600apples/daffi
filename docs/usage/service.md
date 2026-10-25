@@ -17,7 +17,7 @@ The simplest daffi topology: a **Service** hosts `@callback` functions; **Client
 ## Service
 
 ```python
-from daffi import Service, callback
+from daffi import Service, callback, TCPTransport
 
 @callback
 def add(a: int, b: int) -> int:
@@ -31,9 +31,7 @@ def greet(name: str) -> str:
 if __name__ == "__main__":
     svc = Service(
         app_name="calc-service",
-        host="127.0.0.1",
-        port=5001,
-    )
+        transports=TCPTransport("127.0.0.1", 5001))
     svc.start()
     print("Service running — press Ctrl+C to stop.")
     svc.join()   # blocks until Ctrl+C
@@ -44,9 +42,7 @@ if __name__ == "__main__":
 | Parameter | Type | Description |
 |---|---|---|
 | `app_name` | `str` | Unique name for this node. Auto-generated if omitted. |
-| `host` | `str` | TCP host to listen on. |
-| `port` | `int` | TCP port to listen on. |
-| `unix_sock_path` | `os.PathLike` | Unix socket path (mutually exclusive with `host`/`port`). |
+| `transports` | transport or sequence | One `TCPTransport` or `UnixTransport`, or several. Every listener shares this node's membership. |
 | `workers` | `int` | Concurrency level for callback execution. Default: `1` (inline). |
 | `tls` | `bool` | Enable TLS. Requires `cert_file` and `key_file`. |
 
@@ -63,7 +59,7 @@ network, disk, or database, so they genuinely run in parallel:
 
 ```python
 import time
-from daffi import Service, callback
+from daffi import Service, callback, TCPTransport
 
 @callback
 def fetch_data(query: str) -> dict:
@@ -71,10 +67,10 @@ def fetch_data(query: str) -> dict:
     return {"result": query}
 
 # workers=1 (default): 10 concurrent callers finish in ~3 s total
-svc = Service(host="127.0.0.1", port=5000, workers=1)
+svc = Service( workers=1,transports=TCPTransport("127.0.0.1", 5000))
 
 # workers=10: 10 concurrent callers all finish in ~0.3 s
-svc = Service(host="127.0.0.1", port=5000, workers=10)
+svc = Service( workers=10,transports=TCPTransport("127.0.0.1", 5000))
 
 svc.start()
 svc.join()
@@ -84,14 +80,14 @@ The same `workers` parameter applies to a `Client` acting as a worker in the
 [Router topology](router.md):
 
 ```python
-from daffi import Client, callback
+from daffi import Client, callback, TCPTransport
 
 @callback
 def process(task: str) -> str:
     time.sleep(0.5)
     return f"done: {task}"
 
-client = Client(app_name="worker-1", host="127.0.0.1", port=6000, workers=8)
+client = Client(app_name="worker-1", workers=8, transport=TCPTransport("127.0.0.1", 6000))
 client.connect()
 client.join()
 ```
@@ -108,10 +104,10 @@ client.join()
 ## Client
 
 ```python
-from daffi import Client
+from daffi import Client, TCPTransport
 
 if __name__ == "__main__":
-    client = Client(app_name="calc-client", host="127.0.0.1", port=5001)
+    client = Client(app_name="calc-client", transport=TCPTransport("127.0.0.1", 5001))
     conn = client.connect()
 
     # Blocking call — waits for the result.
@@ -129,9 +125,7 @@ if __name__ == "__main__":
 | Parameter | Type | Description |
 |---|---|---|
 | `app_name` | `str` | Unique name for this node. |
-| `host` | `str` | Service host to connect to. |
-| `port` | `int` | Service port to connect to. |
-| `unix_sock_path` | `os.PathLike` | Unix socket path (alternative to host/port). |
+| `transport` | `TCPTransport` or `UnixTransport` | The one address this client connects to. |
 
 ### `conn.rpc()`
 
@@ -168,7 +162,7 @@ daffi will instantiate the class (calling `__init__` with no arguments) and regi
 - All other public methods become callable by remote clients.
 
 ```python
-from daffi import Service, callback
+from daffi import Service, callback, TCPTransport
 from daffi.registry import local
 
 
@@ -196,7 +190,7 @@ class TextProcessor:
 
 
 if __name__ == "__main__":
-    svc = Service(app_name="text-service", host="127.0.0.1", port=5003)
+    svc = Service(app_name="text-service", transports=TCPTransport("127.0.0.1", 5003))
     svc.start()
     svc.join()
 ```
@@ -242,27 +236,27 @@ Both default to `SerdeFormat.OPAQUE` (raw bytes, zero serialisation overhead).
 **Service** — receives one chunk per invocation:
 
 ```python
-from daffi import Service, callback
+from daffi import Service, callback, TCPTransport
 
 @callback
 def receive_chunk(data: bytes) -> None:
     print(f"[service] received {len(data)} bytes: {data!r}")
 
-svc = Service(app_name="stream-service", host="127.0.0.1", port=5010)
+svc = Service(app_name="stream-service", transports=TCPTransport("127.0.0.1", 5010))
 svc.start(); svc.join()
 ```
 
 **Client** — streams a generator:
 
 ```python
-from daffi import Client
-from daffi import SerdeFormat
+from daffi import Client, TCPTransport
+from daffi import SerdeFormat, TCPTransport
 
 def data_source():
     for i in range(5):
         yield f"chunk-{i}".encode()
 
-client = Client(app_name="stream-client", host="127.0.0.1", port=5010)
+client = Client(app_name="stream-client", transport=TCPTransport("127.0.0.1", 5010))
 conn = client.connect()
 
 conn.stream(serde=SerdeFormat.OPAQUE).receive_chunk(data_source())        # blocking, safe
@@ -293,3 +287,4 @@ client.stop()
 | Unix socket | `examples/service/08_unix_socket/` |
 | Events | `examples/service/09_events/` |
 | Generator streaming | `examples/service/10_stream/` |
+| TCP and Unix on one Service | `examples/service/11_multitransport/` |

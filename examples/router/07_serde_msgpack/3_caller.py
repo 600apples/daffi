@@ -11,13 +11,13 @@ Requires:  pip install 'daffi[msgpack]'
 
 Run 1_router.py and 2_worker.py first.
 """
-import time
-from daffi import Client
-from daffi import SerdeFormat
 
+import time
+from daffi import Client, TCPTransport
+from daffi import SerdeFormat, TCPTransport
 
 if __name__ == "__main__":
-    caller = Client(app_name="mp-caller", host="0.0.0.0", port=6007)
+    caller = Client(app_name="mp-caller", transport=TCPTransport("0.0.0.0", 6007))
     conn = caller.connect()
 
     record = {"id": 1, "name": "widget", "value": 42}

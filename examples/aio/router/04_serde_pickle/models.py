@@ -3,6 +3,7 @@ Shared data models for the router PICKLE serialisation example.
 
 Both 2_worker.py and 3_caller.py import from this module.
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass

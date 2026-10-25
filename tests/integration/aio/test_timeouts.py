@@ -3,6 +3,7 @@ Async integration tests for timeout behaviour.
 
 Mirrors tests/integration/test_timeouts.py using daffi.aio.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -12,23 +13,28 @@ import time
 import pytest
 
 from .conftest import (
-    HOST, TIMEOUT,
-    wait_for_port, wait_for_members, silence_subprocess, quiet_kill,
+    HOST,
+    TIMEOUT,
+    wait_for_port,
+    wait_for_members,
+    silence_subprocess,
+    quiet_kill,
     proc_router,
 )
 
 SLOW_SECS = 3.0
-SHORT_TO  = 1
+SHORT_TO = 1
 N_WORKERS = 3
 
 
 # ── subprocess entry points ───────────────────────────────────────────────────
 
+
 def _proc_slow_service(port: int) -> None:
     silence_subprocess()
 
     async def _main():
-        from daffi import callback
+        from daffi import callback, TCPTransport
         from daffi.aio import AsyncService
 
         @callback
@@ -40,7 +46,9 @@ def _proc_slow_service(port: int) -> None:
         async def fast(payload):
             return payload
 
-        svc = AsyncService(app_name="timeout-aio-svc", host=HOST, port=port, workers=4)
+        svc = AsyncService(
+            app_name="timeout-aio-svc", workers=4, transports=TCPTransport(HOST, port)
+        )
         await svc.start()
         await svc.join()
 
@@ -52,8 +60,11 @@ def _proc_router_only(port: int) -> None:
 
     async def _main():
         from daffi.aio import AsyncRouter
+        from daffi import TCPTransport
 
-        r = AsyncRouter(app_name="timeout-aio-router-only", host=HOST, port=port)
+        r = AsyncRouter(
+            app_name="timeout-aio-router-only", transports=TCPTransport(HOST, port)
+        )
         await r.start()
         await r.join()
 
@@ -64,7 +75,7 @@ def _proc_fast_worker(port: int, worker_id: int) -> None:
     silence_subprocess()
 
     async def _main():
-        from daffi import callback
+        from daffi import callback, TCPTransport
         from daffi.aio import AsyncClient
 
         @callback
@@ -72,7 +83,8 @@ def _proc_fast_worker(port: int, worker_id: int) -> None:
             return payload
 
         client = AsyncClient(
-            app_name=f"timeout-aio-fast-{worker_id:02d}", host=HOST, port=port
+            app_name=f"timeout-aio-fast-{worker_id:02d}",
+            transport=TCPTransport(HOST, port),
         )
         await client.connect()
         await client.join()
@@ -84,7 +96,7 @@ def _proc_slow_worker(port: int, worker_id: int) -> None:
     silence_subprocess()
 
     async def _main():
-        from daffi import callback
+        from daffi import callback, TCPTransport
         from daffi.aio import AsyncClient
 
         @callback
@@ -93,7 +105,8 @@ def _proc_slow_worker(port: int, worker_id: int) -> None:
             return payload
 
         client = AsyncClient(
-            app_name=f"timeout-aio-slow-{worker_id:02d}", host=HOST, port=port
+            app_name=f"timeout-aio-slow-{worker_id:02d}",
+            transport=TCPTransport(HOST, port),
         )
         await client.connect()
         await client.join()
@@ -105,7 +118,7 @@ def _proc_all_slow_workers(port: int, n: int) -> None:
     silence_subprocess()
 
     async def _main():
-        from daffi import callback
+        from daffi import callback, TCPTransport
         from daffi.aio import AsyncClient
 
         @callback
@@ -116,7 +129,8 @@ def _proc_all_slow_workers(port: int, n: int) -> None:
         clients = []
         for i in range(n):
             c = AsyncClient(
-                app_name=f"timeout-aio-allslow-{i:02d}", host=HOST, port=port
+                app_name=f"timeout-aio-allslow-{i:02d}",
+                transport=TCPTransport(HOST, port),
             )
             await c.connect()
             clients.append(c)
@@ -130,6 +144,7 @@ def _proc_all_slow_workers(port: int, n: int) -> None:
 
 
 # ── fixtures ──────────────────────────────────────────────────────────────────
+
 
 @pytest.fixture
 def slow_service(free_port):
@@ -163,7 +178,9 @@ def cast_mixed(free_port):
         p.start()
         worker_procs.append(p)
 
-    slow_p = mp.Process(target=_proc_slow_worker, args=(free_port, N_WORKERS - 1), daemon=True)
+    slow_p = mp.Process(
+        target=_proc_slow_worker, args=(free_port, N_WORKERS - 1), daemon=True
+    )
     slow_p.start()
     worker_procs.append(slow_p)
 
@@ -184,10 +201,14 @@ def cast_all_slow(free_port):
     rproc.start()
     wait_for_port(free_port)
 
-    wproc = mp.Process(target=_proc_all_slow_workers, args=(free_port, N_WORKERS), daemon=True)
+    wproc = mp.Process(
+        target=_proc_all_slow_workers, args=(free_port, N_WORKERS), daemon=True
+    )
     wproc.start()
     expected = {f"timeout-aio-allslow-{i:02d}" for i in range(N_WORKERS)}
-    wait_for_members(free_port, expected, timeout=15.0, probe_name="to-aio-allslow-probe")
+    wait_for_members(
+        free_port, expected, timeout=15.0, probe_name="to-aio-allslow-probe"
+    )
     yield free_port
 
     quiet_kill(wproc)
@@ -196,13 +217,17 @@ def cast_all_slow(free_port):
 
 # ── rpc() timeout tests ───────────────────────────────────────────────────────
 
+
 @pytest.mark.asyncio
 class TestRpcTimeoutAsync:
 
     async def test_slow_callback_raises_timeout_error(self, slow_service):
         from daffi.aio import AsyncClient
+        from daffi import TCPTransport
 
-        client = AsyncClient(app_name="to-rpc-slow", host=HOST, port=slow_service)
+        client = AsyncClient(
+            app_name="to-rpc-slow", transport=TCPTransport(HOST, slow_service)
+        )
         conn = await client.connect()
         try:
             with pytest.raises(TimeoutError):
@@ -212,23 +237,33 @@ class TestRpcTimeoutAsync:
 
     async def test_timeout_measures_wall_clock(self, slow_service):
         from daffi.aio import AsyncClient
+        from daffi import TCPTransport
 
-        client = AsyncClient(app_name="to-rpc-wall", host=HOST, port=slow_service)
+        client = AsyncClient(
+            app_name="to-rpc-wall", transport=TCPTransport(HOST, slow_service)
+        )
         conn = await client.connect()
         try:
             t0 = time.monotonic()
             with pytest.raises(TimeoutError):
                 await conn.rpc(timeout=SHORT_TO).slow("x")
             elapsed = time.monotonic() - t0
-            assert elapsed > 0.1, f"TimeoutError raised suspiciously fast ({elapsed:.3f}s)"
-            assert elapsed < SHORT_TO + 2.0, f"TimeoutError raised far too late ({elapsed:.3f}s)"
+            assert (
+                elapsed > 0.1
+            ), f"TimeoutError raised suspiciously fast ({elapsed:.3f}s)"
+            assert (
+                elapsed < SHORT_TO + 2.0
+            ), f"TimeoutError raised far too late ({elapsed:.3f}s)"
         finally:
             await client.stop()
 
     async def test_connection_works_after_timeout(self, slow_service):
         from daffi.aio import AsyncClient
+        from daffi import TCPTransport
 
-        client = AsyncClient(app_name="to-rpc-recovery", host=HOST, port=slow_service)
+        client = AsyncClient(
+            app_name="to-rpc-recovery", transport=TCPTransport(HOST, slow_service)
+        )
         conn = await client.connect()
         try:
             with pytest.raises(TimeoutError):
@@ -240,8 +275,11 @@ class TestRpcTimeoutAsync:
 
     async def test_multiple_timeouts_do_not_corrupt_store(self, slow_service):
         from daffi.aio import AsyncClient
+        from daffi import TCPTransport
 
-        client = AsyncClient(app_name="to-rpc-repeat", host=HOST, port=slow_service)
+        client = AsyncClient(
+            app_name="to-rpc-repeat", transport=TCPTransport(HOST, slow_service)
+        )
         conn = await client.connect()
         try:
             for _ in range(3):
@@ -254,9 +292,12 @@ class TestRpcTimeoutAsync:
 
     async def test_no_receiver_raises_on_call(self, router_no_workers):
         from daffi.aio import AsyncClient
+        from daffi import TCPTransport
         from daffi.exceptions import TransmissionFailure
 
-        client = AsyncClient(app_name="to-rpc-norcv", host=HOST, port=router_no_workers)
+        client = AsyncClient(
+            app_name="to-rpc-norcv", transport=TCPTransport(HOST, router_no_workers)
+        )
         conn = await client.connect()
         try:
             t0 = time.monotonic()
@@ -269,8 +310,11 @@ class TestRpcTimeoutAsync:
 
     async def test_zero_timeout_waits_indefinitely(self, slow_service):
         from daffi.aio import AsyncClient
+        from daffi import TCPTransport
 
-        client = AsyncClient(app_name="to-rpc-inf", host=HOST, port=slow_service)
+        client = AsyncClient(
+            app_name="to-rpc-inf", transport=TCPTransport(HOST, slow_service)
+        )
         conn = await client.connect()
         try:
             result = await conn.rpc(timeout=0).slow("infinite-wait")
@@ -281,30 +325,41 @@ class TestRpcTimeoutAsync:
 
 # ── cast() timeout tests ──────────────────────────────────────────────────────
 
+
 @pytest.mark.asyncio
 class TestCastTimeoutAsync:
 
-    async def test_all_workers_slow_result_dict_contains_timeout_errors(self, cast_all_slow):
+    async def test_all_workers_slow_result_dict_contains_timeout_errors(
+        self, cast_all_slow
+    ):
         from daffi.aio import AsyncClient
+        from daffi import TCPTransport
 
-        client = AsyncClient(app_name="to-cast-allslow", host=HOST, port=cast_all_slow)
+        client = AsyncClient(
+            app_name="to-cast-allslow", transport=TCPTransport(HOST, cast_all_slow)
+        )
         conn = await client.connect()
         try:
             results = await conn.cast(timeout=SHORT_TO).work("broadcast")
             assert isinstance(results, dict)
             assert len(results) == N_WORKERS
             for name, val in results.items():
-                assert isinstance(val, TimeoutError), f"{name}: expected TimeoutError, got {val!r}"
+                assert isinstance(
+                    val, TimeoutError
+                ), f"{name}: expected TimeoutError, got {val!r}"
         finally:
             await client.stop()
 
     async def test_one_slow_worker_partial_result(self, cast_mixed):
         from daffi.aio import AsyncClient
+        from daffi import TCPTransport
 
         port, slow_proc = cast_mixed
         slow_name = f"timeout-aio-slow-{N_WORKERS - 1:02d}"
 
-        client = AsyncClient(app_name="to-cast-mixed", host=HOST, port=port)
+        client = AsyncClient(
+            app_name="to-cast-mixed", transport=TCPTransport(HOST, port)
+        )
         conn = await client.connect()
         try:
             results = await conn.cast(timeout=SHORT_TO).work("payload")
@@ -318,10 +373,15 @@ class TestCastTimeoutAsync:
         finally:
             await client.stop()
 
-    async def test_cast_nowait_returns_immediately_with_slow_workers(self, cast_all_slow):
+    async def test_cast_nowait_returns_immediately_with_slow_workers(
+        self, cast_all_slow
+    ):
         from daffi.aio import AsyncClient
+        from daffi import TCPTransport
 
-        client = AsyncClient(app_name="to-castnw-slow", host=HOST, port=cast_all_slow)
+        client = AsyncClient(
+            app_name="to-castnw-slow", transport=TCPTransport(HOST, cast_all_slow)
+        )
         conn = await client.connect()
         try:
             t0 = time.monotonic()
@@ -333,9 +393,12 @@ class TestCastTimeoutAsync:
 
     async def test_cast_partial_result_connection_still_works(self, cast_mixed):
         from daffi.aio import AsyncClient
+        from daffi import TCPTransport
 
         port, _ = cast_mixed
-        client = AsyncClient(app_name="to-cast-recover", host=HOST, port=port)
+        client = AsyncClient(
+            app_name="to-cast-recover", transport=TCPTransport(HOST, port)
+        )
         conn = await client.connect()
         try:
             results = await conn.cast(timeout=SHORT_TO).work("x")
@@ -343,8 +406,7 @@ class TestCastTimeoutAsync:
             # Connection still usable: fast workers echo fast
             results2 = await conn.cast(timeout=TIMEOUT).work("still-alive")
             fast_names = [
-                k for k, v in results.items()
-                if not isinstance(v, TimeoutError)
+                k for k, v in results.items() if not isinstance(v, TimeoutError)
             ]
             for name in fast_names:
                 assert results2.get(name) == "still-alive"
@@ -353,8 +415,11 @@ class TestCastTimeoutAsync:
 
     async def test_rpc_nowait_returns_immediately(self, slow_service):
         from daffi.aio import AsyncClient
+        from daffi import TCPTransport
 
-        client = AsyncClient(app_name="to-rpcnw-slow", host=HOST, port=slow_service)
+        client = AsyncClient(
+            app_name="to-rpcnw-slow", transport=TCPTransport(HOST, slow_service)
+        )
         conn = await client.connect()
         try:
             t0 = time.monotonic()

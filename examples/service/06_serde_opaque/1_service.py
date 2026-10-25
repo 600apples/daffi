@@ -8,21 +8,24 @@ with a custom schema, or any binary format).
 
 Run first, then run 2_client.py.
 """
+
 import json
-from daffi import Service, callback
+from daffi import Service, callback, TCPTransport
 
 
 @callback
 def echo_raw(payload: bytes) -> bytes:
     """Receive raw bytes, decode as UTF-8 JSON, print, and echo back."""
     data = json.loads(payload.decode("utf-8"))
-    print(f"[service] received {len(payload)} bytes  "
-          f"keys={list(data.keys()) if isinstance(data, dict) else type(data).__name__}")
+    print(
+        f"[service] received {len(payload)} bytes  "
+        f"keys={list(data.keys()) if isinstance(data, dict) else type(data).__name__}"
+    )
     return payload  # echo unchanged
 
 
 if __name__ == "__main__":
-    svc = Service(app_name="opaque-service", host="0.0.0.0", port=5006)
+    svc = Service(app_name="opaque-service", transports=TCPTransport("0.0.0.0", 5006))
     svc.start()
     print("Service running on 0.0.0.0:5006 — press Ctrl+C to stop.")
     svc.join()

@@ -45,13 +45,13 @@ or from Python, before any daffi node is started:
 import os
 os.environ["DAFFI_EXECUTION_MODEL"] = "evented"
 
-from daffi import Service, callback
+from daffi import Service, callback, TCPTransport
 
 @callback
 def echo(x):
     return x
 
-svc = Service(app_name="echo", host="0.0.0.0", port=6000)
+svc = Service(app_name="echo", transports=TCPTransport("0.0.0.0", 6000))
 svc.start()
 svc.join()
 ```

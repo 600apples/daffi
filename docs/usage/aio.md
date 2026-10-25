@@ -17,7 +17,7 @@ The event loop is never blocked.
     ```python
     # 1_service.py
     import asyncio
-    from daffi import callback
+    from daffi import callback, TCPTransport
     from daffi.aio import AsyncService
 
     @callback
@@ -25,7 +25,7 @@ The event loop is never blocked.
         return a * b
 
     async def main():
-        svc = AsyncService(app_name="calc-service", host="127.0.0.1", port=6001)
+        svc = AsyncService(app_name="calc-service", transports=TCPTransport("127.0.0.1", 6001))
         await svc.start()
         print("AsyncService running — press Ctrl+C to stop.")
         await svc.join()
@@ -40,7 +40,7 @@ The event loop is never blocked.
     from daffi.aio import AsyncClient
 
     async def main():
-        client = AsyncClient(app_name="calc-caller", host="127.0.0.1", port=6001)
+        client = AsyncClient(app_name="calc-caller", transport=TCPTransport("127.0.0.1", 6001))
         conn = await client.connect()
 
         result = await conn.rpc(timeout=5).multiply(6, 7)
@@ -60,7 +60,7 @@ The event loop is never blocked.
     from daffi.aio import AsyncRouter
 
     async def main():
-        router = AsyncRouter(app_name="calc-router", host="127.0.0.1", port=6001)
+        router = AsyncRouter(app_name="calc-router", transports=TCPTransport("127.0.0.1", 6001))
         await router.start()
         print("AsyncRouter running — press Ctrl+C to stop.")
         await router.join()
@@ -72,7 +72,7 @@ The event loop is never blocked.
     ```python
     # 2_worker.py
     import asyncio
-    from daffi import callback
+    from daffi import callback, TCPTransport
     from daffi.aio import AsyncClient
 
     @callback
@@ -80,7 +80,7 @@ The event loop is never blocked.
         return a * b
 
     async def main():
-        worker = AsyncClient(app_name="calc-worker", host="127.0.0.1", port=6001)
+        worker = AsyncClient(app_name="calc-worker", transport=TCPTransport("127.0.0.1", 6001))
         await worker.connect()
         print("AsyncWorker connected — press Ctrl+C to stop.")
         await worker.join()
@@ -95,7 +95,7 @@ The event loop is never blocked.
     from daffi.aio import AsyncClient
 
     async def main():
-        caller = AsyncClient(app_name="calc-caller", host="127.0.0.1", port=6001)
+        caller = AsyncClient(app_name="calc-caller", transport=TCPTransport("127.0.0.1", 6001))
         conn = await caller.connect()
 
         result = await conn.rpc(timeout=5).multiply(6, 7)
@@ -127,11 +127,10 @@ The event loop is never blocked.
 from daffi.aio import AsyncClient
 
 client = AsyncClient(
-    app_name="my-client",   # unique name on the network
-    host="127.0.0.1",
-    port=6001,
+    app_name="my-client",
     workers=1,              # asyncio task concurrency for *incoming* callbacks
-)
+,   # unique name on the network
+    transport=TCPTransport("127.0.0.1", 6001))
 
 conn   = await client.connect()   # returns an AsyncClientConnection
 await client.join()               # suspend until stopped
@@ -162,10 +161,8 @@ from daffi.aio import AsyncService
 
 svc = AsyncService(
     app_name="my-service",
-    host="0.0.0.0",
-    port=6001,
     workers=4,
-)
+    transports=TCPTransport("0.0.0.0", 6001))
 
 await svc.start()   # begin listening
 await svc.join()    # block until stopped (typically forever)
@@ -179,7 +176,7 @@ await svc.stop()    # graceful shutdown
 ```python
 from daffi.aio import AsyncRouter
 
-router = AsyncRouter(app_name="my-router", host="0.0.0.0", port=6001)
+router = AsyncRouter(app_name="my-router", transports=TCPTransport("0.0.0.0", 6001))
 
 await router.start()
 await router.join()
@@ -221,7 +218,7 @@ Callbacks can be either regular functions or `async def` coroutines.
 The dispatcher handles both automatically.
 
 ```python
-from daffi import callback
+from daffi import callback, TCPTransport
 
 # Sync callback — run in a thread-pool executor (non-blocking to the loop)
 @callback
@@ -269,7 +266,7 @@ Pass `serde=SerdeFormat.<FORMAT>` to `conn.rpc()`, `conn.cast()`, or
 `conn.stream()`.
 
 ```python
-from daffi import SerdeFormat
+from daffi import SerdeFormat, TCPTransport
 
 result = await conn.rpc(timeout=10, serde=SerdeFormat.MSGPACK).echo(payload)
 ```
@@ -290,7 +287,7 @@ from daffi.aio import AsyncClient
 async def main():
     # Connect 100 independent callers
     clients = [
-        AsyncClient(app_name=f"caller-{i}", host="127.0.0.1", port=6001)
+        AsyncClient(app_name=f"caller-{i}", transport=TCPTransport("127.0.0.1", 6001))
         for i in range(100)
     ]
     conns = await asyncio.gather(*[c.connect() for c in clients])
@@ -315,7 +312,7 @@ reads) yield the event loop while waiting, so other tasks — including
 processing new incoming calls — continue uninterrupted:
 
 ```python
-from daffi import callback
+from daffi import callback, TCPTransport
 from daffi.aio import AsyncClient
 import asyncio
 
@@ -329,10 +326,8 @@ async def db_query(user_id: int) -> dict:
 async def main():
     worker = AsyncClient(
         app_name="db-worker",
-        host="127.0.0.1",
-        port=6001,
         workers=50,   # 50 concurrent async DB queries — zero OS threads
-    )
+        transport=TCPTransport("127.0.0.1", 6001))
     await worker.connect()
     await worker.join()
 

@@ -42,8 +42,14 @@ def main():
         total_statements_covered += statements_covered
         total_statements += statements
 
-        coverage_data[package_name] = {"statements_covered": statements_covered, "statements": statements}
-    coverage_data["total"] = {"statements_covered": total_statements_covered, "statements": total_statements}
+        coverage_data[package_name] = {
+            "statements_covered": statements_covered,
+            "statements": statements,
+        }
+    coverage_data["total"] = {
+        "statements_covered": total_statements_covered,
+        "statements": total_statements,
+    }
 
     coverage_summary = project_root / "coverage-summary.json"
     coverage_summary.write_text(json.dumps(coverage_data, indent=4), encoding="utf-8")

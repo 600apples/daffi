@@ -9,7 +9,8 @@ Requires:  pip install 'daffi[msgpack]'
 
 Run first, then run 2_client.py.
 """
-from daffi import Service, callback
+
+from daffi import Service, callback, TCPTransport
 
 
 @callback
@@ -23,7 +24,7 @@ def transform(record: dict) -> dict:
 
 
 if __name__ == "__main__":
-    svc = Service(app_name="msgpack-service", host="0.0.0.0", port=5007)
+    svc = Service(app_name="msgpack-service", transports=TCPTransport("0.0.0.0", 5007))
     svc.start()
     print("Service running on 0.0.0.0:5007 — press Ctrl+C to stop.")
     svc.join()

@@ -27,6 +27,7 @@ Run::
 
     python3 tests/perf/workers_benchmark.py
 """
+
 from __future__ import annotations
 
 import json
@@ -39,27 +40,29 @@ import time
 from pathlib import Path
 from typing import NamedTuple
 
-HOST    = "127.0.0.1"
+HOST = "127.0.0.1"
 TIMEOUT = 30
-N_SEQ   = 2_000     # sequential calls per (mode × serde × callback) cell
-N_CONC  = 200       # concurrent calls per burst
-N_BURST = 5         # bursts per (mode × serde × callback) cell
-N_THREADS = 16      # caller threads per burst
-CPU_N   = 500       # argument passed to cpu_work(n)
+N_SEQ = 2_000  # sequential calls per (mode × serde × callback) cell
+N_CONC = 200  # concurrent calls per burst
+N_BURST = 5  # bursts per (mode × serde × callback) cell
+N_THREADS = 16  # caller threads per burst
+CPU_N = 500  # argument passed to cpu_work(n)
 
 
 # ── result container ──────────────────────────────────────────────────────────
 
+
 class BenchResult(NamedTuple):
-    mode: str        # "baseline" | "threads×4"
-    topology: str    # "direct" | "router"
-    callback: str    # "echo" | "cpu_work"
-    serde: str       # "PICKLE" | "JSON" | "OPAQUE"
-    seq_cps: float   # sequential calls / second
+    mode: str  # "baseline" | "threads×4"
+    topology: str  # "direct" | "router"
+    callback: str  # "echo" | "cpu_work"
+    serde: str  # "PICKLE" | "JSON" | "OPAQUE"
+    seq_cps: float  # sequential calls / second
     conc_cps: float  # concurrent calls / second
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
+
 
 def _free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -86,6 +89,7 @@ def _silence() -> None:
     os.close(devnull)
     logging.disable(logging.CRITICAL)
     from daffi.registry._executor_registry import EXECUTOR_REGISTRY
+
     EXECUTOR_REGISTRY.subscribers.clear()
     EXECUTOR_REGISTRY.registry.clear()
 
@@ -93,19 +97,24 @@ def _silence() -> None:
 def _quiet_stop(fn, *args) -> None:
     devnull = os.open(os.devnull, os.O_WRONLY)
     saved = (os.dup(1), os.dup(2))
-    os.dup2(devnull, 1); os.dup2(devnull, 2); os.close(devnull)
+    os.dup2(devnull, 1)
+    os.dup2(devnull, 2)
+    os.close(devnull)
     try:
         fn(*args)
     finally:
-        os.dup2(saved[0], 1); os.dup2(saved[1], 2)
-        os.close(saved[0]); os.close(saved[1])
+        os.dup2(saved[0], 1)
+        os.dup2(saved[1], 2)
+        os.close(saved[0])
+        os.close(saved[1])
 
 
 # ── subprocess targets ────────────────────────────────────────────────────────
 
+
 def _proc_service(port: int, workers: int) -> None:
     _silence()
-    from daffi import Service, callback
+    from daffi import Service, callback, TCPTransport
 
     @callback
     def echo(payload):
@@ -116,9 +125,7 @@ def _proc_service(port: int, workers: int) -> None:
         return sum(i * i for i in range(n))
 
     svc = Service(
-        app_name="bench-svc",
-        host=HOST, port=port,
-        workers=workers,
+        app_name="bench-svc", workers=workers, transports=TCPTransport(HOST, port)
     )
     svc.start()
     svc.join()
@@ -126,8 +133,9 @@ def _proc_service(port: int, workers: int) -> None:
 
 def _proc_router(port: int) -> None:
     _silence()
-    from daffi import Router
-    r = Router(app_name="bench-router", host=HOST, port=port)
+    from daffi import Router, TCPTransport
+
+    r = Router(app_name="bench-router", transports=TCPTransport(HOST, port))
     r.start()
     r.join()
 
@@ -135,7 +143,7 @@ def _proc_router(port: int) -> None:
 def _proc_worker(port: int, workers: int) -> None:
     _silence()
     import time as _t
-    from daffi import Client, callback
+    from daffi import Client, callback, TCPTransport
 
     @callback
     def echo(payload):
@@ -146,9 +154,7 @@ def _proc_worker(port: int, workers: int) -> None:
         return sum(i * i for i in range(n))
 
     client = Client(
-        app_name="bench-worker",
-        host=HOST, port=port,
-        workers=workers,
+        app_name="bench-worker", workers=workers, transport=TCPTransport(HOST, port)
     )
     client.connect()
     try:
@@ -161,6 +167,7 @@ def _proc_worker(port: int, workers: int) -> None:
 
 
 # ── benchmark kernel ──────────────────────────────────────────────────────────
+
 
 def _bench(
     port: int,
@@ -175,14 +182,16 @@ def _bench(
     Returns ``(seq_cps, conc_cps)``.
     """
     import threading
-    from daffi import Client
+    from daffi import Client, TCPTransport
     from daffi._serialization import SerdeFormat
 
     wire = json.dumps({}) if serde_name == "OPAQUE" else {}
     cpu_arg = CPU_N
     arg = wire if cb_name == "echo" else cpu_arg
 
-    client = Client(app_name=f"bench-caller-{label}", host=HOST, port=port)
+    client = Client(
+        app_name=f"bench-caller-{label}", transport=TCPTransport(HOST, port)
+    )
     conn = client.connect()
     proxy = conn.rpc(timeout=TIMEOUT, serde=serde_int)
 
@@ -215,7 +224,9 @@ def _bench(
                 with lock:
                     errors.append(exc)
 
-        threads = [threading.Thread(target=_task, daemon=True) for _ in range(N_THREADS)]
+        threads = [
+            threading.Thread(target=_task, daemon=True) for _ in range(N_THREADS)
+        ]
         burst_t0 = time.perf_counter()
         for t in threads:
             t.start()
@@ -231,6 +242,7 @@ def _bench(
 
 
 # ── topology runners ──────────────────────────────────────────────────────────
+
 
 def run_direct(
     workers: int,
@@ -288,15 +300,18 @@ def run_router(
 
 # ── main ──────────────────────────────────────────────────────────────────────
 
+
 def _serde_modes():
     from daffi._serialization import SerdeFormat
+
     modes = [
         (SerdeFormat.PICKLE, "PICKLE"),
-        (SerdeFormat.JSON,   "JSON"),
+        (SerdeFormat.JSON, "JSON"),
         (SerdeFormat.OPAQUE, "OPAQUE"),
     ]
     try:
         import msgpack as _  # noqa: F401
+
         modes.insert(2, (SerdeFormat.MSGPACK, "MSGPACK"))
     except ImportError:
         print("  [note] msgpack not installed — MSGPACK skipped")
@@ -304,8 +319,8 @@ def _serde_modes():
 
 
 WORKER_MODES = [
-    (1,  "baseline  "),
-    (4,  "threads×4 "),
+    (1, "baseline  "),
+    (4, "threads×4 "),
 ]
 
 CALLBACKS = ["echo", "cpu_work"]
@@ -326,8 +341,10 @@ def main() -> None:
         serde_modes = _serde_modes()
 
         print(f"\ndaffi workers benchmark")
-        print(f"  sequential: {N_SEQ} calls/cell  |  "
-              f"concurrent: {N_BURST}×{N_CONC} calls with {N_THREADS} threads")
+        print(
+            f"  sequential: {N_SEQ} calls/cell  |  "
+            f"concurrent: {N_BURST}×{N_CONC} calls with {N_THREADS} threads"
+        )
         print(f"  cpu_work argument n={CPU_N}  |  host: {HOST}\n")
 
         for serde_int, serde_name in serde_modes:
@@ -340,12 +357,21 @@ def main() -> None:
                 for workers, mode_label in WORKER_MODES:
                     tag = f"{mode_label.strip()}/{serde_name}/{cb_name}"
                     print(f"  [{tag}] direct …", end="", flush=True)
-                    r_dir = run_direct(workers, mode_label.strip(), serde_int, serde_name, cb_name)
-                    print(f" seq={r_dir.seq_cps:>7.0f} c/s  conc={r_dir.conc_cps:>7.0f} c/s", end="")
+                    r_dir = run_direct(
+                        workers, mode_label.strip(), serde_int, serde_name, cb_name
+                    )
+                    print(
+                        f" seq={r_dir.seq_cps:>7.0f} c/s  conc={r_dir.conc_cps:>7.0f} c/s",
+                        end="",
+                    )
 
                     print(f"  | router …", end="", flush=True)
-                    r_rtr = run_router(workers, mode_label.strip(), serde_int, serde_name, cb_name)
-                    print(f" seq={r_rtr.seq_cps:>7.0f} c/s  conc={r_rtr.conc_cps:>7.0f} c/s")
+                    r_rtr = run_router(
+                        workers, mode_label.strip(), serde_int, serde_name, cb_name
+                    )
+                    print(
+                        f" seq={r_rtr.seq_cps:>7.0f} c/s  conc={r_rtr.conc_cps:>7.0f} c/s"
+                    )
 
                     results.append(r_dir)
                     results.append(r_rtr)
@@ -360,7 +386,8 @@ def main() -> None:
             for cb_name in CALLBACKS:
                 for serde_int, serde_name in serde_modes:
                     row_results = [
-                        r for r in results
+                        r
+                        for r in results
                         if r.topology == topology
                         and r.callback == cb_name
                         and r.serde == serde_name
@@ -372,7 +399,9 @@ def main() -> None:
                     print(f"    {'mode':<14}  {'sequential':>12}  {'concurrent':>12}")
                     print(f"    {'-'*14}  {'-'*12}  {'-'*12}")
                     for r in row_results:
-                        print(f"    {r.mode:<14}  {r.seq_cps:>12.0f}  {r.conc_cps:>12.0f}")
+                        print(
+                            f"    {r.mode:<14}  {r.seq_cps:>12.0f}  {r.conc_cps:>12.0f}"
+                        )
 
         print()
         _render_chart(results)
@@ -384,9 +413,11 @@ def main() -> None:
 
 # ── optional chart ────────────────────────────────────────────────────────────
 
+
 def _render_chart(results: list[BenchResult]) -> None:
     try:
         import matplotlib
+
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
         import numpy as np
@@ -398,10 +429,11 @@ def _render_chart(results: list[BenchResult]) -> None:
     serde_labels = [s for _, s in serde_modes]
 
     mode_labels = [m for _, m in WORKER_MODES]
-    colours = ["#4C72B0", "#55A868"]   # blue, green
+    colours = ["#4C72B0", "#55A868"]  # blue, green
 
     fig, axes = plt.subplots(
-        nrows=2, ncols=4,
+        nrows=2,
+        ncols=4,
         figsize=(20, 9),
         sharey="row",
     )
@@ -429,7 +461,8 @@ def _render_chart(results: list[BenchResult]) -> None:
                 vals = []
                 for topology in ("direct", "router"):
                     match = [
-                        r.conc_cps for r in results
+                        r.conc_cps
+                        for r in results
                         if r.topology == topology
                         and r.callback == cb_name
                         and r.serde == serde_name
@@ -439,7 +472,9 @@ def _render_chart(results: list[BenchResult]) -> None:
 
                 offset = (mi - 0.5) * width
                 bars = ax.bar(
-                    x + offset, vals, width,
+                    x + offset,
+                    vals,
+                    width,
                     label=mlabel.strip(),
                     color=colours[mi],
                     alpha=0.85,
@@ -450,7 +485,8 @@ def _render_chart(results: list[BenchResult]) -> None:
                             bar.get_x() + bar.get_width() / 2,
                             bar.get_height() * 1.01,
                             f"{v:.0f}",
-                            ha="center", va="bottom",
+                            ha="center",
+                            va="bottom",
                             fontsize=6,
                         )
 

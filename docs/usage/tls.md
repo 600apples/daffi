@@ -9,7 +9,7 @@ daffi supports TLS encryption for TCP connections. Enable it to protect traffic 
 Provide a PEM certificate and private key:
 
 ```python
-from daffi import Service, callback
+from daffi import Service, callback, TCPTransport
 
 @callback
 def secret(data: str) -> str:
@@ -17,12 +17,10 @@ def secret(data: str) -> str:
 
 svc = Service(
     app_name="tls-service",
-    host="0.0.0.0",
-    port=5443,
     tls=True,
     cert_file="/path/to/server.crt",
     key_file="/path/to/server.key",
-)
+    transports=TCPTransport("0.0.0.0", 5443))
 svc.start()
 svc.join()
 ```
@@ -34,17 +32,15 @@ Same parameters apply to `Router`.
 ## Client
 
 ```python
-from daffi import Client
+from daffi import Client, TCPTransport
 
 client = Client(
     app_name="tls-client",
-    host="127.0.0.1",
-    port=5443,
     tls=True,
     # Optional: provide a CA bundle to verify the server certificate.
     # Leave empty to connect without verifying the server cert (not recommended).
     ca_file="/path/to/ca.crt",
-)
+    transport=TCPTransport("127.0.0.1", 5443))
 conn = client.connect()
 result = conn.rpc(timeout=5).secret("hello")
 print(result)

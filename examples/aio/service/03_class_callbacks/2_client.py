@@ -6,8 +6,10 @@ asyncio.gather() pipelines all three calls per sentence concurrently.
 
 Run 1_service.py first.
 """
+
 import asyncio
 from daffi.aio import AsyncClient
+from daffi import TCPTransport
 
 SENTENCES = [
     "the quick brown fox",
@@ -17,7 +19,9 @@ SENTENCES = [
 
 
 async def main():
-    client = AsyncClient(app_name="text-client", host="0.0.0.0", port=5003)
+    client = AsyncClient(
+        app_name="text-client", transport=TCPTransport("0.0.0.0", 5003)
+    )
     conn = await client.connect()
 
     rpc = conn.rpc(timeout=5)

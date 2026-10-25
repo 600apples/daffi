@@ -7,7 +7,8 @@ remain purely local.
 
 Run first, then run 2_client.py.
 """
-from daffi import Service, callback
+
+from daffi import Service, callback, TCPTransport
 from daffi.registry import local
 
 
@@ -40,7 +41,7 @@ class TextProcessor:
 
 
 if __name__ == "__main__":
-    svc = Service(app_name="text-service", host="0.0.0.0", port=5003)
+    svc = Service(app_name="text-service", transports=TCPTransport("0.0.0.0", 5003))
     svc.start()
     print("Service running on 0.0.0.0:5003 — press Ctrl+C to stop.")
     svc.join()

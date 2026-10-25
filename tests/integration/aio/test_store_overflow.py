@@ -13,6 +13,7 @@ This test:
   1. Sends two concurrent requests and verifies BOTH responses arrive.
   2. Confirms the connection remains usable after high concurrency.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -48,7 +49,7 @@ def _proc_service_overflow(port: int) -> None:
     silence_subprocess()
 
     async def _main():
-        from daffi import callback
+        from daffi import callback, TCPTransport
         from daffi.aio import AsyncService
 
         _barrier = _AsyncBarrier2()
@@ -63,7 +64,9 @@ def _proc_service_overflow(port: int) -> None:
         async def fast_echo(payload):
             return payload
 
-        svc = AsyncService(app_name="overflow-aio-svc", host=HOST, port=port, workers=4)
+        svc = AsyncService(
+            app_name="overflow-aio-svc", workers=4, transports=TCPTransport(HOST, port)
+        )
         await svc.start()
         await svc.join()
 
@@ -91,11 +94,15 @@ class TestStoreOverflowAsync:
         stored in a distinct bucket — both responses are delivered.
         """
         from daffi.aio import AsyncClient
+        from daffi import TCPTransport
         from daffi.aio._rpc_proxy import AsyncRpcResult
         from daffi._bindings import send_message_from_client, MessageFlag
         from daffi._serialization import Serializer, SerdeFormat
 
-        client = AsyncClient(app_name="overflow-aio-caller", host=HOST, port=overflow_service)
+        client = AsyncClient(
+            app_name="overflow-aio-caller",
+            transport=TCPTransport(HOST, overflow_service),
+        )
         conn = await client.connect()
         conn_num = client._conn_num
 
@@ -105,17 +112,27 @@ class TestStoreOverflowAsync:
             # poll below.
             data_a, ib_a = Serializer.serialize(SerdeFormat.PICKLE, "payload-a")
             uuid_a, ts_a, found_a = send_message_from_client(
-                data=data_a, flag=MessageFlag.REQUEST, serde=SerdeFormat.PICKLE,
-                receiver="", func_name="hold_echo", return_result=True,
-                conn_num=conn_num, is_bytes=ib_a,
+                data=data_a,
+                flag=MessageFlag.REQUEST,
+                serde=SerdeFormat.PICKLE,
+                receiver="",
+                func_name="hold_echo",
+                return_result=True,
+                conn_num=conn_num,
+                is_bytes=ib_a,
             )
             assert found_a, "No receiver found for hold_echo"
 
             data_b, ib_b = Serializer.serialize(SerdeFormat.PICKLE, "payload-b")
             uuid_b, ts_b, found_b = send_message_from_client(
-                data=data_b, flag=MessageFlag.REQUEST, serde=SerdeFormat.PICKLE,
-                receiver="", func_name="hold_echo", return_result=True,
-                conn_num=conn_num, is_bytes=ib_b,
+                data=data_b,
+                flag=MessageFlag.REQUEST,
+                serde=SerdeFormat.PICKLE,
+                receiver="",
+                func_name="hold_echo",
+                return_result=True,
+                conn_num=conn_num,
+                is_bytes=ib_b,
             )
             assert found_b, "No receiver found for hold_echo"
 
@@ -130,13 +147,17 @@ class TestStoreOverflowAsync:
             results = []
             for uuid, ts in [(uuid_a, ts_a), (uuid_b, ts_b)]:
                 res = await AsyncRpcResult(
-                    conn_num=conn_num, uuid=uuid, ts=ts, timeout=timeout_s,
+                    conn_num=conn_num,
+                    uuid=uuid,
+                    ts=ts,
+                    timeout=timeout_s,
                 ).result()
                 results.append(Serializer.deserialize(res[2], res[0])[0][0])
 
-            assert set(results) == {"payload-a", "payload-b"}, (
-                f"Expected both payloads delivered, got: {results}"
-            )
+            assert set(results) == {
+                "payload-a",
+                "payload-b",
+            }, f"Expected both payloads delivered, got: {results}"
 
             # Connection must still be alive.
             result = await conn.rpc(timeout=TIMEOUT).fast_echo("still-alive")

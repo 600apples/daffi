@@ -37,7 +37,7 @@ Multiple handlers can be registered; they run in registration order.
 The Service tracks how many clients are connected:
 
 ```python
-from daffi import Service, callback
+from daffi import Service, callback, TCPTransport
 
 @callback
 def ping(msg: str) -> str:
@@ -55,7 +55,7 @@ if __name__ == "__main__":
             connected.discard(name)
             print(f"✦ {name!r} disconnected (total: {len(connected)})")
 
-    svc = Service(app_name="event-service", host="127.0.0.1", port=5009)
+    svc = Service(app_name="event-service", transports=TCPTransport("127.0.0.1", 5009))
     svc.add_event_handler(on_event)
     svc.start()
     svc.join()
@@ -69,13 +69,13 @@ Clients receive events about the nodes they are connected to:
 
 ```python
 import time
-from daffi import Client
+from daffi import Client, TCPTransport
 
 if __name__ == "__main__":
     def on_event(event: dict) -> None:
         print(f"[client] {event['member']!r} → {event['type']}")
 
-    client = Client(app_name="event-client", host="127.0.0.1", port=5009)
+    client = Client(app_name="event-client", transport=TCPTransport("127.0.0.1", 5009))
     client.add_event_handler(on_event)
 
     conn = client.connect()
@@ -100,7 +100,7 @@ In the Router topology the Router itself fires events for every node that connec
 def on_event(event: dict) -> None:
     print(f"[router] {event['member']!r} {event['type']}")
 
-router = Router(host="127.0.0.1", port=6008)
+router = Router(transports=TCPTransport("127.0.0.1", 6008))
 router.add_event_handler(on_event)
 router.start()
 router.join()

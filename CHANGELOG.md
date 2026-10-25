@@ -2,8 +2,14 @@
 
 All notable changes to this project are documented in this file.
 
-## 3.1.0
+## 4.0.0
 
+### Breaking
+
+- `Router` and `Service` take addresses through `transports`: one
+  `TCPTransport` or `UnixTransport`, or a sequence of them. Every listener
+  shares that node's membership. `Client` takes a single `transport`.
+  `host`, `port`, and `unix_sock_path` are gone.
 
 ### Added
 

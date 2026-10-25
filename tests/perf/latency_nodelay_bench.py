@@ -25,6 +25,7 @@ Run::
 
     python3 tests/perf/latency_nodelay_bench.py
 """
+
 from __future__ import annotations
 
 import logging
@@ -43,36 +44,45 @@ if _PROJECT_ROOT not in sys.path:
 
 # ── constants ─────────────────────────────────────────────────────────────────
 
-HOST   = "127.0.0.1"
-N      = 3_000   # measured calls per (layout × payload) cell
-WARMUP = 100     # discarded calls before measurement
+HOST = "127.0.0.1"
+N = 3_000  # measured calls per (layout × payload) cell
+WARMUP = 100  # discarded calls before measurement
 TIMEOUT = 30
 
 PAYLOADS: list[tuple[str, bytes]] = [
     ("1 B  (keystroke)", b"x"),
-    ("16 B (command)",   b"x" * 16),
-    ("1 KiB",            b"x" * 1024),
+    ("16 B (command)", b"x" * 16),
+    ("1 KiB", b"x" * 1024),
 ]
 
 # ── silence helpers ───────────────────────────────────────────────────────────
 
+
 def _silence() -> None:
     fd = os.open(os.devnull, os.O_WRONLY)
-    os.dup2(fd, 1); os.dup2(fd, 2); os.close(fd)
+    os.dup2(fd, 1)
+    os.dup2(fd, 2)
+    os.close(fd)
     logging.disable(logging.CRITICAL)
 
 
 def _quiet(fn, *args, **kwargs) -> None:
     fd = os.open(os.devnull, os.O_WRONLY)
     saved = os.dup(1), os.dup(2)
-    os.dup2(fd, 1); os.dup2(fd, 2); os.close(fd)
+    os.dup2(fd, 1)
+    os.dup2(fd, 2)
+    os.close(fd)
     try:
         fn(*args, **kwargs)
     finally:
-        os.dup2(saved[0], 1); os.dup2(saved[1], 2)
-        os.close(saved[0]); os.close(saved[1])
+        os.dup2(saved[0], 1)
+        os.dup2(saved[1], 2)
+        os.close(saved[0])
+        os.close(saved[1])
+
 
 # ── port helpers ──────────────────────────────────────────────────────────────
+
 
 def _free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -91,39 +101,42 @@ def _wait(port: int, timeout: float = 15.0) -> None:
             time.sleep(0.05)
     raise TimeoutError(f"{HOST}:{port} not ready after {timeout}s")
 
+
 # ── subprocess entry points ───────────────────────────────────────────────────
+
 
 def _proc_service(port: int) -> None:
     _silence()
-    from daffi import Service, callback
+    from daffi import Service, callback, TCPTransport
 
     @callback
     def echo(payload: bytes) -> bytes:
         return payload
 
-    svc = Service(app_name="lat-service", host=HOST, port=port)
+    svc = Service(app_name="lat-service", transports=TCPTransport(HOST, port))
     svc.start()
     svc.join()
 
 
 def _proc_router(port: int) -> None:
     _silence()
-    from daffi import Router
-    r = Router(app_name="lat-router", host=HOST, port=port)
+    from daffi import Router, TCPTransport
+
+    r = Router(app_name="lat-router", transports=TCPTransport(HOST, port))
     r.start()
     r.join()
 
 
 def _proc_worker(port: int) -> None:
     _silence()
-    from daffi import Client, callback
+    from daffi import Client, callback, TCPTransport
     import time as _t
 
     @callback
     def echo(payload: bytes) -> bytes:
         return payload
 
-    c = Client(app_name="lat-worker", host=HOST, port=port)
+    c = Client(app_name="lat-worker", transport=TCPTransport(HOST, port))
     c.connect()
     try:
         while True:
@@ -133,7 +146,9 @@ def _proc_worker(port: int) -> None:
     finally:
         c.stop()
 
+
 # ── measurement ───────────────────────────────────────────────────────────────
+
 
 def _measure(proxy, payload: bytes) -> list[float]:
     for _ in range(WARMUP):
@@ -168,10 +183,13 @@ def _row(label: str, stats: dict[str, float]) -> str:
         f"  max={stats['max']:>6.3f} ms"
     )
 
+
 # ── layout runners ────────────────────────────────────────────────────────────
 
+
 def run_direct() -> dict[str, dict]:
-    from daffi import Client
+    from daffi import Client, TCPTransport
+
     port = _free_port()
     proc = mp.Process(target=_proc_service, args=(port,), daemon=True)
     proc.start()
@@ -179,7 +197,9 @@ def run_direct() -> dict[str, dict]:
     try:
         _wait(port)
         time.sleep(0.15)
-        client = Client(app_name="lat-direct-caller", host=HOST, port=port)
+        client = Client(
+            app_name="lat-direct-caller", transport=TCPTransport(HOST, port)
+        )
         conn = client.connect()
         proxy = conn.rpc(timeout=TIMEOUT)
         for label, payload in PAYLOADS:
@@ -189,12 +209,14 @@ def run_direct() -> dict[str, dict]:
             print("done")
         _quiet(client.stop)
     finally:
-        _quiet(proc.terminate); proc.join(timeout=5)
+        _quiet(proc.terminate)
+        proc.join(timeout=5)
     return results
 
 
 def run_router() -> dict[str, dict]:
-    from daffi import Client
+    from daffi import Client, TCPTransport
+
     rport = _free_port()
     rproc = mp.Process(target=_proc_router, args=(rport,), daemon=True)
     wproc = mp.Process(target=_proc_worker, args=(rport,), daemon=True)
@@ -204,7 +226,9 @@ def run_router() -> dict[str, dict]:
         _wait(rport)
         wproc.start()
         time.sleep(0.5)
-        client = Client(app_name="lat-router-caller", host=HOST, port=rport)
+        client = Client(
+            app_name="lat-router-caller", transport=TCPTransport(HOST, rport)
+        )
         conn = client.connect()
         proxy = conn.rpc(timeout=TIMEOUT)
         for label, payload in PAYLOADS:
@@ -214,17 +238,22 @@ def run_router() -> dict[str, dict]:
             print("done")
         _quiet(client.stop)
     finally:
-        _quiet(wproc.terminate); wproc.join(timeout=5)
-        _quiet(rproc.terminate); rproc.join(timeout=5)
+        _quiet(wproc.terminate)
+        wproc.join(timeout=5)
+        _quiet(rproc.terminate)
+        rproc.join(timeout=5)
     return results
 
+
 # ── main ──────────────────────────────────────────────────────────────────────
+
 
 def main() -> None:
     logging.disable(logging.CRITICAL)
     devnull = os.open(os.devnull, os.O_WRONLY)
     saved_err = os.dup(2)
-    os.dup2(devnull, 2); os.close(devnull)
+    os.dup2(devnull, 2)
+    os.close(devnull)
 
     try:
         print(f"\ndaffi TCP_NODELAY latency benchmark")
@@ -239,7 +268,9 @@ def main() -> None:
 
         print()
         print("── Results ───────────────────────────────────────────────────────")
-        print(f"  {'payload':<22}  {'avg':>10}  {'p50':>10}  {'p95':>10}  {'p99':>10}  {'max':>10}")
+        print(
+            f"  {'payload':<22}  {'avg':>10}  {'p50':>10}  {'p95':>10}  {'p99':>10}  {'max':>10}"
+        )
         print(f"  {'-'*22}  {'-'*10}  {'-'*10}  {'-'*10}  {'-'*10}  {'-'*10}")
         print("  Direct:")
         for label, _ in PAYLOADS:
@@ -250,7 +281,8 @@ def main() -> None:
         print()
 
     finally:
-        os.dup2(saved_err, 2); os.close(saved_err)
+        os.dup2(saved_err, 2)
+        os.close(saved_err)
 
 
 if __name__ == "__main__":

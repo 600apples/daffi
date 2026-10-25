@@ -12,6 +12,7 @@ Current public API (daffi.registry / daffi.registry.executor_registry):
   EXECUTOR_REGISTRY — module-level ExecutorRegistry singleton
   Executor          — thin wrapper stored in the registry for each callback
 """
+
 import warnings
 
 import pytest
@@ -20,8 +21,8 @@ from daffi.registry import callback, alias, local
 from daffi.registry._executor_registry import EXECUTOR_REGISTRY, Executor
 from daffi.exceptions import InitializationError
 
-
 # ── registry isolation ─────────────────────────────────────────────────────────
+
 
 @pytest.fixture(autouse=True)
 def _clean_registry():
@@ -39,6 +40,7 @@ def _clean_registry():
 # ══════════════════════════════════════════════════════════════════════════════
 # @callback on plain functions
 # ══════════════════════════════════════════════════════════════════════════════
+
 
 class TestCallbackFunction:
     """@callback on a module-level function."""
@@ -67,6 +69,7 @@ class TestCallbackFunction:
 
     def test_decorated_object_is_callable(self):
         """The @callback instance itself delegates calls to the original fn."""
+
         @callback
         def my_sub(a: int, b: int) -> int:
             return a - b
@@ -107,7 +110,7 @@ class TestCallbackFunction:
             return 1
 
         with pytest.raises(InitializationError):
-            callback(lambda: 2)   # not a dup yet — but let's use a proper dup:
+            callback(lambda: 2)  # not a dup yet — but let's use a proper dup:
 
         # reset name to use same name
         def fn_dup() -> int:  # noqa: F811  (intentional redefinition for test)
@@ -130,12 +133,14 @@ class TestCallbackFunction:
 
     def test_generator_function_raises(self):
         with pytest.raises(InitializationError):
+
             @callback
             def my_gen():
                 yield 1
 
     def test_async_generator_raises(self):
         with pytest.raises(InitializationError):
+
             @callback
             async def my_agen():
                 yield 1
@@ -155,6 +160,7 @@ class TestCallbackFunction:
 # ══════════════════════════════════════════════════════════════════════════════
 # @callback on classes
 # ══════════════════════════════════════════════════════════════════════════════
+
 
 class TestCallbackClass:
     """@callback on a class registers all public instance methods."""
@@ -228,6 +234,7 @@ class TestCallbackClass:
 # @alias
 # ══════════════════════════════════════════════════════════════════════════════
 
+
 class TestAlias:
     """@alias sets a .alias metadata attribute on the function."""
 
@@ -258,6 +265,7 @@ class TestAlias:
 
     def test_callback_uses_function_name_not_alias(self):
         """Current impl: @callback registers under __name__, not .alias."""
+
         @callback
         @alias("alias_key")
         def alias_test_fn() -> int:
@@ -268,6 +276,7 @@ class TestAlias:
 
     def test_stacking_outer_wins(self):
         """When applied twice, the outermost decorator's value is stored."""
+
         @alias("outer")
         @alias("inner")
         def double_aliased() -> int:
@@ -280,11 +289,13 @@ class TestAlias:
 # @local
 # ══════════════════════════════════════════════════════════════════════════════
 
+
 class TestLocal:
     """@local marks a function/method so @callback's class scanner skips it."""
 
     def test_sets_local_attribute_bare(self):
         """@local (no parentheses) must set .local = True."""
+
         @local
         def fn_bare() -> int:
             return 0
@@ -293,6 +304,7 @@ class TestLocal:
 
     def test_sets_local_attribute_with_parens(self):
         """@local() (with parentheses) must also work."""
+
         @local()
         def fn_parens() -> int:
             return 0
@@ -314,6 +326,7 @@ class TestLocal:
 
     def test_local_does_not_break_callable(self):
         """@local leaves the function callable."""
+
         @local
         def fn_still_callable(x: int) -> int:
             return x * 2
@@ -324,6 +337,7 @@ class TestLocal:
 # ══════════════════════════════════════════════════════════════════════════════
 # ExecutorRegistry
 # ══════════════════════════════════════════════════════════════════════════════
+
 
 class TestExecutorRegistry:
     """Direct tests of the ExecutorRegistry API."""
@@ -402,6 +416,7 @@ class TestExecutorRegistry:
 # Executor
 # ══════════════════════════════════════════════════════════════════════════════
 
+
 class TestExecutor:
     """Unit tests for the Executor wrapper."""
 
@@ -418,7 +433,7 @@ class TestExecutor:
                 return x * 2
 
         inst = Worker()
-        ex   = Executor(inst.double, "double", cls=inst)
+        ex = Executor(inst.double, "double", cls=inst)
         assert ex(7) == 14
 
     def test_kwargs_forwarded(self):
@@ -441,8 +456,8 @@ class TestExecutor:
                 return 0
 
         inst = MyClass()
-        ex   = Executor(inst.method, "method", cls=inst)
-        s    = str(ex)
+        ex = Executor(inst.method, "method", cls=inst)
+        s = str(ex)
         assert "MyClass" in s
         assert "method" in s
 

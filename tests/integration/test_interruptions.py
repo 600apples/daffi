@@ -45,6 +45,7 @@ under the "spawn" start method that the integration conftest.py now enforces
 macOS once the parent pytest process has imported the native ``daffi.dfcore``
 extension).
 """
+
 from __future__ import annotations
 
 import multiprocessing as mp
@@ -55,26 +56,39 @@ import time
 
 import pytest
 
-from .conftest import HOST, TIMEOUT, wait_for_port, wait_for_members, silence_subprocess, quiet_kill
-from daffi.exceptions import Disconnected, InitializationError, RemoteCallError, TransmissionFailure
+from .conftest import (
+    HOST,
+    TIMEOUT,
+    wait_for_port,
+    wait_for_members,
+    silence_subprocess,
+    quiet_kill,
+)
+from daffi.exceptions import (
+    Disconnected,
+    InitializationError,
+    RemoteCallError,
+    TransmissionFailure,
+)
 
 # ── constants ──────────────────────────────────────────────────────────────────
 
-BIG_MSG_SIZE = 8 * 1024 * 1024    # 8 MiB — large enough to stress the buffer
-N_CAST_WORKERS = 4                 # workers for cast / partial-result tests
+BIG_MSG_SIZE = 8 * 1024 * 1024  # 8 MiB — large enough to stress the buffer
+N_CAST_WORKERS = 4  # workers for cast / partial-result tests
 
 
 # ── subprocess targets (module-level so they are picklable) ───────────────────
 
+
 def _intr_service(port: int, name: str = "intr-svc") -> None:
     silence_subprocess()
-    from daffi import Service, callback
+    from daffi import Service, callback, TCPTransport
 
     @callback
     def echo(payload):
         return payload
 
-    svc = Service(app_name=name, host=HOST, port=port)
+    svc = Service(app_name=name, transports=TCPTransport(HOST, port))
     svc.start()
     svc.join()
 
@@ -84,23 +98,23 @@ def _intr_slow_service(port: int, name: str = "intr-slow-svc") -> None:
     reliably kill it while a call is in-flight."""
     silence_subprocess()
     import time as _t
-    from daffi import Service, callback
+    from daffi import Service, callback, TCPTransport
 
     @callback
     def slow_echo(payload):
         _t.sleep(60)
         return payload
 
-    svc = Service(app_name=name, host=HOST, port=port)
+    svc = Service(app_name=name, transports=TCPTransport(HOST, port))
     svc.start()
     svc.join()
 
 
 def _intr_router(port: int, name: str = "intr-router") -> None:
     silence_subprocess()
-    from daffi import Router
+    from daffi import Router, TCPTransport
 
-    r = Router(app_name=name, host=HOST, port=port)
+    r = Router(app_name=name, transports=TCPTransport(HOST, port))
     r.start()
     r.join()
 
@@ -108,13 +122,13 @@ def _intr_router(port: int, name: str = "intr-router") -> None:
 def _intr_worker(port: int, name: str) -> None:
     silence_subprocess()
     import time as _t
-    from daffi import Client, callback
+    from daffi import Client, callback, TCPTransport
 
     @callback
     def echo(payload):
         return payload
 
-    client = Client(app_name=name, host=HOST, port=port)
+    client = Client(app_name=name, transport=TCPTransport(HOST, port))
     client.connect()
     try:
         while True:
@@ -126,6 +140,7 @@ def _intr_worker(port: int, name: str) -> None:
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
+
 
 def _start_slow_service(port: int, name: str = "intr-slow-svc") -> mp.Process:
     p = mp.Process(target=_intr_slow_service, args=(port, name), daemon=True)
@@ -161,8 +176,9 @@ def _start_worker(port: int, name: str) -> mp.Process:
 
 def _connect(port: int, name: str):
     """Return (client, conn) connected to *port*."""
-    from daffi import Client
-    client = Client(app_name=name, host=HOST, port=port)
+    from daffi import Client, TCPTransport
+
+    client = Client(app_name=name, transport=TCPTransport(HOST, port))
     conn = client.connect()
     return client, conn
 
@@ -190,6 +206,7 @@ def _sigcont(proc: mp.Process) -> None:
 
 # ── Scenario 1: service killed, existing call raises ─────────────────────────
 
+
 class TestServiceKilled:
     def test_call_on_dead_connection_raises(self, free_port):
         """After SIGKILL, rpc() on the stale connection raises TransmissionFailure.
@@ -214,16 +231,20 @@ class TestServiceKilled:
     def test_connect_to_dead_service_raises(self, free_port):
         """Client.connect() to a terminated service raises InitializationError."""
         svc = _start_service(free_port)
-        _sigkill(svc)   # server is gone
+        _sigkill(svc)  # server is gone
 
-        from daffi import Client
-        client = Client(app_name="intr-dead-connect", host=HOST, port=free_port)
+        from daffi import Client, TCPTransport
+
+        client = Client(
+            app_name="intr-dead-connect", transport=TCPTransport(HOST, free_port)
+        )
         with pytest.raises(InitializationError):
             client.connect()
         # client was never connected so no stop() needed
 
 
 # ── Scenario 2: service frozen (SIGSTOP) ──────────────────────────────────────
+
 
 class TestServiceFrozen:
     def test_frozen_server_causes_timeout(self, free_port):
@@ -252,7 +273,7 @@ class TestServiceFrozen:
 
             _sigstop(svc)
             result_holder: list = []
-            error_holder:  list = []
+            error_holder: list = []
 
             def _call():
                 try:
@@ -262,8 +283,8 @@ class TestServiceFrozen:
 
             t = threading.Thread(target=_call, daemon=True)
             t.start()
-            time.sleep(0.5)        # let the call block
-            _sigcont(svc)          # unfreeze — the call is in-flight, client stays open
+            time.sleep(0.5)  # let the call block
+            _sigcont(svc)  # unfreeze — the call is in-flight, client stays open
             t.join(timeout=20)
 
             assert not error_holder, f"unexpected error: {error_holder}"
@@ -275,6 +296,7 @@ class TestServiceFrozen:
 
 # ── Scenario 3: worker killed during cast ─────────────────────────────────────
 
+
 class TestCastWithDeadWorker:
     def test_cast_succeeds_after_one_worker_dies(self, free_port):
         """cast() returns results from alive workers when one is killed before
@@ -284,7 +306,7 @@ class TestCastWithDeadWorker:
             _start_worker(free_port, f"intr-cast-worker-{i:02d}")
             for i in range(N_CAST_WORKERS)
         ]
-        time.sleep(0.8)   # all workers register
+        time.sleep(0.8)  # all workers register
 
         client, conn = _connect(free_port, "intr-cast-caller")
         # Verify all workers respond first.
@@ -310,8 +332,7 @@ class TestCastWithDeadWorker:
         """cast_nowait() must return immediately regardless of dead workers."""
         rproc = _start_router(free_port, "intr-router-nowait")
         worker_procs = [
-            _start_worker(free_port, f"intr-nw-worker-{i:02d}")
-            for i in range(3)
+            _start_worker(free_port, f"intr-nw-worker-{i:02d}") for i in range(3)
         ]
         time.sleep(0.8)
 
@@ -333,6 +354,7 @@ class TestCastWithDeadWorker:
 
 # ── Scenario 6: big message + interruption ────────────────────────────────────
 
+
 class TestBigMessageInterruption:
     def test_frozen_server_rejects_big_message(self, free_port):
         """Sending an 8 MiB payload to a frozen (SIGSTOP'd) server fills the
@@ -351,7 +373,7 @@ class TestBigMessageInterruption:
                 conn.rpc(timeout=3).echo(bytes(BIG_MSG_SIZE))
         finally:
             client.stop()
-            _sigkill(svc)   # SIGKILL on stopped process; avoids poller race
+            _sigkill(svc)  # SIGKILL on stopped process; avoids poller race
 
     def test_big_message_succeeds_after_service_restart(self, free_port):
         """After the service is restarted, a fresh client can send an 8 MiB
@@ -390,15 +412,17 @@ class TestBigMessageInterruption:
 
         sender = threading.Thread(target=_sender, daemon=True)
         sender.start()
-        time.sleep(0.1)            # let the send start
-        _sigkill(svc, wait=0.0)    # kill server immediately
+        time.sleep(0.1)  # let the send start
+        _sigkill(svc, wait=0.0)  # kill server immediately
 
         sender.join(timeout=15)
 
         try:
             # Either an error was raised (expected) or the transfer completed before
             # the kill — both are acceptable; the important invariant is no hang.
-            assert not sender.is_alive(), "sender thread is still blocked — likely a hang"
+            assert (
+                not sender.is_alive()
+            ), "sender thread is still blocked — likely a hang"
             # If we got a result it means the message was fully transferred before kill.
             # If we got an error it must be a disconnect/timeout variant.
             if error_holder:
@@ -430,7 +454,7 @@ class TestDisconnectedWithBigTimeout:
         client, conn = _connect(free_port, "intr-disc-before-caller")
         try:
             assert conn.rpc(timeout=TIMEOUT).echo("warm") == "warm"
-            _sigkill(svc, wait=0.5)   # disconnect propagates before next call
+            _sigkill(svc, wait=0.5)  # disconnect propagates before next call
 
             t0 = time.monotonic()
             with pytest.raises((Disconnected, TransmissionFailure)):
@@ -464,20 +488,20 @@ class TestDisconnectedWithBigTimeout:
 
         t = threading.Thread(target=_call, daemon=True)
         t.start()
-        time.sleep(0.3)           # let the request reach the service
-        _sigkill(svc, wait=0.0)   # disconnect while call is in-flight
+        time.sleep(0.3)  # let the request reach the service
+        _sigkill(svc, wait=0.0)  # disconnect while call is in-flight
 
         t.join(timeout=10)
 
         try:
             assert not t.is_alive(), "caller thread is still blocked — likely a hang"
             assert error_holder, "no exception raised — expected Disconnected"
-            assert isinstance(error_holder[0], (Disconnected, TransmissionFailure, RemoteCallError)), (
-                f"unexpected exception type: {type(error_holder[0])}"
-            )
-            assert elapsed_holder[0] < _MAX_DISCONNECT_LATENCY, (
-                f"raised after {elapsed_holder[0]:.1f}s — expected <{_MAX_DISCONNECT_LATENCY}s"
-            )
+            assert isinstance(
+                error_holder[0], (Disconnected, TransmissionFailure, RemoteCallError)
+            ), f"unexpected exception type: {type(error_holder[0])}"
+            assert (
+                elapsed_holder[0] < _MAX_DISCONNECT_LATENCY
+            ), f"raised after {elapsed_holder[0]:.1f}s — expected <{_MAX_DISCONNECT_LATENCY}s"
         finally:
             client.stop()
             quiet_kill(svc)

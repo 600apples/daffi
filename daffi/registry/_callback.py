@@ -16,7 +16,6 @@ from daffi.exceptions import InitializationError
 from daffi.utils.misc import is_lambda_function
 from daffi.registry._executor_registry import EXECUTOR_REGISTRY
 
-
 __all__ = ["callback"]
 
 

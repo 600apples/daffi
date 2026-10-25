@@ -3,7 +3,7 @@
 daffi supports four wire formats. Pass `serde=SerdeFormat.X` to any call proxy, or use the string shorthand where supported.
 
 ```python
-from daffi import SerdeFormat
+from daffi import SerdeFormat, TCPTransport
 ```
 
 ---
@@ -30,7 +30,7 @@ class Order:
 
 ```python
 # 1_service.py
-from daffi import Service, callback
+from daffi import Service, callback, TCPTransport
 from models import Order, Status
 
 @callback
@@ -38,17 +38,17 @@ def process_order(order: Order) -> Order:
     order.status = Status.DONE
     return order
 
-svc = Service(app_name="order-service", host="127.0.0.1", port=5004)
+svc = Service(app_name="order-service", transports=TCPTransport("127.0.0.1", 5004))
 svc.start(); svc.join()
 ```
 
 ```python
 # 2_client.py
-from daffi import Client
-from daffi import SerdeFormat
+from daffi import Client, TCPTransport
+from daffi import SerdeFormat, TCPTransport
 from models import Order
 
-client = Client(app_name="order-client", host="127.0.0.1", port=5004)
+client = Client(app_name="order-client", transport=TCPTransport("127.0.0.1", 5004))
 conn = client.connect()
 
 order = Order(order_id="ORD-001", amount=99.95)
@@ -67,7 +67,7 @@ Language-agnostic. Works with plain Python types: `dict`, `list`, `str`, `int`, 
 
 ```python
 # 1_service.py
-from daffi import Service, callback
+from daffi import Service, callback, TCPTransport
 
 @callback
 def summarise(data: dict) -> dict:
@@ -75,16 +75,16 @@ def summarise(data: dict) -> dict:
     total = sum(i["price"] * i["qty"] for i in items)
     return {"item_count": len(items), "total": round(total, 2)}
 
-svc = Service(app_name="json-service", host="127.0.0.1", port=5005)
+svc = Service(app_name="json-service", transports=TCPTransport("127.0.0.1", 5005))
 svc.start(); svc.join()
 ```
 
 ```python
 # 2_client.py
-from daffi import Client
-from daffi import SerdeFormat
+from daffi import Client, TCPTransport
+from daffi import SerdeFormat, TCPTransport
 
-client = Client(app_name="json-client", host="127.0.0.1", port=5005)
+client = Client(app_name="json-client", transport=TCPTransport("127.0.0.1", 5005))
 conn = client.connect()
 
 payload = {"items": [{"price": 9.99, "qty": 2}, {"price": 4.99, "qty": 5}]}
@@ -102,7 +102,7 @@ Requires: `pip install "daffi[msgpack]"`
 
 ```python
 # 1_service.py
-from daffi import Service, callback
+from daffi import Service, callback, TCPTransport
 
 @callback
 def transform(record: dict) -> dict:
@@ -111,16 +111,16 @@ def transform(record: dict) -> dict:
         result["full_name"] = f"{result['first_name']} {result['last_name']}"
     return result
 
-svc = Service(app_name="msgpack-service", host="127.0.0.1", port=5007)
+svc = Service(app_name="msgpack-service", transports=TCPTransport("127.0.0.1", 5007))
 svc.start(); svc.join()
 ```
 
 ```python
 # 2_client.py
-from daffi import Client
-from daffi import SerdeFormat
+from daffi import Client, TCPTransport
+from daffi import SerdeFormat, TCPTransport
 
-client = Client(app_name="msgpack-client", host="127.0.0.1", port=5007)
+client = Client(app_name="msgpack-client", transport=TCPTransport("127.0.0.1", 5007))
 conn = client.connect()
 
 result = conn.rpc(timeout=5, serde=SerdeFormat.MSGPACK).transform(
@@ -140,23 +140,23 @@ Passes raw bytes through with no serialisation. The callback receives a `bytes` 
 
 ```python
 # 1_service.py
-from daffi import Service, callback
+from daffi import Service, callback, TCPTransport
 
 @callback
 def echo_raw(data: bytes) -> bytes:
     print(f"[service] received {len(data)} bytes")
     return data   # echo back
 
-svc = Service(app_name="raw-service", host="127.0.0.1", port=5006)
+svc = Service(app_name="raw-service", transports=TCPTransport("127.0.0.1", 5006))
 svc.start(); svc.join()
 ```
 
 ```python
 # 2_client.py
-from daffi import Client
-from daffi import SerdeFormat
+from daffi import Client, TCPTransport
+from daffi import SerdeFormat, TCPTransport
 
-client = Client(app_name="raw-client", host="127.0.0.1", port=5006)
+client = Client(app_name="raw-client", transport=TCPTransport("127.0.0.1", 5006))
 conn = client.connect()
 
 payload = b"\x01\x02\x03\x04"

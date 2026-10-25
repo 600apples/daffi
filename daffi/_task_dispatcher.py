@@ -64,15 +64,15 @@ except ImportError:
 class _ConnEntry(NamedTuple):
     """All fd-related state for one registered connection, keyed by conn_num."""
 
-    conn:      Any
-    wakeup:    WakeupFd   # task-arrival channel (eventfd on Linux, pipe on macOS)
-    lifecycle: WakeupFd   # lifecycle / stop channel (always a pipe)
+    conn: Any
+    wakeup: WakeupFd  # task-arrival channel (eventfd on Linux, pipe on macOS)
+    lifecycle: WakeupFd  # lifecycle / stop channel (always a pipe)
 
 
 class EventType(str):
     """String constants for the two peer-lifecycle event types emitted by daffi."""
 
-    CONNECTED    = "connected"
+    CONNECTED = "connected"
     DISCONNECTED = "disconnected"
 
 
@@ -144,6 +144,7 @@ def _invoke_callback(
         (error payloads must always be picklable).
     """
     import asyncio as _asyncio
+
     cb = EXECUTOR_REGISTRY.get(func_name)
     args, kwargs = Serializer.deserialize(serde, data)
     try:
@@ -358,10 +359,12 @@ class TaskDispatcher:
         lc = WakeupFd(pipe=True)
 
         self._conns[conn_num] = _ConnEntry(conn=connection, wakeup=wakeup, lifecycle=lc)
-        self._rfd_to_conn_num[wakeup.read_fd]  = conn_num
-        self._rfd_to_conn_num[lc.read_fd]      = conn_num
+        self._rfd_to_conn_num[wakeup.read_fd] = conn_num
+        self._rfd_to_conn_num[lc.read_fd] = conn_num
 
-        set_request_fd(conn_num, wakeup.write_fd, server_mode=bool(connection.server_mode))
+        set_request_fd(
+            conn_num, wakeup.write_fd, server_mode=bool(connection.server_mode)
+        )
         if connection.server_mode is None:
             set_lifecycle_fd(conn_num, lc.write_fd)
 
