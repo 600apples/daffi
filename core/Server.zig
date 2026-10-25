@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const misc = @import("misc.zig");
 const serde = @import("serde.zig");
 const network = @import("network.zig");
@@ -7,6 +8,7 @@ const store = @import("store.zig");
 const runtime = @import("runtime.zig");
 const EventLoop = runtime.EventLoop;
 const posix = std.posix;
+const net = @import("network/posix_net.zig");
 const Mutex = misc.Mutex;
 const AcceptedConnection = @import("network/connection.zig").AcceptedConnection;
 const fmtNetAddr = @import("network/connection.zig").fmtNetAddr;
@@ -24,8 +26,15 @@ const MessageDecoder = serde.MessageDecoder;
 
 const MAX_SERVERS = 256;
 
-/// How often the threaded accept loop wakes up to check for shutdown.
-const ACCEPT_POLL_MS: c_int = 200;
+/// Pause a listener this long after `accept` fails (for example EMFILE), so
+/// one stuck listener cannot spin its thread or event loop.  The others keep
+/// accepting.
+const ACCEPT_BACKOFF_MS: u32 = 50;
+
+/// How often a server checks that its Unix socket files are still linked.
+/// A missing file is bound again; a file that belongs to someone else is left
+/// alone.
+const UNIX_RESTORE_MS: c_int = 500;
 
 /// How long stop waits for connections to finish before giving up and
 /// leaking the server's memory rather than freeing it under them.
@@ -36,14 +45,61 @@ fn HandlerOf(comptime mode: HandlerMode) type {
     return @typeInfo(@TypeOf(H.handler)).@"fn".return_type.?;
 }
 
-/// One listening socket of a logical server.  Allocated individually so its
-/// address stays stable (the event loop holds a pointer into `listener_source`).
+/// One listening socket of a server.  Lives in `Runtime.listeners`, a slice
+/// that never moves, because the event loop holds a pointer to `source`.
 const Listener = struct {
     connection: *ServerConnection,
-    accept_thread: ?std.Thread = null,
-    listener_source: EventLoop.Source = undefined,
-    listener_loop: ?*EventLoop = null,
+    source: EventLoop.Source = undefined,
+    /// Event loop watching this listener, when the evented model is in use.
+    loop: ?*EventLoop = null,
+    /// Owned copy of the socket path.  Null for TCP listeners.
+    unix_path: ?[:0]u8 = null,
+    /// Identity of the directory entry bound at start (or after a restore).
+    /// `fstat` on the socket itself does not report it.
+    bound_id: ?FileId = null,
+    /// Logged once while some other process holds `unix_path`.
+    path_taken: bool = false,
+    /// Logged once while rebinding `unix_path` keeps failing.
+    rebind_logged: bool = false,
+    /// The socket was replaced but its event-loop registration did not stick.
+    unwatched: bool = false,
+    /// Evented model: 1 while a back-off is due to re-arm this listener.
+    /// `stop` waits for it to drop before freeing the listener.
+    backoff: std.atomic.Value(u8) = .init(0),
     runtime: *Runtime,
+
+    /// Accept every connection already queued on the socket.  Returns false
+    /// if accepting failed for a reason other than "none left".
+    fn drain(self: *Listener) bool {
+        while (true) {
+            const raw = self.connection.acceptRaw(0) catch |err| {
+                if (err == error.Timeout) return true;
+                log.warn("failed to accept connection: {}", .{err});
+                return false;
+            };
+            admit(self.runtime, self.connection, raw);
+        }
+    }
+};
+
+/// What watches a server's listeners for new connections.  One watcher covers
+/// all of them, so they start and stop accepting at the same moment.
+const Acceptor = union(enum) {
+    /// Threads model: one thread polls every listener plus a wake-up pipe
+    /// (`pollfds[0]`) that `stop` writes to.
+    thread: struct {
+        handle: std.Thread,
+        pollfds: []net.PollFd,
+        /// Per listener: ignore that socket until this timestamp after a
+        /// failed accept.  Zero means it is being polled.
+        quiet_until: []i64,
+        wake_write: c_int,
+    },
+    /// Evented model: every listener is a source on this one loop.
+    loop: struct {
+        loop: *EventLoop,
+        sources: []*EventLoop.Source,
+    },
 };
 
 /// Per-server state shared between every listener and every accepted connection.
@@ -53,9 +109,15 @@ const Runtime = struct {
     app_name: []const u8,
     msgpool: *MessagePool,
     server_handler: *ServerHandler,
-    /// Listening sockets.  They all admit into this one runtime, so peers that
-    /// arrive on different TCP ports or a Unix socket share one membership.
-    listeners: std.ArrayList(*Listener) = .empty,
+    /// Listening sockets, all equal.  They admit into this one runtime, so
+    /// peers that arrive on different TCP ports or Unix sockets share one
+    /// membership.
+    listeners: []Listener,
+    acceptor: ?Acceptor = null,
+    /// Wakes `unixWatch`, which restores Unix socket files that were deleted.
+    unix_watch: ?std.Thread = null,
+    unix_wake_read: c_int = -1,
+    unix_wake_write: c_int = -1,
     /// Accepted connections currently being served.  Used to interrupt them
     /// (by shutting their sockets down) when the server stops.
     live_mutex: Mutex = .{},
@@ -101,12 +163,125 @@ const Runtime = struct {
         return @field(self.server_handler, @tagName(mode)).handler();
     }
 
-    fn deinit(self: *Runtime) void {
-        for (self.listeners.items) |listener| {
-            listener.connection.destroy();
-            self.allocator.destroy(listener);
+    /// Start watching every listener.  All or nothing: on failure none of
+    /// them is watched.
+    fn startAccepting(self: *Runtime) !void {
+        errdefer self.stopAccepting();
+        switch (runtime.model()) {
+            .threads => try self.startThreadedAccept(),
+            .evented => try self.startEventedAccept(),
         }
-        self.listeners.deinit(self.allocator);
+        if (self.hasUnixPath()) {
+            self.rememberUnixPaths();
+            // The threaded acceptor checks the paths itself between polls.
+            // The evented one is blocked in kqueue, so a helper thread does it.
+            if (runtime.model() == .evented) try self.startUnixWatch();
+        }
+    }
+
+    /// Errdefers here cover only this function.  Once `acceptor` is set, the
+    /// thread owns the arrays and `stopAccepting` frees them.
+    fn startThreadedAccept(self: *Runtime) !void {
+        const pollfds = try self.allocator.alloc(net.PollFd, self.listeners.len + 1);
+        errdefer self.allocator.free(pollfds);
+        const quiet = try self.allocator.alloc(i64, self.listeners.len);
+        errdefer self.allocator.free(quiet);
+        @memset(quiet, 0);
+        var wake: [2]c_int = undefined;
+        if (std.c.pipe(&wake) != 0) return error.PipeFailed;
+        errdefer for (wake) |fd| {
+            _ = std.c.close(fd);
+        };
+        for (wake) |fd| _ = std.c.fcntl(fd, std.c.F.SETFD, @as(c_int, std.c.FD_CLOEXEC));
+        pollfds[0] = .{ .fd = wake[0], .events = net.WAIT_READ, .revents = 0 };
+        for (pollfds[1..], self.listeners) |*p, *listener|
+            p.* = .{ .fd = listener.connection.handle(), .events = net.WAIT_READ, .revents = 0 };
+        const handle = try std.Thread.spawn(.{}, acceptLoop, .{ self, pollfds, quiet });
+        self.acceptor = .{ .thread = .{ .handle = handle, .pollfds = pollfds, .quiet_until = quiet, .wake_write = wake[1] } };
+    }
+
+    fn startEventedAccept(self: *Runtime) !void {
+        const loop = try runtime.loop();
+        const sources = try self.allocator.alloc(*EventLoop.Source, self.listeners.len);
+        errdefer self.allocator.free(sources);
+        for (self.listeners, sources) |*listener, *source| {
+            listener.loop = loop;
+            listener.source = .{ .fd = listener.connection.handle(), .onReadable = onListenerReadable, .onRemoved = onListenerRemoved };
+            source.* = &listener.source;
+        }
+        // One step on the loop thread, so no listener accepts a peer before
+        // every listener is watched.
+        try loop.registerAll(sources);
+        self.acceptor = .{ .loop = .{ .loop = loop, .sources = sources } };
+    }
+
+    fn hasUnixPath(self: *const Runtime) bool {
+        for (self.listeners) |listener| if (listener.unix_path != null) return true;
+        return false;
+    }
+
+    fn rememberUnixPaths(self: *Runtime) void {
+        for (self.listeners) |*listener| {
+            const path = listener.unix_path orelse continue;
+            listener.bound_id = fileIdOfPath(path) catch null;
+        }
+    }
+
+    fn startUnixWatch(self: *Runtime) !void {
+        var wake: [2]c_int = undefined;
+        if (std.c.pipe(&wake) != 0) return error.PipeFailed;
+        errdefer for (wake) |fd| {
+            _ = std.c.close(fd);
+        };
+        for (wake) |fd| _ = std.c.fcntl(fd, std.c.F.SETFD, @as(c_int, std.c.FD_CLOEXEC));
+        self.unix_wake_read = wake[0];
+        self.unix_wake_write = wake[1];
+        self.unix_watch = try std.Thread.spawn(.{}, unixWatch, .{self});
+    }
+
+    /// Stop the Unix-socket watchdog, then stop watching every listener at
+    /// once and wait until no accept is in progress.  The sockets stay open:
+    /// connections still being upgraded use their TLS context.
+    fn stopAccepting(self: *Runtime) void {
+        if (self.unix_watch) |thread| {
+            const byte = [1]u8{1};
+            _ = std.c.write(self.unix_wake_write, &byte, byte.len);
+            thread.join();
+            self.unix_watch = null;
+            _ = std.c.close(self.unix_wake_read);
+            _ = std.c.close(self.unix_wake_write);
+            self.unix_wake_read = -1;
+            self.unix_wake_write = -1;
+        }
+        const acceptor = self.acceptor orelse return;
+        self.acceptor = null;
+        switch (acceptor) {
+            .thread => |t| {
+                const byte = [1]u8{1};
+                _ = std.c.write(t.wake_write, &byte, byte.len);
+                t.handle.join();
+                _ = std.c.close(t.pollfds[0].fd);
+                _ = std.c.close(t.wake_write);
+                self.allocator.free(t.pollfds);
+                self.allocator.free(t.quiet_until);
+            },
+            .loop => |l| {
+                l.loop.detach(l.sources);
+                self.allocator.free(l.sources);
+            },
+        }
+    }
+
+    /// Block until every evented accept back-off has finished touching its
+    /// listener.  `stopping` is already set, so none of them re-arms.
+    fn waitBackoffs(self: *Runtime) void {
+        for (self.listeners) |*listener| {
+            while (listener.backoff.load(.acquire) != 0) sleepMs(1);
+        }
+    }
+
+    fn deinit(self: *Runtime) void {
+        destroyListeners(self.allocator, self.listeners);
         self.server_handler.deinit();
         self.msgpool.deinit();
         self.live.deinit(self.allocator);
@@ -116,7 +291,6 @@ const Runtime = struct {
 };
 
 const ServerEntry = struct {
-    connection: *ServerConnection,
     msgpool: *MessagePool,
     server_handler: *ServerHandler,
     runtime: *Runtime,
@@ -223,120 +397,165 @@ pub fn setServiceRequestFd(conn_num: usize, fd: i32) void {
     }
 }
 
-/// Bind, start accepting and return the server's handle (conn_num).  Accepting
-/// runs on a dedicated thread or on an event loop depending on the execution
+/// Bind every listener in `configs`, start accepting on all of them at once
+/// and return the server's single handle (conn_num).  All or nothing: if one
+/// listener cannot be bound, none stays bound and `failed` holds its index.
+/// Accepting runs on one thread or one event loop depending on the execution
 /// model; either way the server is fully usable once this returns.
-pub fn start(allocator: Allocator, app_name: []const u8, config: ServerConnection.Config) !usize {
-    return startImpl(allocator, app_name, config) catch |err| {
-        log.err("{s}[{s}] failed to start: {}", .{ @tagName(config.mode), app_name, err });
+pub fn start(allocator: Allocator, mode: HandlerMode, app_name: []const u8, configs: []const ServerConnection.Config, failed: *?usize) !usize {
+    failed.* = null;
+    return startImpl(allocator, mode, app_name, configs, failed) catch |err| {
+        if (failed.*) |i| {
+            log.err("{s}[{s}] failed to start on {s}:{d}: {}", .{ @tagName(mode), app_name, hostOf(configs[i]), configs[i].port, err });
+        } else {
+            log.err("{s}[{s}] failed to start: {}", .{ @tagName(mode), app_name, err });
+        }
         return err;
     };
 }
 
-fn startImpl(allocator: Allocator, app_name_arg: []const u8, config: ServerConnection.Config) !usize {
+fn startImpl(allocator: Allocator, mode: HandlerMode, app_name_arg: []const u8, configs: []const ServerConnection.Config, failed: *?usize) !usize {
+    if (configs.len == 0) return error.NoListeners;
+    for (configs, 0..) |config, i| {
+        for (configs[0..i]) |earlier| {
+            if (sameAddress(config, earlier)) {
+                failed.* = i;
+                return error.DuplicateListener;
+            }
+        }
+    }
     try setSignalHandler();
     const conn_num = acquireSlot() orelse return error.TooManyServers;
     errdefer releaseSlot(conn_num);
 
+    const listeners = try bindAll(allocator, configs, failed);
+
     // The caller's strings (Python str buffers) are only guaranteed to live until
     // start() returns; the handler keeps `app_name` for the server's lifetime.
-    // A successful block transfers those allocations to the runtime: its errdefers
-    // do not run, and `rt.deinit` is the single owner afterwards.
+    // A successful block transfers those allocations (and the listeners) to the
+    // runtime: its errdefers do not run, and `rt.deinit` is the single owner
+    // afterwards.
     const rt = blk: {
+        errdefer destroyListeners(allocator, listeners);
         const app_name = try allocator.dupe(u8, app_name_arg);
         errdefer allocator.free(app_name);
         const msgpool = try MessagePool.init(allocator);
         errdefer msgpool.deinit();
-        const server_handler = try ServerHandler.init(config.mode, allocator, app_name);
+        const server_handler = try ServerHandler.init(mode, allocator, app_name);
         errdefer server_handler.deinit();
         const created = try allocator.create(Runtime);
         created.* = .{
             .allocator = allocator,
-            .mode = config.mode,
+            .mode = mode,
             .app_name = app_name,
             .msgpool = msgpool,
             .server_handler = server_handler,
+            .listeners = listeners,
         };
+        for (listeners) |*listener| listener.runtime = created;
         break :blk created;
     };
     errdefer rt.deinit();
-    try attachListener(rt, config);
+    // Must stay the last step that can fail: once it succeeds peers connect,
+    // and only `stop` may free the runtime under them.
+    try rt.startAccepting();
 
     {
         slots_mutex.lock();
         defer slots_mutex.unlock();
-        slot_entries[conn_num] = .{ .connection = rt.listeners.items[0].connection, .msgpool = rt.msgpool, .server_handler = rt.server_handler, .runtime = rt };
+        slot_entries[conn_num] = .{ .msgpool = rt.msgpool, .server_handler = rt.server_handler, .runtime = rt };
     }
-    log.debug("{s}[{s}] listening on {s}:{d} conn_num={d} model={s} listeners=1", .{
-        @tagName(config.mode),
-        rt.app_name,
-        config.host orelse "0.0.0.0",
-        config.port,
-        conn_num,
-        @tagName(runtime.model()),
-    });
+    for (configs) |config| {
+        log.debug("{s}[{s}] listening on {s}:{d} conn_num={d} model={s}", .{
+            @tagName(mode),
+            rt.app_name,
+            hostOf(config),
+            config.port,
+            conn_num,
+            @tagName(runtime.model()),
+        });
+    }
     return conn_num;
 }
 
-/// Bind another socket on an already-running server.  Accepted peers join the
-/// same handler, so a client on this transport can reach peers that connected
-/// through any of the server's other transports.
-pub fn addListener(conn_num: usize, config: ServerConnection.Config) !void {
-    const entry = try getEntry(conn_num);
-    const rt = entry.runtime;
-    rt.live_mutex.lock();
-    const stopping = rt.stopping;
-    rt.live_mutex.unlock();
-    if (stopping) return error.ServerStopping;
-    var cfg = config;
-    cfg.mode = rt.mode;
-    try attachListener(rt, cfg);
-    log.debug("{s}[{s}] added listener {s}:{d} conn_num={d} listeners={d}", .{
-        @tagName(rt.mode),
-        rt.app_name,
-        config.host orelse "0.0.0.0",
-        config.port,
-        conn_num,
-        rt.listeners.items.len,
-    });
+fn hostOf(config: ServerConnection.Config) []const u8 {
+    return config.host orelse "0.0.0.0";
 }
 
-fn attachListener(rt: *Runtime, config: ServerConnection.Config) !void {
-    const conn = try ServerConnection.init(rt.allocator, config);
-    const listener = rt.allocator.create(Listener) catch |err| {
-        conn.destroy();
-        return err;
+/// Two configs that would fight over one socket.  TCP port 0 asks for an
+/// ephemeral port, so those never clash; Unix sockets always carry port 0.
+fn sameAddress(a: ServerConnection.Config, b: ServerConnection.Config) bool {
+    const host = hostOf(a);
+    if (a.port != b.port or !std.mem.eql(u8, host, hostOf(b))) return false;
+    return a.port != 0 or std.mem.indexOfScalar(u8, host, '/') != null;
+}
+
+/// Bind every listener at once, one thread each.  All or nothing: on failure
+/// the sockets that did bind are closed again and `failed` names the first
+/// listener that could not.  The returned listeners still need a runtime.
+fn bindAll(allocator: Allocator, configs: []const ServerConnection.Config, failed: *?usize) ![]Listener {
+    const Bind = struct {
+        result: anyerror!*ServerConnection = error.NotBound,
+        thread: ?std.Thread = null,
+
+        fn run(self: *@This(), a: Allocator, config: ServerConnection.Config) void {
+            self.result = ServerConnection.init(a, config);
+        }
     };
-    listener.* = .{ .connection = conn, .runtime = rt };
-    switch (runtime.model()) {
-        .threads => listener.accept_thread = std.Thread.spawn(.{}, acceptLoop, .{listener}) catch |err| {
-            conn.destroy();
-            rt.allocator.destroy(listener);
-            return err;
-        },
-        .evented => {
-            const loop = runtime.loop() catch |err| {
-                conn.destroy();
-                rt.allocator.destroy(listener);
-                return err;
-            };
-            listener.listener_source = .{ .fd = conn.handle(), .onReadable = onListenerReadable, .onRemoved = onListenerRemoved };
-            loop.register(&listener.listener_source) catch |err| {
-                conn.destroy();
-                rt.allocator.destroy(listener);
-                return err;
-            };
-            listener.listener_loop = loop;
-        },
+    const listeners = try allocator.alloc(Listener, configs.len);
+    errdefer allocator.free(listeners);
+    const binds = try allocator.alloc(Bind, configs.len);
+    defer allocator.free(binds);
+
+    for (binds, configs) |*bind, config| {
+        bind.* = .{};
+        // A lone listener, or one no thread could be spawned for, binds inline.
+        if (configs.len > 1) bind.thread = std.Thread.spawn(.{}, Bind.run, .{ bind, allocator, config }) catch null;
+        if (bind.thread == null) bind.run(allocator, config);
     }
-    rt.listeners.append(rt.allocator, listener) catch |err| {
-        listener.connection.close();
-        if (listener.accept_thread) |thread| thread.join();
-        if (listener.listener_loop) |loop| loop.detach(&listener.listener_source);
+    for (binds) |bind| if (bind.thread) |thread| thread.join();
+
+    for (binds, 0..) |bind, i| {
+        _ = bind.result catch |err| {
+            failed.* = i;
+            for (binds) |other| {
+                if (other.result) |conn| conn.destroy() else |_| {}
+            }
+            return err;
+        };
+    }
+    var filled: usize = 0;
+    errdefer {
+        for (listeners[0..filled]) |listener| {
+            if (listener.unix_path) |path| allocator.free(path);
+        }
+        for (binds) |bind| {
+            if (bind.result) |conn| conn.destroy() else |_| {}
+        }
+    }
+    for (listeners, binds, configs) |*listener, bind, config| {
+        listener.* = .{
+            .connection = bind.result catch unreachable,
+            .unix_path = try duplicateUnixPath(allocator, config),
+            .runtime = undefined,
+        };
+        filled += 1;
+    }
+    return listeners;
+}
+
+fn duplicateUnixPath(allocator: Allocator, config: ServerConnection.Config) !?[:0]u8 {
+    const host = config.host orelse return null;
+    if (std.mem.indexOfScalar(u8, host, '/') == null) return null;
+    return try allocator.dupeSentinel(u8, host, 0);
+}
+
+fn destroyListeners(allocator: Allocator, listeners: []Listener) void {
+    for (listeners) |listener| {
+        if (listener.unix_path) |path| allocator.free(path);
         listener.connection.destroy();
-        rt.allocator.destroy(listener);
-        return err;
-    };
+    }
+    allocator.free(listeners);
 }
 
 /// Stop the server: stop accepting, interrupt every connection, wait until
@@ -357,12 +576,9 @@ pub fn stop(conn_num: usize) void {
     rt.live_mutex.lock();
     rt.stopping = true;
     rt.live_mutex.unlock();
-    for (rt.listeners.items) |listener| listener.connection.close();
-    for (rt.listeners.items) |listener| {
-        if (listener.accept_thread) |thread| thread.join();
-        if (listener.listener_loop) |loop| loop.detach(&listener.listener_source);
-    }
-    log.debug("{s}[{s}] stopped accepting conn_num={d}", .{ @tagName(rt.mode), rt.app_name, conn_num });
+    rt.stopAccepting();
+    rt.waitBackoffs();
+    log.debug("{s}[{s}] stopped accepting on {d} listener(s) conn_num={d}", .{ @tagName(rt.mode), rt.app_name, rt.listeners.len, conn_num });
 
     rt.interruptAllLive();
     const deadline = misc.milliTimestamp() + DRAIN_TIMEOUT_MS;
@@ -384,37 +600,284 @@ fn sleepMs(ms: u32) void {
     _ = std.c.nanosleep(&ts, null);
 }
 
-/// Threads model: accept until the server is stopped.
-fn acceptLoop(listener: *Listener) void {
-    const rt = listener.runtime;
-    while (!listener.connection.isSuspended()) {
-        const raw = listener.connection.acceptRaw(ACCEPT_POLL_MS) catch |err| {
-            switch (err) {
-                // Periodic wake-up to re-check the shutdown flag.
-                error.Timeout => {},
-                else => {
-                    log.warn("failed to accept connection: {}", .{err});
-                    // Avoid a hot loop if accept keeps failing (e.g. EMFILE).
-                    sleepMs(50);
-                },
+/// True when this server has a Unix socket, so the accept thread must wake
+/// periodically.  When the interval has elapsed, rebuild any deleted socket
+/// before the next poll.
+fn restoreDue(rt: *Runtime, now: i64, last: *i64) bool {
+    var unix = false;
+    for (rt.listeners) |listener| if (listener.unix_path != null) {
+        unix = true;
+        break;
+    };
+    if (!unix) return false;
+    if (now - last.* >= UNIX_RESTORE_MS) {
+        for (rt.listeners) |*listener| if (listener.unix_path != null) restoreUnixListener(listener);
+        last.* = misc.milliTimestamp();
+    }
+    return true;
+}
+
+/// Threads model: wait on every listener at once until `stop` writes to the
+/// wake-up pipe in `pollfds[0]`.  A listener whose accept fails is left out
+/// of the poll for `ACCEPT_BACKOFF_MS`; the others are not.
+fn acceptLoop(rt: *Runtime, pollfds: []net.PollFd, quiet_until: []i64) void {
+    var unix_checked = misc.milliTimestamp();
+    while (true) {
+        var timeout: c_int = -1;
+        const now = misc.milliTimestamp();
+        // Restore while not inside poll: dup2 replaces the file a blocked
+        // poll is watching, and that poll would never see the new socket.
+        if (restoreDue(rt, now, &unix_checked)) timeout = UNIX_RESTORE_MS;
+        for (pollfds[1..], quiet_until, rt.listeners) |*pfd, *until, *listener| {
+            if (until.* > now) {
+                // poll ignores a negative fd, so this listener waits out its
+                // back-off without delaying the others.
+                pfd.fd = -1;
+                const wait: c_int = @intCast(@min(until.* - now, std.math.maxInt(c_int)));
+                if (timeout < 0 or wait < timeout) timeout = wait;
+            } else {
+                pfd.fd = listener.connection.handle();
+                until.* = 0;
             }
+        }
+        if (net.poll(pollfds.ptr, @intCast(pollfds.len), timeout) < 0) {
+            // EINTR, or a transient failure: retry without spinning.
+            sleepMs(10);
             continue;
-        };
-        admit(rt, listener.connection, raw);
+        }
+        if (pollfds[0].revents != 0) return;
+        for (pollfds[1..], quiet_until, rt.listeners) |pfd, *until, *listener| {
+            if (pfd.fd < 0 or pfd.revents == 0) continue;
+            if (!listener.drain()) until.* = misc.milliTimestamp() + ACCEPT_BACKOFF_MS;
+        }
     }
 }
 
 /// Evented model: drain the pending connections of a readable listener.
+/// A failed accept parks just this listener for `ACCEPT_BACKOFF_MS`.
 fn onListenerReadable(source: *EventLoop.Source, _: []u8) EventLoop.Action {
-    const listener: *Listener = @alignCast(@fieldParentPtr("listener_source", source));
-    const rt = listener.runtime;
-    while (true) {
-        const raw = listener.connection.acceptRaw(0) catch |err| {
-            if (err != error.Timeout) log.warn("failed to accept connection: {}", .{err});
-            return .keep;
-        };
-        admit(rt, listener.connection, raw);
+    const listener: *Listener = @alignCast(@fieldParentPtr("source", source));
+    if (listener.drain()) return .keep;
+    // Already parked: this delivery was queued before the disarm.
+    if (listener.backoff.swap(1, .acq_rel) != 0) return .keep;
+    const loop = listener.loop orelse {
+        listener.backoff.store(0, .release);
+        return .keep;
+    };
+    loop.disarm(source);
+    const thread = std.Thread.spawn(.{}, rearmListener, .{listener}) catch {
+        sleepMs(ACCEPT_BACKOFF_MS);
+        listener.backoff.store(0, .release);
+        loop.register(source) catch |err| log.warn("listener stayed paused: {}", .{err});
+        return .keep;
+    };
+    thread.detach();
+    return .keep;
+}
+
+/// Re-arm a parked listener after the back-off.  Runs off the loop thread;
+/// the actual re-arm is bounced onto the loop so it cannot land after `stop`
+/// has freed the listener.
+fn rearmListener(listener: *Listener) void {
+    sleepMs(ACCEPT_BACKOFF_MS);
+    const Rearm = struct {
+        listener: *Listener,
+        fn run(ctx: *anyopaque) void {
+            const l: *Listener = @as(*@This(), @ptrCast(@alignCast(ctx))).listener;
+            l.runtime.live_mutex.lock();
+            const stopping = l.runtime.stopping;
+            l.runtime.live_mutex.unlock();
+            if (!stopping) {
+                if (l.loop) |loop| {
+                    loop.register(&l.source) catch |err| log.warn("listener stayed paused: {}", .{err});
+                }
+            }
+            l.backoff.store(0, .release);
+        }
+    };
+    var ctx = Rearm{ .listener = listener };
+    if (listener.loop) |loop| {
+        loop.call(Rearm.run, &ctx);
+    } else {
+        listener.backoff.store(0, .release);
     }
+}
+
+/// Replace a deleted Unix socket file, unless another process now owns the
+/// path.  Existing connections ride on the old socket and are not touched.
+fn unixWatch(rt: *Runtime) void {
+    var pfd = net.PollFd{ .fd = rt.unix_wake_read, .events = net.WAIT_READ, .revents = 0 };
+    while (true) {
+        pfd.revents = 0;
+        if (net.poll(@as([*]net.PollFd, @ptrCast(&pfd)), 1, UNIX_RESTORE_MS) > 0) return;
+        rt.live_mutex.lock();
+        const stopping = rt.stopping;
+        rt.live_mutex.unlock();
+        if (stopping) return;
+        for (rt.listeners) |*listener| {
+            if (listener.unix_path != null) restoreUnixListener(listener);
+        }
+    }
+}
+
+const PathState = enum { ours, absent, taken, unknown };
+
+/// `fstat` of a Unix socket does not return the directory entry's identity
+/// (on macOS the device comes back as -1), so the entry is remembered when
+/// the socket is bound and compared with `stat` of the path afterwards.
+fn unixPathState(listener: *Listener) PathState {
+    const path = listener.unix_path orelse return .unknown;
+    const at_path = fileIdOfPath(path) catch |err| switch (err) {
+        error.Absent => return .absent,
+        error.StatFailed => return .unknown,
+    };
+    const bound = listener.bound_id orelse {
+        listener.bound_id = at_path;
+        return .ours;
+    };
+    return if (at_path.eql(bound)) .ours else .taken;
+}
+
+fn rememberBoundPath(listener: *Listener) void {
+    const path = listener.unix_path orelse return;
+    listener.bound_id = fileIdOfPath(path) catch null;
+}
+
+const FileId = struct {
+    dev: u64,
+    ino: u64,
+
+    fn eql(self: FileId, other: FileId) bool {
+        return self.dev == other.dev and self.ino == other.ino;
+    }
+};
+
+fn fileIdOfPath(path: [:0]const u8) error{ Absent, StatFailed }!FileId {
+    if (comptime builtin.os.tag == .linux) return linuxFileId(std.os.linux.AT.FDCWD, path, 0);
+    var st: std.c.Stat = undefined;
+    if (std.c.stat(path.ptr, &st) != 0) {
+        if (std.c._errno().* == @intFromEnum(std.c.E.NOENT)) return error.Absent;
+        return error.StatFailed;
+    }
+    return .{ .dev = @intCast(st.dev), .ino = st.ino };
+}
+
+fn linuxFileId(dirfd: std.os.linux.fd_t, path: [*:0]const u8, flags: u32) error{ Absent, StatFailed }!FileId {
+    var stx = std.mem.zeroes(std.os.linux.Statx);
+    const rc = std.os.linux.statx(dirfd, path, flags, .{ .INO = true }, &stx);
+    const signed: isize = @bitCast(rc);
+    if (signed < 0) {
+        if (signed == -@as(isize, @intFromEnum(std.os.linux.E.NOENT))) return error.Absent;
+        return error.StatFailed;
+    }
+    return .{ .dev = (@as(u64, stx.dev_major) << 32) | stx.dev_minor, .ino = stx.ino };
+}
+
+fn restoreUnixListener(listener: *Listener) void {
+    const path = listener.unix_path orelse return;
+    if (listener.unwatched) {
+        rewatchUnixListener(listener);
+        if (listener.unwatched) return;
+    }
+    switch (unixPathState(listener)) {
+        .ours => {
+            listener.path_taken = false;
+            listener.rebind_logged = false;
+            return;
+        },
+        .unknown => return,
+        .taken => {
+            if (!listener.path_taken) {
+                listener.path_taken = true;
+                log.warn("unix listener {s} belongs to another process; leaving it alone", .{@as([]const u8, path)});
+            }
+            return;
+        },
+        .absent => {},
+    }
+    const new_fd = bindUnix(path) catch |err| {
+        if (!listener.rebind_logged) {
+            listener.rebind_logged = true;
+            log.warn("unix listener {s} is gone and rebinding failed: {}", .{ @as([]const u8, path), err });
+        }
+        return;
+    };
+    if (listener.loop) |loop| {
+        var swap = UnixSwap{ .listener = listener, .new_fd = new_fd };
+        loop.call(UnixSwap.run, &swap);
+        if (swap.new_fd >= 0) _ = std.c.close(swap.new_fd);
+    } else if (replaceListeningFd(listener.connection.handle(), new_fd)) {
+        rememberBoundPath(listener);
+        listener.path_taken = false;
+        listener.rebind_logged = false;
+        log.info("restored unix listener {s}", .{@as([]const u8, path)});
+    } else {
+        _ = std.c.close(new_fd);
+        if (!listener.rebind_logged) {
+            listener.rebind_logged = true;
+            log.warn("unix listener {s} is gone and replacing its socket failed", .{@as([]const u8, path)});
+        }
+    }
+}
+
+fn bindUnix(path: [:0]const u8) !c_int {
+    const addr = try net.Address.initUnix(path);
+    // The file is absent (the caller checked), so this does not unlink
+    // anything a new owner may have just created: bind fails instead.
+    return (try addr.listen(.{ .kernel_backlog = 512 })).handle;
+}
+
+const UnixSwap = struct {
+    listener: *Listener,
+    new_fd: c_int,
+
+    fn run(ctx: *anyopaque) void {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        const listener = self.listener;
+        const loop = listener.loop orelse return;
+        const path = listener.unix_path orelse return;
+        const current = listener.connection.handle();
+        // The kqueue entry watches the old socket, not the fd number, so the
+        // replacement has to be registered again.
+        loop.disarm(&listener.source);
+        if (!replaceListeningFd(current, self.new_fd)) {
+            loop.register(&listener.source) catch {};
+            return;
+        }
+        self.new_fd = -1;
+        rememberBoundPath(listener);
+        listener.path_taken = false;
+        listener.rebind_logged = false;
+        loop.register(&listener.source) catch |err| {
+            listener.unwatched = true;
+            log.warn("unix listener {s} is bound again but not watched: {}", .{ @as([]const u8, path), err });
+            return;
+        };
+        log.info("restored unix listener {s}", .{@as([]const u8, path)});
+    }
+};
+
+fn rewatchUnixListener(listener: *Listener) void {
+    const loop = listener.loop orelse {
+        listener.unwatched = false;
+        return;
+    };
+    const Run = struct {
+        fn run(ctx: *anyopaque) void {
+            const l: *Listener = @ptrCast(@alignCast(ctx));
+            l.loop.?.register(&l.source) catch return;
+            l.unwatched = false;
+        }
+    };
+    loop.call(Run.run, @ptrCast(listener));
+}
+
+/// Make `current` refer to the socket `new_fd`, and close `new_fd`.
+fn replaceListeningFd(current: c_int, new_fd: c_int) bool {
+    if (std.c.dup2(new_fd, current) < 0) return false;
+    _ = std.c.close(new_fd);
+    _ = std.c.fcntl(current, std.c.F.SETFD, @as(c_int, std.c.FD_CLOEXEC));
+    return true;
 }
 
 /// The listener never removes itself; `stop` detaches it.
@@ -433,7 +896,7 @@ fn admit(rt: *Runtime, listener: *ServerConnection, raw: AcceptedConnection) voi
     started catch |err| {
         log.warn("failed to start connection: {}", .{err});
         _ = rt.active_connections.fetchSub(1, .acq_rel);
-        (@import("network/posix_net.zig").Stream{ .handle = raw.fd }).close();
+        (net.Stream{ .handle = raw.fd }).close();
     };
 }
 

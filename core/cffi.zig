@@ -2,7 +2,6 @@
 
 // --- server functions ---
 pub const startServer               = @import("cffi/server.zig").startServer;
-pub const addListener               = @import("cffi/server.zig").addListener;
 pub const stopServer                = @import("cffi/server.zig").stopServer;
 pub const sendMessageFromServer     = @import("cffi/server.zig").sendMessageFromServer;
 pub const getMessageForServerWorker = @import("cffi/server.zig").getMessageForServerWorker;

@@ -104,21 +104,41 @@ class AsyncServerMixin:
     """Async counterpart of :class:`~daffi.app.ServerMixin`."""
 
     async def start(self) -> None:
-        """Bind the server, register executors, launch the dispatcher."""
+        """Bind the server, register executors, launch the dispatcher.
+
+        All or nothing: if any step fails, every listener is closed, every
+        peer that already connected is dropped, and the error is raised.
+        """
         if self._conn_num is not None:
             raise RuntimeError(f"{self.__class__.__name__} is already started")
-        if self.server_mode == ServerMode.SERVICE:
-            if not self._task_dispatcher:
-                self._task_dispatcher = AsyncTaskDispatcher(workers=self.workers)
-            self._task_dispatcher._start_workers()
-        self._conn_num = self._bind_native_listeners()
-        self.logger.debug(
-            f"has been started successfully. connection info: {self.info}"
-        )
-        self._register_executors()
-        if self.server_mode == ServerMode.SERVICE:
-            self._task_dispatcher.start_for_connection(self)
-            RpcProxy._process_service_handshake(self._conn_num)
+        try:
+            if self.server_mode == ServerMode.SERVICE:
+                if not self._task_dispatcher:
+                    self._task_dispatcher = AsyncTaskDispatcher(workers=self.workers)
+                self._task_dispatcher._start_workers()
+            self._conn_num = self._bind_native_listeners()
+            self.logger.debug(
+                f"has been started successfully. connection info: {self.info}"
+            )
+            self._register_executors()
+            if self.server_mode == ServerMode.SERVICE:
+                self._task_dispatcher.start_for_connection(self)
+                RpcProxy._process_service_handshake(self._conn_num)
+        except BaseException:
+            await self._abort_start()
+            raise
+
+    async def _abort_start(self) -> None:
+        """Async counterpart of :meth:`daffi.app.ServerMixin._abort_start`."""
+        dispatcher, self._task_dispatcher = self._task_dispatcher, None
+        try:
+            if dispatcher is not None:
+                await dispatcher.stop_for_connection(self)
+        finally:
+            if self._conn_num is not None:
+                dfcore.stopServer(self._conn_num)
+                self._conn_num = None
+            self._unregister_executor_subscriber()
 
     async def stop(self, *_, **__) -> None:
         """Stop the server and release resources."""

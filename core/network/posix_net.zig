@@ -90,7 +90,7 @@ pub const PollFd = extern struct {
     events:  c_short,
     revents: c_short,
 };
-extern "c" fn poll(fds: [*]PollFd, nfds: c_uint, timeout: c_int) c_int;
+pub extern "c" fn poll(fds: [*]PollFd, nfds: c_uint, timeout: c_int) c_int;
 
 pub const WAIT_READ: c_short = POLLIN;
 pub const WAIT_WRITE: c_short = POLLOUT;

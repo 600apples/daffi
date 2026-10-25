@@ -5,7 +5,6 @@ const std = @import("std");
 const net = @import("posix_net.zig");
 const tls_impl = @import("tls.zig");
 const Allocator = std.mem.Allocator;
-const HandlerMode = @import("../handlers.zig").HandlerMode;
 const OperationTable = @import("../network.zig").OperationTable;
 const connection = @import("../network/connection.zig");
 const AcceptedConnection = connection.AcceptedConnection;
@@ -39,7 +38,6 @@ pub const Config = struct {
     cert_file: []const u8 = "",
     /// PEM file containing the server private key (required when tls = true).
     key_file: []const u8 = "",
-    mode: HandlerMode,
 };
 
 pub fn init(allocator: Allocator, config: Config) !*ServerConnection {

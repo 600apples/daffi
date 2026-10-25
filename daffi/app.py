@@ -252,50 +252,31 @@ class Application(EventsMixin, ABC):
         set_signal_handler(self.stop)
 
     def _bind_native_listeners(self) -> int:
-        """Start the node on its first transport and attach every other one.
+        """Bind every transport at once and return the node's one conn_num.
 
-        All listeners belong to the one native server this returns, so peers
-        are not split by the socket they used.
+        The native layer binds all listeners in parallel and starts accepting
+        on all of them together.  All or nothing: if one cannot be bound, none
+        stays bound, and the error names that transport.
         """
-        if not self._transports:
-            raise InitializationError("at least one transport is required")
-        first, *extra = self._transports
-        with system_exception_handler(
-            "{}",
-            InitializationError,
-            conn_info=first.conn_info(),
-        ):
-            conn_num = dfcore.startServer(
-                first.native_host,
-                first.native_port,
+        listeners = [(t.native_host, t.native_port) for t in self._transports]
+        try:
+            return dfcore.startServer(
+                listeners,
                 self.server_mode,
                 self.app_name,
                 self.tls,
                 self.cert_file,
                 self.key_file,
             )
-        try:
-            for transport in extra:
-                with system_exception_handler(
-                    "{}",
-                    InitializationError,
-                    conn_info=transport.conn_info(),
-                ):
-                    dfcore.addListener(
-                        conn_num,
-                        transport.native_host,
-                        transport.native_port,
-                        self.tls,
-                        self.cert_file,
-                        self.key_file,
-                    )
-        except BaseException as bind_err:
-            try:
-                dfcore.stopServer(conn_num)
-            except BaseException as stop_err:
-                raise bind_err from stop_err
-            raise
-        return conn_num
+        except ValueError as exc:
+            reason, *where = exc.args
+            failed = self._transports[where[0]] if where else None
+            with system_exception_handler(
+                "{}",
+                InitializationError,
+                conn_info=failed.conn_info() if failed else (),
+            ):
+                raise ValueError(reason) from None
 
     def _register_executors(self):
         """Log all currently registered callbacks and subscribe for future ones.
@@ -407,6 +388,9 @@ class ServerMixin:
         delegated to TLS — pass ``tls=True`` together with ``cert_file`` /
         ``key_file`` (server) and ``ca_file`` (client) on the constructor.
 
+        All or nothing: if any step fails, every listener is closed, every
+        peer that already connected is dropped, and the error is raised.
+
         Raises:
             RuntimeError: If the server is already started.
             InitializationError: If the native layer fails to bind.
@@ -421,20 +405,41 @@ class ServerMixin:
         """
         if self._conn_num is not None:
             raise RuntimeError(f"{self.__class__.__name__} is already started")
-        if self.server_mode == ServerMode.SERVICE:
-            # Start the worker-thread pool before native I/O threads are
-            # created.  Threads idle harmlessly until work arrives.
-            if not self._task_dispatcher:
-                self._task_dispatcher = TaskDispatcher(workers=self.workers)
-            self._task_dispatcher._start_workers()
-        self._conn_num = self._bind_native_listeners()
-        self.logger.debug(
-            f"has been started successfully. connection info: {self.info}"
-        )
-        self._register_executors()
-        if self.server_mode == ServerMode.SERVICE:
-            self._task_dispatcher.start_for_connection(self)
-            RpcProxy._process_service_handshake(self._conn_num)
+        try:
+            if self.server_mode == ServerMode.SERVICE:
+                # Start the worker-thread pool before native I/O threads are
+                # created.  Threads idle harmlessly until work arrives.
+                if not self._task_dispatcher:
+                    self._task_dispatcher = TaskDispatcher(workers=self.workers)
+                self._task_dispatcher._start_workers()
+            self._conn_num = self._bind_native_listeners()
+            self.logger.debug(
+                f"has been started successfully. connection info: {self.info}"
+            )
+            self._register_executors()
+            if self.server_mode == ServerMode.SERVICE:
+                self._task_dispatcher.start_for_connection(self)
+                RpcProxy._process_service_handshake(self._conn_num)
+        except BaseException:
+            self._abort_start()
+            raise
+
+    def _abort_start(self) -> None:
+        """Undo a :meth:`start` that failed part-way, so it can be retried.
+
+        The dispatcher goes first, while ``_conn_num`` still names the
+        lifecycle fd that wakes its poller; then the native server, which
+        closes every listener and drops every peer on all of them.
+        """
+        dispatcher, self._task_dispatcher = self._task_dispatcher, None
+        try:
+            if dispatcher is not None:
+                dispatcher.stop_for_connection(self)
+        finally:
+            if self._conn_num is not None:
+                dfcore.stopServer(self._conn_num)
+                self._conn_num = None
+            self._unregister_executor_subscriber()
 
     def stop(self, *_, **__):
         """Stop the server and release the native connection.

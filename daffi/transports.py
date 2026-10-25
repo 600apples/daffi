@@ -103,9 +103,26 @@ def normalize_transports(value: TransportArg) -> list[Transport]:
         ) from exc
     if not items:
         raise InitializationError("at least one transport is required")
+    seen: set[tuple[str, str | int]] = set()
     for item in items:
         if not isinstance(item, (TCPTransport, UnixTransport)):
             raise InitializationError(
                 f"expected TCPTransport or UnixTransport, got {type(item).__name__}"
             )
+        key = _address_key(item)
+        if key is None:
+            continue
+        if key in seen:
+            raise InitializationError(f"duplicate transport {item.describe()}")
+        seen.add(key)
     return items
+
+
+def _address_key(transport: Transport) -> tuple[str, str | int] | None:
+    """Identity of the socket a transport binds, or None when it never clashes
+    (TCP port 0 asks for a fresh ephemeral port)."""
+    if isinstance(transport, UnixTransport):
+        return "unix", os.path.abspath(transport.path)
+    if transport.port == 0:
+        return None
+    return transport.host, transport.port

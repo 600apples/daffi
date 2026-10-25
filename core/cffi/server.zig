@@ -16,17 +16,21 @@ const HandlerMode = handlers.HandlerMode;
 
 const allocator = std.heap.c_allocator;
 
-/// Bind to host:port, start accepting connections and return a connection
-/// handle (conn_num).  mode: 0 = Router, 1 = Service.
+/// Bind every listener at once, start accepting on all of them and return the
+/// server's single handle (conn_num).  `listeners` is a non-empty list of
+/// (host, port) tuples; a Unix socket is (path, 0).  mode: 0 = Router,
+/// 1 = Service.  TLS settings apply to every listener.
+///
+/// All or nothing: when a listener cannot be bound nothing stays bound, and
+/// the ValueError's args are (reason, index of that listener).
 pub fn startServer(_: [*c]PyObject, args: [*c]PyObject) callconv(.c) [*c]PyObject {
-    var host: [*:0]u8 = undefined;
-    var port: c_long = undefined;
+    var listeners: *PyObject = undefined;
     var mode: c_short = undefined;
     var app_name: [*:0]u8 = undefined;
     var tls_enabled: c_int = 0;
     var cert_file: [*:0]u8 = undefined;
     var key_file: [*:0]u8 = undefined;
-    if (!(py.PyArg_ParseTuple(args, "slpspss", &host, &port, &mode, &app_name, &tls_enabled, &cert_file, &key_file) != 0)) return Py_BuildValue("");
+    if (PyArg_ParseTuple(args, "Ohspss", &listeners, &mode, &app_name, &tls_enabled, &cert_file, &key_file) == 0) return null;
     // Validate everything that comes from Python: an out-of-range value used to
     // hit `@intCast`/`unreachable`, i.e. abort the whole interpreter.
     const pmode: HandlerMode = switch (mode) {
@@ -37,68 +41,66 @@ pub fn startServer(_: [*c]PyObject, args: [*c]PyObject) callconv(.c) [*c]PyObjec
             return null;
         },
     };
-    if (port < 0 or port > std.math.maxInt(u16)) {
-        PyErr_SetString(py.PyExc_ValueError, "port must be in range 0-65535");
+    if (py.PyList_Check(listeners) == 0) {
+        PyErr_SetString(py.PyExc_TypeError, "listeners must be a list of (host, port) tuples");
         return null;
     }
-    const pport: u16 = @intCast(port);
-    const phost = std.mem.span(host);
-    const papp_name = std.mem.span(app_name);
-    const ptls = tls_enabled != 0;
-    const pcert_file = std.mem.span(cert_file);
-    const pkey_file = std.mem.span(key_file);
+    const count: usize = @intCast(py.PyList_Size(listeners));
+    if (count == 0) {
+        PyErr_SetString(py.PyExc_ValueError, "at least one listener is required");
+        return null;
+    }
+    const configs = allocator.alloc(ServerConfig, count) catch return py.PyErr_NoMemory();
+    defer allocator.free(configs);
+    for (configs, 0..) |*cfg, i| {
+        const item = py.PyList_GetItem(listeners, @intCast(i));
+        if (py.PyTuple_Check(item) == 0) {
+            PyErr_SetString(py.PyExc_TypeError, "listeners must be a list of (host, port) tuples");
+            return null;
+        }
+        var host: [*:0]u8 = undefined;
+        var port: c_long = undefined;
+        if (PyArg_ParseTuple(item, "sl", &host, &port) == 0) return null;
+        if (port < 0 or port > std.math.maxInt(u16)) {
+            raiseListenerError("port must be in range 0-65535", i);
+            return null;
+        }
+        cfg.* = .{
+            .host = std.mem.span(host),
+            .port = @intCast(port),
+            .tls = tls_enabled != 0,
+            .cert_file = std.mem.span(cert_file),
+            .key_file = std.mem.span(key_file),
+        };
+    }
 
-    const cfg = @import("../network/ServerConnection.zig").Config{
-        .host = phost, .port = pport, .mode = pmode,
-        .tls = ptls, .cert_file = pcert_file, .key_file = pkey_file,
-    };
-    // Binding (and resolving the host) may block: release the GIL meanwhile.
+    // Binding (and resolving hosts) may block: release the GIL meanwhile.
+    var failed: ?usize = null;
     const py_state = py.PyEval_SaveThread();
-    const started = Server.start(allocator, papp_name, cfg);
+    const started = Server.start(allocator, pmode, std.mem.span(app_name), configs, &failed);
     py.PyEval_RestoreThread(py_state);
     const conn_num = started catch |err| {
-        if (err == error.TooManyServers) {
+        if (failed) |i| {
+            // system_exception_handler enriches "ConnectionRefused" with the
+            // address of listener `i`.
+            raiseListenerError(if (err == error.DuplicateListener) "DuplicateListener" else "ConnectionRefused", i);
+        } else if (err == error.TooManyServers) {
             PyErr_SetString(py.PyExc_ValueError, "too many servers started in this process (limit 256)");
         } else {
-            // system_exception_handler catches this and enriches the message.
-            PyErr_SetString(py.PyExc_ValueError, "ConnectionRefused");
+            PyErr_SetString(py.PyExc_ValueError, @errorName(err));
         }
         return null;
     };
     return Py_BuildValue("k", @as(c_ulong, conn_num));
 }
 
-/// Bind another transport on a server that is already running.  The new
-/// listener shares that server's handler, so peers are not isolated by the
-/// socket they arrived on.
-pub fn addListener(_: [*c]PyObject, args: [*c]PyObject) callconv(.c) [*c]PyObject {
-    var conn_num: usize = undefined;
-    var host: [*:0]u8 = undefined;
-    var port: c_long = undefined;
-    var tls_enabled: c_int = 0;
-    var cert_file: [*:0]u8 = undefined;
-    var key_file: [*:0]u8 = undefined;
-    if (!(py.PyArg_ParseTuple(args, "kslpss", &conn_num, &host, &port, &tls_enabled, &cert_file, &key_file) != 0)) return Py_BuildValue("");
-    if (port < 0 or port > std.math.maxInt(u16)) {
-        PyErr_SetString(py.PyExc_ValueError, "port must be in range 0-65535");
-        return null;
-    }
-    const cfg = @import("../network/ServerConnection.zig").Config{
-        .host = std.mem.span(host),
-        .port = @intCast(port),
-        .mode = .Router,
-        .tls = tls_enabled != 0,
-        .cert_file = std.mem.span(cert_file),
-        .key_file = std.mem.span(key_file),
-    };
-    const py_state = py.PyEval_SaveThread();
-    const added = Server.addListener(conn_num, cfg);
-    py.PyEval_RestoreThread(py_state);
-    added catch |err| {
-        PyErr_SetString(py.PyExc_ValueError, @errorName(err));
-        return null;
-    };
-    return Py_BuildValue("");
+const ServerConfig = @import("../network/ServerConnection.zig").Config;
+
+/// Raise ValueError(reason, index) for the listener at `index`.
+fn raiseListenerError(reason: [*:0]const u8, index: usize) void {
+    const value = Py_BuildValue("(sn)", reason, @as(py.Py_ssize_t, @intCast(index))) orelse return;
+    py.PyErr_SetObject(py.PyExc_ValueError, value);
+    py.Py_DECREF(value);
 }
 
 /// Stop the server identified by conn_num and release every native resource

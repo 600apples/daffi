@@ -31,14 +31,18 @@ const server_methods = [_]PyMethodDef{
         .ml_meth  = cffi.startServer,
         .ml_flags = 1,
         .ml_doc   =
-            \\startServer(host, port, mode, app_name, tls, cert_file, key_file) -> int | None
+            \\startServer(listeners, mode, app_name, tls, cert_file, key_file) -> int
             \\
-            \\Bind to host:port and start accepting connections.
-            \\Returns a conn_num handle, or None on failure.
+            \\Bind every listener at once and start accepting on all of them.
+            \\Returns one conn_num for the whole server.
             \\
-            \\  tls       - True to enable TLS (requires cert_file and key_file)
+            \\  listeners - non-empty list of (host, port); a Unix socket is (path, 0)
+            \\  tls       - True to enable TLS on every listener (needs cert_file and key_file)
             \\  cert_file - path to PEM server certificate (ignored when tls=False)
             \\  key_file  - path to PEM server private key  (ignored when tls=False)
+            \\
+            \\All or nothing: if a listener cannot be bound, none stays bound and
+            \\ValueError.args is (reason, index of the failing listener).
         ,
     },
     .{
@@ -48,20 +52,10 @@ const server_methods = [_]PyMethodDef{
         .ml_doc   =
             \\stopServer(conn_num)
             \\
-            \\Stop the server and release all native resources (listening
-            \\socket, connections, threads).  Blocks until shutdown completes,
-            \\so the port can be rebound as soon as this returns.
-        ,
-    },
-    .{
-        .ml_name  = "addListener",
-        .ml_meth  = cffi.addListener,
-        .ml_flags = 1,
-        .ml_doc   =
-            \\addListener(conn_num, host, port, tls, cert_file, key_file)
-            \\
-            \\Bind another transport on a running Router or Service.  Accepted
-            \\peers share that node's membership with every other transport.
+            \\Stop the server and release all native resources (every
+            \\listening socket, connections, threads).  All listeners stop
+            \\accepting at the same moment.  Blocks until shutdown completes,
+            \\so every port can be rebound as soon as this returns.
         ,
     },
     .{

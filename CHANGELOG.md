@@ -10,6 +10,14 @@ All notable changes to this project are documented in this file.
   `TCPTransport` or `UnixTransport`, or a sequence of them. Every listener
   shares that node's membership. `Client` takes a single `transport`.
   `host`, `port`, and `unix_sock_path` are gone.
+- `start()` binds every transport in parallel and starts accepting on all of
+  them at once, under one native handle. All or nothing: if one transport
+  cannot be bound, none stays bound and the error names that address; if a
+  later step of `start()` fails, every peer that already connected is
+  dropped, every listener is closed and the workers are stopped.
+  `stop()` stops every listener at the same moment. Duplicate transports are
+  rejected. `dfcore.startServer` takes the whole listener list;
+  `dfcore.addListener` is gone.
 
 ### Added
 
@@ -29,6 +37,12 @@ All notable changes to this project are documented in this file.
 - **TLS:** the minimum protocol version is now TLS 1.2.
 - `stop()` on a `Service` / `Router` now blocks until the native server has
   fully shut down, so the port can be rebound right after it returns.
+- A listener whose `accept` keeps failing (for example the process is out of
+  file descriptors) pauses 50 ms and tries again. Its sibling listeners keep
+  accepting in the meantime.
+- A Unix socket file deleted while the server is running is bound again
+  within a second. A path another process has taken over is left alone, and
+  connections that were already open stay open.
 - Server slots are reused after `stop()`, so a process can start and stop
   servers any number of times (the limit of 256 is now on servers running
   at the same time).

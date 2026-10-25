@@ -81,19 +81,50 @@ pub fn register(self: *EventLoop, source: *Source) !void {
     try self.poller.add(source.fd, @intFromPtr(source));
 }
 
-/// Stop watching `source.fd` without calling `onRemoved`; afterwards the loop
-/// never touches `source` again.  Must not be used for a source that may have
-/// removed itself already.
-pub fn detach(self: *EventLoop, source: *Source) void {
+/// Stop watching `source` without calling `onRemoved`.  Only from the loop
+/// thread, inside a source callback; other threads use `detach`.
+pub fn disarm(self: *EventLoop, source: *Source) void {
+    std.debug.assert(self.isLoopThread());
+    self.poller.remove(source.fd);
+}
+
+/// Start watching every source in `sources` as one step, on the loop thread:
+/// no event of any of them is handled before all are watched, and if one
+/// cannot be added, none stays watched.
+pub fn registerAll(self: *EventLoop, sources: []const *Source) !void {
     const Ctx = struct {
         loop: *EventLoop,
-        source: *Source,
+        sources: []const *Source,
+        result: anyerror!void = {},
         fn run(ctx: *anyopaque) void {
             const s: *@This() = @ptrCast(@alignCast(ctx));
-            s.loop.poller.remove(s.source.fd);
+            for (s.sources, 0..) |source, i| {
+                s.loop.poller.add(source.fd, @intFromPtr(source)) catch |err| {
+                    for (s.sources[0..i]) |added| s.loop.poller.remove(added.fd);
+                    s.result = err;
+                    return;
+                };
+            }
         }
     };
-    var ctx = Ctx{ .loop = self, .source = source };
+    var ctx = Ctx{ .loop = self, .sources = sources };
+    self.call(Ctx.run, &ctx);
+    return ctx.result;
+}
+
+/// Stop watching every source in `sources` in one round trip, without calling
+/// `onRemoved`; afterwards the loop never touches them again.  Must not be
+/// used for a source that may have removed itself already.
+pub fn detach(self: *EventLoop, sources: []const *Source) void {
+    const Ctx = struct {
+        loop: *EventLoop,
+        sources: []const *Source,
+        fn run(ctx: *anyopaque) void {
+            const s: *@This() = @ptrCast(@alignCast(ctx));
+            for (s.sources) |source| s.loop.poller.remove(source.fd);
+        }
+    };
+    var ctx = Ctx{ .loop = self, .sources = sources };
     self.call(Ctx.run, &ctx);
 }
 
@@ -203,4 +234,56 @@ test "EventLoop delivers readability and runs commands" {
     probe.removed.wait();
     try std.testing.expect(probe.hits.load(.acquire) >= 1);
     _ = c.close(fds[0]);
+}
+
+test "EventLoop.registerAll watches every source or none" {
+    const loop = try start(std.heap.c_allocator);
+
+    const Probe = struct {
+        source: Source,
+        hits: std.atomic.Value(u32) = .init(0),
+
+        fn onReadable(s: *Source, scratch: []u8) Action {
+            const self: *@This() = @fieldParentPtr("source", s);
+            _ = c.read(s.fd, scratch.ptr, scratch.len);
+            _ = self.hits.fetchAdd(1, .acq_rel);
+            return .keep;
+        }
+        fn onRemoved(_: *Source) void {}
+
+        fn init(fd: c_int) @This() {
+            return .{ .source = .{ .fd = fd, .onReadable = onReadable, .onRemoved = onRemoved } };
+        }
+    };
+    const Noop = struct {
+        fn run(_: *anyopaque) void {}
+    };
+    var token: u8 = 0;
+
+    var a: [2]c.fd_t = undefined;
+    var b: [2]c.fd_t = undefined;
+    try std.testing.expect(c.pipe(&a) == 0);
+    try std.testing.expect(c.pipe(&b) == 0);
+    defer for (a ++ b) |fd| {
+        _ = c.close(fd);
+    };
+    var first = Probe.init(a[0]);
+    var broken = Probe.init(1 << 20); // a descriptor that is not open
+    var last = Probe.init(b[0]);
+
+    try std.testing.expectError(error.PollerAddFailed, loop.registerAll(&.{ &first.source, &broken.source, &last.source }));
+    _ = c.write(a[1], "x", 1);
+    _ = c.write(b[1], "x", 1);
+    // One more round trip: readiness reported before it would have been handled.
+    loop.call(Noop.run, &token);
+    try std.testing.expectEqual(@as(u32, 0), first.hits.load(.acquire));
+    try std.testing.expectEqual(@as(u32, 0), last.hits.load(.acquire));
+
+    try loop.registerAll(&.{ &first.source, &last.source });
+    var rounds: usize = 0;
+    while (first.hits.load(.acquire) == 0 or last.hits.load(.acquire) == 0) : (rounds += 1) {
+        try std.testing.expect(rounds < 1000);
+        loop.call(Noop.run, &token);
+    }
+    loop.detach(&.{ &first.source, &last.source });
 }

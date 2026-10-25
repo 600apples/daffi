@@ -24,7 +24,7 @@ if __name__ == "__main__":
 
 | Parameter | Type | Description |
 |---|---|---|
-| `transports` | transport or sequence | One `TCPTransport` or `UnixTransport`, or several. Every listener shares this router's membership. |
+| `transports` | transport or sequence | One `TCPTransport` or `UnixTransport`, or several. Every listener shares this router's membership. `start()` brings all of them up at once or none of them. |
 | `tls` | `bool` | Enable TLS (requires `cert_file` / `key_file`). |
 
 ---

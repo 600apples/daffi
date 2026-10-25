@@ -42,7 +42,7 @@ if __name__ == "__main__":
 | Parameter | Type | Description |
 |---|---|---|
 | `app_name` | `str` | Unique name for this node. Auto-generated if omitted. |
-| `transports` | transport or sequence | One `TCPTransport` or `UnixTransport`, or several. Every listener shares this node's membership. |
+| `transports` | transport or sequence | One `TCPTransport` or `UnixTransport`, or several. Every listener shares this node's membership. `start()` brings all of them up at once or none of them. |
 | `workers` | `int` | Concurrency level for callback execution. Default: `1` (inline). |
 | `tls` | `bool` | Enable TLS. Requires `cert_file` and `key_file`. |
 

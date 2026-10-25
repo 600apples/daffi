@@ -14,6 +14,8 @@ import time
 
 import pytest
 
+from daffi import TCPTransport
+
 from .conftest import (
     HOST,
     TIMEOUT,
