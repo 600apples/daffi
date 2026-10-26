@@ -17,7 +17,7 @@ const HandlerMode = handlers.HandlerMode;
 const allocator = std.heap.c_allocator;
 
 /// Bind every listener at once and return the server's single handle
-/// (conn_num).  Accepting starts later, from `beginAccepting`.  `listeners`
+/// (conn_num).  Nothing accepts yet; `startServer` does that.  `listeners`
 /// is a non-empty list of
 /// address tuples; a Unix socket is (path, 0).  mode: 0 = Router, 1 = Service.
 ///
@@ -29,7 +29,7 @@ const allocator = std.heap.c_allocator;
 ///
 /// All or nothing: when a listener cannot be bound nothing stays bound, and
 /// the ValueError's args are (reason, index of that listener).
-pub fn startServer(_: [*c]PyObject, args: [*c]PyObject) callconv(.c) [*c]PyObject {
+pub fn addListeners(_: [*c]PyObject, args: [*c]PyObject) callconv(.c) [*c]PyObject {
     var listeners: *PyObject = undefined;
     var mode: c_short = undefined;
     var app_name: [*:0]u8 = undefined;
@@ -121,8 +121,8 @@ fn raiseListenerError(reason: [*:0]const u8, index: usize) void {
     py.Py_DECREF(value);
 }
 
-/// Start accepting on every listener of a server that `startServer` bound.
-pub fn beginAccepting(_: [*c]PyObject, args: [*c]PyObject) callconv(.c) [*c]PyObject {
+/// Start accepting on every listener of a server that `addListeners` bound.
+pub fn startServer(_: [*c]PyObject, args: [*c]PyObject) callconv(.c) [*c]PyObject {
     var conn_num: usize = undefined;
     if (PyArg_ParseTuple(args, "k", &conn_num) == 0) return null;
     const py_state = py.PyEval_SaveThread();

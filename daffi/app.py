@@ -61,7 +61,7 @@ def _coerce_runtime(value: "Runtime | str") -> Runtime:
 
 
 class ServerMode(IntEnum):
-    """Numeric codes passed to the native ``dfcore.startServer`` C extension."""
+    """Numeric codes passed to the native ``dfcore.addListeners`` C extension."""
 
     ROUTER = 0
     SERVICE = 1
@@ -298,16 +298,17 @@ class Application(EventsMixin, ABC):
 
         set_signal_handler(self.stop)
 
-    def _bind_native_listeners(self) -> int:
+    def _add_native_listeners(self) -> int:
         """Bind every transport at once and return the node's one conn_num.
 
-        The native layer binds all listeners in parallel and starts accepting
-        on all of them together.  All or nothing: if one cannot be bound, none
-        stays bound, and the error names that transport.
+        This only adds the listeners.  Accepting starts later, from
+        ``dfcore.startServer``, after a Service has published its callbacks.
+        All or nothing: if one cannot be bound, none stays bound, and the
+        error names that transport.
         """
         listeners = [t.native_listener() for t in self._transports]
         try:
-            return dfcore.startServer(
+            return dfcore.addListeners(
                 listeners,
                 self.server_mode,
                 self.app_name,
@@ -456,7 +457,7 @@ class ServerMixin:
                 if not self._task_dispatcher:
                     self._task_dispatcher = TaskDispatcher(workers=self.workers)
                 self._task_dispatcher._start_workers()
-            self._conn_num = self._bind_native_listeners()
+            self._conn_num = self._add_native_listeners()
             self.logger.debug(
                 f"has been started successfully. connection info: {self.info}"
             )
@@ -465,7 +466,7 @@ class ServerMixin:
                 # Before any socket accepts, so the first handshake already
                 # carries the callback list.
                 RpcProxy._advertise_service_methods(self._conn_num)
-            dfcore.beginAccepting(self._conn_num)
+            dfcore.startServer(self._conn_num)
             self._register_executors()
             if self.server_mode == ServerMode.SERVICE:
                 RpcProxy._process_service_handshake(self._conn_num)

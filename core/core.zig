@@ -27,14 +27,14 @@ const cffi = @import("cffi.zig");
 
 const server_methods = [_]PyMethodDef{
     .{
-        .ml_name  = "startServer",
-        .ml_meth  = cffi.startServer,
+        .ml_name  = "addListeners",
+        .ml_meth  = cffi.addListeners,
         .ml_flags = 1,
         .ml_doc   =
-            \\startServer(listeners, mode, app_name) -> int
+            \\addListeners(listeners, mode, app_name) -> int
             \\
             \\Bind every listener at once and return one conn_num for the
-            \\whole server.  Sockets accept only after beginAccepting().
+            \\whole server.  Sockets accept only after startServer().
             \\
             \\  listeners - non-empty list of address tuples.  Each entry is
             \\              (host, port) for plaintext,
@@ -48,15 +48,15 @@ const server_methods = [_]PyMethodDef{
         ,
     },
     .{
-        .ml_name  = "beginAccepting",
-        .ml_meth  = cffi.beginAccepting,
+        .ml_name  = "startServer",
+        .ml_meth  = cffi.startServer,
         .ml_flags = 1,
         .ml_doc   =
-            \\beginAccepting(conn_num)
+            \\startServer(conn_num)
             \\
-            \\Start accepting on every listener.  Call once after a Service has
-            \\set its request fd and callback list, so the first client handshake
-            \\already carries those callbacks.
+            \\Start accepting on every listener.  Call once after addListeners,
+            \\and for a Service after its request fd and callback list are set,
+            \\so the first client handshake already carries those callbacks.
         ,
     },
     .{
@@ -112,7 +112,7 @@ const server_methods = [_]PyMethodDef{
             \\
             \\Register an eventfd or pipe write-end that the native layer will signal
             \\whenever a message is pushed onto the Service task queue.
-            \\Call once after startServer() returns and before the handshake.
+            \\Call once after addListeners() returns and before startServer().
         ,
     },
 };

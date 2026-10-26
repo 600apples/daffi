@@ -118,14 +118,14 @@ class AsyncServerMixin:
                 if not self._task_dispatcher:
                     self._task_dispatcher = AsyncTaskDispatcher(workers=self.workers)
                 self._task_dispatcher._start_workers()
-            self._conn_num = self._bind_native_listeners()
+            self._conn_num = self._add_native_listeners()
             self.logger.debug(
                 f"has been started successfully. connection info: {self.info}"
             )
             if self.server_mode == ServerMode.SERVICE:
                 self._task_dispatcher.start_for_connection(self)
                 RpcProxy._advertise_service_methods(self._conn_num)
-            dfcore.beginAccepting(self._conn_num)
+            dfcore.startServer(self._conn_num)
             self._register_executors()
             if self.server_mode == ServerMode.SERVICE:
                 RpcProxy._process_service_handshake(self._conn_num)

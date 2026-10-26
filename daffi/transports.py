@@ -97,7 +97,7 @@ class TCPTransport:
         return self.port
 
     def native_listener(self) -> tuple[str, int, bool, str, str, str]:
-        """``(host, port, tls, cert, key, ca)`` for ``dfcore.startServer``.
+        """``(host, port, tls, cert, key, ca)`` for ``dfcore.addListeners``.
 
         A non-empty ``ca`` enables mutual TLS on this listener.
         """
@@ -175,7 +175,7 @@ class UnixTransport:
         return 0
 
     def native_listener(self) -> tuple[str, int, bool, str, str, str]:
-        """``(path, 0, tls, cert, key, ca)`` for ``dfcore.startServer``.
+        """``(path, 0, tls, cert, key, ca)`` for ``dfcore.addListeners``.
 
         A non-empty ``ca`` enables mutual TLS on this listener.
         """

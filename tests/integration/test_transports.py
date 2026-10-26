@@ -563,13 +563,13 @@ def _native_start(listeners, busy_port: int | None) -> dict:
 
     blocker = _occupy(_tcp(busy_port)) if busy_port else None
     try:
-        dfcore.startServer(listeners, 0, "iso-native")
+        dfcore.addListeners(listeners, 0, "iso-native")
     except ValueError as exc:
         return {"args": exc.args}
     finally:
         if blocker is not None:
             blocker.close()
-    raise AssertionError("startServer accepted a listener set it should reject")
+    raise AssertionError("addListeners accepted a listener set it should reject")
 
 
 def _async_start_with_one_bad_listener(spec, bad: int) -> dict:
@@ -910,27 +910,27 @@ class TestRouterSharedMembership:
 
 
 class TestNativeStart:
-    """``dfcore.startServer`` takes every listener in one call."""
+    """``dfcore.addListeners`` takes every listener in one call."""
 
     def test_empty_listener_list_is_rejected(self):
         from daffi import dfcore
 
         with pytest.raises(ValueError, match="at least one listener"):
-            dfcore.startServer([], 0, "empty")
+            dfcore.addListeners([], 0, "empty")
 
     def test_listeners_must_be_a_list_of_pairs(self):
         from daffi import dfcore
 
         with pytest.raises(TypeError):
-            dfcore.startServer((HOST, 1), 0, "not-a-list")
+            dfcore.addListeners((HOST, 1), 0, "not-a-list")
         with pytest.raises(TypeError):
-            dfcore.startServer([HOST], 0, "not-a-pair")
+            dfcore.addListeners([HOST], 0, "not-a-pair")
 
     def test_bad_port_names_its_listener(self):
         from daffi import dfcore
 
         with pytest.raises(ValueError) as info:
-            dfcore.startServer([(HOST, 1), (HOST, 70000)], 0, "bad-port")
+            dfcore.addListeners([(HOST, 1), (HOST, 70000)], 0, "bad-port")
         assert info.value.args == ("port must be in range 0-65535", 1)
 
     def test_duplicate_listener_names_its_index(self):

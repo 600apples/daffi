@@ -370,7 +370,7 @@ class TaskDispatcher:
 
         if self._poller is None:
             # Workers may already be running (pre-started by _start_workers()
-            # before dfcore.startServer/Client); _start_workers() is a no-op
+            # before dfcore.addListeners/startClient); _start_workers() is a no-op
             # if the pool is already populated.
             self._start_workers()
 

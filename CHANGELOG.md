@@ -16,8 +16,8 @@ All notable changes to this project are documented in this file.
   later step of `start()` fails, every peer that already connected is
   dropped, every listener is closed and the workers are stopped.
   `stop()` stops every listener at the same moment. Duplicate transports are
-  rejected. `dfcore.startServer` takes the whole listener list;
-  `dfcore.addListener` is gone.
+  rejected. `dfcore.addListeners` binds the whole listener list and
+  `dfcore.startServer` starts accepting; `dfcore.addListener` is gone.
 
 ### Added
 

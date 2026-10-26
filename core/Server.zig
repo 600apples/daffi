@@ -400,7 +400,7 @@ pub fn setServiceRequestFd(conn_num: usize, fd: i32) void {
 /// Bind every listener in `configs` and return the server's single handle
 /// (conn_num).  All or nothing: if one listener cannot be bound, none stays
 /// bound and `failed` holds its index.  Sockets are not accepting yet;
-/// `beginAccepting` starts them all at once.
+/// `startServer` (the native entry of that name) starts them all at once.
 pub fn start(allocator: Allocator, mode: HandlerMode, app_name: []const u8, configs: []const ServerConnection.Config, failed: *?usize) !usize {
     failed.* = null;
     return startImpl(allocator, mode, app_name, configs, failed) catch |err| {
@@ -456,7 +456,7 @@ fn startImpl(allocator: Allocator, mode: HandlerMode, app_name_arg: []const u8, 
     };
     errdefer rt.deinit();
     // Publish the slot before anyone can connect.  Accepting starts later,
-    // from `beginAccepting`, once a Service has installed its task fd and
+    // from `startServer`, once a Service has installed its task fd and
     // advertised its callbacks.  A client that connected in between would
     // otherwise finish the handshake with an empty method list.
     {
