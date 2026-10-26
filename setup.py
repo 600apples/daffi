@@ -137,20 +137,40 @@ def _safe_extractall(tf, dest: str) -> None:
         tf.extractall(dest)
 
 
+def _zig_install_works(zig_exe: str) -> bool:
+    """True when *zig_exe* can see its standard library.
+
+    A killed download leaves the ``zig`` binary in place and ``lib/std``
+    missing.  ``zig version`` still prints, but ``translate-c`` then fails
+    with ``unable to find zig installation directory``.
+    """
+    std_zig = os.path.join(os.path.dirname(zig_exe), "lib", "std", "std.zig")
+    if not os.path.isfile(std_zig):
+        return False
+    try:
+        proc = subprocess.run(
+            [zig_exe, "env"], capture_output=True, text=True
+        )
+    except OSError:
+        return False
+    return proc.returncode == 0
+
+
 def _ensure_zig() -> str:
     """Return the path to a ``zig`` executable of version ``_ZIG_VERSION``.
 
-    Uses the ``zig`` in PATH when it is that version.  Otherwise downloads the
-    official Zig binary for the current platform into
-    ``/tmp/zig-<arch>-<os>-<version>/`` and returns the path to the extracted
-    binary.  Subsequent calls reuse the cached download.
+    Uses the ``zig`` in PATH when it is that version and its standard library
+    is present.  Otherwise downloads the official Zig binary for the current
+    platform into ``/tmp/zig-<arch>-<os>-<version>/`` and returns the path to
+    the extracted binary.  A later call reuses that directory only when the
+    install is complete.
     """
     zig = shutil.which("zig")
     if zig:
         found = subprocess.run(
             [zig, "version"], capture_output=True, text=True
         ).stdout.strip()
-        if found == _ZIG_VERSION:
+        if found == _ZIG_VERSION and _zig_install_works(zig):
             return zig
         print(
             f"setup.py: ignoring {zig!r} (Zig {found or 'unknown'}, need {_ZIG_VERSION})"
@@ -176,9 +196,12 @@ def _ensure_zig() -> str:
     zig_dir = os.path.join(tempfile.gettempdir(), dir_name)
     zig_exe = os.path.join(zig_dir, "zig.exe" if sys.platform == "win32" else "zig")
 
-    if os.path.isfile(zig_exe):
+    if os.path.isfile(zig_exe) and _zig_install_works(zig_exe):
         print(f"setup.py: reusing cached Zig at {zig_exe!r}")
         return zig_exe
+    if os.path.isdir(zig_dir):
+        print(f"setup.py: discarding incomplete Zig cache at {zig_dir!r}")
+        shutil.rmtree(zig_dir)
 
     zig_sha = _ZIG_SHA256.get((arch, os_name))
 
