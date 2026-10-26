@@ -172,11 +172,18 @@ def test_stale_socket_file_is_replaced(tmp_path):
         deadline = time.monotonic() + 15
         import stat
 
-        while time.monotonic() < deadline and not stat.S_ISSOCK(os.stat(path).st_mode):
+        # Bind unlinks the leftover file before creating the socket, so the
+        # path is briefly absent.  That gap is not a failed replacement.
+        replaced = False
+        while time.monotonic() < deadline:
+            try:
+                replaced = stat.S_ISSOCK(os.stat(path).st_mode)
+            except FileNotFoundError:
+                replaced = False
+            if replaced:
+                break
             time.sleep(0.05)
-        assert stat.S_ISSOCK(
-            os.stat(path).st_mode
-        ), "stale file was not replaced by a socket"
+        assert replaced, "stale file was not replaced by a socket"
         client = Client(app_name="ux-client", transport=UnixTransport(path), runtime=active_runtime())
         conn = client.connect()
         try:
