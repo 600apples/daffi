@@ -1,18 +1,18 @@
 //! Process-wide runtime of the native core.
 //!
-//! `threads` (default): every connection — and every client dispatcher — owns
-//! an OS thread that blocks on reads.
+//! `evented` (default): connections are multiplexed over a few event-loop
+//! threads (kqueue/epoll); messages are decoded incrementally as bytes arrive
+//! and handlers run on the loop thread.  Work that can block indefinitely
+//! (TLS handshake, the protocol probe of an accepted socket, WebSocket
+//! sessions) runs on an elastic blocking pool instead.
 //!
-//! `evented`: connections are multiplexed over a few event-loop threads
-//! (kqueue/epoll); messages are decoded incrementally as bytes arrive and
-//! handlers run on the loop thread.  Work that can block indefinitely (TLS
-//! handshake, the protocol probe of an accepted socket, WebSocket sessions)
-//! runs on an elastic blocking pool instead.
+//! `threads`: every connection — and every client dispatcher — owns an OS
+//! thread that blocks on reads.
 //!
 //! Selected once per process by `runtime.configure` (the `runtime` constructor
-//! argument). The first use without a choice is `threads`.
+//! argument). The first use without a choice is `evented`.
 //! `DAFFI_EVENT_LOOPS` sets the number of loop threads (default: CPU count,
-//! capped at 4). A later choice that disagrees is rejected.
+//! capped at 64). A later choice that disagrees is rejected.
 
 const std = @import("std");
 const misc = @import("misc.zig");
@@ -24,11 +24,10 @@ const log = std.log.scoped(.runtime);
 pub const Model = enum { threads, evented };
 
 const max_loops = 64;
-const default_max_loops = 4;
 
 var init_mutex: misc.Mutex = .{};
 var initialized: bool = false;
-var selected: Model = .threads;
+var selected: Model = .evented;
 var loop_count: usize = 1;
 var loops: [max_loops]?*EventLoop = @splat(null);
 var next_loop: std.atomic.Value(usize) = .init(0);
@@ -79,7 +78,7 @@ fn resetAfterFork() callconv(.c) void {
 
 fn ensureInit() void {
     if (initialized) return;
-    finishInit(.threads);
+    finishInit(.evented);
 }
 
 fn finishInit(chosen: Model) void {
@@ -87,7 +86,8 @@ fn finishInit(chosen: Model) void {
     initialized = true;
     _ = std.c.pthread_atfork(null, null, resetAfterFork);
     const cpus = std.Thread.getCpuCount() catch 1;
-    loop_count = @max(1, @min(cpus, default_max_loops));
+    // Unset DAFFI_EVENT_LOOPS → one loop per CPU (hard cap max_loops).
+    loop_count = @max(1, @min(cpus, max_loops));
     if (std.c.getenv("DAFFI_EVENT_LOOPS")) |raw| {
         const value = std.mem.span(raw);
         if (std.fmt.parseInt(usize, value, 10)) |n| {

@@ -6,8 +6,9 @@ Notification strategy
 ---------------------
 For Service connections the native layer writes to a per-connection
 ``os.eventfd`` (Linux) or pipe (macOS / other) whenever a new message is pushed
-onto the task queue.  The poller thread blocks on ``select.select`` over all
-registered fds — zero CPU when idle, sub-millisecond wake latency.
+onto the task queue.  The poller thread blocks in one long-lived
+``selectors.DefaultSelector`` over all registered fds — zero CPU when idle,
+sub-millisecond wake latency.
 
 For Client connections (bidirectional nodes with registered callbacks) the same
 architecture is used if the native side exposes a wakeup fd; otherwise a short
@@ -252,6 +253,10 @@ class TaskDispatcher:
         # read_fd → conn_num  (covers both wakeup and lifecycle fds; used to
         # route readable events back to the right _ConnEntry without scanning)
         self._rfd_to_conn_num: dict[int, int] = {}
+        # One selector for the life of the poller. Rebuilt only when an fd
+        # disappears out from under a wait (see handle_task_queue).
+        self._selector: selectors.BaseSelector | None = None
+        self._selector_fds: set[int] = set()
 
     def _start_workers(self) -> None:
         """Start the worker-thread pool.
@@ -315,9 +320,10 @@ class TaskDispatcher:
             # close an fd that the poller is still blocked on.
             self._close_lifecycle(conn_num)
         # Deregister (and close) fds only after the poller has exited for the
-        # last-connection case, or immediately for the non-last case (the
-        # poller will see a ValueError on the next select call, catch it, and
-        # rebuild all_fds without the now-closed fd).
+        # last-connection case, or immediately for the non-last case. The
+        # poller drops fds that have left the map before its next wait. If
+        # that wait fails because an fd was closed underneath it, the
+        # selector is discarded and the survivors are registered again.
         self._deregister_fds(conn_num)
 
     def _deregister_fds(self, conn_num) -> None:
@@ -396,8 +402,8 @@ class TaskDispatcher:
 
         I/O multiplexing strategy
         -------------------------
-        The poller uses ``selectors.DefaultSelector`` (kqueue on macOS, epoll
-        on Linux) with ``timeout=None`` (infinite wait).  This has two
+        The poller uses one ``selectors.DefaultSelector`` (kqueue on macOS,
+        epoll on Linux) with ``timeout=None`` (infinite wait).  This has two
         advantages over ``select.select``:
 
         1. **No fd-number limit.** ``select.select`` silently misbehaves or
@@ -412,12 +418,12 @@ class TaskDispatcher:
            acquisitions per millisecond, starving the main thread.  With
            ``timeout=None`` idle threads stay fully asleep.
 
-        The poller rebuilds the selector on every iteration.  This is
-        efficient because an iteration only runs when a real event occurs
-        (a task arrives, a disconnect fires, or shutdown is requested);
-        idle threads never execute the loop body.  The cost of one
-        kqueue/epoll open + a handful of kevent/epoll_ctl registrations
-        per event is negligible.
+        The selector stays open for the life of the poller.  Descriptors are
+        registered when a connection is added and dropped when it leaves, so a
+        call does not pay for a new kqueue plus ``kevent``/``epoll_ctl`` on
+        every wakeup.  If a wait fails because an fd was closed underneath it,
+        the selector is discarded and the next iteration registers whatever
+        is still in the map.
 
         Shutdown is signalled by writing ``LifecycleSignal.STOP`` to the
         connection's lifecycle fd, which causes the selector to return; the
@@ -425,24 +431,24 @@ class TaskDispatcher:
         """
         inline = self.workers == 1
 
+        try:
+            self._poll_loop(inline)
+        finally:
+            self._close_selector()
+
+    def _poll_loop(self, inline: bool) -> None:
         while not self.stop_event.is_set():
-            # Build a fresh selector over every registered fd (wakeup + lifecycle).
-            # Rebuilt each iteration so closed fds never sneak back in.
-            all_fds = list(self._rfd_to_conn_num.keys())
-            readable = set()
-            sel = selectors.DefaultSelector()
+            if not self._sync_selector():
+                # No fds yet (or all of them failed to register). Don't spin.
+                self.stop_event.wait(0.001)
+                continue
+            assert self._selector is not None
             try:
-                for fd in all_fds:
-                    try:
-                        sel.register(fd, selectors.EVENT_READ)
-                    except (ValueError, OSError):
-                        pass
-                events = sel.select(timeout=None)
+                events = self._selector.select(timeout=None)
                 readable = {key.fd for key, _ in events}
             except OSError:
-                pass
-            finally:
-                sel.close()
+                self._close_selector()
+                continue
 
             # --- Dispatch all readable fds in one pass ---
             lifecycle_stop = False
@@ -512,6 +518,35 @@ class TaskDispatcher:
                                 bool(conn.server_mode),
                             )
                         )
+
+    def _sync_selector(self) -> bool:
+        """Make the long-lived selector match ``_rfd_to_conn_num``.
+
+        Returns whether at least one fd is registered.
+        """
+        current = set(self._rfd_to_conn_num)
+        if self._selector is None:
+            self._selector = selectors.DefaultSelector()
+        for fd in self._selector_fds - current:
+            try:
+                self._selector.unregister(fd)
+            except (KeyError, ValueError, OSError):
+                pass
+        watched = set(current)
+        for fd in current - self._selector_fds:
+            try:
+                self._selector.register(fd, selectors.EVENT_READ)
+            except (ValueError, OSError):
+                watched.discard(fd)
+        self._selector_fds = watched
+        return bool(watched)
+
+    def _close_selector(self) -> None:
+        selector = self._selector
+        self._selector = None
+        self._selector_fds = set()
+        if selector is not None:
+            selector.close()
 
     @staticmethod
     def _dispatch_event(conn, payload: dict) -> None:

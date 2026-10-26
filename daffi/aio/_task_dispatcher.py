@@ -179,6 +179,10 @@ class AsyncTaskDispatcher:
 
         self._conns: dict[int, _ConnEntry] = {}
         self._rfd_to_conn_num: dict[int, int] = {}
+        # Readers stay registered across wakeups. Each wait uses a fresh future
+        # because a Future resolves only once.
+        self._readers: set[int] = set()
+        self._wake: asyncio.Future | None = None
 
     # ------------------------------------------------------------------
     # Worker pool
@@ -336,140 +340,149 @@ class AsyncTaskDispatcher:
         """Core event loop: wait for any fd to become readable, dispatch.
 
         Uses ``loop.add_reader()`` + a shared ``asyncio.Future`` instead of
-        ``selectors.DefaultSelector``.  After the future resolves, a
-        non-blocking ``select.select(timeout=0)`` discovers the full set of
-        currently readable fds — the same dispatch logic as the sync version
-        then runs inline.
+        ``selectors.DefaultSelector``.  Readers stay registered until the fd
+        leaves the map, so a call does not pay ``add_reader`` / ``remove_reader``
+        on every wakeup.  After the future resolves, a non-blocking
+        ``select.select(timeout=0)`` discovers the full set of currently
+        readable fds — the same dispatch logic as the sync version then runs
+        inline.
         """
         loop = asyncio.get_running_loop()
         inline = self.workers == 1
 
-        while not self.stop_event.is_set():
-            all_fds = list(self._rfd_to_conn_num.keys())
-            if not all_fds:
-                await asyncio.sleep(0.001)
-                continue
+        try:
+            while not self.stop_event.is_set():
+                self._sync_readers(loop)
+                if not self._readers:
+                    await asyncio.sleep(0.001)
+                    continue
 
-            # One shared future; first readable fd resolves it.
-            wakeup: asyncio.Future = loop.create_future()
-
-            def _make_cb(f: asyncio.Future):
-                def _cb() -> None:
-                    if not f.done():
-                        f.set_result(None)
-
-                return _cb
-
-            registered: list[int] = []
-            for fd in all_fds:
+                wake = loop.create_future()
+                self._wake = wake
                 try:
-                    loop.add_reader(fd, _make_cb(wakeup))
-                    registered.append(fd)
+                    await wake
+                except asyncio.CancelledError:
+                    break
+                finally:
+                    self._wake = None
+
+                if self.stop_event.is_set():
+                    break
+
+                all_fds = list(self._readers)
+                try:
+                    readable_list, _, _ = _select.select(all_fds, [], [], 0)
+                    readable = set(readable_list)
                 except (OSError, ValueError):
-                    pass
+                    continue
 
-            if not registered:
-                await asyncio.sleep(0.001)
-                continue
+                lifecycle_stop = False
+                notified: set = set()
+                for rfd in readable:
+                    conn_num = self._rfd_to_conn_num.get(rfd)
+                    if conn_num is None:
+                        continue
+                    entry = self._conns.get(conn_num)
+                    if entry is None:
+                        continue
+                    if rfd == entry.lifecycle.read_fd:
+                        reason = entry.lifecycle.read(1)
+                        if not reason or reason == LifecycleSignal.STOP:
+                            lifecycle_stop = True
+                            break
+                        await _handle_lifecycle_signal_async(
+                            entry.conn, conn_num, reason
+                        )
+                    elif rfd == entry.wakeup.read_fd:
+                        entry.wakeup.drain()
+                        notified.add(entry.conn)
 
+                if lifecycle_stop:
+                    break
+
+                for conn in list(self.connections):
+                    if conn not in notified:
+                        continue
+                    poller = self.pollers[bool(conn.server_mode)]
+                    while not self.stop_event.is_set():
+                        task = poller(conn._conn_num)
+                        if task is None:
+                            break
+                        (
+                            uuid,
+                            data,
+                            flag,
+                            serde,
+                            transmitter,
+                            _receiver,
+                            func_name,
+                            return_result,
+                        ) = task
+
+                        if flag == MessageFlag.EVENTS:
+                            await self._dispatch_event(conn, json.loads(data))
+                        elif inline:
+                            result, out_flag, out_serde = await _execute_task_async(
+                                func_name, serde, data
+                            )
+                            if return_result:
+                                result_bytes, is_bytes = Serializer.serialize(
+                                    out_serde, result
+                                )
+                                _SENDERS[bool(conn.server_mode)](
+                                    data=result_bytes,
+                                    flag=out_flag,
+                                    serde=out_serde,
+                                    receiver=transmitter,
+                                    func_name=func_name,
+                                    return_result=False,
+                                    conn_num=conn._conn_num,
+                                    is_bytes=is_bytes,
+                                    uuid=uuid,
+                                )
+                        else:
+                            await self.queue.put(
+                                (
+                                    uuid,
+                                    data,
+                                    flag,
+                                    serde,
+                                    transmitter,
+                                    func_name,
+                                    return_result,
+                                    conn._conn_num,
+                                    bool(conn.server_mode),
+                                )
+                            )
+        finally:
+            self._drop_readers(loop)
+
+    def _on_readable(self) -> None:
+        wake = self._wake
+        if wake is not None and not wake.done():
+            wake.set_result(None)
+
+    def _sync_readers(self, loop: asyncio.AbstractEventLoop) -> None:
+        current = set(self._rfd_to_conn_num)
+        for fd in self._readers - current:
+            self._remove_reader(loop, fd)
+        for fd in current - self._readers:
             try:
-                await wakeup
-            except asyncio.CancelledError:
-                break
-            finally:
-                for fd in registered:
-                    try:
-                        loop.remove_reader(fd)
-                    except (OSError, ValueError):
-                        pass
-
-            if self.stop_event.is_set():
-                break
-
-            # Discover the full set of readable fds without blocking.
-            try:
-                readable_list, _, _ = _select.select(all_fds, [], [], 0)
-                readable = set(readable_list)
+                loop.add_reader(fd, self._on_readable)
             except (OSError, ValueError):
                 continue
+            self._readers.add(fd)
 
-            # --- Dispatch ---
-            lifecycle_stop = False
-            notified: set = set()
-            for rfd in readable:
-                conn_num = self._rfd_to_conn_num.get(rfd)
-                if conn_num is None:
-                    continue
-                entry = self._conns.get(conn_num)
-                if entry is None:
-                    continue
-                if rfd == entry.lifecycle.read_fd:
-                    reason = entry.lifecycle.read(1)
-                    if not reason or reason == LifecycleSignal.STOP:
-                        lifecycle_stop = True
-                        break
-                    await _handle_lifecycle_signal_async(entry.conn, conn_num, reason)
-                elif rfd == entry.wakeup.read_fd:
-                    entry.wakeup.drain()
-                    notified.add(entry.conn)
+    def _remove_reader(self, loop: asyncio.AbstractEventLoop, fd: int) -> None:
+        self._readers.discard(fd)
+        try:
+            loop.remove_reader(fd)
+        except (OSError, ValueError):
+            pass
 
-            if lifecycle_stop:
-                break
-
-            for conn in list(self.connections):
-                if conn not in notified:
-                    continue
-                poller = self.pollers[bool(conn.server_mode)]
-                while not self.stop_event.is_set():
-                    task = poller(conn._conn_num)
-                    if task is None:
-                        break
-                    (
-                        uuid,
-                        data,
-                        flag,
-                        serde,
-                        transmitter,
-                        _receiver,
-                        func_name,
-                        return_result,
-                    ) = task
-
-                    if flag == MessageFlag.EVENTS:
-                        await self._dispatch_event(conn, json.loads(data))
-                    elif inline:
-                        result, out_flag, out_serde = await _execute_task_async(
-                            func_name, serde, data
-                        )
-                        if return_result:
-                            result_bytes, is_bytes = Serializer.serialize(
-                                out_serde, result
-                            )
-                            _SENDERS[bool(conn.server_mode)](
-                                data=result_bytes,
-                                flag=out_flag,
-                                serde=out_serde,
-                                receiver=transmitter,
-                                func_name=func_name,
-                                return_result=False,
-                                conn_num=conn._conn_num,
-                                is_bytes=is_bytes,
-                                uuid=uuid,
-                            )
-                    else:
-                        await self.queue.put(
-                            (
-                                uuid,
-                                data,
-                                flag,
-                                serde,
-                                transmitter,
-                                func_name,
-                                return_result,
-                                conn._conn_num,
-                                bool(conn.server_mode),
-                            )
-                        )
+    def _drop_readers(self, loop: asyncio.AbstractEventLoop) -> None:
+        for fd in list(self._readers):
+            self._remove_reader(loop, fd)
 
     @staticmethod
     async def _dispatch_event(conn: Any, payload: dict) -> None:

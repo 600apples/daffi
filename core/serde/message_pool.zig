@@ -60,6 +60,12 @@ pub const MessagePool = struct {
         self.allocator.destroy(self);
     }
 
+    /// Messages that fit here are framed on the stack. A typical RPC (header,
+    /// three short names, a small pickle) is a few hundred bytes, and allocating
+    /// that buffer on every send showed up in the call latency. Larger payloads
+    /// still go through the allocator.
+    const send_scratch_len: usize = 8 * 1024;
+
     pub fn sendMessage(
         self: *Self,
         writer: anytype,
@@ -73,6 +79,14 @@ pub const MessagePool = struct {
         receiver: ?[]const u8,
         func_name: ?[]const u8,
     ) !void {
+        const n = try RawMessage.encodedLen(data, transmitter, receiver, func_name);
+        if (n <= send_scratch_len) {
+            var scratch: [send_scratch_len]u8 = undefined;
+            try RawMessage.encodeInto(scratch[0..n], data, uuid, flag, decoder, is_bytes, return_result, transmitter, receiver, func_name);
+            const raw_message = RawMessage{ .data = scratch[0..n] };
+            try raw_message.sendTo(writer);
+            return;
+        }
         const raw_message = try RawMessage.create(self.allocator, data, uuid, flag, decoder, is_bytes, return_result, transmitter, receiver, func_name);
         defer self.allocator.free(raw_message.data);
         try raw_message.sendTo(writer);

@@ -490,8 +490,16 @@ pub const Message = struct {
 pub const RawMessage = struct {
     data: []u8,
 
-    pub fn create(allocator: Allocator, data: []const u8, uuid: u16, flag: MessageFlag, decoder: MessageDecoder, is_bytes: bool, return_result: bool, transmitter: ?[]const u8, receiver: ?[]const u8, func_name: ?[]const u8) !RawMessage {
-        // Create RawMessage from data and header. Caller is responsible for freeing memory used for data generation.
+    const Parts = struct {
+        transmitter: []const u8,
+        receiver: []const u8,
+        func_name: []const u8,
+        metadata_len: usize,
+        msg_len: usize,
+        total: usize,
+    };
+
+    fn parts(data: []const u8, transmitter: ?[]const u8, receiver: ?[]const u8, func_name: ?[]const u8) !Parts {
         const ptransmitter = transmitter orelse PLACEHOLDER;
         const preceiver = receiver orelse PLACEHOLDER;
         const pfun_name = func_name orelse PLACEHOLDER;
@@ -502,11 +510,38 @@ pub const RawMessage = struct {
         const msg_len = data.len + metadata_len;
         if (msg_len > std.math.maxInt(@FieldType(Header, "msg_len"))) return error.ExceedsMaxMessageSize;
         if (metadata_len > std.math.maxInt(@FieldType(Header, "metadata_len"))) return error.MetadataTooLong;
-        const header: *const Header = &try Header.create(uuid, flag, decoder, is_bytes, return_result, msg_len, metadata_len);
+        return .{
+            .transmitter = ptransmitter,
+            .receiver = preceiver,
+            .func_name = pfun_name,
+            .metadata_len = metadata_len,
+            .msg_len = msg_len,
+            .total = serde.HEADER_SIZE + msg_len,
+        };
+    }
+
+    /// Write one framed message into `buf`. `buf.len` must be the `total` from `parts`.
+    pub fn encodeInto(buf: []u8, data: []const u8, uuid: u16, flag: MessageFlag, decoder: MessageDecoder, is_bytes: bool, return_result: bool, transmitter: ?[]const u8, receiver: ?[]const u8, func_name: ?[]const u8) !void {
+        const framed = try parts(data, transmitter, receiver, func_name);
+        if (buf.len < framed.total) return error.NoSpace;
+        const header = try Header.create(uuid, flag, decoder, is_bytes, return_result, framed.msg_len, framed.metadata_len);
         var backed_header_bytes: [serde.HEADER_SIZE]u8 = undefined;
         header.toBytes(&backed_header_bytes);
-        const slices = &[_][]const u8{ &backed_header_bytes, ptransmitter, SECTION_SEPARATOR_SEQ, preceiver, SECTION_SEPARATOR_SEQ, pfun_name, data };
-        return .{ .data = try serde.concatenateSlicesAlloc(allocator, slices) };
+        const slices = &[_][]const u8{ &backed_header_bytes, framed.transmitter, SECTION_SEPARATOR_SEQ, framed.receiver, SECTION_SEPARATOR_SEQ, framed.func_name, data };
+        serde.concatenateSlicesBuf(buf, slices);
+    }
+
+    pub fn encodedLen(data: []const u8, transmitter: ?[]const u8, receiver: ?[]const u8, func_name: ?[]const u8) !usize {
+        return (try parts(data, transmitter, receiver, func_name)).total;
+    }
+
+    pub fn create(allocator: Allocator, data: []const u8, uuid: u16, flag: MessageFlag, decoder: MessageDecoder, is_bytes: bool, return_result: bool, transmitter: ?[]const u8, receiver: ?[]const u8, func_name: ?[]const u8) !RawMessage {
+        // Create RawMessage from data and header. Caller is responsible for freeing memory used for data generation.
+        const n = try encodedLen(data, transmitter, receiver, func_name);
+        const buf = try allocator.alloc(u8, n);
+        errdefer allocator.free(buf);
+        try encodeInto(buf, data, uuid, flag, decoder, is_bytes, return_result, transmitter, receiver, func_name);
+        return .{ .data = buf };
     }
 
     pub fn createMetadata(allocator: Allocator, transmitter: ?[]const u8, receiver: ?[]const u8, func_name: ?[]const u8) ![]const u8 {

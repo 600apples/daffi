@@ -5,8 +5,8 @@ daffi's native core, the part written in Zig that owns the sockets of every
 
 | Model | How connections are served | Native threads |
 |---|---|---|
-| `threads` (default) | Every connection gets its own OS thread that blocks on reads. | One per connection, plus one per server. |
-| `evented` | All connections are multiplexed over a few event-loop threads (kqueue on macOS, epoll on Linux). Incoming bytes are decoded as they arrive. | A fixed few (4 by default), however many connections there are. |
+| `evented` (default) | All connections are multiplexed over a few event-loop threads (kqueue on macOS, epoll on Linux). Incoming bytes are decoded as they arrive. | One per CPU by default (capped at 64), however many connections there are. |
+| `threads` | Every connection gets its own OS thread that blocks on reads. | One per connection, plus one per server. |
 
 Zig documents the same kind of split as **`Io.Threaded`** (blocking I/O on OS
 threads) vs **`Io.Evented`** (multiplexed / userspace scheduling) in
@@ -34,7 +34,7 @@ the same in both models.
 
 The runtime is selected **once per process**, by the `runtime` argument of
 any `Router`, `Service`, or `Client`. A client uses the same runtime as a
-server. Omit it, or pass `None`, and that node selects `threads`. A later
+server. Omit it, or pass `None`, and that node selects `evented`. A later
 node that asks for the other runtime raises `InitializationError`.
 
 ```python
@@ -44,27 +44,27 @@ from daffi import Runtime, Service, callback, TCPTransport
 def echo(x):
     return x
 
+# evented is the default — pass runtime= only to force threads
 svc = Service(
     app_name="echo",
     transport=TCPTransport("0.0.0.0", 6000),
-    runtime=Runtime.EVENTED,
 )
 svc.start()
 svc.join()
 ```
 
-`"evented"` is accepted in place of `Runtime.EVENTED`. Check which runtime
-is active:
+`"threads"` / `"evented"` are accepted in place of the enum. Check which
+runtime is active:
 
 ```python
 from daffi import dfcore
-print(dfcore.getRuntime())   # "threads" or "evented"
+print(dfcore.getRuntime())   # "evented" or "threads"
 ```
 
 | Argument | Values | Default |
 |---|---|---|
-| `runtime` | `Runtime.THREADS`, `Runtime.EVENTED` (or `"threads"`, `"evented"`) | `threads` |
-| `DAFFI_EVENT_LOOPS` | number of event-loop threads, 1–64 | CPU count, capped at 4 |
+| `runtime` | `Runtime.EVENTED`, `Runtime.THREADS` (or `"evented"`, `"threads"`) | `evented` |
+| `DAFFI_EVENT_LOOPS` | number of event-loop threads, 1–64 | CPU count (capped at 64) |
 
 A value other than those two strings raises `InitializationError`. A process
 started with `spawn` does not inherit the parent's lock, so pass `runtime`
@@ -150,7 +150,7 @@ idle threaded one.
 
 ## When to use which
 
-**Use `evented` when:**
+**`evented` (the default) fits when:**
 
 - Many clients call the **same Service at the same time**. Throughput is
   higher, and the Service stays at a few native threads instead of one per
@@ -164,10 +164,10 @@ idle threaded one.
   does not fit.
 - One process opens **many `Client` connections** (e.g. to many services).
 
-**Keep `threads` (the default) when:**
+**Prefer `threads` when:**
 
 - **One caller** sends calls one after another, either straight to a Service
-  or through a Router to a worker. That path is faster with `threads`.
+  or through a Router to a worker. That path is often faster with `threads`.
 - There are only a **few connections**.
 - Peers may be **slow to read what they are sent**, e.g. large messages or
   streams to clients on slow or distant networks. In the evented model a

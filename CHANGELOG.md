@@ -24,14 +24,15 @@ All notable changes to this project are documented in this file.
 - Python 3.15 support (classifiers, CI test matrix and prebuilt wheels).
 - TLS client verifies the server host name (DNS name or IP address) against
   the certificate when `ca` is given, and sends SNI.
-- Optional evented runtime for the native core, selected with
-  `runtime=Runtime.EVENTED` (or `"evented"`) on a `Router`, `Service`,
-  or `Client`. The default, when `runtime` is omitted, is `threads`.
-  Connections are multiplexed over a few kqueue/epoll event-loop threads
-  (`DAFFI_EVENT_LOOPS`, default: CPU count capped at 4) instead of one OS
-  thread each. The choice is once per process and applies to clients as
-  well as servers; a later constructor that disagrees raises
-  `InitializationError`. `dfcore.getRuntime()` reports the active model.
+- Optional threaded runtime for the native core, selected with
+  `runtime=Runtime.THREADS` (or `"threads"`) on a `Router`, `Service`,
+  or `Client`. The default, when `runtime` is omitted, is `evented`:
+  connections are multiplexed over a few kqueue/epoll event-loop threads
+  (`DAFFI_EVENT_LOOPS`, default: one per CPU, capped at 64) instead of one OS
+  thread each. Pass `threads` for one OS thread per connection. The choice
+  is once per process and applies to clients as well as servers; a later
+  constructor that disagrees raises `InitializationError`.
+  `dfcore.getRuntime()` reports the active model.
 
 ### Changed
 

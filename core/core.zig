@@ -284,7 +284,7 @@ const util_methods = [_]PyMethodDef{
             \\Runtime of the native core: "threads" (an OS thread per
             \\connection) or "evented" (connections multiplexed over a few
             \\event-loop threads).  Chosen once per process by setRuntime.
-            \\The default, when setRuntime was not called, is "threads".
+            \\The default, when setRuntime was not called, is "evented".
             \\DAFFI_EVENT_LOOPS sets the number of loop threads.
         ,
     },

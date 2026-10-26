@@ -128,7 +128,7 @@ def pytest_cmdline_main(config: pytest.Config):
 
 # Set by the ``runtime`` fixture. Not on the tests package: a script run as
 # ``python tests/perf/...`` must not need ``tests/__init__.py`` to import.
-SELECTED_RUNTIME = "threads"
+SELECTED_RUNTIME = "evented"
 
 
 def active_runtime() -> str:

@@ -223,9 +223,9 @@ class Application(EventsMixin, ABC):
                            :class:`Router` which never executes callbacks
                            itself.
             runtime:       Native runtime for this process,
-                           :attr:`Runtime.THREADS` (default) or
-                           :attr:`Runtime.EVENTED`.  Omitting it, or passing
-                           ``None``, selects threads.  A Client, Router, and
+                           :attr:`Runtime.EVENTED` (default) or
+                           :attr:`Runtime.THREADS`.  Omitting it, or passing
+                           ``None``, selects evented.  A Client, Router, and
                            Service in one process share this choice; a
                            conflicting value raises
                            :class:`InitializationError`.
@@ -243,7 +243,7 @@ class Application(EventsMixin, ABC):
         if not getattr(self, "_transports", None):
             raise InitializationError("transport is required")
         if runtime is None:
-            runtime = Runtime.THREADS
+            runtime = Runtime.EVENTED
         self.runtime = _coerce_runtime(runtime)
         try:
             dfcore.setRuntime(self.runtime.value)
