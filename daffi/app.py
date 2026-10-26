@@ -460,9 +460,14 @@ class ServerMixin:
             self.logger.debug(
                 f"has been started successfully. connection info: {self.info}"
             )
-            self._register_executors()
             if self.server_mode == ServerMode.SERVICE:
                 self._task_dispatcher.start_for_connection(self)
+                # Before any socket accepts, so the first handshake already
+                # carries the callback list.
+                RpcProxy._advertise_service_methods(self._conn_num)
+            dfcore.beginAccepting(self._conn_num)
+            self._register_executors()
+            if self.server_mode == ServerMode.SERVICE:
                 RpcProxy._process_service_handshake(self._conn_num)
         except BaseException:
             self._abort_start()

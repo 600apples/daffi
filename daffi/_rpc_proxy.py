@@ -467,14 +467,19 @@ class RpcProxy:
             return payload
 
     @classmethod
+    def _advertise_service_methods(cls, conn_num: int) -> None:
+        """Publish this service's callback names before any client connects."""
+        data = METADATA_SEPARATOR.join([name for name, _ in EXECUTOR_REGISTRY])
+        set_service_methods(data, conn_num)
+
+    @classmethod
     def _process_service_handshake(cls, conn_num: int) -> None:
         """Notify the native layer of this service's exported method names.
 
         Args:
             conn_num: Native connection handle.
         """
-        data = METADATA_SEPARATOR.join([name for name, _ in EXECUTOR_REGISTRY])
-        set_service_methods(data, conn_num)
+        cls._advertise_service_methods(conn_num)
 
 
 class RpcResult:

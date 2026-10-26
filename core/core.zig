@@ -33,8 +33,8 @@ const server_methods = [_]PyMethodDef{
         .ml_doc   =
             \\startServer(listeners, mode, app_name) -> int
             \\
-            \\Bind every listener at once and start accepting on all of them.
-            \\Returns one conn_num for the whole server.
+            \\Bind every listener at once and return one conn_num for the
+            \\whole server.  Sockets accept only after beginAccepting().
             \\
             \\  listeners - non-empty list of address tuples.  Each entry is
             \\              (host, port) for plaintext,
@@ -45,6 +45,18 @@ const server_methods = [_]PyMethodDef{
             \\
             \\All or nothing: if a listener cannot be bound, none stays bound and
             \\ValueError.args is (reason, index of the failing listener).
+        ,
+    },
+    .{
+        .ml_name  = "beginAccepting",
+        .ml_meth  = cffi.beginAccepting,
+        .ml_flags = 1,
+        .ml_doc   =
+            \\beginAccepting(conn_num)
+            \\
+            \\Start accepting on every listener.  Call once after a Service has
+            \\set its request fd and callback list, so the first client handshake
+            \\already carries those callbacks.
         ,
     },
     .{

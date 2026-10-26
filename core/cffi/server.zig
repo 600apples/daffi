@@ -16,8 +16,9 @@ const HandlerMode = handlers.HandlerMode;
 
 const allocator = std.heap.c_allocator;
 
-/// Bind every listener at once, start accepting on all of them and return the
-/// server's single handle (conn_num).  `listeners` is a non-empty list of
+/// Bind every listener at once and return the server's single handle
+/// (conn_num).  Accepting starts later, from `beginAccepting`.  `listeners`
+/// is a non-empty list of
 /// address tuples; a Unix socket is (path, 0).  mode: 0 = Router, 1 = Service.
 ///
 /// Each listener is either `(host, port)` (plaintext),
@@ -118,6 +119,20 @@ fn raiseListenerError(reason: [*:0]const u8, index: usize) void {
     const value = Py_BuildValue("(sn)", reason, @as(py.Py_ssize_t, @intCast(index))) orelse return;
     py.PyErr_SetObject(py.PyExc_ValueError, value);
     py.Py_DECREF(value);
+}
+
+/// Start accepting on every listener of a server that `startServer` bound.
+pub fn beginAccepting(_: [*c]PyObject, args: [*c]PyObject) callconv(.c) [*c]PyObject {
+    var conn_num: usize = undefined;
+    if (PyArg_ParseTuple(args, "k", &conn_num) == 0) return null;
+    const py_state = py.PyEval_SaveThread();
+    Server.beginAccepting(conn_num) catch |err| {
+        py.PyEval_RestoreThread(py_state);
+        PyErr_SetString(py.PyExc_ValueError, @errorName(err));
+        return null;
+    };
+    py.PyEval_RestoreThread(py_state);
+    return Py_BuildValue("");
 }
 
 /// Stop the server identified by conn_num and release every native resource

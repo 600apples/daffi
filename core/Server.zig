@@ -397,11 +397,10 @@ pub fn setServiceRequestFd(conn_num: usize, fd: i32) void {
     }
 }
 
-/// Bind every listener in `configs`, start accepting on all of them at once
-/// and return the server's single handle (conn_num).  All or nothing: if one
-/// listener cannot be bound, none stays bound and `failed` holds its index.
-/// Accepting runs on one thread or one event loop depending on the execution
-/// model; either way the server is fully usable once this returns.
+/// Bind every listener in `configs` and return the server's single handle
+/// (conn_num).  All or nothing: if one listener cannot be bound, none stays
+/// bound and `failed` holds its index.  Sockets are not accepting yet;
+/// `beginAccepting` starts them all at once.
 pub fn start(allocator: Allocator, mode: HandlerMode, app_name: []const u8, configs: []const ServerConnection.Config, failed: *?usize) !usize {
     failed.* = null;
     return startImpl(allocator, mode, app_name, configs, failed) catch |err| {
@@ -456,10 +455,10 @@ fn startImpl(allocator: Allocator, mode: HandlerMode, app_name_arg: []const u8, 
         break :blk created;
     };
     errdefer rt.deinit();
-    // Must stay the last step that can fail: once it succeeds peers connect,
-    // and only `stop` may free the runtime under them.
-    try rt.startAccepting();
-
+    // Publish the slot before anyone can connect.  Accepting starts later,
+    // from `beginAccepting`, once a Service has installed its task fd and
+    // advertised its callbacks.  A client that connected in between would
+    // otherwise finish the handshake with an empty method list.
     {
         slots_mutex.lock();
         defer slots_mutex.unlock();
@@ -1099,6 +1098,15 @@ pub fn sendMessage(data: []const u8, uuid: u16, flag: MessageFlag, decoder: Mess
 
 pub fn getMessageForServerWorker(conn_num: usize) !?*Message {
     return try (try getEntry(conn_num)).getMessageForServerWorkerServerEntry();
+}
+
+/// Start accepting on every listener.  Call once, after a Service has set
+/// its request fd and callback list, so the first handshake already carries
+/// those callbacks.
+pub fn beginAccepting(conn_num: usize) !void {
+    const rt = (try getEntry(conn_num)).runtime;
+    if (rt.acceptor != null) return;
+    try rt.startAccepting();
 }
 
 pub fn setServiceMethods(methods: []const u8, conn_num: usize) !void {

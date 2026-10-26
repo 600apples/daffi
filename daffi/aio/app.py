@@ -122,9 +122,12 @@ class AsyncServerMixin:
             self.logger.debug(
                 f"has been started successfully. connection info: {self.info}"
             )
-            self._register_executors()
             if self.server_mode == ServerMode.SERVICE:
                 self._task_dispatcher.start_for_connection(self)
+                RpcProxy._advertise_service_methods(self._conn_num)
+            dfcore.beginAccepting(self._conn_num)
+            self._register_executors()
+            if self.server_mode == ServerMode.SERVICE:
                 RpcProxy._process_service_handshake(self._conn_num)
         except BaseException:
             await self._abort_start()
