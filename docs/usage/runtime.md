@@ -5,8 +5,8 @@ daffi's native core, the part written in Zig that owns the sockets of every
 
 | Model | How connections are served | Native threads |
 |---|---|---|
-| `evented` (default) | All connections are multiplexed over a few event-loop threads (kqueue on macOS, epoll on Linux). Incoming bytes are decoded as they arrive. | One per CPU by default (capped at 64), however many connections there are. |
-| `threads` | Every connection gets its own OS thread that blocks on reads. | One per connection, plus one per server. |
+| `threads` (default) | Every connection gets its own OS thread that blocks on reads. | One per connection, plus one per server. |
+| `evented` | All connections are multiplexed over a few event-loop threads (kqueue on macOS, epoll on Linux). Incoming bytes are decoded as they arrive. | One per CPU by default (capped at 64), however many connections there are. |
 
 Zig documents the same kind of split as **`Io.Threaded`** (blocking I/O on OS
 threads) vs **`Io.Evented`** (multiplexed / userspace scheduling) in
@@ -34,7 +34,7 @@ the same in both models.
 
 The runtime is selected **once per process**, by the `runtime` argument of
 any `Router`, `Service`, or `Client`. A client uses the same runtime as a
-server. Omit it, or pass `None`, and that node selects `evented`. A later
+server. Omit it, or pass `None`, and that node selects `threads`. A later
 node that asks for the other runtime raises `InitializationError`.
 
 ```python
@@ -44,7 +44,7 @@ from daffi import Runtime, Service, callback, TCPTransport
 def echo(x):
     return x
 
-# evented is the default — pass runtime= only to force threads
+# threads is the default — pass runtime= only to force evented
 svc = Service(
     app_name="echo",
     transport=TCPTransport("0.0.0.0", 6000),
@@ -63,7 +63,7 @@ print(dfcore.getRuntime())   # "evented" or "threads"
 
 | Argument | Values | Default |
 |---|---|---|
-| `runtime` | `Runtime.EVENTED`, `Runtime.THREADS` (or `"evented"`, `"threads"`) | `evented` |
+| `runtime` | `Runtime.THREADS`, `Runtime.EVENTED` (or `"threads"`, `"evented"`) | `threads` |
 | `DAFFI_EVENT_LOOPS` | number of event-loop threads, 1–64 | CPU count (capped at 64) |
 
 A value other than those two strings raises `InitializationError`. A process
@@ -106,10 +106,10 @@ two columns is what matters.
 
 ### Speed
 
-One caller, sending calls one after another, is faster with `threads`. That
-covers Client → Service and Client → Router → one worker. Many clients calling
-**one Service at the same time** are faster with `evented`. There is no Router
-in that scenario: every client connects straight to the Service.
+`threads` is faster for one caller and for many clients calling **one Service
+at the same time**. The single-caller rows are Client → Service and Client →
+Router → one worker. The concurrent rows have no Router: every client connects
+straight to the Service.
 
 `python tests/perf/runtime_benchmark.py` prints this split. Its `direct` and
 `via router` rows are the single sequential caller. Its `concurrent` rows are
@@ -150,24 +150,10 @@ idle threaded one.
 
 ## When to use which
 
-**`evented` (the default) fits when:**
+**`threads` (the default) fits when:**
 
-- Many clients call the **same Service at the same time**. Throughput is
-  higher, and the Service stays at a few native threads instead of one per
-  client.
-- A `Router` or `Service` serves **many connections at once**: hundreds or
-  thousands of clients or workers.
-- Most connections are **idle most of the time**, e.g. many workers waiting
-  for occasional tasks, or many long-lived clients that call rarely.
-- The process runs under a **thread or memory limit**, e.g. containers with a
-  low `pids` limit or small memory requests, where a thread per connection
-  does not fit.
-- One process opens **many `Client` connections** (e.g. to many services).
-
-**Prefer `threads` when:**
-
-- **One caller** sends calls one after another, either straight to a Service
-  or through a Router to a worker. That path is often faster with `threads`.
+- You want the faster path. One caller and many clients calling one Service
+  are both faster with `threads`.
 - There are only a **few connections**.
 - Peers may be **slow to read what they are sent**, e.g. large messages or
   streams to clients on slow or distant networks. In the evented model a
@@ -177,6 +163,16 @@ idle threaded one.
   only that one connection waits.
 - Most clients are **browsers (WebSocket)**. WebSocket sessions keep a
   dedicated thread in both models, so `evented` saves nothing for them.
+
+**Prefer `evented` when:**
+
+- A `Router` or `Service` serves **many connections at once** and one thread
+  per connection does not fit: hundreds or thousands of clients or workers.
+- Most connections are **idle most of the time**, e.g. many workers waiting
+  for occasional tasks, or many long-lived clients that call rarely.
+- The process runs under a **thread or memory limit**, e.g. containers with a
+  low `pids` limit or small memory requests.
+- One process opens **many `Client` connections** (e.g. to many services).
 
 !!! tip
     If you are unsure, keep the default. Switch a `Router` or `Service` to

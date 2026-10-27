@@ -11,6 +11,9 @@ pub const setServiceRequestFd       = @import("cffi/server.zig").setServiceReque
 
 // --- client functions ---
 pub const setLogLevel               = @import("cffi/client.zig").setLogLevel;
+pub const acquireDescriptors        = @import("cffi/client.zig").acquireDescriptors;
+pub const releaseDescriptors        = @import("cffi/client.zig").releaseDescriptors;
+pub const bumpFileLimit             = @import("cffi/client.zig").bumpFileLimit;
 pub const getRuntime         = @import("cffi/client.zig").getRuntime;
 pub const setRuntime         = @import("cffi/client.zig").setRuntime;
 pub const startClient               = @import("cffi/client.zig").startClient;

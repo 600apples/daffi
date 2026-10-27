@@ -17,11 +17,60 @@ Pass ``pipe=True`` whenever the channel must carry arbitrary data bytes
 
 from __future__ import annotations
 
+import errno
 import fcntl
 import os
 from enum import Enum
 
 _HAS_EVENTFD = hasattr(os, "eventfd")
+
+
+def note_descriptors(delta: int) -> None:
+    """Add *delta* to the process-wide descriptor count.
+
+    Positive when descriptors are opened, negative when they are closed.
+    The count and the soft limit both live in the native core and move
+    atomically. When fewer than 100 descriptors remain under the stored
+    limit, that limit doubles.
+    """
+    if delta == 0:
+        return
+    from . import dfcore
+
+    if delta > 0:
+        dfcore.acquireDescriptors(delta)
+    else:
+        dfcore.releaseDescriptors(-delta)
+
+
+def _bump_file_limit() -> bool:
+    """Double the stored soft limit after an open failed with EMFILE."""
+    from . import dfcore
+
+    return bool(dfcore.bumpFileLimit())
+
+
+def _channel_fds(*, pipe: bool) -> int:
+    """How many descriptors :func:`_open_channel` creates."""
+    return 1 if _HAS_EVENTFD and not pipe else 2
+
+
+def _open_channel(*, pipe: bool) -> tuple[int, int, bool]:
+    """Return ``(read_fd, write_fd, is_eventfd)``.
+
+    Retries once after doubling the open-file limit. ``os.pipe`` allocates
+    both ends in one call, so a failure leaves nothing open.
+    """
+    for attempt in range(2):
+        try:
+            if _HAS_EVENTFD and not pipe:
+                fd = os.eventfd(0, os.EFD_NONBLOCK)
+                return fd, fd, True
+            read_fd, write_fd = os.pipe()
+            return read_fd, write_fd, False
+        except OSError as exc:
+            if exc.errno != errno.EMFILE or attempt or not _bump_file_limit():
+                raise
 
 
 class LifecycleSignal(bytes, Enum):
@@ -64,28 +113,30 @@ class WakeupFd:
               the lifecycle disconnect-reason byte written by Zig).
     """
 
-    __slots__ = ("read_fd", "write_fd", "_is_eventfd")
+    __slots__ = ("read_fd", "write_fd", "_is_eventfd", "_tracked")
 
     def __init__(self, *, pipe: bool = False) -> None:
-        if _HAS_EVENTFD and not pipe:
-            # EFD_NONBLOCK — writes from Zig never block; drain from Python is
-            # also non-blocking (so a second concurrent drainer that lost the
-            # race just sees EAGAIN instead of hanging).
-            fd = os.eventfd(0, os.EFD_NONBLOCK)
-            self.read_fd: int = fd
-            self.write_fd: int = fd  # same fd for eventfd
-            self._is_eventfd = True
-        else:
-            r, w = os.pipe()
-            # Both ends non-blocking: write so Zig is never stalled, read so
-            # multiple Python waiters racing to drain don't block when the
-            # signal has already been consumed by another waiter.
-            for fd in (r, w):
-                flags = fcntl.fcntl(fd, fcntl.F_GETFL)
-                fcntl.fcntl(fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
-            self.read_fd = r
-            self.write_fd = w
-            self._is_eventfd = False
+        count = _channel_fds(pipe=pipe)
+        note_descriptors(count)
+        try:
+            read_fd, write_fd, is_eventfd = _open_channel(pipe=pipe)
+        except BaseException:
+            note_descriptors(-count)
+            raise
+        self.read_fd: int = read_fd
+        self.write_fd: int = write_fd  # same fd for eventfd
+        self._is_eventfd = is_eventfd
+        self._tracked = count
+        if is_eventfd:
+            # EFD_NONBLOCK is set at creation. Writes from Zig never block,
+            # and a second Python drainer that lost the race sees EAGAIN.
+            return
+        # Both ends non-blocking: write so Zig is never stalled, read so
+        # multiple Python waiters racing to drain don't block when the
+        # signal has already been consumed by another waiter.
+        for fd in (read_fd, write_fd):
+            flags = fcntl.fcntl(fd, fcntl.F_GETFL)
+            fcntl.fcntl(fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
 
     # ------------------------------------------------------------------
     # Signal / drain helpers (counter / notification semantics)
@@ -160,6 +211,9 @@ class WakeupFd:
         except OSError:
             pass
         self.write_fd = -1
+        if self._tracked:
+            self._tracked -= 1
+            note_descriptors(-1)
 
     def close(self) -> None:
         """Release both ends of the channel."""
@@ -172,3 +226,8 @@ class WakeupFd:
                 os.close(self.write_fd)
             except OSError:
                 pass
+            self.write_fd = -1
+        tracked = self._tracked
+        self._tracked = 0
+        if tracked:
+            note_descriptors(-tracked)

@@ -24,7 +24,7 @@ from daffi._rpc_proxy import (
     system_exception_handler,
 )
 from daffi._signals import set_signal_handler
-from daffi._task_dispatcher import TaskDispatcher
+from daffi._task_dispatcher import TaskDispatcher, shared_dispatcher
 from daffi.registry._executor_registry import EXECUTOR_REGISTRY
 from daffi.transports import (
     TCPTransport,
@@ -223,9 +223,9 @@ class Application(EventsMixin, ABC):
                            :class:`Router` which never executes callbacks
                            itself.
             runtime:       Native runtime for this process,
-                           :attr:`Runtime.EVENTED` (default) or
-                           :attr:`Runtime.THREADS`.  Omitting it, or passing
-                           ``None``, selects evented.  A Client, Router, and
+                           :attr:`Runtime.THREADS` (default) or
+                           :attr:`Runtime.EVENTED`.  Omitting it, or passing
+                           ``None``, selects threads.  A Client, Router, and
                            Service in one process share this choice; a
                            conflicting value raises
                            :class:`InitializationError`.
@@ -243,7 +243,7 @@ class Application(EventsMixin, ABC):
         if not getattr(self, "_transports", None):
             raise InitializationError("transport is required")
         if runtime is None:
-            runtime = Runtime.EVENTED
+            runtime = Runtime.THREADS
         self.runtime = _coerce_runtime(runtime)
         try:
             dfcore.setRuntime(self.runtime.value)
@@ -455,8 +455,7 @@ class ServerMixin:
                 # Start the worker-thread pool before native I/O threads are
                 # created.  Threads idle harmlessly until work arrives.
                 if not self._task_dispatcher:
-                    self._task_dispatcher = TaskDispatcher(workers=self.workers)
-                self._task_dispatcher._start_workers()
+                    self._task_dispatcher = shared_dispatcher()
             self._conn_num = self._add_native_listeners()
             self.logger.debug(
                 f"has been started successfully. connection info: {self.info}"
@@ -608,22 +607,27 @@ class Client(Application[SingleTransportMixin]):
         Its poller thread monitors both task-arrival fds and the lifecycle fd
         so no separate watcher thread is needed.
         """
-        # Always create the dispatcher so the poller thread runs unconditionally,
-        # even when no @callback functions are registered on this client.
+        # One shared poller for every client in this process. Callback
+        # threads, if this client asked for them, start with the connection
+        # and serve only this client.
         if self._task_dispatcher is None:
-            self._task_dispatcher = TaskDispatcher(workers=self.workers)
-        self._task_dispatcher._start_workers()
+            self._task_dispatcher = shared_dispatcher()
 
         t = self.transport
-        self._conn_num = dfcore.startClient(
-            t.native_host,
-            t.native_port,
-            self.app_name,
-            t.tls,
-            t.ca,
-            t.cert,
-            t.key,
-        )
+        try:
+            self._conn_num = dfcore.startClient(
+                t.native_host,
+                t.native_port,
+                self.app_name,
+                t.tls,
+                t.ca,
+                t.cert,
+                t.key,
+            )
+        except Exception as exc:
+            raise InitializationError(
+                f"Failed to connect to the server: {exc}. connection info: {self.info}"
+            ) from exc
         if self._conn_num is None:
             raise InitializationError(
                 f"Failed to connect to the server. connection info: {self.info}"
@@ -648,7 +652,7 @@ class Client(Application[SingleTransportMixin]):
                 pass
             self._conn_num = None
             raise InitializationError(
-                f"Failed to connect to the server. connection info: {self.info}"
+                f"Failed to connect to the server: {exc}. connection info: {self.info}"
             ) from exc
         self._conn_type = handshake["meta"]["type"]
         self.logger.debug(
@@ -679,8 +683,8 @@ class Client(Application[SingleTransportMixin]):
                 self._stop_event.clear()
                 self._connection_error = None
                 self._disconnected = False
-                # Force a fresh dispatcher + poller thread; the old one has
-                # already exited because stop_event was set during teardown.
+                # Drop our handle. The process-wide poller restarts on the
+                # next connect if this was the last connection using it.
                 self._task_dispatcher = None
                 self._do_connect()
                 return True

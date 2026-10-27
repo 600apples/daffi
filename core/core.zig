@@ -128,9 +128,10 @@ const client_methods = [_]PyMethodDef{
         .ml_meth  = cffi.startClient,
         .ml_flags = 1,
         .ml_doc   =
-            \\startClient(host, port, app_name, tls, ca, cert, key) -> int | None
+            \\startClient(host, port, app_name, tls, ca, cert, key) -> int
             \\
-            \\Open a TCP connection and return a conn_num handle, or None on failure.
+            \\Open a TCP connection and return a conn_num handle.
+            \\Raises OSError with the native error name and OS errno on failure.
             \\
             \\  tls  - True to enable TLS
             \\  ca   - path or PEM for the CA used to verify the server; empty
@@ -256,6 +257,37 @@ const client_methods = [_]PyMethodDef{
 // ── Logging / utility methods ─────────────────────────────────────────────────
 const util_methods = [_]PyMethodDef{
     .{
+        .ml_name  = "acquireDescriptors",
+        .ml_meth  = cffi.acquireDescriptors,
+        .ml_flags = 1,
+        .ml_doc   =
+            \\acquireDescriptors(n: int) -> None
+            \\
+            \\Count n more open descriptors. When the stored count passes the
+            \\stored soft limit, that limit doubles.
+        ,
+    },
+    .{
+        .ml_name  = "releaseDescriptors",
+        .ml_meth  = cffi.releaseDescriptors,
+        .ml_flags = 1,
+        .ml_doc   =
+            \\releaseDescriptors(n: int) -> None
+            \\
+            \\Count n fewer open descriptors.
+        ,
+    },
+    .{
+        .ml_name  = "bumpFileLimit",
+        .ml_meth  = cffi.bumpFileLimit,
+        .ml_flags = 4,
+        .ml_doc   =
+            \\bumpFileLimit() -> int
+            \\
+            \\Double the stored soft open-file limit once. 1 if it moved.
+        ,
+    },
+    .{
         .ml_name  = "setLogLevel",
         .ml_meth  = cffi.setLogLevel,
         .ml_flags = 1,
@@ -284,7 +316,7 @@ const util_methods = [_]PyMethodDef{
             \\Runtime of the native core: "threads" (an OS thread per
             \\connection) or "evented" (connections multiplexed over a few
             \\event-loop threads).  Chosen once per process by setRuntime.
-            \\The default, when setRuntime was not called, is "evented".
+            \\The default, when setRuntime was not called, is "threads".
             \\DAFFI_EVENT_LOOPS sets the number of loop threads.
         ,
     },

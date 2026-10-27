@@ -55,8 +55,19 @@ pub fn init(allocator: Allocator, config: Config) !*ClientConnection {
     const stream = if (std.mem.indexOfScalar(u8, config.host, '/') != null)
         try net.connectUnixSocket(config.host)
     else
-        net.tcpConnectToHost(allocator, config.host, config.port) catch blk: {
-            break :blk try net.connectUnixSocket(config.host);
+        net.tcpConnectToHost(allocator, config.host, config.port) catch |tcp_err| blk: {
+            // A Unix-socket fallback runs next and would replace the TCP
+            // errno (EMFILE, ECONNREFUSED, timeout) with its own. Keep the
+            // TCP reason for the Python traceback when the fallback fails.
+            var saved: [160]u8 = undefined;
+            const detail = net.connectFailure();
+            const n = @min(detail.len, saved.len);
+            @memcpy(saved[0..n], detail[0..n]);
+            const unix_stream = net.connectUnixSocket(config.host) catch {
+                if (n > 0) net.setConnectFailure(saved[0..n]);
+                return tcp_err;
+            };
+            break :blk unix_stream;
         };
     errdefer stream.close();
 

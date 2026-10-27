@@ -117,6 +117,79 @@ pub fn setNonBlocking(fd: c_int) void {
 }
 
 const std = @import("std");
+const nofile = @import("../nofile.zig");
+
+/// Last connect/listen/accept failure on this thread. `Client.init` fails
+/// with a coarse Zig error (`ConnectionRefused`, `SocketCreateFailed`); the
+/// OS reason (EMFILE, ECONNREFUSED, timeout) lives here so Python can put it
+/// in the traceback. Cleared at the start of each attempt.
+threadlocal var fail_buf: [160]u8 = undefined;
+threadlocal var fail_len: usize = 0;
+
+pub fn noteOsFailure(what: []const u8) void {
+    noteErrno(what);
+}
+
+fn noteErrno(what: []const u8) void {
+    noteCode(what, std.c._errno().*);
+}
+
+fn noteCode(what: []const u8, code: c_int) void {
+    const label = errnoLabel(code);
+    const msg = if (label.len == 0)
+        std.fmt.bufPrint(&fail_buf, "{s}: errno {d}", .{ what, code }) catch what
+    else
+        std.fmt.bufPrint(&fail_buf, "{s}: {s} (errno {d})", .{ what, label, code }) catch what;
+    fail_len = msg.len;
+}
+
+fn noteLiteral(text: []const u8) void {
+    const n = @min(text.len, fail_buf.len);
+    @memcpy(fail_buf[0..n], text[0..n]);
+    fail_len = n;
+}
+
+fn errnoLabel(code: c_int) []const u8 {
+    return switch (code) {
+        1 => "EPERM",
+        2 => "ENOENT",
+        12 => "ENOMEM",
+        13 => "EACCES",
+        22 => "EINVAL",
+        23 => "ENFILE",
+        24 => "EMFILE",
+        28 => "ENOSPC",
+        32 => "EPIPE",
+        48, 98 => "EADDRINUSE",
+        49, 99 => "EADDRNOTAVAIL",
+        54, 104 => "ECONNRESET",
+        55, 105 => "ENOBUFS",
+        60, 110 => "ETIMEDOUT",
+        61, 111 => "ECONNREFUSED",
+        64, 112 => "EHOSTDOWN",
+        65, 113 => "EHOSTUNREACH",
+        101 => "ENETUNREACH",
+        else => "",
+    };
+}
+
+pub fn connectFailure() []const u8 {
+    return fail_buf[0..fail_len];
+}
+
+pub fn clearConnectFailure() void {
+    fail_len = 0;
+}
+
+pub fn setConnectFailure(text: []const u8) void {
+    const n = @min(text.len, fail_buf.len);
+    @memcpy(fail_buf[0..n], text[0..n]);
+    fail_len = n;
+}
+
+fn isFileLimit(code: c_int) bool {
+    return code == 23 or code == 24;
+}
 const posix = std.posix;
 const Allocator = std.mem.Allocator;
 
@@ -259,12 +332,33 @@ pub const Stream = struct {
     pub fn close(self: Stream) void {
         self.shutdown();
         _ = c.close(self.handle);
+        nofile.release(1);
     }
 };
 
 /// Maximum time (ms) to wait for a TCP connect() to complete.
 /// Overrides the kernel's default retransmission timeout (~75 s on Linux).
 const CONNECT_TIMEOUT_MS: c_int = 15_000;
+
+/// Open a socket, counting it before the syscall so the soft limit grows
+/// first. If the kernel still returns EMFILE/ENFILE (descriptors this
+/// counter does not own), double the limit once and retry.
+fn openSocket(family: c_int, socktype: c_int, protocol: c_int) !c_int {
+    var grew = false;
+    while (true) {
+        nofile.acquire(1);
+        const fd = c.socket(family, socktype, protocol);
+        if (fd >= 0) return fd;
+        const err = std.c._errno().*;
+        nofile.release(1);
+        if (!grew and isFileLimit(err) and nofile.bump()) {
+            grew = true;
+            continue;
+        }
+        noteCode("socket", err);
+        return error.SocketCreateFailed;
+    }
+}
 
 pub fn tcpConnectToHost(_: Allocator, host: []const u8, port: u16) !Stream {
     var port_buf: [8]u8 = undefined;
@@ -279,14 +373,20 @@ pub fn tcpConnectToHost(_: Allocator, host: []const u8, port: u16) !Stream {
     @memcpy(host_buf[0..host.len], host);
     host_buf[host.len] = 0;
 
+    clearConnectFailure();
     var res: ?*c.addrinfo = null;
-    if (c.getaddrinfo(&host_buf, port_str.ptr, &hints, &res) != 0) return error.UnknownHostName;
+    const gai = c.getaddrinfo(&host_buf, port_str.ptr, &hints, &res);
+    if (gai != 0) {
+        var gai_buf: [48]u8 = undefined;
+        const text = std.fmt.bufPrint(&gai_buf, "getaddrinfo failed ({d})", .{gai}) catch "getaddrinfo failed";
+        noteLiteral(text);
+        return error.UnknownHostName;
+    }
     defer if (res) |r| c.freeaddrinfo(r);
 
     var it = res;
     while (it) |rp| : (it = rp.ai_next) {
-        const fd = c.socket(rp.ai_family, rp.ai_socktype, rp.ai_protocol);
-        if (fd < 0) continue;
+        const fd = openSocket(rp.ai_family, rp.ai_socktype, rp.ai_protocol) catch continue;
         setCloexec(fd);
 
         // Switch to non-blocking so connect() returns immediately instead of
@@ -299,6 +399,7 @@ pub fn tcpConnectToHost(_: Allocator, host: []const u8, port: u16) !Stream {
             // Rare fast path: connected synchronously (e.g. loopback).
             _ = fcntl(fd, F_SETFL, orig_flags);
             applyKeepalive(fd);
+            clearConnectFailure();
             return Stream{ .handle = fd };
         }
 
@@ -310,8 +411,10 @@ pub fn tcpConnectToHost(_: Allocator, host: []const u8, port: u16) !Stream {
         var pfd = PollFd{ .fd = fd, .events = POLLOUT, .revents = 0 };
         const nready = poll(@as([*]PollFd, @ptrCast(&pfd)), 1, CONNECT_TIMEOUT_MS);
         if (nready <= 0) {
-            // 0 = timeout, -1 = poll error.
+            // 0 = timeout, -1 = poll error. Record it before close().
+            if (nready < 0) noteErrno("poll") else noteLiteral("connect: timed out");
             _ = c.close(fd);
+            nofile.release(1);
             continue;
         }
 
@@ -320,13 +423,16 @@ pub fn tcpConnectToHost(_: Allocator, host: []const u8, port: u16) !Stream {
         var so_len: c.socklen_t = @sizeOf(c_int);
         _ = c.getsockopt(fd, c.SOL_SOCKET, c.SO_ERROR, &so_err, &so_len);
         if (so_err != 0) {
+            noteCode("connect", so_err);
             _ = c.close(fd);
+            nofile.release(1);
             continue;
         }
 
         // Restore blocking mode for normal send/recv I/O.
         _ = fcntl(fd, F_SETFL, orig_flags);
         applyKeepalive(fd);
+        clearConnectFailure();
         return Stream{ .handle = fd };
     }
     return error.ConnectionRefused;
@@ -338,14 +444,16 @@ pub fn connectUnixSocket(path: []const u8) !Stream {
     if (path.len >= sun.sun_path.len) return error.NameTooLong;
     @memcpy(sun.sun_path[0..path.len], path);
 
-    const fd = c.socket(c.AF_UNIX, c.SOCK_STREAM, 0);
-    if (fd < 0) return error.SocketCreateFailed;
+    const fd = openSocket(c.AF_UNIX, c.SOCK_STREAM, 0) catch return error.SocketCreateFailed;
     setCloexec(fd);
 
     if (c.connect(fd, @ptrCast(&sun), @sizeOf(c.sockaddr_un)) != 0) {
+        noteErrno("connect");
         _ = c.close(fd);
+        nofile.release(1);
         return error.ConnectionRefused;
     }
+    clearConnectFailure();
     return Stream{ .handle = fd };
 }
 
@@ -422,46 +530,62 @@ pub const Server = struct {
         if (n == 0) return error.Timeout;
         if (n < 0) {
             if (Stream.lastErrno() == .INTR) return error.Timeout;
+            noteErrno("poll");
             return error.AcceptError;
         }
         return self.accept();
     }
 
     pub fn accept(self: *Server) !ServerConn {
-        var addr_storage: c.sockaddr_storage = std.mem.zeroes(c.sockaddr_storage);
-        var addr_len: c.socklen_t = @sizeOf(c.sockaddr_storage);
-        const fd = c.accept(self.handle, @ptrCast(&addr_storage), &addr_len);
-        if (fd < 0) {
-            return switch (Stream.lastErrno()) {
-                .INTR, .CONNABORTED, .AGAIN => error.Timeout,
-                else => error.AcceptError,
-            };
-        }
-        setCloexec(fd);
-        applyKeepalive(fd);
+        var grew = false;
+        while (true) {
+            var addr_storage: c.sockaddr_storage = std.mem.zeroes(c.sockaddr_storage);
+            var addr_len: c.socklen_t = @sizeOf(c.sockaddr_storage);
+            nofile.acquire(1);
+            const fd = c.accept(self.handle, @ptrCast(&addr_storage), &addr_len);
+            if (fd < 0) {
+                const err = std.c._errno().*;
+                nofile.release(1);
+                if (!grew and isFileLimit(err) and nofile.bump()) {
+                    grew = true;
+                    continue;
+                }
+                noteCode("accept", err);
+                return switch (Stream.lastErrno()) {
+                    .INTR, .CONNABORTED, .AGAIN => error.Timeout,
+                    else => error.AcceptError,
+                };
+            }
+            setCloexec(fd);
+            applyKeepalive(fd);
 
-        var addr = Address{ .family = addr_storage.ss_family };
-        const copy_len = @min(@sizeOf(Address), addr_len);
-        @memcpy(addr.bytes[0..copy_len], std.mem.asBytes(&addr_storage)[0..copy_len]);
-        if (addr_storage.ss_family == c.AF_INET) {
-            const sa4: *const c.sockaddr_in = @ptrCast(&addr_storage);
-            addr.port = std.mem.bigToNative(u16, sa4.sin_port);
-        } else if (addr_storage.ss_family == c.AF_INET6) {
-            const sa6: *const c.sockaddr_in6 = @ptrCast(&addr_storage);
-            addr.port = std.mem.bigToNative(u16, sa6.sin6_port);
+            var addr = Address{ .family = addr_storage.ss_family };
+            const copy_len = @min(@sizeOf(Address), addr_len);
+            @memcpy(addr.bytes[0..copy_len], std.mem.asBytes(&addr_storage)[0..copy_len]);
+            if (addr_storage.ss_family == c.AF_INET) {
+                const sa4: *const c.sockaddr_in = @ptrCast(&addr_storage);
+                addr.port = std.mem.bigToNative(u16, sa4.sin_port);
+            } else if (addr_storage.ss_family == c.AF_INET6) {
+                const sa6: *const c.sockaddr_in6 = @ptrCast(&addr_storage);
+                addr.port = std.mem.bigToNative(u16, sa6.sin6_port);
+            }
+            return ServerConn{ .stream = .{ .handle = fd }, .address = addr };
         }
-        return ServerConn{ .stream = .{ .handle = fd }, .address = addr };
     }
 
     pub fn deinit(self: *Server) void {
         _ = c.close(self.handle);
+        nofile.release(1);
     }
 };
 
 fn listenOn(addr: *const Address, options: ListenOptions) !Server {
     const family: c_int = @intCast(addr.family);
-    const fd = c.socket(family, c.SOCK_STREAM, 0);
-    if (fd < 0) return error.SocketCreateFailed;
+    const fd = openSocket(family, c.SOCK_STREAM, 0) catch return error.SocketCreateFailed;
+    errdefer {
+        _ = c.close(fd);
+        nofile.release(1);
+    }
     setCloexec(fd);
 
     if (options.reuse_address) {
@@ -478,12 +602,13 @@ fn listenOn(addr: *const Address, options: ListenOptions) !Server {
     };
 
     if (c.bind(fd, sa, sa_len) != 0) {
-        _ = c.close(fd);
+        noteErrno("bind");
         return error.AddressInUse;
     }
     if (c.listen(fd, options.kernel_backlog) != 0) {
-        _ = c.close(fd);
+        noteErrno("listen");
         return error.ListenError;
     }
+    clearConnectFailure();
     return Server{ .handle = fd, .listen_address = addr.* };
 }

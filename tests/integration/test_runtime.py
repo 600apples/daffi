@@ -106,13 +106,13 @@ def test_constructor_locks_evented():
     assert result.returncode == 0 and "OK" in result.stdout, result.stdout + result.stderr
 
 
-def test_omitted_runtime_is_evented():
+def test_omitted_runtime_is_threads():
     result = _run_fresh(
         """
         from daffi import Runtime, Service, TCPTransport, dfcore
         svc = Service(transport=TCPTransport("127.0.0.1", 1))
-        assert svc.runtime is Runtime.EVENTED
-        assert dfcore.getRuntime() == "evented"
+        assert svc.runtime is Runtime.THREADS
+        assert dfcore.getRuntime() == "threads"
         print("OK")
         """
     )

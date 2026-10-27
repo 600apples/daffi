@@ -12,6 +12,7 @@
 
 const std = @import("std");
 const misc = @import("../misc.zig");
+const nofile = @import("../nofile.zig");
 const Poller = @import("Poller.zig");
 
 const EventLoop = @This();
@@ -54,10 +55,15 @@ pub fn start(allocator: std.mem.Allocator) !*EventLoop {
     var poller = try Poller.init();
     errdefer poller.deinit();
     var fds: [2]c.fd_t = undefined;
-    if (c.pipe(&fds) != 0) return error.PipeFailed;
+    nofile.acquire(2);
+    if (c.pipe(&fds) != 0) {
+        nofile.release(2);
+        return error.PipeFailed;
+    }
     errdefer {
         _ = c.close(fds[0]);
         _ = c.close(fds[1]);
+        nofile.release(2);
     }
     for (fds) |fd| {
         _ = c.fcntl(fd, c.F.SETFD, @as(c_int, c.FD_CLOEXEC));

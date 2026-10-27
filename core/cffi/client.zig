@@ -12,12 +12,14 @@ const handlers = @import("../handlers.zig");
 const MessageFlag = serde.MessageFlag;
 const MessageDecoder = serde.MessageDecoder;
 const Client = @import("../Client.zig");
+const net = @import("../network/posix_net.zig");
 const HandlerMode = handlers.HandlerMode;
 
 const allocator = std.heap.c_allocator;
 
 /// Open a TCP connection to host:port and return a connection handle (conn_num).
-/// Returns the Python None object on failure.
+/// On failure sets OSError to the Zig error name plus the OS reason, when one
+/// was recorded, and returns null.
 pub fn startClient(_: [*c]PyObject, args: [*c]PyObject) callconv(.c) [*c]PyObject {
     var host: [*:0]u8 = undefined;
     var port: c_long = undefined;
@@ -41,8 +43,26 @@ pub fn startClient(_: [*c]PyObject, args: [*c]PyObject) callconv(.c) [*c]PyObjec
     const conn_num = Client.init(allocator, papp_name, .{
         .host = phost, .port = pport,
         .tls = ptls, .ca = pca, .cert = pcert, .key = pkey,
-    }) catch return Py_BuildValue("");
+    }) catch |err| return raiseConnectError(err);
     return Py_BuildValue("k", @as(c_ulong, conn_num));
+}
+
+fn raiseConnectError(err: anyerror) [*c]PyObject {
+    var buf: [256]u8 = undefined;
+    const detail = net.connectFailure();
+    const text = if (detail.len == 0)
+        std.fmt.bufPrint(buf[0 .. buf.len - 1], "{s}", .{@errorName(err)}) catch {
+            PyErr_SetString(py.PyExc_OSError, @errorName(err));
+            return null;
+        }
+    else
+        std.fmt.bufPrint(buf[0 .. buf.len - 1], "{s} ({s})", .{ @errorName(err), detail }) catch {
+            PyErr_SetString(py.PyExc_OSError, @errorName(err));
+            return null;
+        };
+    buf[text.len] = 0;
+    PyErr_SetString(py.PyExc_OSError, buf[0..text.len :0].ptr);
+    return null;
 }
 
 /// Close the connection identified by conn_num and free all associated resources.
@@ -241,6 +261,25 @@ pub fn setResponseFd(_: [*c]PyObject, args: [*c]PyObject) callconv(.c) [*c]PyObj
 /// level values: 0=DEBUG  1=INFO  2=WARNING  3=ERROR  4=OFF (default, silent)
 ///
 /// setLogLevel(level: int) -> None
+pub fn acquireDescriptors(_: [*c]PyObject, args: [*c]PyObject) callconv(.c) [*c]PyObject {
+    var n: c_long = 0;
+    if (!(py.PyArg_ParseTuple(args, "l", &n) != 0)) return Py_BuildValue("");
+    if (n > 0) @import("../nofile.zig").acquire(@intCast(n));
+    return Py_BuildValue("");
+}
+
+pub fn releaseDescriptors(_: [*c]PyObject, args: [*c]PyObject) callconv(.c) [*c]PyObject {
+    var n: c_long = 0;
+    if (!(py.PyArg_ParseTuple(args, "l", &n) != 0)) return Py_BuildValue("");
+    if (n > 0) @import("../nofile.zig").release(@intCast(n));
+    return Py_BuildValue("");
+}
+
+pub fn bumpFileLimit(_: [*c]PyObject, _: [*c]PyObject) callconv(.c) [*c]PyObject {
+    const ok: c_int = if (@import("../nofile.zig").bump()) 1 else 0;
+    return Py_BuildValue("i", ok);
+}
+
 pub fn setLogLevel(_: [*c]PyObject, args: [*c]PyObject) callconv(.c) [*c]PyObject {
     var level: c_int = 4;
     if (!(py.PyArg_ParseTuple(args, "i", &level) != 0)) return Py_BuildValue("");

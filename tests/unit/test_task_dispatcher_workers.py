@@ -12,44 +12,74 @@ import asyncio
 import pytest
 
 
+class _Node:
+    def __init__(self, workers: int, conn_num: int, conn_type: str | None = None):
+        self.workers = workers
+        self._conn_num = conn_num
+        self.server_mode = None
+        self._conn_type = conn_type
+
+
+def _stop_pools(dispatcher) -> None:
+    for conn_num in list(dispatcher._pools):
+        dispatcher._stop_connection_workers(conn_num)
+
+
 class TestSyncTaskDispatcherWorkers:
     def test_workers_n_spawns_n_threads(self):
         from daffi._task_dispatcher import TaskDispatcher
 
         n = 7
-        d = TaskDispatcher(workers=n)
+        dispatcher = TaskDispatcher()
+        node = _Node(n, 1, conn_type="router")
         try:
-            d._start_workers()
-            assert len(d._workers) == n
-            assert all(t.is_alive() for t in d._workers)
+            dispatcher._start_connection_workers(node)
+            pool = dispatcher._pools[node._conn_num]
+            assert len(pool.threads) == n
+            assert all(thread.is_alive() for thread in pool.threads)
         finally:
-            d.stop_event.set()
-            for _ in range(len(d._workers)):
-                d.queue.put(None)
-            for t in d._workers:
-                t.join(timeout=3)
+            _stop_pools(dispatcher)
 
     def test_workers_1_spawns_no_pool_threads(self):
         from daffi._task_dispatcher import TaskDispatcher
 
-        d = TaskDispatcher(workers=1)
-        d._start_workers()
-        assert d._workers == []
+        dispatcher = TaskDispatcher()
+        dispatcher._start_connection_workers(_Node(1, 1, conn_type="router"))
+        assert dispatcher._pools == {}
+
+    def test_service_client_ignores_workers(self):
+        from daffi._task_dispatcher import TaskDispatcher
+
+        dispatcher = TaskDispatcher()
+        dispatcher._start_connection_workers(_Node(5, 1, conn_type="service"))
+        assert dispatcher._pools == {}
+
+    def test_each_connection_gets_its_own_pool(self):
+        from daffi._task_dispatcher import TaskDispatcher
+
+        dispatcher = TaskDispatcher()
+        first = _Node(2, 1, conn_type="router")
+        second = _Node(3, 2, conn_type="router")
+        try:
+            dispatcher._start_connection_workers(first)
+            dispatcher._start_connection_workers(second)
+            assert len(dispatcher._pools[1].threads) == 2
+            assert len(dispatcher._pools[2].threads) == 3
+            assert set(dispatcher._pools[1].threads).isdisjoint(dispatcher._pools[2].threads)
+        finally:
+            _stop_pools(dispatcher)
 
     def test_start_workers_is_idempotent(self):
         from daffi._task_dispatcher import TaskDispatcher
 
-        d = TaskDispatcher(workers=3)
+        dispatcher = TaskDispatcher()
+        node = _Node(3, 1, conn_type="router")
         try:
-            d._start_workers()
-            d._start_workers()
-            assert len(d._workers) == 3
+            dispatcher._start_connection_workers(node)
+            dispatcher._start_connection_workers(node)
+            assert len(dispatcher._pools[node._conn_num].threads) == 3
         finally:
-            d.stop_event.set()
-            for _ in range(len(d._workers)):
-                d.queue.put(None)
-            for t in d._workers:
-                t.join(timeout=3)
+            _stop_pools(dispatcher)
 
 
 @pytest.mark.asyncio

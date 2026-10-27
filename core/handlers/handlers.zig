@@ -197,18 +197,6 @@ pub fn ServerHandler(comptime HandlerConnectionT: ConnectionType) type {
                 const data = try service_hs.toJson(allocator);
                 try message.setData(data);
 
-                // Snapshot (with references) everyone who must receive the reply.
-                var targets: std.ArrayList(*ParentConnT) = .empty;
-                defer {
-                    for (targets.items) |t| t.release();
-                    targets.deinit(self.allocator);
-                }
-                for (self.chan_mapper.channels.values()) |c| {
-                    try targets.ensureUnusedCapacity(self.allocator, 1);
-                    c.conn.retain();
-                    targets.appendAssumeCapacity(c.conn);
-                }
-
                 // Event message for the service itself.
                 const event_message = try serde.createEventMessage(self.allocator, 0, connection_name, "connected");
                 var event_pushed = false;
@@ -226,7 +214,11 @@ pub fn ServerHandler(comptime HandlerConnectionT: ConnectionType) type {
                     try self.tasks_queue.pushMessageToQueue(ev);
                     evict_event = null; // queue owns it now
                 }
-                for (targets.items) |t| try self.sendToConnection(Message, t, message);
+                // Reply only to the client that just connected. The body is this
+                // service and its methods, which that client already asked for.
+                // Writing it to every older client as well made connect number N
+                // do N socket writes, so a few thousand clients never finished.
+                try self.sendToConnection(Message, conn, message);
                 try self.tasks_queue.pushMessageToQueue(event_message);
                 event_pushed = true;
             }

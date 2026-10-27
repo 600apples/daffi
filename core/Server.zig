@@ -9,6 +9,7 @@ const runtime = @import("runtime.zig");
 const EventLoop = runtime.EventLoop;
 const posix = std.posix;
 const net = @import("network/posix_net.zig");
+const nofile = @import("nofile.zig");
 const Mutex = misc.Mutex;
 const AcceptedConnection = @import("network/connection.zig").AcceptedConnection;
 const fmtNetAddr = @import("network/connection.zig").fmtNetAddr;
@@ -188,10 +189,15 @@ const Runtime = struct {
         errdefer self.allocator.free(quiet);
         @memset(quiet, 0);
         var wake: [2]c_int = undefined;
-        if (std.c.pipe(&wake) != 0) return error.PipeFailed;
-        errdefer for (wake) |fd| {
-            _ = std.c.close(fd);
-        };
+        nofile.acquire(2);
+        if (std.c.pipe(&wake) != 0) {
+            nofile.release(2);
+            return error.PipeFailed;
+        }
+        errdefer {
+            for (wake) |fd| _ = std.c.close(fd);
+            nofile.release(2);
+        }
         for (wake) |fd| _ = std.c.fcntl(fd, std.c.F.SETFD, @as(c_int, std.c.FD_CLOEXEC));
         pollfds[0] = .{ .fd = wake[0], .events = net.WAIT_READ, .revents = 0 };
         for (pollfds[1..], self.listeners) |*p, *listener|
@@ -229,10 +235,15 @@ const Runtime = struct {
 
     fn startUnixWatch(self: *Runtime) !void {
         var wake: [2]c_int = undefined;
-        if (std.c.pipe(&wake) != 0) return error.PipeFailed;
-        errdefer for (wake) |fd| {
-            _ = std.c.close(fd);
-        };
+        nofile.acquire(2);
+        if (std.c.pipe(&wake) != 0) {
+            nofile.release(2);
+            return error.PipeFailed;
+        }
+        errdefer {
+            for (wake) |fd| _ = std.c.close(fd);
+            nofile.release(2);
+        }
         for (wake) |fd| _ = std.c.fcntl(fd, std.c.F.SETFD, @as(c_int, std.c.FD_CLOEXEC));
         self.unix_wake_read = wake[0];
         self.unix_wake_write = wake[1];
@@ -250,6 +261,7 @@ const Runtime = struct {
             self.unix_watch = null;
             _ = std.c.close(self.unix_wake_read);
             _ = std.c.close(self.unix_wake_write);
+            nofile.release(2);
             self.unix_wake_read = -1;
             self.unix_wake_write = -1;
         }
@@ -262,6 +274,7 @@ const Runtime = struct {
                 t.handle.join();
                 _ = std.c.close(t.pollfds[0].fd);
                 _ = std.c.close(t.wake_write);
+                nofile.release(2);
                 self.allocator.free(t.pollfds);
                 self.allocator.free(t.quiet_until);
             },

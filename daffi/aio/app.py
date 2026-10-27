@@ -308,15 +308,20 @@ class AsyncClient(AsyncApplication[SingleTransportMixin]):
         self._task_dispatcher._start_workers()
 
         t = self.transport
-        self._conn_num = dfcore.startClient(
-            t.native_host,
-            t.native_port,
-            self.app_name,
-            t.tls,
-            t.ca,
-            t.cert,
-            t.key,
-        )
+        try:
+            self._conn_num = dfcore.startClient(
+                t.native_host,
+                t.native_port,
+                self.app_name,
+                t.tls,
+                t.ca,
+                t.cert,
+                t.key,
+            )
+        except Exception as exc:
+            raise InitializationError(
+                f"Failed to connect to the server: {exc}. connection info: {self.info}"
+            ) from exc
         if self._conn_num is None:
             raise InitializationError(
                 f"Failed to connect to the server. connection info: {self.info}"
@@ -344,7 +349,7 @@ class AsyncClient(AsyncApplication[SingleTransportMixin]):
                 pass
             self._conn_num = None
             raise InitializationError(
-                f"Failed to connect to the server. connection info: {self.info}"
+                f"Failed to connect to the server: {exc}. connection info: {self.info}"
             ) from exc
 
         self._conn_type = handshake["meta"]["type"]

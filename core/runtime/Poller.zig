@@ -7,6 +7,8 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const c = std.c;
+const nofile = @import("../nofile.zig");
+const net = @import("../network/posix_net.zig");
 
 const os_tag = builtin.target.os.tag;
 const use_kqueue = os_tag.isDarwin() or os_tag.isBSD();
@@ -26,13 +28,28 @@ fd: c_int,
 events: [max_events]RawEvent = undefined,
 
 pub fn init() !Poller {
-    const fd = if (use_kqueue) c.kqueue() else c.epoll_create1(std.os.linux.EPOLL.CLOEXEC);
-    if (fd < 0) return error.PollerInitFailed;
-    return .{ .fd = fd };
+    var grew = false;
+    while (true) {
+        nofile.acquire(1);
+        const fd = if (use_kqueue) c.kqueue() else c.epoll_create1(std.os.linux.EPOLL.CLOEXEC);
+        if (fd >= 0) {
+            net.clearConnectFailure();
+            return .{ .fd = fd };
+        }
+        const err = c._errno().*;
+        net.noteOsFailure(if (use_kqueue) "kqueue" else "epoll_create1");
+        nofile.release(1);
+        if (!grew and (err == 23 or err == 24) and nofile.bump()) {
+            grew = true;
+            continue;
+        }
+        return error.PollerInitFailed;
+    }
 }
 
 pub fn deinit(self: *Poller) void {
     _ = c.close(self.fd);
+    nofile.release(1);
 }
 
 /// Watch `fd` for readability (including EOF/hang-up); `udata` is handed back
@@ -48,11 +65,17 @@ pub fn add(self: *Poller, fd: c_int, udata: usize) !void {
             .udata = udata,
         };
         var none: c.Kevent = undefined;
-        if (c.kevent(self.fd, @ptrCast(&change), 1, @ptrCast(&none), 0, null) < 0) return error.PollerAddFailed;
+        if (c.kevent(self.fd, @ptrCast(&change), 1, @ptrCast(&none), 0, null) < 0) {
+            net.noteOsFailure("kevent");
+            return error.PollerAddFailed;
+        }
     } else {
         const EPOLL = std.os.linux.EPOLL;
         var ev = c.epoll_event{ .events = EPOLL.IN | EPOLL.RDHUP, .data = .{ .ptr = udata } };
-        if (c.epoll_ctl(self.fd, EPOLL.CTL_ADD, fd, &ev) != 0) return error.PollerAddFailed;
+        if (c.epoll_ctl(self.fd, EPOLL.CTL_ADD, fd, &ev) != 0) {
+            net.noteOsFailure("epoll_ctl");
+            return error.PollerAddFailed;
+        }
     }
 }
 

@@ -204,13 +204,21 @@ def bench_concurrent(n_clients: int, seconds: float) -> dict:
         time.sleep(0.3)
         idle_threads = _thread_count(svc.pid)
 
+        print(f"concurrent: connecting {n_clients} clients", flush=True)
         clients, conns = [], []
+        connect_started = time.perf_counter()
         for i in range(n_clients):
             client = Client(app_name=f"bench-c{i}", transport=TCPTransport(HOST, port), runtime=active_runtime())
             conn = client.connect()
-            conn.wait_for_members("bench-service", timeout=10)
+            conn.wait_for_members("bench-service", timeout=10, interval=0.05)
             clients.append(client)
             conns.append(conn)
+            if (i + 1) % 200 == 0 or i + 1 == n_clients:
+                print(
+                    f"concurrent: connected {i + 1}/{n_clients} "
+                    f"in {time.perf_counter() - connect_started:.1f}s",
+                    flush=True,
+                )
         time.sleep(0.5)
         connected_threads = _thread_count(svc.pid)
 
@@ -227,18 +235,37 @@ def bench_concurrent(n_clients: int, seconds: float) -> dict:
                 n += 1
             counts[idx] = n
 
-        threads = [threading.Thread(target=run, args=(i,)) for i in range(n_clients)]
-        for t in threads:
-            t.start()
-        deadline[0] = time.perf_counter() + seconds
-        start.set()
-        time.sleep(seconds / 2)
-        busy_threads = _thread_count(svc.pid)
-        for t in threads:
-            t.join()
+        # Daemon threads so a failure while starting them cannot leave the
+        # process stuck in interpreter shutdown, waiting on threads that
+        # never saw start.set().
+        threads = [
+            threading.Thread(target=run, args=(i,), daemon=True)
+            for i in range(n_clients)
+        ]
+        print(f"concurrent: starting {n_clients} callers", flush=True)
+        try:
+            for started, t in enumerate(threads, start=1):
+                t.start()
+                if started % 200 == 0 or started == n_clients:
+                    print(f"concurrent: callers started {started}/{n_clients}", flush=True)
+            deadline[0] = time.perf_counter() + seconds
+            start.set()
+            print(f"concurrent: load for {seconds:.0f}s", flush=True)
+            time.sleep(seconds / 2)
+            busy_threads = _thread_count(svc.pid)
+            for t in threads:
+                t.join()
+        finally:
+            start.set()
+            deadline[0] = time.perf_counter()
+            print("concurrent: stopping clients", flush=True)
+            for client in clients:
+                client.stop()
 
-        for client in clients:
-            client.stop()
+        print(
+            f"concurrent: done {sum(counts) / seconds:,.0f} calls/s",
+            flush=True,
+        )
         return {
             "calls_per_s": sum(counts) / seconds,
             "fairness_min_max": min(counts) / max(1, max(counts)),
@@ -270,7 +297,10 @@ def run_model(calls: int, n_clients: int, seconds: float, repeats: int) -> dict:
     model = dfcore.getRuntime()
 
     def repeated(fn, *args):
-        return _summarize([fn(*args) for _ in range(repeats)])
+        print(f"{model}: {fn.__name__} x{repeats}", flush=True)
+        summary = _summarize([fn(*args) for _ in range(repeats)])
+        print(f"{model}: {fn.__name__} done", flush=True)
+        return summary
 
     return {
         "model": model,
@@ -412,7 +442,7 @@ def main() -> None:
     results = {}
     for model in order:
         print(f"running {model} model…", flush=True)
-        proc = subprocess.run(
+        proc = subprocess.Popen(
             [
                 sys.executable,
                 __file__,
@@ -428,19 +458,32 @@ def main() -> None:
                 "--repeats",
                 str(args.repeats),
             ],
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
             text=True,
+            bufsize=1,
         )
+        captured: list[str] = []
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            captured.append(line)
+            print(line, end="", flush=True)
+        proc.wait()
+        text = "".join(captured)
         line = next(
-            (l for l in proc.stdout.splitlines() if l.startswith("RESULT ")), None
+            (l for l in text.splitlines() if l.startswith("RESULT ")), None
         )
         if line is None:
-            sys.exit(f"{model} run failed:\n{proc.stdout}\n{proc.stderr}")
+            print(f"{model} run failed (exit {proc.returncode})", flush=True)
+            results[model] = None
+            continue
         result = json.loads(line[len("RESULT ") :])
         assert (
             result["model"] == model
         ), f"expected {model}, core reports {result['model']}"
         results[model] = result
+    if None in results.values() or set(results) != set(MODELS):
+        sys.exit("benchmark failed")
     _print_table(results)
 
 
