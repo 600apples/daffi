@@ -9,6 +9,7 @@ Each test fails on the behaviour that used to happen:
 * a cancelled call's late response could reach a later call;
 * an evicted client took its name back on the next call;
 * a callback could not stop its own application;
+* ``stop()`` on a service or router left the server running;
 * signals ended the process with ``_exit(0)``;
 * a peer could make a JSON caller unpickle data.
 """
@@ -20,6 +21,7 @@ import asyncio
 import multiprocessing as mp
 import os
 import signal
+import socket
 import subprocess
 import sys
 import time
@@ -435,6 +437,25 @@ async def test_callback_can_stop_its_own_client(router_port, workers):
         quiet_kill(proc)
 
 
+@pytest.mark.parametrize("kind", ["service", "router"])
+async def test_stop_closes_the_server_and_releases_join(free_port, kind):
+    from daffi import TCPTransport
+    from daffi.aio import AsyncRouter, AsyncService
+
+    cls = AsyncService if kind == "service" else AsyncRouter
+    app = cls(
+        app_name=f"aio-stop-{kind}",
+        transport=TCPTransport(HOST, free_port),
+        runtime=active_runtime(),
+    )
+    await app.start()
+    joiner = asyncio.ensure_future(app.join())
+    await app.stop()
+    await asyncio.wait_for(joiner, 5)
+    with pytest.raises(OSError):
+        socket.create_connection((HOST, free_port), timeout=1).close()
+
+
 # ── 4. signals ────────────────────────────────────────────────────────────────
 
 _SERVICE_SCRIPT = """
@@ -472,6 +493,7 @@ def _service_script(port: int) -> subprocess.Popen:
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX signals")
 class TestSignals:
+    @pytest.mark.skipif(sys.version_info < (3, 11), reason="asyncio.run handles SIGINT since 3.11")
     def test_sigint_reaches_asyncio_and_runs_finally(self, free_port):
         """``asyncio.run`` installs its own SIGINT handler before the service
         exists; daffi stops the service and then defers to it, so the program
@@ -481,6 +503,14 @@ class TestSignals:
         code, output = _finish(proc)
         assert code != 0, output
         assert "finally" in output and "KeyboardInterrupt" in output, output
+
+    @pytest.mark.skipif(sys.version_info >= (3, 11), reason="asyncio.run handles SIGINT since 3.11")
+    def test_sigint_stops_the_service_and_returns_from_join(self, free_port):
+        proc = _service_script(free_port)
+        proc.send_signal(signal.SIGINT)
+        code, output = _finish(proc)
+        assert code == 0, output
+        assert "joined" in output and "finally" in output, output
 
     def test_sigterm_terminates_with_the_signal(self, free_port):
         proc = _service_script(free_port)

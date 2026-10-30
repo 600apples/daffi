@@ -85,6 +85,9 @@ All notable changes to this project are documented in this file.
   descriptor, or deadlocks against a stop started by a server shutdown.
 - A WebSocket ping no longer disconnects the client, and control frames are
   never written into the middle of another frame.
+- `stop()` on an async `Service` or `Router` did not stop the server:
+  listeners, the dispatcher and peer connections stayed open and `join()`
+  never returned. Affects 3.0.x.
 - Eviction (another connection took this client's name) is reported as
   `Evicted`, and a disconnect during a call as `Disconnected`. An evicted
   client no longer reconnects and takes its name back.

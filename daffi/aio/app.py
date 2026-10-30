@@ -173,7 +173,7 @@ class AsyncServerMixin:
 # ---------------------------------------------------------------------------
 
 
-class AsyncRouter(AsyncApplication[MultipleTransportMixin], AsyncServerMixin):
+class AsyncRouter(AsyncServerMixin, AsyncApplication[MultipleTransportMixin]):
     """Async routing server.
 
     Example::
@@ -192,7 +192,7 @@ class AsyncRouter(AsyncApplication[MultipleTransportMixin], AsyncServerMixin):
 # ---------------------------------------------------------------------------
 
 
-class AsyncService(AsyncApplication[MultipleTransportMixin], AsyncServerMixin):
+class AsyncService(AsyncServerMixin, AsyncApplication[MultipleTransportMixin]):
     """Async service that exposes ``@callback`` functions.
 
     Example::
