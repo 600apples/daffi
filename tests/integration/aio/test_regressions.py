@@ -9,7 +9,8 @@ Each test fails on the behaviour that used to happen:
 * a cancelled call's late response could reach a later call;
 * an evicted client took its name back on the next call;
 * a callback could not stop its own application;
-* ``stop()`` on a service or router left the server running;
+* ``stop()`` on a service or router left the server running, and waited
+  for running callbacks;
 * signals ended the process with ``_exit(0)``;
 * a peer could make a JSON caller unpickle data.
 """
@@ -456,6 +457,52 @@ async def test_stop_closes_the_server_and_releases_join(free_port, kind):
         socket.create_connection((HOST, free_port), timeout=1).close()
 
 
+@pytest.mark.parametrize("workers", [1, 4], ids=["inline", "pool"])
+@pytest.mark.parametrize("flavour", ["sync", "async"])
+def test_stop_does_not_wait_for_a_running_callback(free_port, workers, flavour):
+    """stop() used to await the running callback, and a sync one held the
+    default executor, which ``asyncio.run`` waits for at exit."""
+    rt = active_runtime()
+    body = "time.sleep(60)" if flavour == "sync" else "await asyncio.sleep(60)"
+    script = f"""
+import asyncio, time
+from daffi import TCPTransport, callback, dfcore
+from daffi.aio import AsyncClient, AsyncService
+dfcore.setRuntime({rt!r})
+
+@callback
+{"def" if flavour == "sync" else "async def"} stuck():
+    {body}
+
+async def _call(conn):
+    try:
+        await conn.rpc(timeout=120).stuck()
+    except BaseException:
+        pass
+
+async def main():
+    svc = AsyncService(app_name="aio-stuck-svc", transport=TCPTransport("127.0.0.1", {free_port}), workers={workers}, runtime={rt!r})
+    await svc.start()
+    client = AsyncClient(app_name="aio-stuck-caller", transport=TCPTransport("127.0.0.1", {free_port}), runtime={rt!r})
+    conn = await client.connect()
+    await conn.wait_for_members("aio-stuck-svc", timeout=10)
+    call = asyncio.ensure_future(_call(conn))
+    await asyncio.sleep(0.5)
+    started = time.monotonic()
+    await svc.stop()
+    print(f"stopped in {{time.monotonic() - started:.3f}}", flush=True)
+    await client.stop()
+    await call
+
+asyncio.run(main())
+"""
+    started = time.monotonic()
+    code, output = _finish(_run_script(script))
+    assert code == 0, output
+    assert float(output.split("stopped in ")[1].split()[0]) < 1, output
+    assert time.monotonic() - started < 15, output
+
+
 # ── 4. signals ────────────────────────────────────────────────────────────────
 
 _SERVICE_SCRIPT = """
@@ -493,24 +540,19 @@ def _service_script(port: int) -> subprocess.Popen:
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX signals")
 class TestSignals:
-    @pytest.mark.skipif(sys.version_info < (3, 11), reason="asyncio.run handles SIGINT since 3.11")
-    def test_sigint_reaches_asyncio_and_runs_finally(self, free_port):
-        """``asyncio.run`` installs its own SIGINT handler before the service
-        exists; daffi stops the service and then defers to it, so the program
-        ends with the usual ``KeyboardInterrupt``."""
+    def test_sigint_stops_the_service_and_runs_finally(self, free_port):
+        """Since 3.11 ``asyncio.run`` installs its own SIGINT handler before
+        the service exists; daffi stops the service and then defers to it,
+        so the program ends with the usual ``KeyboardInterrupt``.  Before
+        3.11 there is none, and ``join()`` returns."""
         proc = _service_script(free_port)
         proc.send_signal(signal.SIGINT)
         code, output = _finish(proc)
-        assert code != 0, output
-        assert "finally" in output and "KeyboardInterrupt" in output, output
-
-    @pytest.mark.skipif(sys.version_info >= (3, 11), reason="asyncio.run handles SIGINT since 3.11")
-    def test_sigint_stops_the_service_and_returns_from_join(self, free_port):
-        proc = _service_script(free_port)
-        proc.send_signal(signal.SIGINT)
-        code, output = _finish(proc)
-        assert code == 0, output
-        assert "joined" in output and "finally" in output, output
+        assert "finally" in output, output
+        if sys.version_info >= (3, 11):
+            assert code != 0 and "KeyboardInterrupt" in output, output
+        else:
+            assert code == 0 and "joined" in output, output
 
     def test_sigterm_terminates_with_the_signal(self, free_port):
         proc = _service_script(free_port)

@@ -8,10 +8,11 @@ that used to happen:
   dispatcher for every connection in the process;
 * Ctrl+C / SIGTERM ended the process with ``_exit(0)``, skipping ``finally``
   and hiding the signal from supervisors; a forked child ignored SIGTERM;
+  a signal that landed while a lock was held deadlocked the process;
 * a late response could reach a later call that reused the request id;
 * waiting broke once descriptor numbers passed 1024;
-* ``stop()`` raced sends, deadlocked against a server-initiated stop, and
-  could not be called from inside a callback;
+* ``stop()`` raced sends, deadlocked against a server-initiated stop, could
+  not be called from inside a callback, and waited for running callbacks;
 * a WebSocket ping disconnected the client;
 * a peer that stops reading froze the server;
 * concurrent callers lost wakeups;
@@ -750,6 +751,46 @@ def test_callback_can_stop_its_own_client(router_port, workers):
         quiet_kill(proc)
 
 
+@pytest.mark.parametrize("workers", [1, 4], ids=["inline", "pool"])
+def test_stop_does_not_wait_for_a_running_callback(free_port, workers):
+    """stop() used to wait for the callback (inline) or 3 s per worker, and
+    the worker threads then kept the process alive until it returned."""
+    rt = active_runtime()
+    script = f"""
+import threading, time
+from daffi import Client, Service, TCPTransport, callback, dfcore
+dfcore.setRuntime({rt!r})
+
+@callback
+def stuck():
+    time.sleep(60)
+
+svc = Service(app_name="stuck-svc", transport=TCPTransport("127.0.0.1", {free_port}), workers={workers}, runtime={rt!r})
+svc.start()
+client = Client(app_name="stuck-caller", transport=TCPTransport("127.0.0.1", {free_port}), runtime={rt!r})
+conn = client.connect()
+conn.wait_for_members("stuck-svc", timeout=10)
+
+def _call():
+    try:
+        conn.rpc(timeout=120).stuck()
+    except BaseException:
+        pass
+
+threading.Thread(target=_call, daemon=True).start()
+time.sleep(0.5)
+started = time.monotonic()
+svc.stop()
+print(f"stopped in {{time.monotonic() - started:.3f}}", flush=True)
+client.stop()
+"""
+    started = time.monotonic()
+    code, output = _finish(_run_script(script))
+    assert code == 0, output
+    assert float(output.split("stopped in ")[1].split()[0]) < 1, output
+    assert time.monotonic() - started < 15, output
+
+
 # ── 5. signals ────────────────────────────────────────────────────────────────
 
 _SERVICE_SCRIPT = """
@@ -798,6 +839,28 @@ class TestSignals:
         # It used to be _exit(0): a supervisor saw a clean exit.
         assert code == -signal.SIGTERM, output
 
+    def test_sigterm_during_stop_terminates_at_once(self, inline_service):
+        port, _ = inline_service
+        script = f"""
+import os, signal
+from daffi import Client, TCPTransport, dfcore
+dfcore.setRuntime({active_runtime()!r})
+client = Client(app_name="term-in-stop", transport=TCPTransport("127.0.0.1", {port}), runtime={active_runtime()!r})
+client.connect()
+_release = Client._release_connection
+def _release_after_sigterm(self):
+    os.kill(os.getpid(), signal.SIGTERM)
+    _release(self)
+Client._release_connection = _release_after_sigterm
+client.stop()
+print("survived", flush=True)
+"""
+        started = time.monotonic()
+        code, output = _finish(_run_script(script))
+        assert code == -signal.SIGTERM, output
+        assert time.monotonic() - started < 3, output
+
+
     def test_user_handler_still_runs(self, free_port):
         setup = (
             "def _mine(signum, frame):\n"
@@ -810,6 +873,43 @@ class TestSignals:
         code, output = _finish(proc)
         assert code == 3, output
         assert "user handler" in output and "finally" in output, output
+
+    def test_sigint_while_connect_holds_the_dispatcher_lock(self, inline_service):
+        """The handler used to run stop() on the interrupted thread, which
+        waited forever for the lock that thread held; later signals could
+        not run either."""
+        port, _ = inline_service
+        script = f"""
+import os, signal, threading
+from daffi import Client, TCPTransport, dfcore
+from daffi._task_dispatcher import shared_dispatcher
+dfcore.setRuntime({active_runtime()!r})
+
+class _SignalInside:
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._armed = True
+    def __enter__(self):
+        self._lock.acquire()
+        if self._armed:
+            self._armed = False
+            os.kill(os.getpid(), signal.SIGINT)
+    def __exit__(self, *exc):
+        self._lock.release()
+
+shared_dispatcher()._poller_lock = _SignalInside()
+client = Client(app_name="sigint-in-connect", transport=TCPTransport("127.0.0.1", {port}), runtime={active_runtime()!r})
+try:
+    client.connect()
+except Exception as exc:
+    print("connect failed:", type(exc).__name__, flush=True)
+client.join()
+print("joined", flush=True)
+"""
+        started = time.monotonic()
+        code, output = _finish(_run_script(script))
+        assert code == 0 and "joined" in output, output
+        assert time.monotonic() - started < 5, output
 
     def test_sigint_interrupts_a_call_on_the_main_thread(self, inline_service):
         port, _ = inline_service

@@ -169,7 +169,7 @@ def _handle_lifecycle_signal(conn, conn_num: int, reason: bytes) -> None:
     A disconnect or eviction stores the error on *conn*; in-flight calls
     already learnt it from the native wait.  When a thread is parked in
     ``join()`` the connection is stopped so ``join()`` returns.  ``stop()``
-    joins the dispatcher, so it runs on its own thread, never here.
+    runs on its own thread, so the poller keeps serving other connections.
     """
     if reason == LifecycleSignal.INIT:
         RpcProxy._process_client_handshake(conn_num)
@@ -282,33 +282,6 @@ def _send_reply(
         logger.warning(f"Could not send the result of {func_name!r} to {transmitter!r}: {exc}")
 
 
-def _execute_task(
-    uuid: int,
-    data: bytes,
-    serde: SerdeFormat,
-    transmitter: str,
-    func_name: str,
-    return_result: bool,
-    conn: Any,
-) -> None:
-    """Invoke a registered callback and send the response inline.
-
-    Called only for regular RPC tasks on the inline (workers=1) path.
-    EVENTS dispatching and worker-pool routing are handled by the caller.
-    """
-    outcome = _invoke_callback(func_name, serde, data)
-    if return_result:
-        _send_reply(
-            bool(conn.server_mode),
-            conn._conn_num,
-            uuid,
-            transmitter,
-            func_name,
-            outcome,
-            conn.logger,
-        )
-
-
 class TaskDispatcher:
     """Manages the lifecycle of worker threads that handle incoming RPC
     messages for one or more server/client connections.
@@ -342,7 +315,10 @@ class TaskDispatcher:
         # waiting on is undefined on macOS.
         self._control = WakeupFd(pipe=True)
         self._retire_lock = threading.Lock()
-        self._retired: list[tuple[int, threading.Event]] = []
+        # fds (with their close) the poller must drop and close.  Only
+        # accepted while ``_poller_running``; afterwards the closer closes.
+        self._retired: list[tuple[int, Any]] = []
+        self._poller_running = False
 
         # conn_num → _ConnEntry  (all fd-related state for a connection)
         self._conns: dict[int, _ConnEntry] = {}
@@ -368,20 +344,23 @@ class TaskDispatcher:
             return
         pool = _Pool()
         for i in range(n):
+            # Daemon: neither stop() nor interpreter exit waits for a
+            # callback that is still running.
             thread = Thread(
                 target=self._worker_loop,
-                args=(pool.queue,),
+                args=(pool,),
                 name=f"daffi-worker-{conn_num}-{i}",
+                daemon=True,
             )
             thread.start()
             pool.threads.append(thread)
         self._pools[conn_num] = pool
 
     def _stop_connection_workers(self, conn_num) -> None:
-        """Stop the private pool for *conn_num*, if it has one.
+        """Close the private pool for *conn_num*, if it has one.
 
-        A callback that stops its own connection runs on one of these
-        threads; that one is not joined.
+        Nothing waits for the workers: queued tasks are dropped, and a
+        callback that is still running is abandoned with its reply.
         """
         pool = self._pools.get(conn_num)
         if pool is None:
@@ -390,26 +369,15 @@ class TaskDispatcher:
             pool.closed = True
             self._pools.pop(conn_num, None)
             for _ in pool.threads:
-                try:
-                    pool.queue.put_nowait(None)
-                except Exception:
-                    pass
-        current = threading.current_thread()
-        for thread in pool.threads:
-            if thread is not current:
-                thread.join(timeout=3)
+                pool.queue.put_nowait(None)
 
     def stop_for_connection(self, connection) -> None:
-        """Deregister *connection* and, if no connections remain, stop all workers.
+        """Deregister *connection*; the last one also stops the poller.
 
-        **Ordering guarantee**: the poller thread is joined *before* any
-        wakeup/lifecycle fds are closed.  Closing an fd while the poller is
-        blocked in ``select`` on that same fd is undefined behaviour on macOS
-        (the fd number may be reused, causing select to report activity on the
-        wrong resource, or a SIGSEGV from kqueue's internal state).
-
-        The poller blocks indefinitely on ``DefaultSelector.select(timeout=None)``
-        and is woken through the dispatcher's control pipe.
+        Returns at once.  A callback still running is abandoned, and its
+        reply is dropped.  Closing an fd a kqueue is still waiting on is
+        undefined on macOS, so while the poller runs it closes the fds
+        itself (see :meth:`_retire`).
         """
         conn_num = getattr(connection, "_conn_num", None)
         # This connection's callback threads stop with it. Other connections
@@ -421,64 +389,47 @@ class TaskDispatcher:
         # new one; it is never left with a poller that is exiting.
         with self._poller_lock:
             self.connections.discard(connection)
-            last = not self.connections
-            if last:
+            if not self.connections:
                 self.stop_event.set()
-                poller = self._poller
-                in_poller = threading.current_thread() is poller
-        if last:
-            # Wake the poller so it sees stop_event, then wait for it to exit
-            # (not from the poller itself), and only then close its fds.
-            if poller is not None and not in_poller:
-                self._control.signal()
-                poller.join()
-        # Wakeup first, then lifecycle. While the poller is still running it
-        # unregisters the fd and only then is the fd closed.
+        # Wakeup first, then lifecycle: the native layer gives each fd up
+        # before it is closed.
         self._deregister_fds(conn_num)
         self._close_lifecycle(conn_num)
+        self._control.signal()
 
     def _retire(self, fd: int, close) -> None:
-        """Unregister *fd* from the poller, then call *close*.
+        """Unregister *fd* from the poller's selector, then call *close*.
 
-        The poller thread closes immediately. Any other thread waits until
-        the poller has dropped the fd from its selector, so kqueue is not
-        still waiting on it.
+        While the poller runs, the close is handed to it and nobody waits.
         """
-        poller = self._poller
-        if (
-            poller is None
-            or not poller.is_alive()
-            or threading.current_thread() is poller
-        ):
-            if self._selector is not None and threading.current_thread() is poller:
-                try:
-                    self._selector.unregister(fd)
-                except (KeyError, ValueError, OSError):
-                    pass
-                self._selector_fds.discard(fd)
+        if threading.current_thread() is self._poller:
+            self._forget_fd(fd)
             close()
             return
-        done = threading.Event()
         with self._retire_lock:
-            self._retired.append((fd, done))
-        self._control.signal()
-        done.wait(timeout=5)
-        close()
+            handed_off = self._poller_running
+            if handed_off:
+                self._retired.append((fd, close))
+        if handed_off:
+            self._control.signal()
+        else:
+            close()
 
     def _release_retired(self) -> None:
-        """Unregister fds a stopper is waiting on, then let it close them."""
+        """Poller thread: unregister and close the fds handed to it."""
         with self._retire_lock:
-            pending = self._retired
-            self._retired = []
-        selector = self._selector
-        for fd, done in pending:
-            if selector is not None:
-                try:
-                    selector.unregister(fd)
-                except (KeyError, ValueError, OSError):
-                    pass
-            self._selector_fds.discard(fd)
-            done.set()
+            pending, self._retired = self._retired, []
+        for fd, close in pending:
+            self._forget_fd(fd)
+            close()
+
+    def _forget_fd(self, fd: int) -> None:
+        if self._selector is not None:
+            try:
+                self._selector.unregister(fd)
+            except (KeyError, ValueError, OSError):
+                pass
+        self._selector_fds.discard(fd)
 
     def _deregister_fds(self, conn_num) -> None:
         """Close the wakeup fd for *conn_num* and remove it from the reverse map.
@@ -557,6 +508,8 @@ class TaskDispatcher:
                     poller.join()
             if self._poller is None or not self._poller.is_alive():
                 self.stop_event.clear()
+                with self._retire_lock:
+                    self._poller_running = True
                 self._poller = Thread(
                     target=self.handle_task_queue,
                     name="daffi-poller",
@@ -609,9 +562,12 @@ class TaskDispatcher:
             self._poll_loop()
         finally:
             self._close_selector()
-            # Unblock anyone waiting to close an fd. The selector is already
-            # shut, so the close is no longer racing a wait.
-            self._release_retired()
+            # The selector is shut, so closing is no longer racing a wait.
+            with self._retire_lock:
+                self._poller_running = False
+                pending, self._retired = self._retired, []
+            for _, close in pending:
+                close()
 
     def _poll_loop(self) -> None:
         while not self.stop_event.is_set():
@@ -667,16 +623,17 @@ class TaskDispatcher:
         task is logged and the rest still run.
         """
         poller = self.pollers[bool(conn.server_mode)]
-        while not self.stop_event.is_set():
-            task = poller(conn._conn_num)
+        conn_num = conn._conn_num
+        while conn in self.connections and not self.stop_event.is_set():
+            task = poller(conn_num)
             if task is None:
                 return
             try:
-                self._dispatch_task(conn, task)
+                self._dispatch_task(conn, conn_num, task)
             except Exception:
                 conn.logger.exception("Task dispatch failed")
 
-    def _dispatch_task(self, conn, task: tuple) -> None:
+    def _dispatch_task(self, conn, conn_num: int, task: tuple) -> None:
         (
             uuid,
             data,
@@ -691,21 +648,24 @@ class TaskDispatcher:
         if flag == MessageFlag.EVENTS:
             self._dispatch_event(conn, json.loads(data))
             return
-        pool = self._pools.get(conn._conn_num)
+        pool = self._pools.get(conn_num)
         if pool is None:
             # No private pool means this connection runs inline.
             # A pool that was just removed belongs to a connection
             # that is stopping; leave that callback alone.
             if _pool_size(conn) == 1 and conn in self.connections:
-                _execute_task(
-                    uuid,
-                    data,
-                    serde,
-                    transmitter,
-                    func_name,
-                    return_result,
-                    conn,
-                )
+                outcome = _invoke_callback(func_name, serde, data)
+                # A connection stopped during the callback gets no reply.
+                if return_result and conn in self.connections:
+                    _send_reply(
+                        bool(conn.server_mode),
+                        conn_num,
+                        uuid,
+                        transmitter,
+                        func_name,
+                        outcome,
+                        conn.logger,
+                    )
             return
         task_item = (
             uuid,
@@ -714,7 +674,7 @@ class TaskDispatcher:
             transmitter,
             func_name,
             return_result,
-            conn._conn_num,
+            conn_num,
             bool(conn.server_mode),
             conn.logger,
         )
@@ -788,15 +748,18 @@ class TaskDispatcher:
             except Exception:
                 conn.logger.exception(f"{event_type} handler {handler!r} failed")
 
-    def _worker_loop(self, queue: Queue) -> None:
+    def _worker_loop(self, pool: _Pool) -> None:
         """Thread-pool worker body for one connection.
 
-        Blocks on *queue* until a task arrives or a ``None`` sentinel is
-        received.  The sentinel is placed by :meth:`_stop_connection_workers`
-        (one per worker), so no polling or ``stop_event`` check is needed —
-        the worker exits when told to, without waiting for a timeout.
+        Blocks on the pool's queue until a task arrives or a ``None``
+        sentinel is received.  The sentinel is placed by
+        :meth:`_stop_connection_workers` (one per worker).  Once the pool is
+        closed, the tasks still queued and the reply of the running one are
+        dropped.
         """
-        for task in iter(queue.get, None):
+        for task in iter(pool.queue.get, None):
+            if pool.closed:
+                continue
             (
                 uuid,
                 data,
@@ -809,5 +772,5 @@ class TaskDispatcher:
                 logger,
             ) = task
             outcome = _invoke_callback(func_name, serde, data)
-            if return_result:
+            if return_result and not pool.closed:
                 _send_reply(server_mode, conn_num, uuid, transmitter, func_name, outcome, logger)

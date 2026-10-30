@@ -13,15 +13,20 @@ Execution model
 * The sync worker-thread pool becomes a pool of ``asyncio.Task`` objects.
 * Every fd has its own ``add_reader`` callback that records the fd as ready
   and wakes the poller, which then services exactly those fds.
-* Coroutine callbacks are ``await``ed directly.  Sync callbacks run in the
-  default executor so a slow one never stalls the event loop.
+* Coroutine callbacks are ``await``ed directly.  Sync callbacks run on
+  daemon threads so a slow one never stalls the event loop.
+* ``stop`` cancels whatever is still running and does not wait for it.
 """
 
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import functools
 import json
+import os
+import queue
+import threading
 from typing import Any
 
 from .. import dfcore
@@ -43,6 +48,58 @@ from daffi._task_dispatcher import (
 )
 
 
+class _DaemonExecutor(concurrent.futures.Executor):
+    """Runs sync callbacks on daemon threads.
+
+    Unlike ``ThreadPoolExecutor`` (and so the loop's default executor),
+    neither ``stop()`` nor interpreter exit waits for a callback that is
+    still running.
+    """
+
+    def __init__(self, max_workers: int) -> None:
+        self._max_workers = max_workers
+        self._tasks: queue.SimpleQueue = queue.SimpleQueue()
+        self._lock = threading.Lock()
+        self._threads = 0
+        self._idle = 0
+
+    def submit(self, fn, /, *args, **kwargs) -> concurrent.futures.Future:
+        future: concurrent.futures.Future = concurrent.futures.Future()
+        with self._lock:
+            if self._idle:
+                self._idle -= 1
+                spawn = False
+            else:
+                spawn = self._threads < self._max_workers
+                self._threads += spawn
+        self._tasks.put((future, fn, args, kwargs))
+        if spawn:
+            threading.Thread(target=self._work, name="daffi-aio-callback", daemon=True).start()
+        return future
+
+    def _work(self) -> None:
+        while True:
+            future, fn, args, kwargs = self._tasks.get()
+            if future.set_running_or_notify_cancel():
+                try:
+                    future.set_result(fn(*args, **kwargs))
+                except BaseException as exc:
+                    future.set_exception(exc)
+            with self._lock:
+                self._idle += 1
+
+
+def _new_callback_executor() -> None:
+    """A forked child has none of the parent's threads."""
+    global _callback_executor
+    _callback_executor = _DaemonExecutor(min(32, (os.cpu_count() or 1) + 4))
+
+
+_new_callback_executor()
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_new_callback_executor)
+
+
 async def _invoke_callback_async(
     func_name: str,
     serde: SerdeFormat,
@@ -58,7 +115,7 @@ async def _invoke_callback_async(
             result = await cb(*args, **kwargs)
         else:
             result = await asyncio.get_running_loop().run_in_executor(
-                None, functools.partial(cb, *args, **kwargs)
+                _callback_executor, functools.partial(cb, *args, **kwargs)
             )
         return result, MessageFlag.RESPONSE, serde
     except asyncio.CancelledError:
@@ -126,8 +183,8 @@ class AsyncTaskDispatcher:
             finally:
                 queue.task_done()
 
-    @staticmethod
     async def _run_task(
+        self,
         uuid: int,
         data: bytes,
         serde: SerdeFormat,
@@ -139,7 +196,8 @@ class AsyncTaskDispatcher:
         logger,
     ) -> None:
         outcome = await _invoke_callback_async(func_name, serde, data)
-        if return_result:
+        # A connection stopped during the callback gets no reply.
+        if return_result and conn_num in self._conns:
             _send_reply(server_mode, conn_num, uuid, transmitter, func_name, outcome, logger)
 
     # ------------------------------------------------------------------
@@ -210,7 +268,11 @@ class AsyncTaskDispatcher:
             )
 
     async def stop_for_connection(self, connection: Any) -> None:
-        """Deregister *connection*; the last one also stops every task."""
+        """Deregister *connection*; the last one also cancels every task.
+
+        Nothing is awaited: a callback still running is cancelled, or, if it
+        is sync, abandoned on its thread, and its reply is dropped.
+        """
         self.connections.discard(connection)
         self._deregister_fds(getattr(connection, "_conn_num", None))
         if self.connections:
@@ -223,12 +285,9 @@ class AsyncTaskDispatcher:
         workers, self._workers = self._workers, []
         self.queue = asyncio.Queue()
         self._wake_poller()
-        for w in workers:
-            if w is not current:
-                w.cancel()
-        waiting = [t for t in (*workers, poller) if t is not None and t is not current]
-        if waiting:
-            await asyncio.gather(*waiting, return_exceptions=True)
+        for task in (*workers, poller):
+            if task is not None and task is not current:
+                task.cancel()
 
     # ------------------------------------------------------------------
     # Poller coroutine
@@ -315,7 +374,7 @@ class AsyncTaskDispatcher:
     ) -> None:
         """Async counterpart of ``_task_dispatcher._handle_lifecycle_signal``.
 
-        ``stop()`` awaits this dispatcher, so it runs as its own task.
+        ``stop()`` cancels the poller, so it runs as its own task.
         """
         from daffi.aio._rpc_proxy import AsyncResponseNotifier, AsyncRpcProxy
 

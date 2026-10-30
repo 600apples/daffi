@@ -7,6 +7,7 @@ held weakly, so registering one does not keep it alive.
 
 import atexit
 import os
+import queue
 import signal
 import threading
 import weakref
@@ -22,22 +23,34 @@ _handlers: "list[weakref.WeakMethod]" = []
 _previous: dict = {}
 _atexit_installed = False
 _signals_installed = False
+# Signals hand stop() to this thread and do not wait for it: the interrupted
+# code may hold a lock that stop() needs. SimpleQueue is the one queue safe to
+# use from a signal handler.
+_requests: "queue.SimpleQueue[None]" = queue.SimpleQueue()
+_stopper: "threading.Thread | None" = None
 
 
 def set_signal_handler(handler) -> None:
     """Call the bound method *handler* on ``SIGINT``, ``SIGTERM`` and at exit.
 
     Every registered application is stopped, not just the latest one.  A
-    handler the program installed before daffi still runs afterwards.
+    handler the program installed before daffi still runs afterwards.  A
+    signal whose action is the default one (``SIGTERM`` unless the program
+    changed it) terminates the process at once, as it would without daffi.
     Signal handlers can only be installed from the main thread; until an
     application is created there, only the ``atexit`` hook is active.
     """
-    global _atexit_installed, _signals_installed
+    global _atexit_installed, _signals_installed, _stopper
     with _lock:
         _handlers.append(weakref.WeakMethod(handler))
         if not _atexit_installed:
             atexit.register(_stop_all)
             _atexit_installed = True
+        if _stopper is None:
+            _stopper = threading.Thread(
+                target=_serve_stop_requests, name="daffi-signal-stop", daemon=True
+            )
+            _stopper.start()
         if not _signals_installed and threading.current_thread() is threading.main_thread():
             for signum in _HANDLED:
                 _previous[signum] = signal.getsignal(signum)
@@ -58,13 +71,21 @@ def _stop_all() -> None:
             pass
 
 
+def _serve_stop_requests() -> None:
+    while True:
+        _requests.get()
+        _stop_all()
+
+
 def _forget_after_fork() -> None:
     """The applications belong to the parent: their native state (event-loop
     threads included) does not exist in a forked child, so stopping them
     there would hang."""
-    global _lock
+    global _lock, _requests, _stopper
     _lock = threading.Lock()
     _handlers.clear()
+    _requests = queue.SimpleQueue()
+    _stopper = None
 
 
 if hasattr(os, "register_at_fork"):
@@ -72,13 +93,15 @@ if hasattr(os, "register_at_fork"):
 
 
 def _on_signal(signum, frame) -> None:
-    _stop_all()
     previous = _previous.get(signum)
+    if previous == signal.SIG_DFL:
+        signal.signal(signum, signal.SIG_DFL)
+        os.kill(os.getpid(), signum)
+        return
+    if _stopper is not None:
+        _requests.put(None)
     if previous is signal.default_int_handler:
         # Ctrl+C stops the applications and lets ``join()`` return.
         return
     if callable(previous):
         previous(signum, frame)
-    elif previous == signal.SIG_DFL:
-        signal.signal(signum, signal.SIG_DFL)
-        os.kill(os.getpid(), signum)

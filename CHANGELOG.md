@@ -49,10 +49,14 @@ All notable changes to this project are documented in this file.
   servers any number of times (the limit of 256 is now on servers running
   at the same time).
 - **Signals:** the native layer no longer installs SIGINT/SIGTERM handlers
-  that ended the process with `_exit(0)`. Python stops every running app and
-  then defers to the handler that was installed before: Ctrl+C raises
-  `KeyboardInterrupt` as usual, a user handler is called, and a default
-  action (e.g. SIGTERM) terminates the process with that signal.
+  that ended the process with `_exit(0)`. A signal with the default action
+  (e.g. SIGTERM) terminates the process at once, with that signal. Ctrl+C
+  stops every running app and `join()` returns; under `asyncio.run` on
+  Python 3.11+ it raises `KeyboardInterrupt` as usual. A handler the program
+  installed before daffi is still called.
+- `stop()` returns at once. Callbacks still running are abandoned (async
+  ones are cancelled) and their replies dropped; queued tasks are discarded.
+  Worker threads no longer keep the process alive after it.
 - Waiting for a response happens in the native layer with the GIL released.
   Each response wakes only the call it belongs to (in `daffi.aio`, only that
   call's future), instead of every waiter on the client.
