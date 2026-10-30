@@ -21,7 +21,7 @@ from daffi._rpc_proxy import (
     ClientConnection,
     system_exception_handler,
 )
-from daffi._signals import set_signal_handler
+from daffi._signals import SIGNAL_POLL_S, set_signal_handler
 from daffi._task_dispatcher import TaskDispatcher, shared_dispatcher
 from daffi.registry._executor_registry import EXECUTOR_REGISTRY
 from daffi.transports import (
@@ -381,6 +381,10 @@ class Application(EventsMixin, ABC):
             self._registry_subscriber = None
         self._executors_subscribed = False
 
+    def _wait_stopped(self) -> None:
+        while not self._stop_event.wait(SIGNAL_POLL_S):
+            pass
+
     def join(self):
         """Block the calling thread until :meth:`stop` is called (or until a
         registered signal handler triggers it).
@@ -405,7 +409,7 @@ class Application(EventsMixin, ABC):
         """
         self._joining = True
         try:
-            self._stop_event.wait()
+            self._wait_stopped()
         finally:
             self._joining = False
         # ``_stop_event`` is flipped only at the *end* of ``stop()``, so by
@@ -703,7 +707,7 @@ class Client(Application[SingleTransportMixin]):
         """
         self._joining = True
         try:
-            self._stop_event.wait()
+            self._wait_stopped()
         finally:
             self._joining = False
 

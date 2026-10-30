@@ -51,7 +51,8 @@ All notable changes to this project are documented in this file.
 - **Signals:** the native layer no longer installs SIGINT/SIGTERM handlers
   that ended the process with `_exit(0)`. A signal with the default action
   (e.g. SIGTERM) terminates the process at once, with that signal. Ctrl+C
-  stops every running app and `join()` returns; under `asyncio.run` on
+  stops every running app and `join()` returns, also when the kernel
+  delivers the signal to one of daffi's threads; under `asyncio.run` on
   Python 3.11+ it raises `KeyboardInterrupt` as usual. A handler the program
   installed before daffi is still called.
 - `stop()` returns at once. Callbacks still running are abandoned (async

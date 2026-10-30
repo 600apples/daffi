@@ -34,6 +34,7 @@ from daffi.app import (
     SingleTransportMixin,
 )
 from daffi.exceptions import Evicted, InitializationError
+from daffi._signals import SIGNAL_POLL_S
 from daffi._rpc_proxy import RpcProxy
 from daffi.transports import TCPTransport, UnixTransport
 
@@ -82,11 +83,18 @@ class AsyncApplication(Application):
         self._stop_tasks.add(task)
         task.add_done_callback(self._stop_tasks.discard)
 
+    async def _wait_stopped(self) -> None:
+        while not self._stop_event.is_set():
+            try:
+                await asyncio.wait_for(self._stop_event.wait(), SIGNAL_POLL_S)
+            except asyncio.TimeoutError:
+                pass
+
     async def join(self) -> None:
         """Block until :meth:`stop` is called or a signal fires."""
         self._joining = True
         try:
-            await self._stop_event.wait()
+            await self._wait_stopped()
         finally:
             self._joining = False
         if self._connection_error is not None:
@@ -258,7 +266,7 @@ class AsyncClient(AsyncApplication[SingleTransportMixin]):
         """
         self._joining = True
         try:
-            await self._stop_event.wait()
+            await self._wait_stopped()
         finally:
             self._joining = False
 

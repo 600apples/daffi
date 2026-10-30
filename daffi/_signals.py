@@ -18,6 +18,11 @@ SIGNALS_TO_NAMES_DICT = dict(
 
 _HANDLED = (signal.SIGINT, signal.SIGTERM)
 
+# Python runs signal handlers on the main thread only.  When another thread
+# takes the signal, a main thread blocked without a timeout never runs the
+# handler, so waits in ``join()`` wake up this often (seconds).
+SIGNAL_POLL_S = 0.2
+
 _lock = threading.Lock()
 _handlers: "list[weakref.WeakMethod]" = []
 _previous: dict = {}
@@ -36,7 +41,7 @@ def set_signal_handler(handler) -> None:
     Every registered application is stopped, not just the latest one.  A
     handler the program installed before daffi still runs afterwards.  A
     signal whose action is the default one (``SIGTERM`` unless the program
-    changed it) terminates the process at once, as it would without daffi.
+    changed it) is not touched, so it terminates the process at once.
     Signal handlers can only be installed from the main thread; until an
     application is created there, only the ``atexit`` hook is active.
     """
@@ -53,8 +58,13 @@ def set_signal_handler(handler) -> None:
             _stopper.start()
         if not _signals_installed and threading.current_thread() is threading.main_thread():
             for signum in _HANDLED:
-                _previous[signum] = signal.getsignal(signum)
-                signal.signal(signum, _on_signal)
+                previous = signal.getsignal(signum)
+                # A default or ignored action is left to the kernel: it
+                # terminates even while the main thread is stuck in native
+                # code, where a Python handler would never run.
+                if callable(previous):
+                    _previous[signum] = previous
+                    signal.signal(signum, _on_signal)
             _signals_installed = True
 
 
@@ -93,15 +103,10 @@ if hasattr(os, "register_at_fork"):
 
 
 def _on_signal(signum, frame) -> None:
-    previous = _previous.get(signum)
-    if previous == signal.SIG_DFL:
-        signal.signal(signum, signal.SIG_DFL)
-        os.kill(os.getpid(), signum)
-        return
     if _stopper is not None:
         _requests.put(None)
+    previous = _previous[signum]
     if previous is signal.default_int_handler:
         # Ctrl+C stops the applications and lets ``join()`` return.
         return
-    if callable(previous):
-        previous(signum, frame)
+    previous(signum, frame)

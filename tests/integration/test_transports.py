@@ -307,6 +307,19 @@ def _released(endpoint) -> bool:
     return not _accepts(endpoint)
 
 
+def _worker_threads(timeout: float = 5.0) -> list[str]:
+    """Names of daffi worker threads still alive once *timeout* passes or none
+    are left; ``stop()`` does not wait for them to exit."""
+    import threading
+
+    deadline = time.monotonic() + timeout
+    while True:
+        names = [t.name for t in threading.enumerate() if t.name.startswith("daffi-worker")]
+        if not names or time.monotonic() > deadline:
+            return names
+        time.sleep(0.01)
+
+
 def _members(conn) -> set[str]:
     from daffi._rpc_proxy import get_available_members
 
@@ -437,8 +450,6 @@ def _start_failing_after_peers_connected(spec, node: str, sync: bool = True) -> 
     """Connect a peer through every listener while start() is still running,
     then fail the step after the bind.  start() must raise, drop every peer,
     close every listener and stay retryable."""
-    import threading
-
     from daffi import Client, Router, Service
     from daffi._rpc_proxy import RpcProxy
     from daffi.aio import AsyncRouter, AsyncService
@@ -499,7 +510,7 @@ def _start_failing_after_peers_connected(spec, node: str, sync: bool = True) -> 
         "peers_dropped": [p._disconnected or p._stop_event.is_set() for p in peers],
         "conn_num": app._conn_num,
         "dispatcher_gone": app._task_dispatcher is None,
-        "worker_threads": [t.name for t in threading.enumerate() if t.name.startswith("daffi-worker")],
+        "worker_threads": _worker_threads(),
         "released": [_released(endpoint) for endpoint in spec],
     }
     for peer in peers:
@@ -521,8 +532,6 @@ def _start_failing_after_peers_connected(spec, node: str, sync: bool = True) -> 
 
 def _failed_service_start_threads(spec) -> dict:
     """A Service pre-starts its worker threads; a failed bind must stop them."""
-    import threading
-
     from daffi import Service
 
     from daffi.exceptions import InitializationError as InitError
@@ -540,7 +549,7 @@ def _failed_service_start_threads(spec) -> dict:
         blocker.close()
     return {
         "error": error,
-        "worker_threads": [t.name for t in threading.enumerate() if t.name.startswith("daffi-worker")],
+        "worker_threads": _worker_threads(),
         "others_released": [_released(endpoint) for endpoint in spec[:-1]],
     }
 

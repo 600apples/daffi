@@ -805,6 +805,7 @@ def ping():
 
 svc = Service(app_name="signal-target", transport=TCPTransport("127.0.0.1", {port}), runtime={runtime!r})
 svc.start()
+print("started", flush=True)
 try:
     svc.join()
     print("joined", flush=True)
@@ -814,12 +815,13 @@ finally:
 
 
 def _service_script(port: int, setup: str = "") -> subprocess.Popen:
+    """Start the script and return once ``start()`` has returned in it."""
     proc = _run_script(_SERVICE_SCRIPT.format(runtime=active_runtime(), port=port, setup=setup))
-    try:
-        wait_for_port(port)
-    except TimeoutError:
+    line = proc.stdout.readline().strip()
+    if line != "started":
         proc.kill()
-        raise
+        _, err = proc.communicate()
+        pytest.fail(f"service script did not start: {line!r}\n{err}")
     return proc
 
 
