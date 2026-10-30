@@ -219,6 +219,30 @@ pub fn getMessageFromClientStore(_: [*c]PyObject, args: [*c]PyObject) callconv(.
     return responseTuple(msg);
 }
 
+/// uuids of responses parked since the last drain.  Empty list when none
+/// have arrived; "disconnected" when the handle is gone.
+pub fn drainParkedResponses(_: [*c]PyObject, args: [*c]PyObject) callconv(.c) [*c]PyObject {
+    var conn_num: c_ulong = undefined;
+    if (py.PyArg_ParseTuple(args, "k", &conn_num) == 0) return null;
+    var uuids: std.ArrayList(u16) = .empty;
+    defer uuids.deinit(allocator);
+    Client.drainParked(conn_num, &uuids, allocator) catch return reasonString("disconnected");
+    const list = py.PyList_New(0) orelse return null;
+    for (uuids.items) |uuid| {
+        const item = Py_BuildValue("I", @as(c_uint, uuid)) orelse {
+            py.Py_DECREF(list);
+            return null;
+        };
+        const rc = py.PyList_Append(list, item);
+        py.Py_DECREF(item);
+        if (rc != 0) {
+            py.Py_DECREF(list);
+            return null;
+        }
+    }
+    return list;
+}
+
 /// Block (without the GIL) for the response to uuid, up to timeout_ms.
 /// Returns (data, flag, serde); None on timeout; "disconnected" or
 /// "evicted" once no response can arrive.

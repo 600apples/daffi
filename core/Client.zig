@@ -436,6 +436,14 @@ pub fn getMessageByUuid(uuid: u16, conn_num: usize) !?*Message {
     return entry.client_handler.msg_store.fetch(uuid);
 }
 
+/// uuids of responses parked since the last drain.  The messages stay in
+/// the store until `getMessageByUuid`.
+pub fn drainParked(conn_num: usize, out: *std.ArrayList(u16), out_alloc: std.mem.Allocator) !void {
+    const entry = try ClientEntry.acquire(conn_num, .any);
+    defer entry.release();
+    try entry.client_handler.msg_store.drainParked(out, out_alloc);
+}
+
 pub const WaitOutcome = union(enum) {
     message: *Message,
     timeout,

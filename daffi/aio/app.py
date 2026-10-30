@@ -59,8 +59,7 @@ class AsyncApplication(Application):
     """
 
     def __init__(self, *args, **kwargs) -> None:
-        # Concurrent by default: a request waiting on I/O must not hold up
-        # the next one.  ``workers=1`` runs one request at a time.
+        # Same default as the sync dispatcher (one callback at a time).
         kwargs.setdefault("workers", AsyncTaskDispatcher.DEFAULT_WORKERS)
         super().__init__(*args, **kwargs)
         # Replace threading.Event / threading.Lock with asyncio equivalents.

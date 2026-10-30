@@ -4,7 +4,7 @@ End-to-end regression tests for the second review round, through
 
 Each test fails on the behaviour that used to happen:
 
-* an AsyncService ran one call at a time unless ``workers`` was raised;
+* ``workers=N`` on an AsyncService did not overlap incoming calls;
 * a ``serdes=`` allow-list did not exist, so any peer could make a service
   unpickle its payload;
 * one request whose text payload was not valid UTF-8 stopped the
@@ -164,16 +164,30 @@ def default_target(free_port):
 @pytest.mark.asyncio
 class TestConcurrencyByDefault:
     @pytest.mark.parametrize("func", ["nap", "blocking_nap"])
-    async def test_calls_overlap_by_default(self, default_target, func):
-        async with _client(default_target, f"overlap-{func}", TARGET) as (_, conn):
+    async def test_default_runs_one_at_a_time(self, default_target, func):
+        async with _client(default_target, f"serial-{func}", TARGET) as (_, conn):
             started = time.monotonic()
             results = await asyncio.gather(
-                *(getattr(conn.rpc(timeout=10), func)(0.2) for _ in range(10))
+                *(getattr(conn.rpc(timeout=10), func)(0.1) for _ in range(5))
             )
             took = time.monotonic() - started
-        assert results == [0.2] * 10
-        # One at a time this took 2 s.
-        assert took < 1.0, f"10 x 0.2 s calls took {took:.2f}s"
+        assert results == [0.1] * 5
+        assert took >= 0.45, f"default workers ran calls in parallel ({took:.2f}s)"
+
+    @pytest.mark.parametrize("func", ["nap", "blocking_nap"])
+    async def test_workers_n_overlaps_calls(self, free_port, func):
+        proc = _start_target(free_port, workers=10)
+        try:
+            async with _client(free_port, f"overlap-{func}", TARGET) as (_, conn):
+                started = time.monotonic()
+                results = await asyncio.gather(
+                    *(getattr(conn.rpc(timeout=10), func)(0.2) for _ in range(10))
+                )
+                took = time.monotonic() - started
+            assert results == [0.2] * 10
+            assert took < 1.0, f"10 x 0.2 s calls took {took:.2f}s"
+        finally:
+            quiet_kill(proc)
 
     async def test_workers_1_runs_one_at_a_time(self, free_port):
         proc = _start_target(free_port, workers=1)

@@ -31,6 +31,12 @@ allocator: Allocator,
 /// Only the asyncio client sets it; blocking callers use `wait`.  Guarded by
 /// `mutex`, so Python can set it to -1 and then close the descriptor.
 response_fd: i32 = -1,
+    /// uuids parked since the last `drainParked`.  The asyncio waiter asks for
+    /// this list instead of probing every pending future.
+    ready: std.ArrayList(u16) = .empty,
+    /// A wakeup is in flight; further parked responses wait for `drainParked`
+    /// to clear it, so each burst is one write to `response_fd`.
+    armed: bool = false,
 
 const Waiter = struct {
     cond: Condition = .{},
@@ -71,6 +77,7 @@ pub fn deinit(self: *ClientMessageStore) void {
     self.expired.deinit();
     self.pending.deinit();
     self.waiters.deinit();
+    self.ready.deinit(self.allocator);
 }
 
 /// Store a response, or hand it to the caller waiting for it.
@@ -94,23 +101,59 @@ pub fn insert(self: *ClientMessageStore, msg: *Message) !InsertResult {
     const result = try self.map.getOrPut(uuid);
     if (result.found_existing) return error.StoreFull;
     result.value_ptr.* = msg;
+    self.ready.append(self.allocator, uuid) catch {
+        _ = self.map.fetchRemove(uuid);
+        return error.OutOfMemory;
+    };
     return .parked;
 }
 
-/// Wake asyncio waiters after a response was parked.
+/// Wake asyncio waiters after a response was parked, unless a wakeup is
+/// already waiting to be drained.
 pub fn triggerWakeup(self: *ClientMessageStore) void {
     if (comptime @import("builtin").target.os.tag == .freestanding) return;
     self.mutex.lock();
     defer self.mutex.unlock();
+    self.triggerWakeupLocked();
+}
+
+fn triggerWakeupLocked(self: *ClientMessageStore) void {
+    if (self.armed) return;
     if (self.response_fd < 0) return;
+    self.armed = true;
     const val: u64 = 1;
     _ = write(@intCast(self.response_fd), @as([*]const u8, @ptrCast(&val)), @sizeOf(u64));
 }
 
 pub fn setResponseFd(self: *ClientMessageStore, fd: i32) void {
     self.mutex.lock();
-    defer self.mutex.unlock();
     self.response_fd = fd;
+    const pending = self.ready.items.len > 0;
+    self.armed = false;
+    self.mutex.unlock();
+    if (fd >= 0 and pending) self.triggerWakeup();
+}
+
+/// Take the uuids of every response parked since the last drain.  The
+/// messages stay in `map` until `fetch`.  Call after a wakeup; further
+/// parkings will write the fd again.
+pub fn drainParked(self: *ClientMessageStore, out: *std.ArrayList(u16), out_alloc: Allocator) !void {
+    self.mutex.lock();
+    defer self.mutex.unlock();
+    try out.appendSlice(out_alloc, self.ready.items);
+    self.ready.clearRetainingCapacity();
+    self.armed = false;
+}
+
+fn dropReady(self: *ClientMessageStore, uuid: u16) void {
+    var i: usize = 0;
+    while (i < self.ready.items.len) {
+        if (self.ready.items[i] == uuid) {
+            _ = self.ready.swapRemove(i);
+        } else {
+            i += 1;
+        }
+    }
 }
 
 /// Retrieve and remove the response for uuid, if it arrived.
@@ -118,6 +161,7 @@ pub fn fetch(self: *ClientMessageStore, uuid: u16) ?*Message {
     self.mutex.lock();
     defer self.mutex.unlock();
     const kv = self.map.fetchRemove(uuid) orelse return null;
+    self.dropReady(uuid);
     _ = self.pending.remove(uuid);
     return kv.value;
 }
@@ -128,6 +172,7 @@ pub fn wait(self: *ClientMessageStore, uuid: u16, timeout_ms: u32) !WaitResult {
     self.mutex.lock();
     defer self.mutex.unlock();
     if (self.map.fetchRemove(uuid)) |kv| {
+        self.dropReady(uuid);
         _ = self.pending.remove(uuid);
         return .{ .message = kv.value };
     }
@@ -163,9 +208,11 @@ pub fn expire(self: *ClientMessageStore, uuid: u16) !void {
         defer self.mutex.unlock();
         // Already taken: there is nothing left to drop.
         if (self.track_pending and !self.pending.remove(uuid)) return;
+        self.dropReady(uuid);
         if (!self.closed) try self.expired.put(uuid, {});
         return;
     }
+    self.dropReady(uuid);
     _ = self.pending.remove(uuid);
     self.mutex.unlock();
     kv.?.value.deinit();
@@ -184,6 +231,7 @@ pub fn claim(self: *ClientMessageStore, uuid: u16, reuse_expired: bool) !bool {
     if (self.track_pending) try self.pending.put(uuid, {});
     _ = self.expired.remove(uuid);
     const stale = self.map.fetchRemove(uuid);
+    if (stale != null) self.dropReady(uuid);
     self.mutex.unlock();
     if (stale) |kv| kv.value.deinit();
     return true;
@@ -260,4 +308,47 @@ test "ClientMessageStore reuses an expired uuid only when nothing else is free" 
     s.fetch(4).?.deinit();
     try s.expire(4);
     try std.testing.expect(try s.claim(4, false));
+}
+
+test "drainParked names every parked uuid once and coalesces wakeups" {
+    if (comptime is_wasm) return;
+    const c = @import("posix_c");
+    var s = ClientMessageStore.init(std.testing.allocator);
+    s.track_pending = true;
+    defer s.deinit();
+
+    var fds: [2]c_int = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), c.socketpair(c.AF_UNIX, c.SOCK_STREAM, 0, &fds));
+    defer {
+        _ = c.close(fds[0]);
+        _ = c.close(fds[1]);
+    }
+    s.setResponseFd(fds[1]);
+
+    try std.testing.expect(try s.claim(11, false));
+    try std.testing.expect(try s.claim(12, false));
+    const m1 = try testResponse(11, "a");
+    const m2 = try testResponse(12, "b");
+    try std.testing.expectEqual(InsertResult.parked, try s.insert(m1));
+    s.triggerWakeup();
+    try std.testing.expectEqual(InsertResult.parked, try s.insert(m2));
+    s.triggerWakeup();
+
+    var buf: [16]u8 = undefined;
+    const n = c.read(fds[0], &buf, buf.len);
+    try std.testing.expectEqual(@as(isize, 8), n);
+
+    var uuids: std.ArrayList(u16) = .empty;
+    defer uuids.deinit(std.testing.allocator);
+    try s.drainParked(&uuids, std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 2), uuids.items.len);
+    try std.testing.expect(std.mem.indexOfScalar(u16, uuids.items, 11) != null);
+    try std.testing.expect(std.mem.indexOfScalar(u16, uuids.items, 12) != null);
+
+    // Messages stay until fetch, and a fetch is not listed again.
+    s.fetch(11).?.deinit();
+    uuids.clearRetainingCapacity();
+    try s.drainParked(&uuids, std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), uuids.items.len);
+    s.fetch(12).?.deinit();
 }

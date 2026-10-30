@@ -137,13 +137,15 @@ class AsyncTaskDispatcher:
     """Async counterpart of :class:`~daffi._task_dispatcher.TaskDispatcher`.
 
     Uses one ``asyncio.Task`` for the poller and one per request, at most
-    ``workers`` of them at a time.
+    ``workers`` of them at a time.  Default is 1, same as the sync
+    dispatcher: callbacks run one at a time, in arrival order.  Raise
+    ``workers`` to overlap incoming callbacks (each is a Task, not a thread).
 
     The public API (``start_for_connection`` / ``stop_for_connection``) mirrors
     the sync version except that ``stop_for_connection`` is ``async def``.
     """
 
-    DEFAULT_WORKERS = 64
+    DEFAULT_WORKERS = 1
 
     def __init__(self, workers: int = DEFAULT_WORKERS) -> None:
         if workers < 1:

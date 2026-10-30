@@ -123,6 +123,16 @@ def get_message_from_client_store(
     return dfcore.getMessageFromClientStore(uuid, conn_num)
 
 
+def drain_parked_responses(conn_num: int) -> Union[list, str]:
+    """uuids of responses parked since the last drain.
+
+    Returns a list of request ids, or ``"disconnected"`` when the handle
+    is gone.  The payloads stay in the store until
+    :func:`get_message_from_client_store`.
+    """
+    return dfcore.drainParkedResponses(conn_num)
+
+
 def wait_message_from_client_store(
     uuid: int, timeout_ms: int, conn_num: int
 ) -> Union[Tuple[Union[bytes, str], int, int], str, None]:

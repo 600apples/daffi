@@ -201,11 +201,12 @@ class _AsyncHarness:
 
 @pytest.mark.asyncio
 class TestAsyncTaskDispatcherWorkers:
-    async def test_default_runs_64_at_once(self):
+    async def test_default_is_one_like_the_sync_dispatcher(self):
+        from daffi._task_dispatcher import TaskDispatcher
         from daffi.aio._task_dispatcher import AsyncTaskDispatcher
 
-        assert AsyncTaskDispatcher.DEFAULT_WORKERS == 64
-        assert AsyncTaskDispatcher().workers == 64
+        assert AsyncTaskDispatcher.DEFAULT_WORKERS == TaskDispatcher.DEFAULT_WORKERS == 1
+        assert AsyncTaskDispatcher().workers == 1
 
     async def test_runs_up_to_workers_at_once(self):
         h = _AsyncHarness(workers=3, queued=5)

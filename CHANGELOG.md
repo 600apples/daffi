@@ -22,10 +22,6 @@ All notable changes to this project are documented in this file.
   WebSocket peers with a `SerdeNotAllowed` error, and a `Router` drops PICKLE
   replies from them. Any web page can open a WebSocket to a local server,
   and unpickling runs code the sender chooses.
-- `AsyncService` and `AsyncClient` run up to 64 incoming callbacks at once
-  by default (`workers=64`); before, they ran one at a time. Pass
-  `workers=1` for the old order. Requests beyond the limit wait in the
-  native queue, which pushes back with `ServiceOverloaded` when full.
 - `rpc_nowait()` sends exactly one call with the arguments it is given.
   It used to send one call per item when the first argument was a list or
   other iterable, and dropped keyword arguments; use `stream_nowait()` to
@@ -145,6 +141,10 @@ All notable changes to this project are documented in this file.
   stretches them.
 - `Client.connect()` fails at once when the kernel refuses the connection,
   instead of waiting out the connect timeout.
+- asyncio waiters take a list of uuids that arrived, instead of probing
+  every pending call on each wakeup.
+- Growing the open-file limit on macOS clamps to `kern.maxfilesperproc`
+  when `setrlimit` refuses a value above it.
 
 ### Fixed
 
@@ -196,6 +196,8 @@ All notable changes to this project are documented in this file.
 - `stream_nowait()` in `daffi.aio` uses the requested `serde`.
 - The poller no longer spins at full CPU when `kevent`/`epoll_wait` fails.
 - A client handler's method list and token are no longer leaked.
+- A peer name copied for the channel map is no longer leaked when the map
+  cannot grow.
 
 
 ## 3.0.1

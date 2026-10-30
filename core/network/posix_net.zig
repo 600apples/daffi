@@ -541,10 +541,26 @@ pub fn removeStaleSocket(path: []const u8) !void {
     path_buf[path.len] = 0;
     const path_z: [*:0]const u8 = @ptrCast(&path_buf);
 
-    var st: std.c.Stat = undefined;
-    // Nothing there (or not reachable): bind reports any real problem.
-    if (std.c.fstatat(std.c.AT.FDCWD, path_z, &st, std.c.AT.SYMLINK_NOFOLLOW) != 0) return;
-    if (!std.c.S.ISSOCK(@intCast(st.mode))) {
+    const is_sock = blk: {
+        if (comptime @import("builtin").os.tag == .linux) {
+            var stx = std.mem.zeroes(std.os.linux.Statx);
+            const rc = std.os.linux.statx(
+                std.os.linux.AT.FDCWD,
+                path_z,
+                std.os.linux.AT.SYMLINK_NOFOLLOW,
+                .{ .TYPE = true, .MODE = true },
+                &stx,
+            );
+            const signed: isize = @bitCast(rc);
+            if (signed < 0) return; // absent / unreachable — bind reports it
+            break :blk std.os.linux.S.ISSOCK(stx.mode);
+        } else {
+            var st: std.c.Stat = undefined;
+            if (std.c.stat(path_z, &st) != 0) return;
+            break :blk std.c.S.ISSOCK(@intCast(st.mode));
+        }
+    };
+    if (!is_sock) {
         noteLiteral("the path exists and is not a socket");
         return error.PathAlreadyExists;
     }

@@ -203,6 +203,16 @@ const client_methods = [_]PyMethodDef{
         ,
     },
     .{
+        .ml_name  = "drainParkedResponses",
+        .ml_meth  = cffi.drainParkedResponses,
+        .ml_flags = 1,
+        .ml_doc   =
+            \\drainParkedResponses(conn_num) -> list[int] | "disconnected"
+            \\
+            \\uuids of responses parked since the last drain.
+        ,
+    },
+    .{
         .ml_name  = "waitMessageFromClientStore",
         .ml_meth  = cffi.waitMessageFromClientStore,
         .ml_flags = 1,
@@ -361,6 +371,7 @@ test {
     _ = @import("store.zig");
     _ = @import("handlers/handlers.zig");
     _ = @import("Server.zig");
+    _ = @import("nofile.zig");
 }
 
 // ── Combined method table ─────────────────────────────────────────────────────

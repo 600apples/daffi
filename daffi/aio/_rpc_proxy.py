@@ -6,9 +6,9 @@ Design notes
 ------------
 ``AsyncResponseNotifier``
     One per connection.  The native layer signals its fd whenever a
-    response is parked; a ``loop.add_reader`` callback then takes the parked
-    responses of the uuids being awaited and resolves their futures.  Only
-    those waiters wake.
+    response is parked; a ``loop.add_reader`` callback then takes the uuids
+    that arrived and resolves only those futures.  One wakeup covers a
+    burst of replies.
 
 ``AsyncRpcResult``
     Awaits its future (with a liveness-check timeout cap).
@@ -46,6 +46,7 @@ from daffi.registry._executor_registry import EXECUTOR_REGISTRY
 from daffi._bindings import (
     send_message_from_client,
     get_message_from_client_store,
+    drain_parked_responses,
     expire_message,
     set_service_methods,
     send_handshake_from_client,
@@ -87,8 +88,15 @@ class AsyncResponseNotifier:
 
     def _on_readable(self) -> None:
         self._wakeup.drain()
-        for uuid, fut in list(self._futures.items()):
-            if fut.done():
+        batch = drain_parked_responses(self._conn_num)
+        if batch == "disconnected":
+            for fut in self._futures.values():
+                if not fut.done():
+                    fut.set_result(batch)
+            return
+        for uuid in batch:
+            fut = self._futures.get(uuid)
+            if fut is None or fut.done():
                 continue
             res = get_message_from_client_store(uuid, self._conn_num)
             if res is not None:

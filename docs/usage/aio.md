@@ -128,7 +128,7 @@ from daffi.aio import AsyncClient
 
 client = AsyncClient(
     app_name="my-client",   # unique name on the network
-    workers=64,             # incoming callbacks that may run at once (default)
+    workers=1,              # incoming callbacks at once (default; raise to overlap)
     transport=TCPTransport("127.0.0.1", 6001))
 
 conn   = await client.connect()   # returns an AsyncClientConnection
@@ -143,9 +143,8 @@ this node.
 
 | Value | Behaviour |
 |---|---|
-| `64` (default) | Up to 64 callbacks run concurrently, each in its own `asyncio.Task`. |
-| `N` | Up to `N` callbacks run concurrently. |
-| `1` | One callback at a time, in arrival order. |
+| `1` (default) | One callback at a time, in arrival order. Same as the sync dispatcher. |
+| `N` | Up to `N` callbacks run concurrently, each in its own `asyncio.Task`. |
 
 Requests beyond the limit stay queued in the native layer and start as
 running ones finish; once that queue is full, callers get

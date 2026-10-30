@@ -158,7 +158,10 @@ pub fn ChannelsMapper(comptime ConnectionT: type) type {
             self.mutex.lock();
             defer self.mutex.unlock();
             const chan_uuid_dup = try self.allocator.dupe(u8, chan_uuid);
-            const result = try self.channels.getOrPut(self.allocator, chan_uuid_dup);
+            const result = self.channels.getOrPut(self.allocator, chan_uuid_dup) catch |err| {
+                self.allocator.free(chan_uuid_dup);
+                return err;
+            };
             const chan = result.value_ptr;
             if (!result.found_existing) {
                 chan.* = Channel.init(self.allocator, conn, chan_uuid_dup) catch |err| {
@@ -285,4 +288,22 @@ pub fn ChannelsMapper(comptime ConnectionT: type) type {
             self.channels.clearAndFree(self.allocator);
         }
     };
+}
+
+test "getOrCreateChannel frees the name if the map cannot grow" {
+    const Dummy = struct {
+        refs: u32 = 1,
+        pub fn retain(self: *@This()) void {
+            self.refs += 1;
+        }
+        pub fn release(self: *@This()) void {
+            self.refs -= 1;
+        }
+    };
+    const Mapper = ChannelsMapper(Dummy);
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 1 });
+    var mapper = Mapper{ .channels = .{}, .allocator = failing.allocator() };
+    var dummy = Dummy{};
+    try std.testing.expectError(error.OutOfMemory, mapper.getOrCreateChannel(&dummy, "peer"));
+    try std.testing.expectEqual(@as(u32, 1), dummy.refs);
 }

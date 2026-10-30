@@ -126,10 +126,44 @@ fn grow(needed: usize) bool {
     }
     if (cap <= limit.load(.monotonic)) return cap >= needed;
 
+    if (!setLimit(cap)) {
+        // macOS reports RLIM_INFINITY as the hard cap, but setrlimit
+        // refuses a soft limit above kern.maxfilesperproc.
+        if (comptime @import("builtin").os.tag.isDarwin()) {
+            const max_proc = procMaxFiles() orelse return false;
+            hard_cap.store(max_proc, .release);
+            if (cap > max_proc) cap = max_proc;
+            if (cap <= limit.load(.monotonic)) return false;
+            if (!setLimit(cap)) return false;
+        } else return false;
+    }
+    limit.store(cap, .release);
+    return cap >= needed;
+}
+
+fn setLimit(cap: usize) bool {
     std.posix.setrlimit(.NOFILE, .{
         .cur = @intCast(cap),
         .max = hard_rlim,
     }) catch return false;
-    limit.store(cap, .release);
-    return cap >= needed;
+    return true;
+}
+
+/// `kern.maxfilesperproc`, or null if the sysctl is missing.
+fn procMaxFiles() ?usize {
+    var mib = [2]c_int{ 1, 29 }; // CTL_KERN, KERN_MAXFILESPERPROC
+    var max: c_int = 0;
+    var len: usize = @sizeOf(c_int);
+    if (sysctl(&mib, 2, &max, &len, null, 0) != 0) return null;
+    if (max <= 0) return null;
+    return @intCast(max);
+}
+
+extern "c" fn sysctl(name: [*c]c_int, namelen: c_uint, oldp: ?*anyopaque, oldlenp: ?*usize, newp: ?*anyopaque, newlen: usize) c_int;
+
+test "procMaxFiles is a finite cap on Darwin" {
+    if (comptime !@import("builtin").os.tag.isDarwin()) return;
+    const max = procMaxFiles() orelse return error.TestUnexpectedResult;
+    try std.testing.expect(max >= 256);
+    try std.testing.expect(max < std.math.maxInt(usize) / 2);
 }

@@ -23,6 +23,7 @@ pub const sendHandshakeFromClient   = @import("cffi/client.zig").sendHandshakeFr
 pub const getAvailableMembers       = @import("cffi/client.zig").getAvailableMembers;
 pub const missingMembers            = @import("cffi/client.zig").missingMembers;
 pub const getMessageFromClientStore = @import("cffi/client.zig").getMessageFromClientStore;
+pub const drainParkedResponses      = @import("cffi/client.zig").drainParkedResponses;
 pub const waitMessageFromClientStore = @import("cffi/client.zig").waitMessageFromClientStore;
 pub const expireMessage             = @import("cffi/client.zig").expireMessage;
 pub const getMessageForClientWorker = @import("cffi/client.zig").getMessageForClientWorker;
