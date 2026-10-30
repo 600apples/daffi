@@ -19,6 +19,8 @@ def alias(value: str):
 
     if not isinstance(value, str) or not value:
         raise ValueError("Alias must be a non-empty string.")
+    if "," in value:
+        raise ValueError("Alias cannot contain a comma (method lists are comma-separated on the wire).")
 
     def dec(fn: Callable[..., Any]):
         from daffi.registry._callback import callback

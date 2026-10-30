@@ -51,6 +51,23 @@ from . import dfcore
 METADATA_SEPARATOR = ","
 
 
+def coerce_timeout(timeout) -> float:
+    """Seconds to wait; ``None`` or ``0`` means wait forever.
+
+    Fractional values are kept (``timeout=0.5`` is half a second).  Negatives
+    are rejected.
+    """
+    if timeout is None:
+        return 0.0
+    try:
+        value = float(timeout)
+    except (TypeError, ValueError) as exc:
+        raise TypeError(f"timeout must be a number of seconds, got {timeout!r}") from exc
+    if value < 0:
+        raise ValueError("timeout must be >= 0")
+    return value
+
+
 def _names(names: "list[str] | None") -> "list[str]":
     if names is None:
         return [name for name, _ in EXECUTOR_REGISTRY]
@@ -282,7 +299,7 @@ class RpcProxy:
         logger: logging.Logger,
     ):
         self.conn = conn
-        self.timeout = int(timeout or 0)
+        self.timeout = coerce_timeout(timeout)
         self._to = _Receivers(receiver)
         self.receiver = str(self._to)
         self.serde = serde
@@ -585,7 +602,7 @@ class BroadcastProxy:
         logger: logging.Logger,
     ):
         self.conn = conn
-        self.timeout = int(timeout or 0)
+        self.timeout = coerce_timeout(timeout)
         self.serde = serde
         self.return_result = return_result
         self.logger = logger
@@ -670,15 +687,29 @@ class BroadcastProxy:
                     self.logger.warning(
                         f"call_all: receiver {receiver_name!r} not reachable, skipping."
                     )
-            # Wait for every response and collect into a dict.
+            # Wait in parallel: a hung peer must not delay results already parked.
             results: dict = {}
-            for name in list(pending):
+            names = list(pending)
+
+            def _take(name: str):
                 rpc_result = pending.pop(name)
                 try:
                     result_data, _, serde_r = rpc_result.result()
-                    results[name] = Serializer.deserialize(serde_r, result_data)[0][0]
+                    return name, Serializer.deserialize(serde_r, result_data)[0][0]
                 except Exception as exc:
-                    results[name] = exc
+                    return name, exc
+
+            if len(names) == 1:
+                key, value = _take(names[0])
+                results[key] = value
+            else:
+                from concurrent.futures import ThreadPoolExecutor, as_completed
+
+                with ThreadPoolExecutor(max_workers=len(names)) as pool:
+                    futs = [pool.submit(_take, name) for name in names]
+                    for fut in as_completed(futs):
+                        key, value = fut.result()
+                        results[key] = value
             return results
         finally:
             # Requests nobody will wait for any more keep their uuid taken
@@ -791,7 +822,7 @@ class _StreamBase:
         self.conn = conn
         self.receiver = receiver or ""
         self.serde = serde
-        self.timeout = int(timeout or 0)
+        self.timeout = coerce_timeout(timeout)
         self.logger = logger
         self._receiver = {receiver} if receiver else set()
 
@@ -911,7 +942,9 @@ class ClientConnection:
         native-layer message.
         """
         client = self.client
-        if not client._disconnected:
+        if client._intentionally_stopped:
+            raise TransmissionFailure("Client was stopped.")
+        if not client._disconnected and client._conn_num is not None:
             return
         if isinstance(client._connection_error, Evicted):
             # Reconnecting would evict the connection that took the name.
@@ -932,7 +965,7 @@ class ClientConnection:
         self,
         timeout: Union[int, None] = None,
         receiver: Union[str, List[str], None] = None,
-        serde: SerdeFormat = SerdeFormat.PICKLE,
+        serde: SerdeFormat = SerdeFormat.DEFAULT,
     ) -> RpcProxy:
         """Configure a **blocking** call to a single worker and return a proxy.
 
@@ -949,7 +982,7 @@ class ClientConnection:
                       ``None`` picks a worker using round-robin among all
                       peers that expose the requested method.
             serde:    Serialisation format.  Defaults to
-                      :attr:`~daffi.serialization.SerdeFormat.PICKLE`.
+                      :attr:`~daffi._serialization.SerdeFormat.MSGPACK`.
 
         Example::
 
@@ -968,7 +1001,7 @@ class ClientConnection:
     def rpc_nowait(
         self,
         receiver: Union[str, List[str], None] = None,
-        serde: SerdeFormat = SerdeFormat.PICKLE,
+        serde: SerdeFormat = SerdeFormat.DEFAULT,
     ) -> RpcProxy:
         """Configure a **fire-and-forget** call to a single worker and return a proxy.
 
@@ -980,7 +1013,7 @@ class ClientConnection:
                       to whichever of them is connected (taking turns).
                       ``None`` picks one using round-robin.
             serde:    Serialisation format.  Defaults to
-                      :attr:`~daffi.serialization.SerdeFormat.PICKLE`.
+                      :attr:`~daffi._serialization.SerdeFormat.MSGPACK`.
 
         Example::
 
@@ -1000,7 +1033,7 @@ class ClientConnection:
         self,
         timeout: Union[int, None] = None,
         receiver: Union[str, List[str], None] = None,
-        serde: SerdeFormat = SerdeFormat.PICKLE,
+        serde: SerdeFormat = SerdeFormat.DEFAULT,
     ) -> BroadcastProxy:
         """Configure a **blocking broadcast** to all matching workers and return a proxy.
 
@@ -1037,7 +1070,7 @@ class ClientConnection:
     def cast_nowait(
         self,
         receiver: Union[str, List[str], None] = None,
-        serde: SerdeFormat = SerdeFormat.PICKLE,
+        serde: SerdeFormat = SerdeFormat.DEFAULT,
     ) -> BroadcastProxy:
         """Configure a **fire-and-forget broadcast** to all matching workers and return a proxy.
 
@@ -1168,10 +1201,21 @@ class ClientConnection:
         """
         if not members:
             return
+        client = self.client
+        if client._disconnected or client._conn_num is None:
+            err = client._connection_error
+            if err is not None:
+                raise err
+            raise Disconnected("Client is not connected.")
         needed = set(members)
         start = time.monotonic()
         while True:
-            raw = get_available_members(self.client._conn_num)
+            if client._disconnected or client._conn_num is None:
+                err = client._connection_error
+                if err is not None:
+                    raise err
+                raise Disconnected("Client disconnected while waiting for members.")
+            raw = get_available_members(client._conn_num)
             current = {m["name"] for m in raw}
             if needed.issubset(current):
                 return

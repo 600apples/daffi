@@ -41,6 +41,7 @@ response_fd: i32 = -1,
 const Waiter = struct {
     cond: Condition = .{},
     msg: ?*Message = null,
+    expired: bool = false,
 };
 
 pub const WaitResult = union(enum) {
@@ -122,7 +123,8 @@ fn triggerWakeupLocked(self: *ClientMessageStore) void {
     if (self.response_fd < 0) return;
     self.armed = true;
     const val: u64 = 1;
-    _ = write(@intCast(self.response_fd), @as([*]const u8, @ptrCast(&val)), @sizeOf(u64));
+    const n = write(@intCast(self.response_fd), @as([*]const u8, @ptrCast(&val)), @sizeOf(u64));
+    if (n <= 0) self.armed = false;
 }
 
 pub fn setResponseFd(self: *ClientMessageStore, fd: i32) void {
@@ -178,10 +180,28 @@ pub fn wait(self: *ClientMessageStore, uuid: u16, timeout_ms: u32) !WaitResult {
     }
     if (self.closed) return .closed;
     var waiter = Waiter{};
-    try self.waiters.put(uuid, &waiter);
-    defer _ = self.waiters.remove(uuid);
     const deadline = misc.monotonicMs() + timeout_ms;
-    while (waiter.msg == null and !self.closed) {
+    self.waiters.put(uuid, &waiter) catch {
+        // Hash map OOM: poll the store instead of registering a waiter.
+        while (true) {
+            if (self.map.fetchRemove(uuid)) |kv| {
+                self.dropReady(uuid);
+                _ = self.pending.remove(uuid);
+                return .{ .message = kv.value };
+            }
+            if (self.closed) return .closed;
+            const now = misc.monotonicMs();
+            if (now >= deadline) return .timeout;
+            self.mutex.unlock();
+            if (comptime !is_wasm) {
+                const ts = std.c.timespec{ .sec = 0, .nsec = std.time.ns_per_ms };
+                _ = std.c.nanosleep(&ts, null);
+            }
+            self.mutex.lock();
+        }
+    };
+    defer _ = self.waiters.remove(uuid);
+    while (waiter.msg == null and !self.closed and !waiter.expired) {
         const now = misc.monotonicMs();
         if (now >= deadline) break;
         _ = waiter.cond.timedWait(&self.mutex, @intCast(deadline - now));
@@ -203,6 +223,14 @@ pub fn close(self: *ClientMessageStore) void {
 /// remembers the uuid so one that arrives later is discarded.
 pub fn expire(self: *ClientMessageStore, uuid: u16) !void {
     self.mutex.lock();
+    if (self.waiters.get(uuid)) |waiter| {
+        defer self.mutex.unlock();
+        waiter.*.expired = true;
+        waiter.*.cond.signal();
+        if (self.track_pending) _ = self.pending.remove(uuid);
+        if (!self.closed) try self.expired.put(uuid, {});
+        return;
+    }
     const kv = self.map.fetchRemove(uuid);
     if (kv == null) {
         defer self.mutex.unlock();
@@ -223,7 +251,7 @@ pub fn expire(self: *ClientMessageStore, uuid: u16) !void {
 /// be on the way, and is then dropped as the new request's.
 pub fn claim(self: *ClientMessageStore, uuid: u16, reuse_expired: bool) !bool {
     self.mutex.lock();
-    if (self.pending.contains(uuid) or (!reuse_expired and self.expired.contains(uuid))) {
+    if (self.pending.contains(uuid) or self.waiters.contains(uuid) or (!reuse_expired and self.expired.contains(uuid))) {
         self.mutex.unlock();
         return false;
     }
@@ -235,6 +263,18 @@ pub fn claim(self: *ClientMessageStore, uuid: u16, reuse_expired: bool) !bool {
     self.mutex.unlock();
     if (stale) |kv| kv.value.deinit();
     return true;
+}
+
+/// Next free uuid after `counter`, never 0.  `reuse_expired` allows ids whose
+/// caller already gave up.  Null when every id is still waiting.
+pub fn claimNext(self: *ClientMessageStore, counter: *std.atomic.Value(u16), reuse_expired: bool) !?u16 {
+    var tries: u32 = 0;
+    while (tries < std.math.maxInt(u16)) : (tries += 1) {
+        const next = counter.fetchAdd(1, .monotonic) +% 1;
+        if (next == 0) continue;
+        if (try self.claim(next, reuse_expired)) return next;
+    }
+    return null;
 }
 
 /// Undo `claim` for a request that was never sent.

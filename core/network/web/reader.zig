@@ -121,6 +121,7 @@ pub const Reader = struct {
                         const byte1 = msg[0];
                         const byte2 = msg[1];
                         masked = byte2 & 128 == 128;
+                        if (!masked) return error.UnmaskedFrame;
                         length_of_length = switch (byte2 & 127) {
                             126 => 2,
                             127 => 8,

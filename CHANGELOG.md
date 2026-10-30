@@ -6,6 +6,22 @@ All notable changes to this project are documented in this file.
 
 ### Breaking
 
+- **Default wire format is MSGPACK.** `rpc()` / `cast()` (Python and the JS
+  client) use MessagePack unless `serde=` is set. Pass
+  `serde=SerdeFormat.PICKLE` (or JSON / OPAQUE) to choose another format.
+  `msgpack>=1.0` is a required dependency (`daffi[msgpack]` is gone). The JS
+  client embeds a MessagePack codec; no extra script is needed.
+- **Default `serdes=` accepts every format** (`SerdeFormat.ALL`). Pass
+  `serdes=SerdeFormat.SAFE` to refuse PICKLE on a node.
+- **WebSocket Origin is fail-closed.** An empty
+  `TCPTransport.websocket_allowed_origins` refuses every upgrade. Set the
+  property after construction to the pages that may connect, or set
+  `auth_token=` (which allows any origin). Native TCP/Unix clients are
+  unaffected (WebSocket-only; formerly the constructor kwarg
+  `allowed_origins`).
+- TCP `auth_token=` requires `tls=True` (the token is in handshake JSON).
+  Unix sockets may still use a token without TLS.
+
 - `Router`, `Service`, and `Client` all take addresses through `transport`.
   `Client` accepts a single `TCPTransport` or `UnixTransport`. `Router` and
   `Service` accept one transport or a sequence of them; every listener shares
@@ -65,14 +81,18 @@ All notable changes to this project are documented in this file.
 - `serdes=` on `Service`, `Client` and their async counterparts: the
   `SerdeFormat` values accepted in incoming requests. A request in another
   format is answered with a `SerdeNotAllowed` error before its payload is
-  decoded. The default accepts every format; leave out `PICKLE` unless every
-  peer is trusted.
+  decoded. The default is `SerdeFormat.ALL`; pass `SerdeFormat.SAFE` to
+  refuse PICKLE.
 - `auth_token=` on `Router`, `Service`, `Client` and their async
   counterparts (`authToken` in the JS client): a shared secret every peer
   must send in its handshake. A peer without it is disconnected before it
   can call anything or take a name.
-- `allowed_origins=` on a listening `TCPTransport`: the web pages that may
-  open a WebSocket to it. Other upgrades are refused with 403.
+- `TCPTransport.websocket_allowed_origins` (set after construction on a
+  listening transport): the web pages that may open a WebSocket to it. Empty
+  (the default) refuses every upgrade; `*` (set when `auth_token=` is given)
+  allows any origin. Other upgrades are refused with 403.
+- `DAFFI_MAX_CONNECTIONS` (default 4096): a process-wide cap on accepted
+  connections. Further accepts are refused.
 - `callbacks=` on `Service`, `Client` and their async counterparts: the
   callbacks this node offers. Default: every registered callback.
 - `verify=` on `TCPTransport` and `UnixTransport` (see Breaking).
@@ -94,7 +114,9 @@ All notable changes to this project are documented in this file.
   accepting in the meantime.
 - A Unix socket file deleted while the server is running is bound again
   within a second. A path another process has taken over is left alone, and
-  connections that were already open stay open.
+  connections that were already open stay open. Newly bound Unix sockets are
+  created with mode `0600`.
+- Client-to-server WebSocket frames without a mask are refused.
 - Server slots are reused after `stop()`, so a process can start and stop
   servers any number of times (the limit of 256 is now on servers running
   at the same time).

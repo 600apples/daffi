@@ -274,7 +274,7 @@ class Application(EventsMixin, ABC):
             workers:       Number of concurrent worker **threads** for executing
                            incoming ``@callback`` calls.  ``1`` (default) runs
                            callbacks inline with zero overhead.  ``N >= 2``
-                           spawns a pool of N-1 threads.  Ignored by
+                           spawns a pool of N threads.  Ignored by
                            :class:`Router` which never executes callbacks
                            itself.
             runtime:       Native runtime for this process,
@@ -296,16 +296,17 @@ class Application(EventsMixin, ABC):
                            in incoming ``@callback`` requests; a request in
                            any other format is answered with a
                            ``SerdeNotAllowed`` error and never decoded.
-                           ``None`` (default) accepts every format.  Leave
-                           out ``SerdeFormat.PICKLE`` unless every peer is
-                           trusted: unpickling runs code the sender chooses.
+                           ``None`` (default) accepts every format
+                           (:attr:`SerdeFormat.ALL`).  Pass
+                           :attr:`SerdeFormat.SAFE` to refuse PICKLE.
                            PICKLE from a WebSocket peer is always refused.
                            Ignored by :class:`Router`.
             auth_token:    Shared secret.  A :class:`Router` or
                            :class:`Service` given one refuses every peer
                            whose handshake does not carry the same token; a
-                           :class:`Client` sends it.  It travels in the clear
-                           unless the transport uses TLS.  ``None``
+                           :class:`Client` sends it.  On TCP it requires
+                           ``tls=True`` (the token travels in handshake JSON).
+                           Unix sockets may use it without TLS.  ``None``
                            (default) accepts any peer.
             callbacks:     The ``@callback`` functions (or their names) this
                            node offers to peers.  The others are neither
@@ -354,12 +355,20 @@ class Application(EventsMixin, ABC):
         # re-raise ``_connection_error``) or whether it must be raised
         # directly from the watcher thread to avoid being silently swallowed.
         self._joining: bool = False
+        # Set by :meth:`stop`; cleared by :meth:`connect` / :meth:`start`.
+        # Reconnect must not resurrect a client the user shut down.
+        self._intentionally_stopped: bool = False
         self.__init_events__()
         self._executors_subscribed: bool = False
 
         if self.app_name is None:
             self.app_name = f"{socket.gethostname()}-{string_uuid()}"
         self.app_name = str(self.app_name)
+        if "," in self.app_name:
+            raise InitializationError(
+                f"app_name cannot contain a comma (got {self.app_name!r})"
+            )
+        self._require_tls_for_token()
 
         process_ident = f"{self.__class__.__name__.lower()}[{self.app_name}]"
         if self.server_mode == ServerMode.ROUTER:
@@ -377,6 +386,18 @@ class Application(EventsMixin, ABC):
 
         set_signal_handler(self._signal_stop)
 
+    def _require_tls_for_token(self) -> None:
+        """auth_token on TCP is sent in handshake JSON; require TLS there."""
+        if self.auth_token is None:
+            return
+        for t in self._transports:
+            if isinstance(t, TCPTransport) and not t.tls:
+                raise InitializationError(
+                    "auth_token on a TCP transport requires tls=True; "
+                    "the token is sent in the handshake JSON. "
+                    "Unix sockets may use auth_token without TLS."
+                )
+
     def _signal_stop(self) -> None:
         """Stop on SIGINT / SIGTERM / interpreter exit."""
         self.stop()
@@ -389,7 +410,13 @@ class Application(EventsMixin, ABC):
         All or nothing: if one cannot be bound, none stays bound, and the
         error names that transport.
         """
-        listeners = [t.native_listener() for t in self._transports]
+        allow_any_ws = self.auth_token is not None
+        listeners = [
+            t.native_listener(allow_any_origin=allow_any_ws)
+            if isinstance(t, TCPTransport)
+            else t.native_listener()
+            for t in self._transports
+        ]
         try:
             return dfcore.addListeners(
                 listeners,
@@ -471,7 +498,8 @@ class Application(EventsMixin, ABC):
 
     def _wait_stopped(self) -> None:
         while not self._stop_event.wait(SIGNAL_POLL_S):
-            pass
+            if self._disconnected:
+                return
 
     def join(self):
         """Block the calling thread until :meth:`stop` is called (or until a
@@ -497,7 +525,8 @@ class Application(EventsMixin, ABC):
         """
         self._joining = True
         try:
-            self._wait_stopped()
+            if not self._disconnected:
+                self._wait_stopped()
         finally:
             self._joining = False
         # ``_stop_event`` is flipped only at the *end* of ``stop()``, so by
@@ -547,6 +576,7 @@ class ServerMixin:
         if self._conn_num is not None:
             raise RuntimeError(f"{self.__class__.__name__} is already started")
         # A server can start again after stop(); stop() must then work again.
+        self._intentionally_stopped = False
         self._stop_event.clear()
         try:
             if self.server_mode == ServerMode.SERVICE:
@@ -597,6 +627,7 @@ class ServerMixin:
         thread.  Clearing it first (as an earlier version did) made the signal
         go nowhere and ``stop()`` block forever joining the poller.
         """
+        self._intentionally_stopped = True
         with self._stop_lock:
             if self._stopping or self._stop_event.is_set():
                 return
@@ -696,6 +727,7 @@ class Client(Application[SingleTransportMixin]):
         if self._conn_num is not None:
             raise RuntimeError("Client is already connected")
         # A client can connect again after stop().
+        self._intentionally_stopped = False
         self._stop_event.clear()
         self._connection_error = None
         self._disconnected = False
@@ -773,22 +805,46 @@ class Client(Application[SingleTransportMixin]):
             ``True`` when the reconnect succeeded, ``False`` otherwise.
         """
         with self._reconnect_lock:
+            if self._intentionally_stopped:
+                return False
             if not self._disconnected:
-                # Another thread already reconnected while we were waiting.
-                return self._conn_num is not None
+                # Another thread already finished while we were waiting.
+                if self._conn_num is not None:
+                    return True
+                # Inconsistent: looks connected but has no handle — heal it.
+                self._disconnected = True
             if isinstance(self._connection_error, Evicted):
                 # The name now belongs to a newer connection.
                 return False
+            saved_error = self._connection_error
             try:
                 with self._stop_lock:
+                    if self._intentionally_stopped:
+                        return False
                     self._release_connection()
-                self._stop_event.clear()
-                self._connection_error = None
-                self._disconnected = False
-                self._do_connect()
+                    self._stop_event.clear()
+                    self._connection_error = None
+                    self._disconnected = False
+                    self._do_connect()
+                    if self._intentionally_stopped:
+                        self._release_connection()
+                        self._stop_event.set()
+                        return False
                 return True
             except Exception as exc:
                 self.logger.warning(f"Reconnect attempt failed: {exc!r}")
+                # Restore disconnected state so join()/RPC do not treat a
+                # missing handle as a healthy connection (and so join does
+                # not hang on a cleared _stop_event).
+                with self._stop_lock:
+                    if self._conn_num is not None:
+                        try:
+                            self._release_connection()
+                        except Exception:
+                            pass
+                    self._disconnected = True
+                    self._connection_error = saved_error
+                    self._stop_event.set()
                 return False
 
     def join(self):
@@ -803,7 +859,8 @@ class Client(Application[SingleTransportMixin]):
         """
         self._joining = True
         try:
-            self._wait_stopped()
+            if not self._disconnected:
+                self._wait_stopped()
         finally:
             self._joining = False
 
@@ -837,6 +894,8 @@ class Client(Application[SingleTransportMixin]):
           fully-stopped client — no half-torn-down race window where
           ``_conn_num`` is still set.
         """
+        self._intentionally_stopped = True
+        self._unregister_executor_subscriber()
         with self._stop_lock:
             self._release_connection()
             self._stop_event.set()
@@ -849,5 +908,8 @@ class Client(Application[SingleTransportMixin]):
         if self._task_dispatcher:
             self._task_dispatcher.stop_for_connection(self)
         if self._conn_num is not None:
+            from daffi._bindings import invalidate_members
+
+            invalidate_members(self._conn_num)
             dfcore.stopClient(self._conn_num)
             self._conn_num = None

@@ -7,8 +7,7 @@ Direct  — Client → Service         (one hop, no broker)
 Router  — Client → Router → Worker (two hops)
 
 Each layout is exercised with multiple payload types and all four serde
-formats (PICKLE, JSON, OPAQUE, MSGPACK).  MSGPACK is skipped automatically
-when the optional ``msgpack`` package is absent.
+formats (PICKLE, JSON, OPAQUE, MSGPACK).
 """
 
 from __future__ import annotations
@@ -21,15 +20,6 @@ import pytest
 from .conftest import HOST, TIMEOUT
 
 
-def _msgpack_available() -> bool:
-    try:
-        import msgpack  # noqa: F401
-
-        return True
-    except ImportError:
-        return False
-
-
 # ── helpers ───────────────────────────────────────────────────────────────────
 
 
@@ -37,7 +27,7 @@ def _rpc(port: int, name: str, *args, serde=None, **kwargs):
     """Connect a fresh Client, fire one RPC call, stop, return result."""
     from daffi import Client, SerdeFormat, TCPTransport
 
-    serde = serde if serde is not None else SerdeFormat.PICKLE
+    serde = serde if serde is not None else SerdeFormat.DEFAULT
     client = Client(app_name=name, transport=TCPTransport(HOST, port), runtime=active_runtime())
     conn = client.connect()
     try:
@@ -119,7 +109,6 @@ class TestDirectRpc:
         )
         assert result == payload
 
-    @pytest.mark.skipif(not _msgpack_available(), reason="msgpack not installed")
     def test_echo_serde_msgpack(self, direct_service):
         from daffi import SerdeFormat, TCPTransport
 
@@ -186,7 +175,6 @@ class TestRouterRpc:
         )
         assert result == payload
 
-    @pytest.mark.skipif(not _msgpack_available(), reason="msgpack not installed")
     def test_echo_serde_msgpack(self, router_with_worker):
         from daffi import SerdeFormat, TCPTransport
 

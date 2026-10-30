@@ -123,6 +123,7 @@ export fn sendMessage(data: [*]u8, data_len: u32, receiver: [*]u8, receiver_len:
     }
     const ident = Client.createMessage(allocator, actual_data, 0, .REQUEST, decoder, is_bytes, return_result, actual_receiver, actual_func_name, conn_num) catch |err| {
         const available_receivers = Client.getAvailableMembers(allocator, conn_num) catch throwError("failed to get available receivers\n");
+        defer allocator.free(available_receivers);
         var iterator = std.mem.splitSequence(u8, available_receivers, "members");
         _ = iterator.next();
         const members = iterator.next() orelse throwError("failed to get members\n");

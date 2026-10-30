@@ -54,9 +54,13 @@ pub fn triggerWakeup(self: *TasksQueue) void {
     if (self.armed.swap(true, .acq_rel)) return;
     self.fd_mutex.lock();
     defer self.fd_mutex.unlock();
-    if (self.request_fd < 0) return;
+    if (self.request_fd < 0) {
+        self.armed.store(false, .release);
+        return;
+    }
     const val: u64 = 1;
-    _ = write(@intCast(self.request_fd), @as([*]const u8, @ptrCast(&val)), @sizeOf(u64));
+    const n = write(@intCast(self.request_fd), @as([*]const u8, @ptrCast(&val)), @sizeOf(u64));
+    if (n <= 0) self.armed.store(false, .release);
 }
 
 pub fn triggerDisconnect(self: *TasksQueue) void {

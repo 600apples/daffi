@@ -121,7 +121,15 @@ pub fn sendMessageFromClient(_: [*c]PyObject, args: [*c]PyObject) callconv(.c) [
     // For REQUEST the receiver is a copy made under the channel lock (a view
     // into the channel map could be freed by a concurrent disconnect).
     defer if (pflag == .REQUEST) allocator.free(msgident.receiver);
-    return Py_BuildValue("(Ils#)", @as(c_uint, msgident.uuid), @as(c_long, msgident.timestamp), msgident.receiver.ptr, @as(py.Py_ssize_t, @intCast(msgident.receiver.len)));
+    return identTuple(msgident);
+}
+
+fn cPtr(s: []const u8) [*c]const u8 {
+    return if (s.len == 0) "".ptr else s.ptr;
+}
+
+fn identTuple(msgident: Client.MessageIdentifier) [*c]PyObject {
+    return Py_BuildValue("(Ils#)", @as(c_uint, msgident.uuid), @as(c_long, msgident.timestamp), cPtr(msgident.receiver), @as(py.Py_ssize_t, @intCast(msgident.receiver.len)));
 }
 
 /// The bytes of a `bytes` object or of any buffer; anything else is sent as
@@ -136,6 +144,10 @@ pub const Payload = struct {
 };
 
 pub fn bytesOf(data: *PyObject) ?Payload {
+    if (py.Py_IsNone(data) != 0) {
+        PyErr_SetString(py.PyExc_TypeError, "payload cannot be None");
+        return null;
+    }
     var size: py.Py_ssize_t = 0;
     var raw: [*c]u8 = undefined;
     if (py.PyBytes_Check(data) != 0) {
@@ -175,7 +187,7 @@ pub fn sendHandshakeFromClient(_: [*c]PyObject, args: [*c]PyObject) callconv(.c)
         PyErr_SetString(py.PyExc_ValueError, @errorName(err));
         return null;
     };
-    return Py_BuildValue("(Ils#)", @as(c_uint, msgident.uuid), @as(c_long, msgident.timestamp), msgident.receiver.ptr, @as(py.Py_ssize_t, @intCast(msgident.receiver.len)));
+    return identTuple(msgident);
 }
 
 /// The payload of `msg` as a new reference.  A text payload that is not
@@ -184,24 +196,26 @@ pub fn sendHandshakeFromClient(_: [*c]PyObject, args: [*c]PyObject) callconv(.c)
 fn payloadObject(msg: *serde.Message) [*c]PyObject {
     const data: []const u8 = msg.getData();
     const len: py.Py_ssize_t = @intCast(data.len);
+    const ptr = cPtr(data);
     if (!msg.isBytes()) {
-        if (py.PyUnicode_DecodeUTF8(data.ptr, len, null)) |text| return text;
+        if (py.PyUnicode_DecodeUTF8(ptr, len, null)) |text| return text;
         py.PyErr_Clear();
     }
-    return py.PyBytes_FromStringAndSize(data.ptr, len);
+    return py.PyBytes_FromStringAndSize(ptr, len);
 }
 
 /// A name from the wire as a new `str` reference; invalid UTF-8 is replaced.
 fn nameObject(name: []const u8) [*c]PyObject {
-    return py.PyUnicode_DecodeUTF8(name.ptr, @intCast(name.len), "replace");
+    return py.PyUnicode_DecodeUTF8(cPtr(name), @intCast(name.len), "replace");
 }
 
 /// (data, flag, serde) for a response, or the reason no response can come.
 fn responseTuple(msg: *serde.Message) [*c]PyObject {
     defer msg.deinit();
+    const payload = payloadObject(msg) orelse return null;
     const flag: c_uint = @backingInt(msg.getFlag());
     const decoder: c_uint = @backingInt(msg.getDecoder());
-    return Py_BuildValue("(NII)", payloadObject(msg), flag, decoder);
+    return Py_BuildValue("(NII)", payload, flag, decoder);
 }
 
 fn reasonString(comptime reason: []const u8) [*c]PyObject {
@@ -295,15 +309,31 @@ pub fn taskTuple(msg: *serde.Message) [*c]PyObject {
     const flag: c_uint = @backingInt(msg.getFlag());
     const decoder: c_uint = @backingInt(msg.getDecoder());
     const return_result: c_int = @intFromBool(msg.getReturnResult());
+    const payload = payloadObject(msg) orelse return null;
+    const transmitter = nameObject(msg.getTransmitter()) orelse {
+        py.Py_DECREF(payload);
+        return null;
+    };
+    const receiver = nameObject(msg.getReceiver()) orelse {
+        py.Py_DECREF(payload);
+        py.Py_DECREF(transmitter);
+        return null;
+    };
+    const func_name = nameObject(msg.getFuncName()) orelse {
+        py.Py_DECREF(payload);
+        py.Py_DECREF(transmitter);
+        py.Py_DECREF(receiver);
+        return null;
+    };
     return Py_BuildValue(
         "(INIINNNi)",
         uuid,
-        payloadObject(msg),
+        payload,
         flag,
         decoder,
-        nameObject(msg.getTransmitter()),
-        nameObject(msg.getReceiver()),
-        nameObject(msg.getFuncName()),
+        transmitter,
+        receiver,
+        func_name,
         return_result,
     );
 }
@@ -448,5 +478,5 @@ pub fn getAvailableMembers(_: [*c]PyObject, args: [*c]PyObject) callconv(.c) [*c
     // free it after Py_BuildValue has copied it into a Python string object.
     const members = Client.getAvailableMembers(allocator, conn_num) catch return Py_BuildValue("");
     defer allocator.free(members);
-    return Py_BuildValue("s#", members.ptr, members.len);
+    return Py_BuildValue("s#", cPtr(members), @as(py.Py_ssize_t, @intCast(members.len)));
 }

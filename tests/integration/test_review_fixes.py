@@ -72,11 +72,13 @@ def _proc_target_service(runtime: str, port: int, workers: int, serdes) -> None:
     def add(a: int, b: int) -> int:
         return a + b
 
+    transport = TCPTransport(HOST, port)
+    transport.websocket_allowed_origins = ["http://localhost"]
     svc = Service(
         app_name=TARGET,
         workers=workers,
         serdes=serdes,
-        transport=TCPTransport(HOST, port),
+        transport=transport,
         runtime=runtime,
     )
     svc.start()
@@ -251,7 +253,9 @@ def _websocket(port: int):
 
 @pytest.fixture(params=[1, 4], ids=["inline", "pool"])
 def target(request, free_port):
-    proc = _start_target(free_port, request.param)
+    from daffi import SerdeFormat
+
+    proc = _start_target(free_port, request.param, serdes=SerdeFormat.ALL)
     yield free_port
     quiet_kill(proc)
 
@@ -273,8 +277,8 @@ class TestPickleFromWebSocket:
                 )
             )
             with _client(target, "ws-witness", TARGET) as (_, conn):
-                _wait_until(lambda: conn.rpc(timeout=10).recall(), 10, "the WebSocket request")
-                assert conn.rpc(timeout=10).recall() == [(("from-ws",), {})]
+                _wait_until(lambda: conn.rpc(timeout=10, serde=SerdeFormat.PICKLE).recall(), 10, "the WebSocket request")
+                assert conn.rpc(timeout=10, serde=SerdeFormat.PICKLE).recall() == [(("from-ws",), {})]
 
     def test_pickle_request_is_refused_and_never_unpickled(self, target, tmp_path):
         from daffi import SerdeFormat
@@ -345,7 +349,7 @@ class TestSerdesAllowList:
             marker = tmp_path / "unpickled"
             with _client(free_port, "allow-list", TARGET) as (_, conn):
                 with pytest.raises(RemoteCallError, match="PICKLE") as info:
-                    conn.rpc(timeout=10).lookup(_Booby(str(marker)))
+                    conn.rpc(timeout=10, serde=SerdeFormat.PICKLE).lookup(_Booby(str(marker)))
                 assert type(info.value).__name__ == "SerdeNotAllowed"
                 with pytest.raises(RemoteCallError) as info:
                     conn.rpc(timeout=10, serde=SerdeFormat.OPAQUE).lookup(b"raw")
@@ -389,7 +393,7 @@ def test_invalid_utf8_text_does_not_stop_the_service(target):
                 is_bytes=False,
             )
         assert conn.rpc(timeout=10).add(20, 22) == 42
-        assert conn.rpc(timeout=10).recall() == [((b"\xff\xfe",), {})] * 3
+        assert conn.rpc(timeout=10, serde=SerdeFormat.PICKLE).recall() == [((b"\xff\xfe",), {})] * 3
 
 
 # ── 3. nested calls between clients of one process ────────────────────────────
@@ -501,14 +505,16 @@ def test_client_reconnected_after_stop_works(free_port):
 
 
 def test_rpc_nowait_sends_one_call_with_all_arguments(target):
+    from daffi import SerdeFormat
+
     with _client(target, "nowait-caller", TARGET) as (_, conn):
         conn.rpc_nowait().remember(["a", "b", "c"], tag="x")
         conn.rpc_nowait().remember("plain")
         conn.rpc_nowait().remember(key=[1, 2])
-        _wait_until(lambda: len(conn.rpc(timeout=10).recall()) >= 3, 10, "the calls")
+        _wait_until(lambda: len(conn.rpc(timeout=10, serde=SerdeFormat.PICKLE).recall()) >= 3, 10, "the calls")
         time.sleep(0.2)
         # A pool may run them in any order.
-        assert sorted(conn.rpc(timeout=10).recall(), key=repr) == sorted(
+        assert sorted(conn.rpc(timeout=10, serde=SerdeFormat.PICKLE).recall(), key=repr) == sorted(
             [
                 ((["a", "b", "c"],), {"tag": "x"}),
                 (("plain",), {}),

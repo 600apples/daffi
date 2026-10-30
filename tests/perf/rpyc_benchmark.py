@@ -265,7 +265,7 @@ def bench_daffi_direct(data: dict) -> list[float]:
             transport=TCPTransport(HOST, port),
             runtime=active_runtime(),
         )
-        c = client.connect().rpc(timeout=TIMEOUT, serde=SerdeFormat.PICKLE)
+        c = client.connect().rpc(timeout=TIMEOUT)
         try:
             return _measure("daffi-direct", lambda: c.echo(data))
         finally:
@@ -292,7 +292,7 @@ def bench_daffi_via_router(data: dict) -> list[float]:
             transport=TCPTransport(HOST, port),
             runtime=active_runtime(),
         )
-        c = client.connect().rpc(timeout=TIMEOUT, serde=SerdeFormat.PICKLE)
+        c = client.connect().rpc(timeout=TIMEOUT)
         try:
             return _measure("daffi-router", lambda: c.echo(data))
         finally:
@@ -317,7 +317,7 @@ def main() -> None:
 
     print(f"\nRPyC {_rpyc.__version__} vs daffi  —  {N} sequential rpc calls")
     print(f"host: {HOST}   warmup: {WARMUP}   payload: {_DATA_FILE.name} ({payload_bytes} bytes JSON)")
-    print("daffi serde=PICKLE (object RPC peer)\n")
+    print("daffi serde=MSGPACK (object RPC peer)\n")
 
     print("── Direct (Client → Server/Service) ─────────────────────")
     print("  RPyC")

@@ -22,6 +22,7 @@ Proxy classes (``AsyncRpcProxy``, ``AsyncBroadcastProxy``, ``AsyncStreamProxy``,
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import time
 import logging
@@ -35,6 +36,7 @@ if TYPE_CHECKING:
 from daffi._serialization import SerdeFormat, Serializer
 from daffi.exceptions import (
     CallTimeout,
+    Disconnected,
     Evicted,
     TransmissionFailure,
     InitializationError,
@@ -57,11 +59,41 @@ from daffi._bindings import (
 from daffi._rpc_proxy import (
     METADATA_SEPARATOR,
     _Receivers,
+    coerce_timeout,
     system_exception_handler,
     RpcResult,
     connection_lost_error,
     unpack_response,
 )
+
+
+async def _offload(fn, *args):
+    """Run a blocking native call off the event loop."""
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, fn, *args)
+
+
+async def _aiter_chunks(gen):
+    """Yield chunks without blocking the loop on a synchronous generator."""
+    if inspect.isasyncgen(gen) or hasattr(gen, "__aiter__"):
+        async for chunk in gen:
+            yield chunk
+        return
+    chunks = gen if iterable(gen) else [gen]
+    it = iter(chunks)
+
+    def _next():
+        try:
+            return True, next(it)
+        except StopIteration:
+            return False, None
+
+    loop = asyncio.get_running_loop()
+    while True:
+        ok, chunk = await loop.run_in_executor(None, _next)
+        if not ok:
+            return
+        yield chunk
 
 # ---------------------------------------------------------------------------
 # AsyncResponseNotifier
@@ -319,7 +351,7 @@ class AsyncRpcProxy:
         logger: logging.Logger,
     ):
         self.conn = conn
-        self.timeout = int(timeout or 0)
+        self.timeout = coerce_timeout(timeout)
         self._to = _Receivers(receiver)
         self.receiver = str(self._to)
         self.serde = serde
@@ -346,7 +378,8 @@ class AsyncRpcProxy:
         with system_exception_handler(
             f"Unable to proceed with {label}: {{}}", TransmissionFailure, conn_num
         ):
-            uuid, ts, found_receiver = self._to.send(
+            uuid, ts, found_receiver = await _offload(
+                self._to.send,
                 lambda receiver: send_message_from_client(
                     data=data,
                     flag=MessageFlag.REQUEST,
@@ -356,7 +389,7 @@ class AsyncRpcProxy:
                     return_result=self.return_result,
                     conn_num=conn_num,
                     is_bytes=is_bytes,
-                )
+                ),
             )
         found_receivers = {found_receiver} if found_receiver else None
         if not found_receivers:
@@ -386,7 +419,8 @@ class AsyncRpcProxy:
         with system_exception_handler(
             f"Unable to proceed with {label}: {{}}", TransmissionFailure, conn_num
         ):
-            uuid, ts, found_receiver = self._to.send(
+            uuid, ts, found_receiver = await _offload(
+                self._to.send,
                 lambda receiver: send_message_from_client(
                     data=payload,
                     flag=MessageFlag.REQUEST,
@@ -396,7 +430,7 @@ class AsyncRpcProxy:
                     return_result=self.return_result,
                     conn_num=conn_num,
                     is_bytes=is_bytes,
-                )
+                ),
             )
         if not found_receiver:
             members = (
@@ -473,7 +507,7 @@ class AsyncBroadcastProxy:
         logger: logging.Logger,
     ):
         self.conn = conn
-        self.timeout = int(timeout or 0)
+        self.timeout = coerce_timeout(timeout)
         self.serde = serde
         self.return_result = return_result
         self.logger = logger
@@ -518,15 +552,17 @@ class AsyncBroadcastProxy:
                     TransmissionFailure,
                     conn_num,
                 ):
-                    uuid, ts, found = send_message_from_client(
-                        data=data,
-                        flag=MessageFlag.REQUEST,
-                        serde=self.serde,
-                        receiver=receiver_name,
-                        func_name=func_name,
-                        return_result=True,
-                        conn_num=conn_num,
-                        is_bytes=is_bytes,
+                    uuid, ts, found = await _offload(
+                        lambda: send_message_from_client(
+                            data=data,
+                            flag=MessageFlag.REQUEST,
+                            serde=self.serde,
+                            receiver=receiver_name,
+                            func_name=func_name,
+                            return_result=True,
+                            conn_num=conn_num,
+                            is_bytes=is_bytes,
+                        )
                     )
                 if found:
                     pending[receiver_name] = AsyncRpcResult(
@@ -541,15 +577,19 @@ class AsyncBroadcastProxy:
                     self.logger.warning(
                         f"call_all: receiver {receiver_name!r} not reachable, skipping."
                     )
-            results: dict = {}
-            for name in list(pending):
-                rpc_result = pending.pop(name)
+            async def _take(name: str, rpc_result: AsyncRpcResult):
                 try:
                     result_data, _, serde_r = await rpc_result.result()
-                    results[name] = Serializer.deserialize(serde_r, result_data)[0][0]
+                    return name, Serializer.deserialize(serde_r, result_data)[0][0]
                 except Exception as exc:
-                    results[name] = exc
-            return results
+                    return name, exc
+
+            items = list(pending.items())
+            pending.clear()
+            gathered = await asyncio.gather(
+                *[_take(name, rpc_result) for name, rpc_result in items]
+            )
+            return dict(gathered)
         finally:
             # Requests nobody will wait for any more keep their uuid taken
             # until expired.
@@ -572,15 +612,17 @@ class AsyncBroadcastProxy:
                 TransmissionFailure,
                 conn_num,
             ):
-                send_message_from_client(
-                    data=data,
-                    flag=MessageFlag.REQUEST,
-                    serde=self.serde,
-                    receiver=receiver_name,
-                    func_name=func_name,
-                    return_result=False,
-                    conn_num=conn_num,
-                    is_bytes=is_bytes,
+                await _offload(
+                    lambda: send_message_from_client(
+                        data=data,
+                        flag=MessageFlag.REQUEST,
+                        serde=self.serde,
+                        receiver=receiver_name,
+                        func_name=func_name,
+                        return_result=False,
+                        conn_num=conn_num,
+                        is_bytes=is_bytes,
+                    )
                 )
 
 
@@ -608,7 +650,7 @@ class _AsyncStreamBase:
         self.conn = conn
         self.receiver = receiver or ""
         self.serde = serde
-        self.timeout = int(timeout or 0)
+        self.timeout = coerce_timeout(timeout)
         self.logger = logger
         self._receiver = {receiver} if receiver else set()
 
@@ -628,15 +670,17 @@ class _AsyncStreamBase:
         with system_exception_handler(
             f"Unable to stream to {label}: {{}}", TransmissionFailure, conn_num
         ):
-            uuid, ts, found_receiver = send_message_from_client(
-                data=data,
-                flag=MessageFlag.REQUEST,
-                serde=self.serde,
-                receiver=self.receiver,
-                func_name=func_name,
-                return_result=return_result,
-                conn_num=conn_num,
-                is_bytes=is_bytes,
+            uuid, ts, found_receiver = await _offload(
+                lambda: send_message_from_client(
+                    data=data,
+                    flag=MessageFlag.REQUEST,
+                    serde=self.serde,
+                    receiver=self.receiver,
+                    func_name=func_name,
+                    return_result=return_result,
+                    conn_num=conn_num,
+                    is_bytes=is_bytes,
+                )
             )
         if not found_receiver:
             members = (
@@ -691,8 +735,7 @@ class _AsyncBoundStreamBlocking(_AsyncBoundStream):
     async def __call__(self, gen) -> None:  # type: ignore[override]
         await self._proxy.conn._ensure_connected()
         conn_num = self._proxy.conn.client._conn_num
-        chunks = gen if iterable(gen) else [gen]
-        for chunk in chunks:
+        async for chunk in _aiter_chunks(gen):
             uuid, ts, _ = await self._proxy._send_chunk(
                 self._func_name, conn_num, chunk, return_result=True
             )
@@ -723,8 +766,7 @@ class _AsyncBoundStreamNowait(_AsyncBoundStream):
     async def __call__(self, gen) -> None:  # type: ignore[override]
         await self._proxy.conn._ensure_connected()
         conn_num = self._proxy.conn.client._conn_num
-        chunks = gen if iterable(gen) else [gen]
-        for chunk in chunks:
+        async for chunk in _aiter_chunks(gen):
             await self._proxy._send_chunk(
                 self._func_name, conn_num, chunk, return_result=False
             )
@@ -759,7 +801,9 @@ class AsyncClientConnection:
     async def _ensure_connected(self) -> None:
         """Detect a background disconnect and attempt one reconnect."""
         client = self.client
-        if not client._disconnected:
+        if client._intentionally_stopped:
+            raise TransmissionFailure("Client was stopped.")
+        if not client._disconnected and client._conn_num is not None:
             return
         if isinstance(client._connection_error, Evicted):
             # Reconnecting would evict the connection that took the name.
@@ -800,7 +844,7 @@ class AsyncClientConnection:
         self,
         timeout: Union[int, None] = None,
         receiver: Union[str, List[str], None] = None,
-        serde: SerdeFormat = SerdeFormat.PICKLE,
+        serde: SerdeFormat = SerdeFormat.DEFAULT,
     ) -> AsyncRpcProxy:
         """Configure a blocking call and return an async proxy.
 
@@ -820,7 +864,7 @@ class AsyncClientConnection:
     def rpc_nowait(
         self,
         receiver: Union[str, List[str], None] = None,
-        serde: SerdeFormat = SerdeFormat.PICKLE,
+        serde: SerdeFormat = SerdeFormat.DEFAULT,
     ) -> AsyncRpcProxy:
         """Configure a fire-and-forget call and return an async proxy.
 
@@ -841,7 +885,7 @@ class AsyncClientConnection:
         self,
         timeout: Union[int, None] = None,
         receiver: Union[str, List[str], None] = None,
-        serde: SerdeFormat = SerdeFormat.PICKLE,
+        serde: SerdeFormat = SerdeFormat.DEFAULT,
     ) -> AsyncBroadcastProxy:
         """Broadcast to all matching workers; collect ``{name: result}`` dict.
 
@@ -861,7 +905,7 @@ class AsyncClientConnection:
     def cast_nowait(
         self,
         receiver: Union[str, List[str], None] = None,
-        serde: SerdeFormat = SerdeFormat.PICKLE,
+        serde: SerdeFormat = SerdeFormat.DEFAULT,
     ) -> AsyncBroadcastProxy:
         """Fire-and-forget broadcast to all matching workers."""
         return AsyncBroadcastProxy(
@@ -921,12 +965,23 @@ class AsyncClientConnection:
         """
         if not members:
             return
+        client = self.client
+        if client._disconnected or client._conn_num is None:
+            err = client._connection_error
+            if err is not None:
+                raise err
+            raise Disconnected("Client is not connected.")
         needed = set(members)
         import time as _time
 
         start = _time.monotonic()
         while True:
-            current = {m["name"] for m in get_available_members(self.client._conn_num)}
+            if client._disconnected or client._conn_num is None:
+                err = client._connection_error
+                if err is not None:
+                    raise err
+                raise Disconnected("Client disconnected while waiting for members.")
+            current = {m["name"] for m in get_available_members(client._conn_num)}
             if needed.issubset(current):
                 return
             if timeout is not None and (_time.monotonic() - start) >= timeout:

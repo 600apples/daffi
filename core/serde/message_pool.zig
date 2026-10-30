@@ -156,8 +156,14 @@ pub const FrameDecoder = struct {
     }
 
     fn chargeBudget(self: *FrameDecoder) !void {
-        if (self.filled <= INITIAL_RECV_CHUNK) return;
-        const want = self.filled - INITIAL_RECV_CHUNK;
+        try self.chargeBudgetFor(self.filled);
+    }
+
+    /// Charge the shared budget from the size we are about to hold
+    /// (allocated or filled), not only from bytes already copied.
+    fn chargeBudgetFor(self: *FrameDecoder, held: usize) !void {
+        if (held <= INITIAL_RECV_CHUNK) return;
+        const want = held - INITIAL_RECV_CHUNK;
         if (want <= self.budgeted) return;
         const delta = want - self.budgeted;
         const before = partial_bytes.fetchAdd(delta, .monotonic);
@@ -187,6 +193,7 @@ pub const FrameDecoder = struct {
 
             self.header = try Header.parse(&self.header_buf);
             const total: usize = @as(usize, serde.HEADER_SIZE) + self.header.msg_len;
+            try self.chargeBudgetFor(total);
             self.frame = try self.allocator.alloc(u8, @min(total, INITIAL_RECV_CHUNK));
             @memcpy(self.frame[0..self.header_buf.len], &self.header_buf);
             self.filled = self.header_buf.len;
@@ -196,6 +203,7 @@ pub const FrameDecoder = struct {
         while (self.filled < total) {
             if (input.len == 0) return null;
             if (self.filled == self.frame.len) {
+                try self.chargeBudgetFor(total);
                 self.frame = try self.allocator.realloc(self.frame, total);
             }
             const n = @min(input.len, self.frame.len - self.filled);
@@ -215,7 +223,10 @@ pub const FrameDecoder = struct {
         if (self.frame.len == 0) return null;
         const total: usize = @as(usize, serde.HEADER_SIZE) + self.header.msg_len;
         if (total - self.filled < min) return null;
-        if (self.filled == self.frame.len) self.frame = try self.allocator.realloc(self.frame, total);
+        if (self.filled == self.frame.len) {
+            try self.chargeBudgetFor(total);
+            self.frame = try self.allocator.realloc(self.frame, total);
+        }
         return self.frame[self.filled..];
     }
 
@@ -330,15 +341,14 @@ test "FrameDecoder budget refuses a large frame and is returned on close" {
 
     var first = FrameDecoder.init(allocator);
     var input: []const u8 = raw.data[0 .. INITIAL_RECV_CHUNK + 60 * 1024];
-    try expect(try first.next(&input) == null);
-    try expect(first.partial());
-    try expect(partialBytes() - before == 60 * 1024);
+    try std.testing.expectError(error.FrameBudgetExceeded, first.next(&input));
+    first.deinit();
+    try expect(partialBytes() == before);
 
     var second = FrameDecoder.init(allocator);
     input = raw.data[0 .. INITIAL_RECV_CHUNK + 60 * 1024];
     try std.testing.expectError(error.FrameBudgetExceeded, second.next(&input));
     second.deinit();
-    first.deinit();
     try expect(partialBytes() == before);
 
     // Within the budget the whole message still arrives.

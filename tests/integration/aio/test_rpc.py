@@ -19,15 +19,6 @@ import pytest
 from .conftest import HOST, TIMEOUT
 
 
-def _msgpack_available() -> bool:
-    try:
-        import msgpack  # noqa: F401
-
-        return True
-    except ImportError:
-        return False
-
-
 # ── async helper ──────────────────────────────────────────────────────────────
 
 
@@ -36,7 +27,7 @@ async def _rpc(port: int, name: str, *args, serde=None, **kwargs):
     from daffi.aio import AsyncClient
     from daffi import SerdeFormat, TCPTransport
 
-    serde = serde if serde is not None else SerdeFormat.PICKLE
+    serde = serde if serde is not None else SerdeFormat.DEFAULT
     client = AsyncClient(app_name=name, transport=TCPTransport(HOST, port), runtime=active_runtime())
     conn = await client.connect()
     try:
@@ -117,7 +108,6 @@ class TestDirectRpcAsync:
         )
         assert result == payload
 
-    @pytest.mark.skipif(not _msgpack_available(), reason="msgpack not installed")
     async def test_echo_serde_msgpack(self, direct_service):
         from daffi import SerdeFormat, TCPTransport
 
@@ -186,7 +176,6 @@ class TestRouterRpcAsync:
         )
         assert result == payload
 
-    @pytest.mark.skipif(not _msgpack_available(), reason="msgpack not installed")
     async def test_echo_serde_msgpack(self, router_with_worker):
         from daffi import SerdeFormat, TCPTransport
 

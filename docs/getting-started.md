@@ -4,9 +4,6 @@
 
 ```bash
 pip install daffi
-
-# MessagePack serialisation (optional)
-pip install "daffi[msgpack]"
 ```
 
 Requires Python 3.10+. Linux and macOS are supported.

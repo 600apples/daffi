@@ -132,7 +132,7 @@ daffi supports four wire formats — see [Serialization](usage/serialization.md)
 
 | Format | Cross-language | Best for |
 |---|---|---|
-| `PICKLE` | No (Python only) | Python dataclasses, Enums, arbitrary objects |
+| `MSGPACK` | Yes | Default; compact binary, cross-language |
 | `JSON` | Yes | Simple dicts / lists, cross-language |
-| `MSGPACK` | Yes | Binary-efficient alternative to JSON |
 | `OPAQUE` | Yes | Raw bytes, custom encoding |
+| `PICKLE` | No (Python only) | Opt-in; dataclasses, Enums, arbitrary objects |

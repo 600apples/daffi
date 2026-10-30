@@ -3,8 +3,6 @@ router/07_serde_msgpack — Worker.
 
 Accepts dict payloads via MSGPACK serialisation.
 
-Requires:  pip install 'daffi[msgpack]'
-
 Start 1_router.py first, then this, then 3_caller.py.
 """
 

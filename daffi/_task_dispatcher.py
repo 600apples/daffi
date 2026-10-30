@@ -208,8 +208,12 @@ def _handle_lifecycle_signal(conn, conn_num: int, reason: bytes) -> None:
     runs on its own thread, so the poller keeps serving other connections.
     """
     if reason == LifecycleSignal.INIT:
-        RpcProxy._process_client_handshake(conn_num, conn._exposed_names())
-        conn._register_executors()
+        Thread(
+            target=_run_init_handshake,
+            args=(conn, conn_num),
+            name="daffi-init",
+            daemon=True,
+        ).start()
         return
 
     if reason == LifecycleSignal.NORMAL:
@@ -228,6 +232,14 @@ def _handle_lifecycle_signal(conn, conn_num: int, reason: bytes) -> None:
         _stop_in_background(conn)
     else:
         conn.logger.error(f"Error in connection {conn_num}: {err}")
+
+
+def _run_init_handshake(conn, conn_num: int) -> None:
+    try:
+        RpcProxy._process_client_handshake(conn_num, conn._exposed_names())
+        conn._register_executors()
+    except Exception:
+        conn.logger.exception("INIT handshake failed")
 
 
 def _stop_in_background(conn) -> None:
@@ -305,7 +317,7 @@ def _invoke_callback(
             )
         args, kwargs = Serializer.deserialize(serde, data)
         return cb(*args, **kwargs), MessageFlag.RESPONSE, serde
-    except:  # noqa: E722
+    except Exception:
         return _error_result(_reply_serde(serde, accepted))
 
 
@@ -858,17 +870,24 @@ class TaskDispatcher:
         event_type: str = payload["type"]
         member: str = payload["member"]
 
+        from daffi._bindings import invalidate_members
+
+        invalidate_members(getattr(conn, "_conn_num", None))
         if event_type == EventType.CONNECTED:
             handlers = conn._on_member_added_handlers
         elif event_type == EventType.DISCONNECTED:
             handlers = conn._on_member_removed_handlers
         else:
             return
-        for handler in handlers:
-            try:
-                handler(member)
-            except Exception:
-                conn.logger.exception(f"{event_type} handler {handler!r} failed")
+
+        def _run():
+            for handler in handlers:
+                try:
+                    handler(member)
+                except Exception:
+                    conn.logger.exception(f"{event_type} handler {handler!r} failed")
+
+        Thread(target=_run, name="daffi-event", daemon=True).start()
 
     def _worker_loop(self, pool: _Pool) -> None:
         """Thread-pool worker body for one connection.

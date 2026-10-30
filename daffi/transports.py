@@ -59,14 +59,6 @@ class TCPTransport:
 
     Each of ``cert``, ``key``, and ``ca`` may be a filesystem path or PEM
     material (detected natively by a leading ``-----BEGIN ``).
-
-    ``allowed_origins`` (listening transports only) restricts which web pages
-    may open a WebSocket to this listener, e.g.
-    ``["https://app.example.com"]``.  Upgrades with any other ``Origin``, or
-    with none, get ``403``.  ``None`` (the default) accepts every origin.
-    The check stops other sites' pages in a visitor's browser from reaching
-    the server; it is no defence against non-browser clients, which can send
-    any ``Origin``.
     """
 
     def __init__(
@@ -79,7 +71,6 @@ class TCPTransport:
         key: TlsBlob = "",
         ca: TlsBlob = "",
         verify: bool = True,
-        allowed_origins: Iterable[str] | None = None,
     ) -> None:
         if (
             isinstance(port, bool)
@@ -100,7 +91,26 @@ class TCPTransport:
         self.key = _tls_blob(key, name="key")
         self.ca = _tls_blob(ca, name="ca")
         self.verify = _verify(verify)
-        self.allowed_origins = _origins(allowed_origins)
+        self._websocket_allowed_origins: tuple[str, ...] | None = None
+
+    @property
+    def websocket_allowed_origins(self) -> tuple[str, ...] | None:
+        """Origins that may open a WebSocket to this listener.
+
+        Listening transports only.  Native TCP/Unix clients are not checked.
+        ``None`` (the default) refuses every WebSocket upgrade unless the
+        node has ``auth_token=`` (the token is then the gate).  Set a list
+        such as ``["https://app.example.com"]`` or ``["*"]`` after
+        construction.  Upgrades with any other ``Origin``, or with none,
+        get ``403``.  The check stops other sites' pages in a visitor's
+        browser from reaching the server; it is no defence against
+        non-browser clients, which can send any ``Origin``.
+        """
+        return self._websocket_allowed_origins
+
+    @websocket_allowed_origins.setter
+    def websocket_allowed_origins(self, value: Iterable[str] | None) -> None:
+        self._websocket_allowed_origins = _websocket_origins(value)
 
     @property
     def native_host(self) -> str:
@@ -110,12 +120,23 @@ class TCPTransport:
     def native_port(self) -> int:
         return self.port
 
-    def native_listener(self) -> tuple[str, int, bool, str, str, str, str]:
-        """``(host, port, tls, cert, key, ca, allowed_origins)`` for
+    def native_listener(
+        self, *, allow_any_origin: bool = False
+    ) -> tuple[str, int, bool, str, str, str, str]:
+        """``(host, port, tls, cert, key, ca, websocket_allowed_origins)`` for
         ``dfcore.addListeners``.
 
         A non-empty ``ca`` enables mutual TLS on this listener.
+        Empty ``websocket_allowed_origins`` refuses every WebSocket upgrade.
+        ``*`` (used when *allow_any_origin* is true, i.e. the node has an
+        ``auth_token``) allows every origin.  Native clients ignore this.
         """
+        if self._websocket_allowed_origins:
+            origins = "\n".join(self._websocket_allowed_origins)
+        elif allow_any_origin:
+            origins = "*"
+        else:
+            origins = ""
         return (
             self.native_host,
             self.native_port,
@@ -123,7 +144,7 @@ class TCPTransport:
             self.cert,
             self.key,
             self.ca,
-            "\n".join(self.allowed_origins or ()),
+            origins,
         )
 
     def conn_info(self) -> tuple[str | None, int | None, str]:
@@ -150,17 +171,24 @@ def _verify(value: bool) -> bool:
     return value
 
 
-def _origins(value: Iterable[str] | None) -> tuple[str, ...] | None:
+def _websocket_origins(value: Iterable[str] | None) -> tuple[str, ...] | None:
     if value is None:
         return None
     if isinstance(value, (str, bytes)):
-        raise InitializationError("allowed_origins must be a list of origins, not a single string")
+        raise InitializationError(
+            "websocket_allowed_origins must be a list of origins, not a single string"
+        )
     origins = tuple(value)
     for origin in origins:
         if not isinstance(origin, str) or not origin or any(c in origin for c in "\r\n\0"):
-            raise InitializationError(f"invalid origin in allowed_origins: {origin!r}")
+            raise InitializationError(
+                f"invalid origin in websocket_allowed_origins: {origin!r}"
+            )
     if not origins:
-        raise InitializationError("allowed_origins must name at least one origin (None allows all)")
+        raise InitializationError(
+            "websocket_allowed_origins must name at least one origin "
+            "(None refuses WebSocket unless auth_token is set)"
+        )
     return tuple(o.rstrip("/") for o in origins)
 
 

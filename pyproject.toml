@@ -30,14 +30,14 @@ classifiers = [
     "Topic :: System :: Distributed Computing",
     "Topic :: System :: Networking",
 ]
-dependencies = []
+dependencies = [
+    "msgpack>=1.0",
+]
 
 [project.optional-dependencies]
-msgpack = ["msgpack>=1.0"]
 tests = [
     "pytest>=7.0",
     "pytest-asyncio>=0.23",
-    "msgpack>=1.0",
     "wasmtime>=20",
 ]
 

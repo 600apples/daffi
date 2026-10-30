@@ -78,9 +78,11 @@ def _proc_target_service(runtime: str, port: int, workers, serdes) -> None:
             return a + b
 
         kwargs = {} if workers is None else {"workers": workers}
+        from daffi import SerdeFormat
+
         svc = AsyncService(
             app_name=TARGET,
-            serdes=serdes,
+            serdes=SerdeFormat.ALL if serdes is None else serdes,
             transport=TCPTransport(HOST, port),
             runtime=runtime,
             **kwargs,
@@ -229,7 +231,7 @@ async def test_serdes_allow_list_refuses_before_decoding(free_port, tmp_path):
         marker = tmp_path / "unpickled"
         async with _client(free_port, "aio-allow-list", TARGET) as (_, conn):
             with pytest.raises(RemoteCallError, match="PICKLE") as info:
-                await conn.rpc(timeout=10).lookup(_Booby(str(marker)))
+                await conn.rpc(timeout=10, serde=SerdeFormat.PICKLE).lookup(_Booby(str(marker)))
             assert type(info.value).__name__ == "SerdeNotAllowed"
             assert await conn.rpc(timeout=10, serde=SerdeFormat.JSON).add(2, 3) == 5
         assert not marker.exists(), "a refused PICKLE payload was unpickled"
@@ -263,7 +265,7 @@ async def test_invalid_utf8_text_does_not_stop_the_service(default_target):
             return len(await conn.rpc(timeout=10).recall()) == 3
 
         await _wait_until(_all_seen, 10, "the three requests")
-        assert await conn.rpc(timeout=10).recall() == [((b"\xff\xfe",), {})] * 3
+        assert await conn.rpc(timeout=10, serde=SerdeFormat.PICKLE).recall() == [((b"\xff\xfe",), {})] * 3
 
 
 # ── 4. restart ────────────────────────────────────────────────────────────────
@@ -330,18 +332,20 @@ async def test_client_reconnected_after_stop_works(free_port):
 
 @pytest.mark.asyncio
 async def test_rpc_nowait_sends_one_call_with_all_arguments(default_target):
+    from daffi import SerdeFormat
+
     async with _client(default_target, "aio-nowait", TARGET) as (_, conn):
         await conn.rpc_nowait().remember(["a", "b", "c"], tag="x")
         await conn.rpc_nowait().remember("plain")
         await conn.rpc_nowait().remember(key=[1, 2])
 
         async def _all_seen():
-            return len(await conn.rpc(timeout=10).recall()) >= 3
+            return len(await conn.rpc(timeout=10, serde=SerdeFormat.PICKLE).recall()) >= 3
 
         await _wait_until(_all_seen, 10, "the calls")
         await asyncio.sleep(0.2)
         # Requests run concurrently, so in any order.
-        assert sorted(await conn.rpc(timeout=10).recall(), key=repr) == sorted(
+        assert sorted(await conn.rpc(timeout=10, serde=SerdeFormat.PICKLE).recall(), key=repr) == sorted(
             [
                 ((["a", "b", "c"],), {"tag": "x"}),
                 (("plain",), {}),

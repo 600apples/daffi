@@ -5,8 +5,6 @@ Accepts and returns data via MSGPACK serialisation.
 The browser sends msgpack-encoded args; the worker receives them as
 native Python objects and responds with msgpack-encoded results.
 
-Requires: pip install 'daffi[msgpack]'
-
 Start 1_router.py first, then this, then open index.html.
 """
 

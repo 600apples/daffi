@@ -142,7 +142,7 @@ def proc_service(runtime: str,
     silence_subprocess(runtime)
 
     async def _main():
-        from daffi import callback, TCPTransport
+        from daffi import callback, SerdeFormat, TCPTransport
         from daffi.aio import AsyncService
 
         @callback
@@ -155,7 +155,7 @@ def proc_service(runtime: str,
 
         svc = AsyncService(
             app_name=app_name, workers=workers, transport=TCPTransport(HOST, port),
-            runtime=runtime,
+            runtime=runtime, serdes=SerdeFormat.ALL,
         )
         await svc.start()
         await svc.join()
@@ -183,7 +183,7 @@ def proc_worker(runtime: str, port: int, app_name: str, workers: int = 4) -> Non
     silence_subprocess(runtime)
 
     async def _main():
-        from daffi import callback, TCPTransport
+        from daffi import callback, SerdeFormat, TCPTransport
         from daffi.aio import AsyncClient
 
         @callback
@@ -196,7 +196,7 @@ def proc_worker(runtime: str, port: int, app_name: str, workers: int = 4) -> Non
 
         client = AsyncClient(
             app_name=app_name, workers=workers, transport=TCPTransport(HOST, port),
-            runtime=runtime,
+            runtime=runtime, serdes=SerdeFormat.ALL,
         )
         await client.connect()
         await client.join()

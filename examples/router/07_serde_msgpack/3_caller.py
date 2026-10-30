@@ -7,8 +7,6 @@ Demonstrates all four call styles with MSGPACK serialisation:
   cast()        — blocking broadcast, all workers
   cast_nowait() — fire-and-forget broadcast, all workers
 
-Requires:  pip install 'daffi[msgpack]'
-
 Run 1_router.py and 2_worker.py first.
 """
 

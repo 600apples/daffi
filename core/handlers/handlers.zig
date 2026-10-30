@@ -340,11 +340,19 @@ pub fn ServerHandler(comptime HandlerConnectionT: ConnectionType) type {
                 self.routes.dropConnection(conn);
                 self.mutex.lock();
                 defer self.mutex.unlock();
-                // One connection can hold several channels (a peer may
-                // handshake again under another name).
+                // Destroy first so an OOM building the event cannot leave a
+                // retain() on a connection that is about to be freed.
                 while (self.chan_mapper.getChannelByConnection(conn)) |chan| {
-                    const event_message = try serde.createEventMessage(self.allocator, 0, chan.connection_name, "disconnected");
+                    const name = self.allocator.dupe(u8, chan.connection_name) catch {
+                        self.chan_mapper.destroyChannel(chan);
+                        continue;
+                    };
                     self.chan_mapper.destroyChannel(chan);
+                    const event_message = serde.createEventMessage(self.allocator, 0, name, "disconnected") catch {
+                        self.allocator.free(name);
+                        continue;
+                    };
+                    self.allocator.free(name);
                     self.tasks_queue.pushMessageToQueue(event_message);
                 }
             }
@@ -400,8 +408,8 @@ pub fn ServerHandler(comptime HandlerConnectionT: ConnectionType) type {
             /// router changes its channels only under that mutex, so they are
             /// read here without the mapper's own lock.
             fn lookupRoute(self: *Self, conn: *ParentConnT, message: *Message) Route {
-                self.mutex.lock();
-                defer self.mutex.unlock();
+                self.chan_mapper.mutex.lock();
+                defer self.chan_mapper.mutex.unlock();
                 const channels = &self.chan_mapper.channels;
                 const target: ?*ParentConnT = if (channels.getPtr(message.getReceiver())) |chan|
                     (if (chan.containsMethod(message.getFuncName())) chan.conn else null)
@@ -462,6 +470,10 @@ pub fn ServerHandler(comptime HandlerConnectionT: ConnectionType) type {
                     evicted.deinit(self.allocator);
                 }
                 for (client_hs.value.members) |mb| {
+                    if (!std.mem.eql(u8, mb.name, connection_name)) {
+                        log_router.warn("ignoring extra handshake name '{s}' (connection is '{s}')", .{ mb.name, connection_name });
+                        continue;
+                    }
                     if (self.chan_mapper.evictChannel(mb.name, conn)) |stale_conn| {
                         log_router.warn("evicting stale slot for '{s}' — new connection takes over", .{mb.name});
                         evicted.append(self.allocator, .{ .name = try alloc.dupe(u8, mb.name), .conn = stale_conn }) catch |err| {
@@ -471,6 +483,7 @@ pub fn ServerHandler(comptime HandlerConnectionT: ConnectionType) type {
                     }
                 }
                 for (client_hs.value.members) |mb| {
+                    if (!std.mem.eql(u8, mb.name, connection_name)) continue;
                     var chan = try self.chan_mapper.getOrCreateChannel(conn, mb.name);
                     chan.clear();
                     if (mb.methods) |methods| {
@@ -636,8 +649,12 @@ pub fn ServerHandler(comptime HandlerConnectionT: ConnectionType) type {
                 // A client registers one channel per member it announced.
                 var departed: std.ArrayList([]const u8) = .empty;
                 while (self.chan_mapper.getChannelByConnection(conn)) |chan| {
-                    try departed.append(allocator, try allocator.dupe(u8, chan.connection_name));
+                    const name = allocator.dupe(u8, chan.connection_name) catch {
+                        self.chan_mapper.destroyChannel(chan);
+                        continue;
+                    };
                     self.chan_mapper.destroyChannel(chan);
+                    departed.append(allocator, name) catch continue;
                 }
                 if (departed.items.len == 0) return;
 
@@ -666,9 +683,9 @@ pub fn ServerHandler(comptime HandlerConnectionT: ConnectionType) type {
                 self.mutex.unlock();
                 locked = false;
                 for (departed.items) |name| {
-                    var event_message = try serde.createEventMessage(self.allocator, 0, name, "disconnected");
+                    var event_message = serde.createEventMessage(self.allocator, 0, name, "disconnected") catch continue;
                     defer event_message.deinit();
-                    for (targets.items) |t| try self.sendToConnection(Message, t, event_message);
+                    for (targets.items) |t| self.sendToConnection(Message, t, event_message) catch {};
                 }
             }
 

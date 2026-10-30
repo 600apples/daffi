@@ -43,6 +43,14 @@ var registry_lock: misc.RwLock = .{};
 var registry: std.AutoHashMapUnmanaged(usize, *ClientEntry) = .empty;
 var next_handle: usize = 1;
 
+pub fn resetRegistryAfterFork() void {
+    // Child must not run parent dtors (those threads do not exist). Drop
+    // the map; parent allocations are leaked in the child.
+    registry = .empty;
+    next_handle = 1;
+    registry_lock = .{};
+}
+
 /// Stack for the receiver thread.  It decodes into a 16 KiB buffer and runs
 /// no Python code.
 
@@ -65,6 +73,8 @@ const ClientEntry = struct {
     /// Callers between `acquire` and `release`.  `destroy` frees nothing
     /// until it drops to zero.
     users: std.atomic.Value(u32) = .init(0),
+    users_mutex: misc.Mutex = .{},
+    users_cond: misc.Condition = .{},
     /// What reads incoming messages (native targets): a dispatcher thread
     /// (threads model) or an event-loop source (evented model).
     receiver: union(enum) {
@@ -96,7 +106,12 @@ const ClientEntry = struct {
     }
 
     pub fn release(self: *ClientEntry) void {
-        _ = self.users.fetchSub(1, .release);
+        const n = self.users.fetchSub(1, .release);
+        if (n == 1) {
+            self.users_mutex.lock();
+            self.users_cond.signal();
+            self.users_mutex.unlock();
+        }
     }
 
     /// Next request uuid (never 0, wraps at 65535).  With `reply` the uuid is
@@ -105,15 +120,15 @@ const ClientEntry = struct {
     /// is cleared.  uuids whose caller gave up are only reused once no other
     /// one is free.
     pub fn generateUUID(self: *ClientEntry, reply: bool) !u16 {
+        if (!reply) {
+            while (true) {
+                const next = self.uuid.fetchAdd(1, .monotonic) +% 1;
+                if (next != 0) return next;
+            }
+        }
         const msg_store = &self.client_handler.msg_store;
         for ([_]bool{ false, true }) |reuse_expired| {
-            var tries: u32 = 0;
-            while (tries < std.math.maxInt(u16)) : (tries += 1) {
-                const next = self.uuid.fetchAdd(1, .monotonic) +% 1;
-                if (next == 0) continue; // 0 is reserved
-                if (!reply) return next;
-                if (try msg_store.claim(next, reuse_expired)) return next;
-            }
+            if (try msg_store.claimNext(&self.uuid, reuse_expired)) |id| return id;
         }
         return error.TooManyPendingRequests;
     }
@@ -144,7 +159,9 @@ const ClientEntry = struct {
                 self.alloc.destroy(src);
             },
         }
-        while (self.users.load(.acquire) != 0) sleepMs(1);
+        self.users_mutex.lock();
+        while (self.users.load(.acquire) != 0) self.users_cond.wait(&self.users_mutex);
+        self.users_mutex.unlock();
         log.debug("[{s}] destroy: freeing connection", .{self.client_handler.app_name});
         self.connection.destroy();
         self.msgpool.deinit();

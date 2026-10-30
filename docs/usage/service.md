@@ -143,7 +143,7 @@ result = rpc.add(3, 4)
 |---|---|---|
 | `timeout` | `float \| None` | Seconds to wait for a result before raising. `None` = wait forever. |
 | `receiver` | `str \| list[str] \| None` | Pin the call to a specific node by name, or to whichever of the listed nodes is connected (taking turns). In the Service topology there is only one Service so this is optional. |
-| `serde` | `SerdeFormat` | Serialisation format (default: `PICKLE`). |
+| `serde` | `SerdeFormat` | Serialisation format (default: `MSGPACK`). |
 
 ### `conn.rpc_nowait()`
 

@@ -49,8 +49,31 @@ pub const Handshake = struct {
         token: ?[]const u8 = null,
     };
 
+    // Must clear the join-broadcast fan-out integration test (≥520 peers)
+    // and leave headroom for larger clusters; the old fixed bcast_conns
+    // array was 512, membership itself is unbounded in the router.
+    pub const max_members: usize = 1024;
+    pub const max_methods: usize = 1024;
+    pub const max_name_len: usize = 64;
+
     pub fn fromJson(allocator: Allocator, data: []const u8) !json.Parsed(Handshake) {
-        return try json.parseFromSlice(Handshake, allocator, data, .{ .ignore_unknown_fields = true });
+        const parsed = try json.parseFromSlice(Handshake, allocator, data, .{ .ignore_unknown_fields = true });
+        errdefer parsed.deinit();
+        try parsed.value.validate();
+        return parsed;
+    }
+
+    pub fn validate(self: Handshake) !void {
+        if (self.members.len > max_members) return error.TooManyMembers;
+        for (self.members) |mb| {
+            if (mb.name.len == 0 or mb.name.len > max_name_len) return error.InvalidMemberName;
+            if (mb.methods) |methods| {
+                if (methods.len > max_methods) return error.TooManyMethods;
+                for (methods) |m| {
+                    if (m.len == 0 or m.len > max_name_len) return error.InvalidMethodName;
+                }
+            }
+        }
     }
 
     /// Whether `given` is the token a server expects; `expected` null
@@ -115,4 +138,20 @@ test "handshake token check" {
     );
     defer parsed.deinit();
     try std.testing.expectEqualStrings("t", parsed.value.meta.token.?);
+}
+
+test "handshake rejects oversized membership" {
+    try std.testing.expectError(error.InvalidMemberName, Handshake.fromJson(std.testing.allocator,
+        \\{"meta":{"type":"client"},"members":[{"name":"","methods":null}]}
+    ));
+    const item = "{\"name\":\"a\",\"methods\":null}";
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(std.testing.allocator);
+    try body.appendSlice(std.testing.allocator, "{\"meta\":{\"type\":\"client\"},\"members\":[");
+    for (0..Handshake.max_members + 1) |i| {
+        if (i != 0) try body.append(std.testing.allocator, ',');
+        try body.appendSlice(std.testing.allocator, item);
+    }
+    try body.appendSlice(std.testing.allocator, "]}");
+    try std.testing.expectError(error.TooManyMembers, Handshake.fromJson(std.testing.allocator, body.items));
 }

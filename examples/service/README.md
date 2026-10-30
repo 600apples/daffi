@@ -35,7 +35,7 @@ python examples/service/01_rpc/2_client.py
 | `PICKLE` | Any Python object | No | — |
 | `JSON` | dict, list, str, int, float, bool, None | Yes | — |
 | `OPAQUE` | `bytes` or `str` (pass-through) | Yes | — |
-| `MSGPACK` | Same as JSON (binary) | Yes | `pip install 'daffi[msgpack]'` |
+| `MSGPACK` | Same as JSON (binary) | Yes | included |
 
 ## API Reference
 

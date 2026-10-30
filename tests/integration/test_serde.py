@@ -18,8 +18,6 @@ MSGPACK (3) — msgpack.packb([args, kwargs], use_bin_type=True).
               Tuples become lists.  Bytes survive (use_bin_type keeps them
               distinct from str).  No sets or custom objects.  Integer dict
               keys survive (strict_map_key=False).
-              Requires the optional ``msgpack`` package.
-
 Each test class uses the shared ``direct_service`` fixture from conftest.py
 (Client → Service in a subprocess), so the round-trip is real network I/O,
 not just a unit-test of the serializer module.
@@ -33,24 +31,6 @@ import math
 import pytest
 
 from .conftest import HOST, TIMEOUT
-
-# ── skip marker for MSGPACK ───────────────────────────────────────────────────
-
-
-def _msgpack_available() -> bool:
-    try:
-        import msgpack  # noqa: F401
-
-        return True
-    except ImportError:
-        return False
-
-
-skip_no_msgpack = pytest.mark.skipif(
-    not _msgpack_available(),
-    reason="msgpack not installed — run: pip install 'daffi[msgpack]'",
-)
-
 
 # ── shared helper ─────────────────────────────────────────────────────────────
 
@@ -339,7 +319,6 @@ class TestOpaque:
 # ══════════════════════════════════════════════════════════════════════════════
 
 
-@skip_no_msgpack
 class TestMsgpack:
     """MSGPACK: binary msgpack encoding; tuples→lists; bytes preserved."""
 
@@ -463,7 +442,6 @@ class TestCrossFormat:
         )
         assert result == self.JSON_SAFE_PAYLOAD
 
-    @skip_no_msgpack
     def test_json_safe_payload_msgpack(self, direct_service):
         from daffi import SerdeFormat, TCPTransport
 
@@ -513,7 +491,6 @@ class TestCrossFormat:
             )
             assert result == payload, f"{description} not preserved by PICKLE"
 
-    @skip_no_msgpack
     def test_msgpack_preserves_bytes_unlike_json(self, direct_service):
         """MSGPACK handles bytes; JSON would raise TypeError on serialisation."""
         from daffi import SerdeFormat, TCPTransport

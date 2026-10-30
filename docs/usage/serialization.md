@@ -8,7 +8,7 @@ from daffi import SerdeFormat, TCPTransport
 
 ---
 
-## PICKLE (default)
+## PICKLE
 
 Python-native binary serialisation. Supports arbitrary Python objects — dataclasses, Enums, custom classes — as long as both sides share the same class definitions.
 
@@ -59,27 +59,23 @@ print(result.status)   # Status.DONE
 !!! warning
     PICKLE is Python-only. Use JSON or MSGPACK when interoperating with non-Python processes.
 
-!!! danger "Only accept PICKLE from peers you trust"
-    Unpickling a payload runs code its sender chooses. A node decodes each
-    request in the format the caller picked, so by default any peer that can
-    reach a `Service` (or a `Client` with callbacks) can run code in it.
-
-    PICKLE from a WebSocket peer is always refused: any web page can open a
-    WebSocket to a server on the user's machine. For TCP and Unix-socket
-    peers, restrict the accepted formats with `serdes=`:
+!!! danger "PICKLE runs code the sender chooses"
+    Unpickling a payload is code execution. The default allow-list
+    (`serdes=SerdeFormat.ALL`) accepts PICKLE from TCP / Unix peers. Pass
+    `serdes=SerdeFormat.SAFE` to refuse it:
 
     ```python
     svc = Service(
-        app_name="public-service",
-        serdes=[SerdeFormat.JSON, SerdeFormat.MSGPACK],
-        transport=TCPTransport("0.0.0.0", 5004),
+        app_name="safe-service",
+        serdes=SerdeFormat.SAFE,
+        transport=TCPTransport("127.0.0.1", 5004),
     )
     ```
 
-    A request in any other format is answered with a `SerdeNotAllowed`
-    error (a `RemoteCallError` on the caller) and its payload is never
-    decoded. The same argument works on `Client` and on the `daffi.aio`
-    classes. TLS with client certificates (`cert` / `key` / `ca` on
+    PICKLE from a WebSocket peer is always refused: any web page can open a
+    WebSocket to a server on the user's machine. A request in a format
+    outside `serdes=` is answered with `SerdeNotAllowed` and never decoded.
+    TLS with client certificates (`cert` / `key` / `ca` on
     `TCPTransport`) limits who can connect at all.
 
 ---
@@ -117,11 +113,9 @@ print(result)   # {"item_count": 2, "total": 44.93}
 
 ---
 
-## MSGPACK
+## MSGPACK (default)
 
-Binary MessagePack encoding — more compact than JSON, same type support. Ideal for high-throughput pipelines or when bandwidth matters.
-
-Requires: `pip install "daffi[msgpack]"`
+Binary MessagePack encoding — more compact than JSON, same type support. Ideal for high-throughput pipelines or when bandwidth matters. This is the default for `rpc()` / `cast()` and is a required dependency of daffi.
 
 ```python
 # 1_service.py

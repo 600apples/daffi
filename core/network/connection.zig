@@ -119,9 +119,10 @@ pub const AcceptedConnection = struct {
     /// The pointer is cast to *anyopaque here to keep connection.zig free of
     /// TLS headers — ClientConnection.initFromAccepted() casts it back.
     ssl_ctx: ?*anyopaque = null,
-    /// The listener's WebSocket Origin allow-list (newline-separated, empty
-    /// allows any).  Owned by the listener, which outlives every upgrade.
-    allowed_origins: []const u8 = "",
+    /// The listener's WebSocket Origin allow-list (newline-separated; empty
+    /// refuses every upgrade, ``*`` allows any).  Native clients ignore this.
+    /// Owned by the listener, which outlives every upgrade.
+    websocket_allowed_origins: []const u8 = "",
 };
 
 pub const OperationTable = struct {
@@ -278,6 +279,9 @@ pub fn Connection(comptime contype: ConnectionType) type {
             // to the worker that sends the rest.
             self.enqueue(parts, skip) catch |err| {
                 self.wlock.unlock();
+                // Bytes already on the wire — drop the connection so a later
+                // write cannot continue mid-frame after a failed enqueue.
+                self.close();
                 return err;
             };
             return self.startDrain(true);
@@ -450,7 +454,7 @@ pub fn Connection(comptime contype: ConnectionType) type {
             stream.setIoTimeout(tls_impl.HANDSHAKE_TIMEOUT_MS);
             const deadline = @import("../misc.zig").monotonicMs() + tls_impl.HANDSHAKE_TIMEOUT_MS;
 
-            var sync_parser = SynParser.init(self.allocator, deadline, conn.allowed_origins);
+            var sync_parser = SynParser.init(self.allocator, deadline, conn.websocket_allowed_origins);
             defer sync_parser.deinit();
             const pnet_addr = posix_net.Address{};
 
@@ -646,6 +650,34 @@ test "post closes a peer that stops reading once max_outbox_bytes are queued" {
     peer.conn.outbox_mutex.unlock();
     try std.testing.expectEqual(error.OutboxFull, err);
     try std.testing.expect(posted >= max_outbox_bytes);
+    try std.testing.expect(peer.conn.isSuspended());
+    try peer.close();
+}
+
+test "post closes when enqueue fails after a partial write" {
+    // Regression: a non-zero skip followed by enqueue failure used to unlock
+    // the write gate without close(), leaving the wire mid-frame.
+    if (comptime is_wasm) return;
+    const peer = try TestPeer.open();
+    const chunk = try std.testing.allocator.alloc(u8, 1024 * 1024);
+    defer std.testing.allocator.free(chunk);
+    @memset(chunk, 7);
+
+    // Nearly fill the outbox with no drainer, leaving less room than one chunk.
+    peer.conn.outbox_mutex.lock();
+    while (peer.conn.outbox_bytes + chunk.len <= max_outbox_bytes) {
+        try peer.conn.enqueue(&.{chunk}, 0);
+    }
+    peer.conn.outbox_mutex.unlock();
+
+    // Saturate the kernel send buffer so the next post() cannot send everything.
+    while (true) {
+        const n = peer.conn.op_table.writeNonBlocking(peer.conn.ctx, chunk) catch break;
+        if (n < chunk.len) break;
+    }
+
+    const result = peer.conn.post(&.{chunk});
+    try std.testing.expectError(error.OutboxFull, result);
     try std.testing.expect(peer.conn.isSuspended());
     try peer.close();
 }

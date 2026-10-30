@@ -31,6 +31,7 @@ from tests.conftest import active_runtime
 
 import json
 import multiprocessing as mp
+import os
 import socket
 import threading
 import time
@@ -111,8 +112,13 @@ class RawPeer:
     """Speaks the native wire format directly, so it can send what a daffi
     client never would."""
 
-    def __init__(self, port: int, name: str = "", methods=()):
-        self.sock = socket.create_connection((HOST, port), timeout=10)
+    def __init__(self, port, name: str = "", methods=()):
+        if isinstance(port, str):
+            self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            self.sock.settimeout(10)
+            self.sock.connect(port)
+        else:
+            self.sock = socket.create_connection((HOST, port), timeout=10)
         self.sock.sendall(SYN)
         self.name = name
         if name:
@@ -428,9 +434,11 @@ def _proc_origin_router(runtime: str, port: int) -> None:
     silence_subprocess(runtime)
     from daffi import Router, TCPTransport
 
+    transport = TCPTransport(HOST, port)
+    transport.websocket_allowed_origins = [APP_ORIGIN + "/"]
     r = Router(
         app_name="origin-router",
-        transport=TCPTransport(HOST, port, allowed_origins=[APP_ORIGIN + "/"]),
+        transport=transport,
         runtime=runtime,
     )
     r.start()
@@ -493,15 +501,50 @@ def test_origin_allow_list_does_not_affect_native_clients(origin_router):
         wait_for_members(origin_router, {"origin-native"})
 
 
-def test_allowed_origins_is_validated():
+def test_websocket_allowed_origins_is_validated():
     from daffi import TCPTransport
     from daffi.exceptions import InitializationError
 
     for bad in ("https://app.example", [], ["https://a\r\nX: y"], [""], [1]):
+        t = TCPTransport(HOST, 1)
         with pytest.raises(InitializationError):
-            TCPTransport(HOST, 1, allowed_origins=bad)
+            t.websocket_allowed_origins = bad
     assert TCPTransport(HOST, 1).native_listener()[-1] == ""
-    assert TCPTransport(HOST, 1, allowed_origins=["https://a", "https://b/"]).native_listener()[-1] == "https://a\nhttps://b"
+    ok = TCPTransport(HOST, 1)
+    ok.websocket_allowed_origins = ["https://a", "https://b/"]
+    assert ok.native_listener()[-1] == "https://a\nhttps://b"
+    assert ok.websocket_allowed_origins == ("https://a", "https://b")
+
+
+def _proc_star_origin_router(runtime: str, port: int) -> None:
+    silence_subprocess(runtime)
+    from daffi import Router, TCPTransport
+
+    # Same allow-list the js-client examples use for browser demos.
+    transport = TCPTransport(HOST, port)
+    transport.websocket_allowed_origins = ["*"]
+    r = Router(
+        app_name="star-origin-router",
+        transport=transport,
+        runtime=runtime,
+    )
+    r.start()
+    r.join()
+
+
+def test_star_websocket_allowed_origins_accepts_upgrade_without_origin_header(free_port):
+    """``websocket_allowed_origins = ['*']`` must accept upgrades that omit Origin
+    (raw clients / some local demos), matching the js-client examples."""
+    proc = mp.Process(
+        target=_proc_star_origin_router, args=(active_runtime(), free_port), daemon=True
+    )
+    proc.start()
+    try:
+        wait_for_port(free_port)
+        status = _upgrade_status(free_port, origin=None)
+        assert b" 101 " in status, status
+    finally:
+        quiet_kill(proc)
 
 
 # ── 6. a half-sent message does not hold the connection forever ───────────────
@@ -553,58 +596,91 @@ def test_stalled_half_sent_message_closes_only_that_connection(free_port, monkey
 # ── 7. auth_token ─────────────────────────────────────────────────────────────
 
 TOKEN = "s3cret-token"
+_token_seq = iter(range(1, 10_000))
 
 
-def _proc_token_service(runtime: str, port: int) -> None:
+def _proc_token_service(runtime: str, path: str) -> None:
     silence_subprocess(runtime)
-    from daffi import Service, TCPTransport
+    from daffi import Service, UnixTransport
 
     _register_callbacks()
-    svc = Service(app_name=SLOW, transport=TCPTransport(HOST, port), runtime=runtime, auth_token=TOKEN)
+    svc = Service(app_name=SLOW, transport=UnixTransport(path), runtime=runtime, auth_token=TOKEN)
     svc.start()
     svc.join()
 
 
-def _proc_token_router(runtime: str, port: int) -> None:
+def _proc_token_router(runtime: str, path: str) -> None:
     silence_subprocess(runtime)
-    from daffi import Router, TCPTransport
+    from daffi import Router, UnixTransport
 
-    r = Router(app_name="token-router", transport=TCPTransport(HOST, port), runtime=runtime, auth_token=TOKEN)
+    r = Router(app_name="token-router", transport=UnixTransport(path), runtime=runtime, auth_token=TOKEN)
     r.start()
     r.join()
 
 
-def _proc_token_worker(runtime: str, port: int) -> None:
+def _proc_token_worker(runtime: str, path: str) -> None:
     silence_subprocess(runtime)
-    from daffi import Client, TCPTransport
+    from daffi import Client, UnixTransport
 
     _register_callbacks()
-    client = Client(app_name=SLOW, transport=TCPTransport(HOST, port), runtime=runtime, auth_token=TOKEN)
+    client = Client(app_name=SLOW, transport=UnixTransport(path), runtime=runtime, auth_token=TOKEN)
     client.connect()
     client.join()
 
 
+def _wait_unix(path: str, timeout: float = 15.0) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if os.path.exists(path):
+            return
+        time.sleep(0.05)
+    raise TimeoutError(f"Unix socket {path} did not appear within {timeout}s")
+
+
+def _wait_unix_members(path: str, names, timeout: float = 15.0) -> None:
+    from daffi import Client, UnixTransport
+
+    client = Client(
+        app_name="token-probe",
+        transport=UnixTransport(path),
+        runtime=active_runtime(),
+        auth_token=TOKEN,
+    )
+    conn = client.connect()
+    try:
+        conn.wait_for_members(*names, timeout=timeout)
+    finally:
+        client.stop()
+
+
 @pytest.fixture(params=["service", "router"])
-def token_node(request, free_port):
+def token_node(request):
+    # macOS sockaddr_un is 104 bytes; pytest's tmp_path is too long.
+    path = f"/tmp/dftok-{os.getpid()}-{request.param[0]}-{next(_token_seq)}.sock"
     procs = []
     if request.param == "service":
-        procs.append(mp.Process(target=_proc_token_service, args=(active_runtime(), free_port), daemon=True))
+        procs.append(mp.Process(target=_proc_token_service, args=(active_runtime(), path), daemon=True))
     else:
-        procs.append(mp.Process(target=_proc_token_router, args=(active_runtime(), free_port), daemon=True))
+        procs.append(mp.Process(target=_proc_token_router, args=(active_runtime(), path), daemon=True))
     procs[0].start()
-    wait_for_port(free_port)
+    _wait_unix(path)
     if request.param == "router":
-        procs.append(mp.Process(target=_proc_token_worker, args=(active_runtime(), free_port), daemon=True))
+        procs.append(mp.Process(target=_proc_token_worker, args=(active_runtime(), path), daemon=True))
         procs[1].start()
-    yield free_port
+        _wait_unix_members(path, {SLOW})
+    yield path
     for proc in procs:
         quiet_kill(proc)
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
 
 
-def _token_client(port: int, name: str, token):
-    from daffi import Client, TCPTransport
+def _token_client(path: str, name: str, token):
+    from daffi import Client, UnixTransport
 
-    return Client(app_name=name, transport=TCPTransport(HOST, port), runtime=active_runtime(), auth_token=token)
+    return Client(app_name=name, transport=UnixTransport(path), runtime=active_runtime(), auth_token=token)
 
 
 def test_client_with_the_token_is_served(token_node):
@@ -647,12 +723,12 @@ def test_refused_peer_cannot_call_or_take_over_a_name(token_node):
 
 
 def test_async_client_sends_the_token(token_node):
-    from daffi import TCPTransport
+    from daffi import UnixTransport
     from daffi.aio import AsyncClient
 
     async def main():
         client = AsyncClient(
-            app_name="token-async", transport=TCPTransport(HOST, token_node),
+            app_name="token-async", transport=UnixTransport(token_node),
             runtime=active_runtime(), auth_token=TOKEN,
         )
         conn = await client.connect()
@@ -668,12 +744,22 @@ def test_async_client_sends_the_token(token_node):
 
 
 def test_auth_token_is_validated():
-    from daffi import Client, TCPTransport
+    from daffi import Client, TCPTransport, UnixTransport
     from daffi.exceptions import InitializationError
 
     for bad in ("", 123, b"bytes", "a\0b"):
         with pytest.raises(InitializationError):
-            Client(app_name="x", transport=TCPTransport(HOST, 1), auth_token=bad)
+            Client(app_name="x", transport=UnixTransport("/tmp/daffi-token-check.sock"), auth_token=bad)
+
+
+def test_tcp_auth_token_requires_tls():
+    from daffi import Client, Service, TCPTransport
+    from daffi.exceptions import InitializationError
+
+    with pytest.raises(InitializationError, match="tls=True"):
+        Service(app_name="x", transport=TCPTransport(HOST, 1), runtime=active_runtime(), auth_token=TOKEN)
+    with pytest.raises(InitializationError, match="tls=True"):
+        Client(app_name="x", transport=TCPTransport(HOST, 1), runtime=active_runtime(), auth_token=TOKEN)
 
 
 # ── 8. callbacks= offers only the listed callbacks ────────────────────────────

@@ -316,10 +316,10 @@ pub const SynParser = struct {
     handshake_pool: ?*HandshakePool = null,
     /// Newline-separated origins a browser upgrade may come from; empty
     /// allows any.  Not owned.
-    allowed_origins: []const u8,
+    websocket_allowed_origins: []const u8,
 
-    pub fn init(allocator: Allocator, deadline: i64, allowed_origins: []const u8) SynParser {
-        return .{ .allocator = allocator, .deadline = deadline, .allowed_origins = allowed_origins };
+    pub fn init(allocator: Allocator, deadline: i64, websocket_allowed_origins: []const u8) SynParser {
+        return .{ .allocator = allocator, .deadline = deadline, .websocket_allowed_origins = websocket_allowed_origins };
     }
 
     pub fn deinit(self: *SynParser) void {
@@ -374,7 +374,7 @@ pub const SynParser = struct {
             // 8 KiB is enough for any real browser upgrade request.
             // Chrome sends Sec-Fetch-* headers that push the total well past 512 B.
             const pool = self.handshake_pool orelse blk: {
-                const created = try HandshakePool.init(self.allocator, 1, 8192, 10);
+                const created = try HandshakePool.init(self.allocator, 1, 8192, 32);
                 self.handshake_pool = created;
                 break :blk created;
             };
@@ -398,7 +398,7 @@ pub const SynParser = struct {
                 try WebConnection.Handshake.close(stream, err);
                 return error.HandshakeFailed;
             };
-            if (!h.originAllowed(self.allowed_origins)) {
+            if (!h.originAllowed(self.websocket_allowed_origins)) {
                 try WebConnection.Handshake.refuseOrigin(stream);
                 return error.OriginNotAllowed;
             }

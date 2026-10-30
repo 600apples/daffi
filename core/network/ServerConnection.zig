@@ -32,8 +32,8 @@ allocator: Allocator,
 /// Non-null when this server is in TLS mode.  Shared across all accepted
 /// connections; freed by close().
 ssl_ctx: ?*tls_impl.SslCtx = null,
-/// Owned copy of `Config.allowed_origins`.
-allowed_origins: []const u8 = "",
+/// Owned copy of `Config.websocket_allowed_origins`.
+websocket_allowed_origins: []const u8 = "",
 
 pub const Config = struct {
     host: ?[]const u8,
@@ -46,8 +46,9 @@ pub const Config = struct {
     /// When non-empty with tls, require and verify client certificates (mTLS).
     ca: []const u8 = "",
     /// Newline-separated origins a WebSocket upgrade may come from; empty
-    /// allows any.
-    allowed_origins: []const u8 = "",
+    /// refuses every upgrade (fail closed). ``*`` allows any. Native
+    /// TCP/Unix clients are not checked.
+    websocket_allowed_origins: []const u8 = "",
 };
 
 pub fn init(allocator: Allocator, config: Config) !*ServerConnection {
@@ -75,8 +76,8 @@ pub fn init(allocator: Allocator, config: Config) !*ServerConnection {
     const self = try allocator.create(ServerConnection);
     errdefer allocator.destroy(self);
     self.* = ServerConnection{ .listener = l, .allocator = allocator };
-    if (config.allowed_origins.len > 0) self.allowed_origins = try allocator.dupe(u8, config.allowed_origins);
-    errdefer allocator.free(self.allowed_origins);
+    if (config.websocket_allowed_origins.len > 0) self.websocket_allowed_origins = try allocator.dupe(u8, config.websocket_allowed_origins);
+    errdefer allocator.free(self.websocket_allowed_origins);
 
     if (config.tls) {
         // Asking for TLS but providing no certificate must fail loudly, not
@@ -135,7 +136,7 @@ pub fn accept(ctx: *anyopaque, timeout_ms: c_int) !AcceptedConnection {
         .fd = conn.stream.handle,
         .address = na,
         .ssl_ctx = @ptrCast(self.ssl_ctx),
-        .allowed_origins = self.allowed_origins,
+        .websocket_allowed_origins = self.websocket_allowed_origins,
     };
 }
 
@@ -158,7 +159,7 @@ pub fn destroy(ctx: *anyopaque) void {
         self.ssl_ctx = null;
     }
     close(ctx);
-    self.allocator.free(self.allowed_origins);
+    self.allocator.free(self.websocket_allowed_origins);
     self.allocator.destroy(self);
 }
 

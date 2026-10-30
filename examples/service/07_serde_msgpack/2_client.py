@@ -5,8 +5,6 @@ Uses MSGPACK serialisation to send a dict to the service.
 MSGPACK is more efficient than JSON for binary-heavy payloads and is
 supported natively in many languages.
 
-Requires:  pip install 'daffi[msgpack]'
-
 Run 1_service.py first.
 """
 

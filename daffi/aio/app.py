@@ -87,6 +87,8 @@ class AsyncApplication(Application):
 
     async def _wait_stopped(self) -> None:
         while not self._stop_event.is_set():
+            if self._disconnected:
+                return
             try:
                 await asyncio.wait_for(self._stop_event.wait(), SIGNAL_POLL_S)
             except asyncio.TimeoutError:
@@ -96,7 +98,8 @@ class AsyncApplication(Application):
         """Block until :meth:`stop` is called or a signal fires."""
         self._joining = True
         try:
-            await self._wait_stopped()
+            if not self._disconnected:
+                await self._wait_stopped()
         finally:
             self._joining = False
         if self._connection_error is not None:
@@ -125,19 +128,21 @@ class AsyncServerMixin:
             raise RuntimeError(f"{self.__class__.__name__} is already started")
         self._loop = asyncio.get_running_loop()
         # A server can start again after stop(); stop() must then work again.
+        self._intentionally_stopped = False
         self._stop_event.clear()
         try:
             if self.server_mode == ServerMode.SERVICE:
                 if not self._task_dispatcher:
                     self._task_dispatcher = AsyncTaskDispatcher(workers=self.workers)
-            self._conn_num = self._add_native_listeners()
+            loop = asyncio.get_running_loop()
+            self._conn_num = await loop.run_in_executor(None, self._add_native_listeners)
             self.logger.debug(
                 f"has been started successfully. connection info: {self.info}"
             )
             if self.server_mode == ServerMode.SERVICE:
                 self._task_dispatcher.start_for_connection(self)
                 RpcProxy._advertise_service_methods(self._conn_num, self._exposed_names())
-            dfcore.startServer(self._conn_num)
+            await loop.run_in_executor(None, dfcore.startServer, self._conn_num)
             self._register_executors()
             if self.server_mode == ServerMode.SERVICE:
                 RpcProxy._process_service_handshake(self._conn_num, self._exposed_names())
@@ -159,6 +164,7 @@ class AsyncServerMixin:
 
     async def stop(self, *_, **__) -> None:
         """Stop the server and release resources."""
+        self._intentionally_stopped = True
         self._unregister_executor_subscriber()
         async with self._stop_lock:
             if self._stop_event.is_set():
@@ -259,6 +265,7 @@ class AsyncClient(AsyncApplication[SingleTransportMixin]):
             raise RuntimeError("Client is already connected")
         self._loop = asyncio.get_running_loop()
         # A client can connect again after stop().
+        self._intentionally_stopped = False
         self._stop_event.clear()
         self._connection_error = None
         self._disconnected = False
@@ -273,7 +280,8 @@ class AsyncClient(AsyncApplication[SingleTransportMixin]):
         """
         self._joining = True
         try:
-            await self._wait_stopped()
+            if not self._disconnected:
+                await self._wait_stopped()
         finally:
             self._joining = False
 
@@ -297,6 +305,7 @@ class AsyncClient(AsyncApplication[SingleTransportMixin]):
 
         Idempotent and safe to call from multiple coroutines concurrently.
         """
+        self._intentionally_stopped = True
         self._unregister_executor_subscriber()
         async with self._stop_lock:
             await self._release_connection()
@@ -329,7 +338,10 @@ class AsyncClient(AsyncApplication[SingleTransportMixin]):
 
         t = self.transport
         try:
-            self._conn_num = dfcore.startClient(
+            loop = asyncio.get_running_loop()
+            self._conn_num = await loop.run_in_executor(
+                None,
+                dfcore.startClient,
                 t.native_host,
                 t.native_port,
                 self.app_name,
@@ -383,20 +395,44 @@ class AsyncClient(AsyncApplication[SingleTransportMixin]):
         Returns ``True`` on success, ``False`` otherwise.
         """
         async with self._reconnect_lock:
+            if self._intentionally_stopped:
+                return False
             if not self._disconnected:
-                return self._conn_num is not None
+                if self._conn_num is not None:
+                    return True
+                # Inconsistent: looks connected but has no handle — heal it.
+                self._disconnected = True
             if isinstance(self._connection_error, Evicted):
                 # The name now belongs to a newer connection.
                 return False
+            saved_error = self._connection_error
             try:
                 async with self._stop_lock:
+                    if self._intentionally_stopped:
+                        return False
                     await self._release_connection()
-                self._stop_event.clear()
-                self._connection_error = None
-                self._disconnected = False
-                self._task_dispatcher = None  # force a fresh dispatcher + poller
-                await self._do_connect()
+                    self._stop_event.clear()
+                    self._connection_error = None
+                    self._disconnected = False
+                    self._task_dispatcher = None  # force a fresh dispatcher + poller
+                    await self._do_connect()
+                    if self._intentionally_stopped:
+                        await self._release_connection()
+                        self._stop_event.set()
+                        return False
                 return True
             except Exception as exc:
                 self.logger.warning(f"Reconnect attempt failed: {exc!r}")
+                # Restore disconnected state so join()/RPC do not treat a
+                # missing handle as a healthy connection (and so join does
+                # not hang on a cleared _stop_event).
+                async with self._stop_lock:
+                    if self._conn_num is not None:
+                        try:
+                            await self._release_connection()
+                        except Exception:
+                            pass
+                    self._disconnected = True
+                    self._connection_error = saved_error
+                    self._stop_event.set()
                 return False

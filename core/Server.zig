@@ -129,6 +129,8 @@ const Runtime = struct {
     /// membership.
     listeners: []Listener,
     acceptor: ?Acceptor = null,
+    /// Set before spawning acceptors so two beginAccepting calls cannot both start.
+    accepting: std.atomic.Value(bool) = .init(false),
     /// Runs `housekeep`: closes stalled connections and, in the evented
     /// model, restores Unix socket files that were deleted.  Writing to
     /// `housekeeper_wake_write` stops it.
@@ -291,6 +293,7 @@ const Runtime = struct {
     /// Stop the housekeeper, then stop watching every listener at once and
     /// wait until no accept is in progress.
     fn stopAccepting(self: *Runtime) void {
+        self.accepting.store(false, .release);
         if (self.housekeeper) |thread| {
             const byte = [1]u8{1};
             _ = std.c.write(self.housekeeper_wake_write, &byte, byte.len);
@@ -380,6 +383,11 @@ const Slot = struct {
 var slots_mutex: Mutex = .{};
 var slots: [MAX_SERVERS]Slot = @splat(.{});
 
+pub fn resetSlotsAfterFork() void {
+    slots_mutex = .{};
+    slots = @splat(.{});
+}
+
 fn acquireSlot() ?usize {
     slots_mutex.lock();
     defer slots_mutex.unlock();
@@ -448,6 +456,7 @@ pub fn start(allocator: Allocator, mode: HandlerMode, app_name: []const u8, conf
 fn startImpl(allocator: Allocator, mode: HandlerMode, app_name_arg: []const u8, configs: []const ServerConnection.Config, failed: *?usize, auth_token: ?[]const u8) !usize {
     if (configs.len == 0) return error.NoListeners;
     readFrameStallSetting();
+    readMaxConnections();
     for (configs, 0..) |config, i| {
         for (configs[0..i]) |earlier| {
             if (sameAddress(config, earlier)) {
@@ -874,7 +883,11 @@ fn bindUnix(path: [:0]const u8) !c_int {
     const addr = try net.Address.initUnix(path);
     // The file is absent (the caller checked), so this does not unlink
     // anything a new owner may have just created: bind fails instead.
-    return (try addr.listen(.{ .kernel_backlog = 512 })).handle;
+    const fd = (try addr.listen(.{ .kernel_backlog = 512 })).handle;
+    if (std.c.chmod(path, 0o600) != 0) {
+        log.warn("could not chmod 0600 {s}", .{@as([]const u8, path)});
+    }
+    return fd;
 }
 
 const UnixSwap = struct {
@@ -939,12 +952,29 @@ fn closeListeningFd(fd: c_int) void {
 /// The listener never removes itself; `stop` detaches it.
 fn onListenerRemoved(_: *EventLoop.Source) void {}
 
+/// Process-wide cap on accepted connections (threads and evented).
+/// Override with `DAFFI_MAX_CONNECTIONS`.
+const default_max_connections: usize = 4096;
+var max_connections: std.atomic.Value(usize) = .init(default_max_connections);
+
+fn readMaxConnections() void {
+    const raw = std.c.getenv("DAFFI_MAX_CONNECTIONS") orelse return;
+    const n = std.fmt.parseInt(usize, std.mem.span(raw), 10) catch return;
+    if (n >= 1) max_connections.store(n, .monotonic);
+}
+
 /// Hand an accepted descriptor to its own thread (threads model) or to the
 /// blocking pool (evented model) for the protocol probe / TLS handshake, so a
 /// silent peer cannot stall accepting.
 fn admit(rt: *Runtime, listener: *ServerConnection, raw: AcceptedConnection) void {
-    // Counted first so stop never frees `rt` while the connection starts up.
-    _ = rt.active_connections.fetchAdd(1, .acq_rel);
+    const cap = max_connections.load(.monotonic);
+    const n = rt.active_connections.fetchAdd(1, .acq_rel);
+    if (n >= cap) {
+        log.warn("refusing connection: {d} already active (DAFFI_MAX_CONNECTIONS={d})", .{ n, cap });
+        _ = rt.active_connections.fetchSub(1, .acq_rel);
+        (net.Stream{ .handle = raw.fd }).close();
+        return;
+    }
     const started = switch (rt.mode) {
         .Service => startConnection(.Service, rt, listener, raw),
         .Router => startConnection(.Router, rt, listener, raw),
@@ -1213,7 +1243,8 @@ pub fn getMessageForServerWorker(conn_num: usize) !?*Message {
 pub fn beginAccepting(conn_num: usize) !void {
     const rt = try acquire(conn_num);
     defer rt.release();
-    if (rt.acceptor != null) return;
+    if (rt.accepting.swap(true, .acq_rel)) return;
+    errdefer _ = rt.accepting.store(false, .release);
     try rt.startAccepting();
 }
 

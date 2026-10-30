@@ -72,9 +72,6 @@ pub fn init(allocator: Allocator, config: Config) !*ClientConnection {
         .allocator = allocator,
     };
 
-    // Applies to plain TCP; the TLS path replaces it with non-blocking I/O.
-    try self.writeTimeout(1000);
-
     if (config.tls) {
         tls_impl.init();
         const ssl_ctx = try tls_impl.clientCtx(config.ca, config.cert, config.key, config.verify);
@@ -87,6 +84,10 @@ pub fn init(allocator: Allocator, config: Config) !*ClientConnection {
         tls_impl.finishHandshake(ssl);
         self.ssl_ctx = ssl_ctx;
         self.ssl = ssl;
+    } else {
+        // Same stall bound as accepted sockets.  1 s dropped large
+        // payloads on a slow window.
+        try self.writeTimeout(net.SEND_STALL_TIMEOUT_MS);
     }
 
     self.enableKeepalive(10, 5, 3);
@@ -158,6 +159,13 @@ pub fn writeNonBlocking(ctx: *anyopaque, data: []const u8) !usize {
 pub fn writeParts(ctx: *anyopaque, head: []const u8, body: []const u8) !void {
     const self: *ClientConnection = @ptrCast(@alignCast(ctx));
     if (self.ssl) |ssl| {
+        const total = head.len + body.len;
+        if (total <= 16 * 1024) {
+            var tmp: [16 * 1024]u8 = undefined;
+            @memcpy(tmp[0..head.len], head);
+            @memcpy(tmp[head.len..][0..body.len], body);
+            return tls_impl.sslWrite(ssl, tmp[0..total]);
+        }
         try tls_impl.sslWrite(ssl, head);
         return tls_impl.sslWrite(ssl, body);
     }

@@ -1,7 +1,7 @@
 """
 service/04_serde_pickle — Service side.
 
-PICKLE serialisation is the default and supports arbitrary Python objects
+PICKLE serialisation (`serde=SerdeFormat.PICKLE`) supports arbitrary Python objects
 including dataclasses, Enums, and custom classes.  Both sides must share
 the same class definitions (models.py).
 

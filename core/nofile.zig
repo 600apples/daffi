@@ -60,7 +60,11 @@ fn nativeAcquire(additional: usize) void {
 
 fn nativeRelease(n: usize) void {
     if (n == 0) return;
-    _ = in_use.fetchSub(n, .monotonic);
+    while (true) {
+        const cur = in_use.load(.monotonic);
+        const next = if (cur >= n) cur - n else 0;
+        if (in_use.cmpxchgWeak(cur, next, .monotonic, .monotonic) == null) return;
+    }
 }
 
 fn nativeBump() bool {

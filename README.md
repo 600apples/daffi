@@ -197,10 +197,10 @@ Pass `serde=SerdeFormat.X` to any call method.
 
 | Format | Import | Notes                                                                    |
 |---|---|--------------------------------------------------------------------------|
-| `PICKLE` | `from daffi import SerdeFormat` | Default. Any Python object.                                              |
+| `MSGPACK` | `from daffi import SerdeFormat` | Default. Compact binary; language-agnostic.                              |
 | `JSON` | same | Human-readable; requires JSON-serialisable values.                       |
 | `OPAQUE` | same | Raw `bytes` or `string` — zero-copy, fastest for binary and string data. |
-| `MSGPACK` | same | Compact binary; requires `pip install daffi[msgpack]`.                   |
+| `PICKLE` | same | Any Python object. Pass `serde=SerdeFormat.PICKLE` on the call.          |
 
 ```python
 from daffi import Client, SerdeFormat

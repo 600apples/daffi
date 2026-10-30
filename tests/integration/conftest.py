@@ -138,7 +138,7 @@ def quiet_kill(proc: mp.Process, timeout: float = 5.0) -> None:
 def proc_service(runtime: str, port: int, app_name: str = "integ-service", workers: int = 4) -> None:
     """Service subprocess: registers echo + add callbacks, then joins."""
     silence_subprocess(runtime)
-    from daffi import Service, callback, TCPTransport
+    from daffi import Service, callback, SerdeFormat, TCPTransport
 
     @callback
     def echo(payload):
@@ -148,9 +148,12 @@ def proc_service(runtime: str, port: int, app_name: str = "integ-service", worke
     def add(a: int, b: int) -> int:
         return a + b
 
+    transport = TCPTransport(HOST, port)
+    transport.websocket_allowed_origins = ["http://localhost"]
     svc = Service(
-        app_name=app_name, workers=workers, transport=TCPTransport(HOST, port),
-        runtime=runtime,
+        app_name=app_name, workers=workers,
+        transport=transport,
+        runtime=runtime, serdes=SerdeFormat.ALL,
     )
     svc.start()
     svc.join()
@@ -161,7 +164,13 @@ def proc_router(runtime: str, port: int, app_name: str = "integ-router") -> None
     silence_subprocess(runtime)
     from daffi import Router, TCPTransport
 
-    r = Router(app_name=app_name, transport=TCPTransport(HOST, port), runtime=runtime)
+    transport = TCPTransport(HOST, port)
+    transport.websocket_allowed_origins = ["http://localhost"]
+    r = Router(
+        app_name=app_name,
+        transport=transport,
+        runtime=runtime,
+    )
     r.start()
     r.join()
 
@@ -170,7 +179,7 @@ def proc_worker(runtime: str, port: int, app_name: str, workers: int = 4) -> Non
     """Client+callback worker subprocess: registers echo + add, keeps running."""
     silence_subprocess(runtime)
     import time as _time
-    from daffi import Client, callback, TCPTransport
+    from daffi import Client, callback, SerdeFormat, TCPTransport
 
     @callback
     def echo(payload):
@@ -182,7 +191,7 @@ def proc_worker(runtime: str, port: int, app_name: str, workers: int = 4) -> Non
 
     client = Client(
         app_name=app_name, workers=workers, transport=TCPTransport(HOST, port),
-        runtime=runtime,
+        runtime=runtime, serdes=SerdeFormat.ALL,
     )
     client.connect()
     try:

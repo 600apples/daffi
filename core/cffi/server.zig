@@ -25,10 +25,11 @@ const allocator = std.heap.c_allocator;
 /// Each listener is either `(host, port)` (plaintext),
 /// `(host, port, tls, cert, key)`, or
 /// `(host, port, tls, cert, key, ca)`, or
-/// `(host, port, tls, cert, key, ca, allowed_origins)`.  A non-empty `ca` on
+/// `(host, port, tls, cert, key, ca, websocket_allowed_origins)`.  A non-empty `ca` on
 /// a TLS listener enables mutual TLS (clients must present a cert chaining to
-/// that CA).  `allowed_origins` is a newline-separated list of the origins a
-/// WebSocket upgrade may come from; empty allows any.
+/// that CA).  `websocket_allowed_origins` is a newline-separated list of the
+/// origins a WebSocket upgrade may come from; empty refuses every upgrade,
+/// `*` allows any.  Native TCP/Unix clients are not checked.
 /// `cert` / `key` / `ca` are a filesystem path or PEM material.
 ///
 /// All or nothing: when a listener cannot be bound nothing stays bound, and
@@ -83,7 +84,7 @@ pub fn addListeners(_: [*c]PyObject, args: [*c]PyObject) callconv(.c) [*c]PyObje
         } else if (nitems == 7) {
             if (PyArg_ParseTuple(item, "slpssss", &host, &port, &tls_enabled, &cert, &key, &ca, &origins) == 0) return null;
         } else {
-            PyErr_SetString(py.PyExc_TypeError, "listener must be (host, port), (host, port, tls, cert, key), (host, port, tls, cert, key, ca), or (host, port, tls, cert, key, ca, allowed_origins)");
+            PyErr_SetString(py.PyExc_TypeError, "listener must be (host, port), (host, port, tls, cert, key), (host, port, tls, cert, key, ca), or (host, port, tls, cert, key, ca, websocket_allowed_origins)");
             return null;
         }
         if (port < 0 or port > std.math.maxInt(u16)) {
@@ -97,7 +98,7 @@ pub fn addListeners(_: [*c]PyObject, args: [*c]PyObject) callconv(.c) [*c]PyObje
             .cert = if (nitems >= 5) std.mem.span(cert) else "",
             .key = if (nitems >= 5) std.mem.span(key) else "",
             .ca = if (nitems >= 6) std.mem.span(ca) else "",
-            .allowed_origins = if (nitems == 7) std.mem.span(origins) else "",
+            .websocket_allowed_origins = if (nitems == 7) std.mem.span(origins) else "",
         };
     }
 
@@ -192,7 +193,9 @@ pub fn sendMessageFromServer(_: [*c]PyObject, args: [*c]PyObject) callconv(.c) [
         PyErr_SetString(py.PyExc_ValueError, @errorName(err));
         return null;
     };
-    return Py_BuildValue("(Ils#)", @as(c_uint, msgident.uuid), @as(c_long, msgident.timestamp), msgident.receiver.ptr, @as(py.Py_ssize_t, @intCast(msgident.receiver.len)));
+    const rec = msgident.receiver;
+    const rec_ptr: [*c]const u8 = if (rec.len == 0) "" else rec.ptr;
+    return Py_BuildValue("(Ils#)", @as(c_uint, msgident.uuid), @as(c_long, msgident.timestamp), rec_ptr, @as(py.Py_ssize_t, @intCast(rec.len)));
 }
 
 /// Dequeue one inbound task from the server's incoming message queue.

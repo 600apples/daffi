@@ -106,8 +106,13 @@ def _proc_fragile_service(runtime: str, port: int, workers: int, explode_on_join
     def add(a: int, b: int) -> int:
         return a + b
 
+    transport = TCPTransport(HOST, port)
+    # Raw WS clients in this file omit Origin; ``*`` is required for those.
+    transport.websocket_allowed_origins = ["*"]
     svc = Service(
-        app_name=FRAGILE, workers=workers, transport=TCPTransport(HOST, port),
+        app_name=FRAGILE,
+        workers=workers,
+        transport=transport,
         runtime=runtime,
     )
 

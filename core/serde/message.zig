@@ -595,6 +595,7 @@ pub fn createHandshakeMessage(allocator: Allocator, memberdata: []serde.Handshak
     var handshake = try serde.Handshake.create(arena.allocator(), memberdata, hstype);
     const handshake_data = try handshake.toJson(arena.allocator());
     var raw_message = try RawMessage.create(allocator, handshake_data, uuid, .HANDSHAKE, .JSON, false, false, null, null, null);
+    errdefer allocator.free(raw_message.data);
     return try Message.fromRawMessage(allocator, &raw_message);
 }
 
@@ -603,6 +604,7 @@ pub fn createEventMessage(allocator: Allocator, uuid: @FieldType(Header, "uuid")
     const event_data = try event.toJson(allocator);
     defer allocator.free(event_data);
     var raw_message = try RawMessage.create(allocator, event_data, uuid, .EVENTS, .JSON, false, false, null, null, null);
+    errdefer allocator.free(raw_message.data);
     return try Message.fromRawMessage(allocator, &raw_message);
 }
 

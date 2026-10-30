@@ -15,21 +15,6 @@ import pytest
 from .conftest import HOST, TIMEOUT
 
 
-def _msgpack_available() -> bool:
-    try:
-        import msgpack  # noqa: F401
-
-        return True
-    except ImportError:
-        return False
-
-
-skip_no_msgpack = pytest.mark.skipif(
-    not _msgpack_available(),
-    reason="msgpack not installed — run: pip install 'daffi[msgpack]'",
-)
-
-
 async def _rpc(port: int, name: str, method: str, *args, serde, **kwargs):
     from daffi.aio import AsyncClient
     from daffi import TCPTransport
@@ -303,7 +288,6 @@ class TestOpaqueAsync:
 # ══════════════════════════════════════════════════════════════════════════════
 
 
-@skip_no_msgpack
 @pytest.mark.asyncio
 class TestMsgpackAsync:
 
@@ -427,7 +411,6 @@ class TestCrossFormatAsync:
         )
         assert result == self.JSON_SAFE_PAYLOAD
 
-    @skip_no_msgpack
     async def test_json_safe_payload_msgpack(self, direct_service):
         from daffi import SerdeFormat, TCPTransport
 

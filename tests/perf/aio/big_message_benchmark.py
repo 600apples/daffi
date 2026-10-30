@@ -302,7 +302,7 @@ async def _run_all_formats(conn, layout_name: str) -> None:
         if fmt_name == "MSGPACK" and not _msgpack_available():
             print(
                 f"  {'msgpack':<8}  (skipped — msgpack not installed; "
-                "run: pip install 'daffi[msgpack]')"
+                "msgpack is a required daffi dependency")"
             )
             continue
 

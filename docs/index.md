@@ -12,7 +12,7 @@ It lets processes call each other's functions over TCP or Unix sockets — with 
 | **Native core** | The message framing, connection management and routing logic is implemented in a native compiled extension (`dfcore`) for maximum throughput. |
 | **Multiple transports** | TCP, Unix domain sockets, TLS — same API.                                                                                                     |
 | **Four call styles** | `rpc`, `rpc_nowait`, `cast`, `cast_nowait` — blocking/non-blocking, single target/broadcast.                                                  |
-| **Four serialisation formats** | PICKLE (Python-only, default), JSON, MSGPACK, OPAQUE (raw bytes or string).                                                                   |
+| **Four serialisation formats** | MSGPACK (default), JSON, OPAQUE (raw bytes or string), PICKLE (Python-only).                                                                            |
 | **Event subscriptions** | React to nodes joining and leaving the network.                                                                                               |
 
 ---
@@ -21,9 +21,6 @@ It lets processes call each other's functions over TCP or Unix sockets — with 
 
 ```bash
 pip install daffi
-
-# optional: MessagePack support
-pip install "daffi[msgpack]"
 ```
 
 ---

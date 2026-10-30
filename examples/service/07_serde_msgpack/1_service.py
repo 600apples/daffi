@@ -3,9 +3,8 @@ service/07_serde_msgpack — Service side.
 
 MSGPACK serialisation is compact and language-agnostic.  It supports the
 same basic types as JSON (dict, list, str, int, float, bool, None) but
-encodes them in a binary format — smaller on the wire than JSON.
-
-Requires:  pip install 'daffi[msgpack]'
+encodes them in a binary format — smaller on the wire than JSON.  Default
+for ``rpc()`` / ``cast()``.
 
 Run first, then run 2_client.py.
 """

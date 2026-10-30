@@ -80,6 +80,10 @@ fn resetAfterFork() callconv(.c) void {
     init_mutex = .{};
     loops = @splat(null);
     blocking_pool = .{};
+    initialized = false;
+    selected = .threads;
+    @import("Client.zig").resetRegistryAfterFork();
+    @import("Server.zig").resetSlotsAfterFork();
 }
 
 fn ensureInit() void {

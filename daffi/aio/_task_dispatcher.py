@@ -39,6 +39,7 @@ from daffi._wakeup import WakeupFd, LifecycleSignal
 from daffi._bindings import (
     set_request_fd,
     set_lifecycle_fd,
+    invalidate_members,
     MessageFlag,
 )
 from daffi.exceptions import Evicted
@@ -129,7 +130,7 @@ async def _invoke_callback_async(
         return result, MessageFlag.RESPONSE, serde
     except asyncio.CancelledError:
         raise
-    except:  # noqa: E722
+    except Exception:
         return _error_result(_reply_serde(serde, accepted))
 
 
@@ -403,10 +404,7 @@ class AsyncTaskDispatcher:
         from daffi.aio._rpc_proxy import AsyncResponseNotifier, AsyncRpcProxy
 
         if reason == LifecycleSignal.INIT:
-            await asyncio.get_running_loop().run_in_executor(
-                None, AsyncRpcProxy._process_client_handshake, conn_num, conn._exposed_names()
-            )
-            conn._register_executors()
+            asyncio.ensure_future(self._run_init_handshake(conn, conn_num))
             return
 
         if reason == LifecycleSignal.NORMAL:
@@ -427,6 +425,17 @@ class AsyncTaskDispatcher:
         else:
             conn.logger.error(f"Error in connection {conn_num}: {err}")
 
+    async def _run_init_handshake(self, conn: Any, conn_num: int) -> None:
+        from daffi.aio._rpc_proxy import AsyncRpcProxy
+
+        try:
+            await asyncio.get_running_loop().run_in_executor(
+                None, AsyncRpcProxy._process_client_handshake, conn_num, conn._exposed_names()
+            )
+            conn._register_executors()
+        except Exception:
+            conn.logger.exception("INIT handshake failed")
+
     def _stop_in_background(self, conn: Any) -> None:
         task = asyncio.ensure_future(conn.stop())
         self._stop_tasks.add(task)
@@ -441,16 +450,21 @@ class AsyncTaskDispatcher:
         """
         event_type: str = payload["type"]
         member: str = payload["member"]
+        invalidate_members(getattr(conn, "_conn_num", None))
         if event_type == EventType.CONNECTED:
             handlers = conn._on_member_added_handlers
         elif event_type == EventType.DISCONNECTED:
             handlers = conn._on_member_removed_handlers
         else:
             return
-        for handler in handlers:
-            try:
-                result = handler(member)
-                if asyncio.iscoroutine(result):
-                    await result
-            except Exception:
-                conn.logger.exception(f"Event handler {handler!r} failed")
+
+        async def _run():
+            for handler in handlers:
+                try:
+                    result = handler(member)
+                    if asyncio.iscoroutine(result):
+                        await result
+                except Exception:
+                    conn.logger.exception(f"Event handler {handler!r} failed")
+
+        asyncio.ensure_future(_run())

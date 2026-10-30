@@ -68,6 +68,7 @@ def ws_upgrade_request() -> bytes:
     return (
         "GET / HTTP/1.1\r\n"
         f"Host: {HOST}\r\n"
+        "Origin: http://localhost\r\n"
         "Upgrade: websocket\r\n"
         "Connection: Upgrade\r\n"
         f"Sec-WebSocket-Key: {key}\r\n"

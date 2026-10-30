@@ -9,11 +9,24 @@ the rest of the Python code does not call ``dfcore.*`` directly.
 from __future__ import annotations
 
 import json
+import threading
 from . import dfcore
 from enum import IntEnum
 from typing import Union, Tuple
 
 from daffi._serialization import SerdeFormat
+
+_members_cache: dict[int, list] = {}
+_members_lock = threading.Lock()
+
+
+def invalidate_members(conn_num: int | None = None) -> None:
+    """Drop cached membership for *conn_num*, or for every connection."""
+    with _members_lock:
+        if conn_num is None:
+            _members_cache.clear()
+        else:
+            _members_cache.pop(conn_num, None)
 
 
 class MessageFlag(IntEnum):
@@ -86,8 +99,15 @@ def get_available_members(conn_num: int) -> list:
     Returns:
         A list of member-info dicts, or an empty list when none are available.
     """
-    members = dfcore.getAvailableMembers(conn_num)
-    return json.loads(members)["members"] if members else []
+    with _members_lock:
+        cached = _members_cache.get(conn_num)
+        if cached is not None:
+            return cached
+    members_json = dfcore.getAvailableMembers(conn_num)
+    members = json.loads(members_json)["members"] if members_json else []
+    with _members_lock:
+        _members_cache[conn_num] = members
+    return members
 
 
 def send_message_from_service(

@@ -12,7 +12,7 @@ Client
     ``.cast()``, or stream a generator via ``.stream()``.
 SerdeFormat
     Serialisation format selector: ``OPAQUE``, ``JSON``, ``PICKLE``, ``MSGPACK``.
-    ``MSGPACK`` requires the optional dependency: ``pip install 'daffi[msgpack]'``.
+    Default for ``rpc()`` / ``cast()`` is ``MSGPACK``.
 TCPTransport
     A TCP address.  Pass one, or a list of transports, to Router or Service.
 UnixTransport
