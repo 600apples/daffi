@@ -116,6 +116,15 @@ pub fn setNonBlocking(fd: c_int) void {
     if (flags >= 0) _ = fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 }
 
+pub fn setBlocking(fd: c_int) void {
+    const flags = fcntl(fd, F_GETFL, @as(c_int, 0));
+    if (flags >= 0 and flags & O_NONBLOCK != 0) _ = fcntl(fd, F_SETFL, flags & ~O_NONBLOCK);
+}
+
+/// A write to an accepted peer that makes no progress for this long fails,
+/// and the connection is dropped.
+pub const SEND_STALL_TIMEOUT_MS: u32 = 5_000;
+
 const std = @import("std");
 const nofile = @import("../nofile.zig");
 
@@ -294,6 +303,8 @@ pub const Stream = struct {
             if (result >= 0) return @intCast(result);
             switch (lastErrno()) {
                 .INTR => continue,
+                // SO_SNDTIMEO expired.
+                .AGAIN => return error.WriteTimeout,
                 else => return error.WriteError,
             }
         }
@@ -308,12 +319,22 @@ pub const Stream = struct {
 
     /// Set (or, with 0, clear) the receive and send timeouts of the socket.
     pub fn setIoTimeout(self: Stream, ms: u32) void {
-        const tv = posix.timeval{
-            .sec = @intCast(ms / 1000),
-            .usec = @intCast((ms % 1000) * 1000),
-        };
+        self.setReadTimeout(ms);
+        self.setWriteTimeout(ms);
+    }
+
+    pub fn setReadTimeout(self: Stream, ms: u32) void {
+        const tv = timeval(ms);
         _ = c.setsockopt(self.handle, c.SOL_SOCKET, c.SO_RCVTIMEO, &tv, @sizeOf(posix.timeval));
+    }
+
+    pub fn setWriteTimeout(self: Stream, ms: u32) void {
+        const tv = timeval(ms);
         _ = c.setsockopt(self.handle, c.SOL_SOCKET, c.SO_SNDTIMEO, &tv, @sizeOf(posix.timeval));
+    }
+
+    fn timeval(ms: u32) posix.timeval {
+        return .{ .sec = @intCast(ms / 1000), .usec = @intCast((ms % 1000) * 1000) };
     }
 
     /// Shut both directions down *without* releasing the descriptor.
@@ -525,6 +546,8 @@ pub const Server = struct {
     /// flag; closing a listening fd from another thread does not reliably wake a
     /// blocked accept() on all platforms.
     pub fn acceptTimeout(self: *Server, timeout_ms: c_int) !ServerConn {
+        // The listening socket is non-blocking: try it directly.
+        if (timeout_ms == 0) return self.accept();
         var pfd = PollFd{ .fd = self.handle, .events = POLLIN, .revents = 0 };
         const n = poll(@as([*]PollFd, @ptrCast(&pfd)), 1, timeout_ms);
         if (n == 0) return error.Timeout;
@@ -550,10 +573,12 @@ pub const Server = struct {
                     grew = true;
                     continue;
                 }
-                noteCode("accept", err);
                 return switch (Stream.lastErrno()) {
                     .INTR, .CONNABORTED, .AGAIN => error.Timeout,
-                    else => error.AcceptError,
+                    else => {
+                        noteCode("accept", err);
+                        return error.AcceptError;
+                    },
                 };
             }
             setCloexec(fd);
@@ -609,6 +634,8 @@ fn listenOn(addr: *const Address, options: ListenOptions) !Server {
         noteErrno("listen");
         return error.ListenError;
     }
+    // Accept loops drain the backlog until EAGAIN instead of polling first.
+    setNonBlocking(fd);
     clearConnectFailure();
     return Server{ .handle = fd, .listen_address = addr.* };
 }

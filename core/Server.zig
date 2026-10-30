@@ -27,6 +27,8 @@ const MessageDecoder = serde.MessageDecoder;
 
 const MAX_SERVERS = 256;
 
+const thread_stack_size = misc.thread_stack_size;
+
 /// Pause a listener this long after `accept` fails (for example EMFILE), so
 /// one stuck listener cannot spin its thread or event loop.  The others keep
 /// accepting.
@@ -130,6 +132,12 @@ const Runtime = struct {
     /// Accepted connections whose thread or event source may still touch this
     /// struct.  `stop` waits for it to reach zero before freeing anything.
     active_connections: std.atomic.Value(usize) = .init(0),
+    /// Callers inside a public function that looked this server up.
+    users: std.atomic.Value(usize) = .init(0),
+
+    fn release(self: *Runtime) void {
+        _ = self.users.fetchSub(1, .release);
+    }
 
     /// Remember `conn` so shutdown can interrupt it.  Fails if the server is
     /// already stopping, in which case the caller must drop the connection.
@@ -202,7 +210,7 @@ const Runtime = struct {
         pollfds[0] = .{ .fd = wake[0], .events = net.WAIT_READ, .revents = 0 };
         for (pollfds[1..], self.listeners) |*p, *listener|
             p.* = .{ .fd = listener.connection.handle(), .events = net.WAIT_READ, .revents = 0 };
-        const handle = try std.Thread.spawn(.{}, acceptLoop, .{ self, pollfds, quiet });
+        const handle = try std.Thread.spawn(.{ .stack_size = thread_stack_size }, acceptLoop, .{ self, pollfds, quiet });
         self.acceptor = .{ .thread = .{ .handle = handle, .pollfds = pollfds, .quiet_until = quiet, .wake_write = wake[1] } };
     }
 
@@ -247,12 +255,11 @@ const Runtime = struct {
         for (wake) |fd| _ = std.c.fcntl(fd, std.c.F.SETFD, @as(c_int, std.c.FD_CLOEXEC));
         self.unix_wake_read = wake[0];
         self.unix_wake_write = wake[1];
-        self.unix_watch = try std.Thread.spawn(.{}, unixWatch, .{self});
+        self.unix_watch = try std.Thread.spawn(.{ .stack_size = thread_stack_size }, unixWatch, .{self});
     }
 
     /// Stop the Unix-socket watchdog, then stop watching every listener at
-    /// once and wait until no accept is in progress.  The sockets stay open:
-    /// connections still being upgraded use their TLS context.
+    /// once and wait until no accept is in progress.
     fn stopAccepting(self: *Runtime) void {
         if (self.unix_watch) |thread| {
             const byte = [1]u8{1};
@@ -293,23 +300,14 @@ const Runtime = struct {
         }
     }
 
-    fn deinit(self: *Runtime) void {
-        destroyListeners(self.allocator, self.listeners);
-        self.server_handler.deinit();
-        self.msgpool.deinit();
-        self.live.deinit(self.allocator);
-        self.allocator.free(self.app_name);
-        self.allocator.destroy(self);
+    /// Close the listening sockets so peers are refused at once instead of
+    /// queueing in the backlog while stop drains.  Their TLS contexts stay
+    /// alive for connections still being upgraded.
+    fn closeListeners(self: *Runtime) void {
+        for (self.listeners) |listener| listener.connection.close();
     }
-};
 
-const ServerEntry = struct {
-    msgpool: *MessagePool,
-    server_handler: *ServerHandler,
-    runtime: *Runtime,
-
-    pub fn sendMessageServerEntry(self: ServerEntry, data: []const u8, uuid: u16, flag: MessageFlag, decoder: MessageDecoder, is_bytes: bool, return_result: bool, receiver: []const u8, func_name: []const u8) !MessageIdentifier {
-        // TODO: send messages to WebMessagePool
+    fn sendMessage(self: *Runtime, data: []const u8, uuid: u16, flag: MessageFlag, decoder: MessageDecoder, is_bytes: bool, return_result: bool, receiver: []const u8, func_name: []const u8) !MessageIdentifier {
         switch (self.server_handler.*) {
             .Service => |*s| {
                 std.debug.assert(uuid != 0);
@@ -325,71 +323,62 @@ const ServerEntry = struct {
         }
     }
 
-    pub fn getMessageForServerWorkerServerEntry(self: ServerEntry) !?*Message {
-        switch (self.server_handler.*) {
-            .Service => |*s| return s.tasks_queue.getMessageFromQueue(),
-            .Router => return error.QueueNotSupported,
-        }
-    }
-
-    pub fn setServiceMethodsServerEntry(self: ServerEntry, methods: []const u8) !void {
-        try switch (self.server_handler.*) {
-            .Service => |*s| s.setServiceMethods(methods),
-            .Router => error.MethodsNotSupported,
-        };
+    fn deinit(self: *Runtime) void {
+        destroyListeners(self.allocator, self.listeners);
+        self.server_handler.deinit();
+        self.msgpool.deinit();
+        self.live.deinit(self.allocator);
+        self.allocator.free(self.app_name);
+        self.allocator.destroy(self);
     }
 };
 
-/// Slot table.  `start` claims a slot and publishes the server in it; `stop`
-/// withdraws the server and frees the slot for reuse.
+/// Slot table.  A handle is `slot + MAX_SERVERS * generation`; the
+/// generation moves on whenever a slot is freed, so a stale handle never
+/// reaches the server that reused its slot.
+const Slot = struct {
+    used: bool = false,
+    generation: usize = 0,
+    runtime: ?*Runtime = null,
+
+    fn handle(self: *const Slot, index: usize) usize {
+        return index + MAX_SERVERS * self.generation;
+    }
+};
+
 var slots_mutex: Mutex = .{};
-var slot_used: [MAX_SERVERS]bool = @splat(false);
-var slot_entries: [MAX_SERVERS]?ServerEntry = @splat(null);
+var slots: [MAX_SERVERS]Slot = @splat(.{});
 
 fn acquireSlot() ?usize {
     slots_mutex.lock();
     defer slots_mutex.unlock();
-    for (&slot_used, 0..) |*used, i| {
-        if (!used.*) {
-            used.* = true;
-            slot_entries[i] = null;
+    for (&slots, 0..) |*slot, i| {
+        if (!slot.used) {
+            slot.used = true;
+            slot.runtime = null;
             return i;
         }
     }
     return null;
 }
 
-fn releaseSlot(conn_num: usize) void {
+fn releaseSlot(index: usize) void {
     slots_mutex.lock();
     defer slots_mutex.unlock();
-    slot_entries[conn_num] = null;
-    slot_used[conn_num] = false;
+    slots[index] = .{ .generation = slots[index].generation +% 1 };
 }
 
-fn getEntry(conn_num: usize) !ServerEntry {
-    if (conn_num >= MAX_SERVERS) return error.ServerNotInitialized;
+/// The server behind `conn_num`, held until `release`: stop waits for every
+/// holder before freeing it.
+fn acquire(conn_num: usize) !*Runtime {
+    const index = conn_num % MAX_SERVERS;
     slots_mutex.lock();
     defer slots_mutex.unlock();
-    return slot_entries[conn_num] orelse error.ServerNotInitialized;
-}
-
-/// SIGINT/SIGTERM handler.  Only async-signal-safe calls are allowed here: the
-/// previous version walked the entry table, closed sockets and called
-/// `exit()`, which runs atexit handlers and may take locks the interrupted
-/// thread already holds.
-fn setSignalHandler() !void {
-    const internal_handler = struct {
-        fn internal_handler(_: posix.SIG) callconv(.c) void {
-            std.c._exit(0);
-        }
-    }.internal_handler;
-    const act = posix.Sigaction{
-        .handler = .{ .handler = internal_handler },
-        .mask = posix.sigemptyset(),
-        .flags = 0,
-    };
-    posix.sigaction(posix.SIG.INT, &act, null);
-    posix.sigaction(posix.SIG.TERM, &act, null);
+    const slot = &slots[index];
+    if (slot.handle(index) != conn_num) return error.ServerNotInitialized;
+    const rt = slot.runtime orelse return error.ServerNotInitialized;
+    _ = rt.users.fetchAdd(1, .acquire);
+    return rt;
 }
 
 pub const MessageIdentifier = struct {
@@ -398,15 +387,14 @@ pub const MessageIdentifier = struct {
     receiver: []const u8,
 };
 
-/// Register the eventfd (or pipe write-end) that the native layer should
-/// signal whenever a message is pushed onto the Service task queue for
-/// conn_num.  Must be called after start() returns and before any
-/// client can send messages (i.e. before the handshake advertises methods).
-pub fn setServiceRequestFd(conn_num: usize, fd: i32) void {
-    const entry = getEntry(conn_num) catch return;
-    switch (entry.server_handler.*) {
-        .Service => |*s| s.tasks_queue.request_fd = fd,
-        .Router => {}, // routers have no task queue
+/// Install (or with -1, withdraw) the descriptor signalled when the
+/// Service task queue gets work.  Routers have no task queue.
+pub fn setServiceRequestFd(conn_num: usize, fd: i32) !void {
+    const rt = try acquire(conn_num);
+    defer rt.release();
+    switch (rt.server_handler.*) {
+        .Service => |*s| s.tasks_queue.setRequestFd(fd),
+        .Router => {},
     }
 }
 
@@ -436,9 +424,8 @@ fn startImpl(allocator: Allocator, mode: HandlerMode, app_name_arg: []const u8, 
             }
         }
     }
-    try setSignalHandler();
-    const conn_num = acquireSlot() orelse return error.TooManyServers;
-    errdefer releaseSlot(conn_num);
+    const index = acquireSlot() orelse return error.TooManyServers;
+    errdefer releaseSlot(index);
 
     const listeners = try bindAll(allocator, configs, failed);
 
@@ -472,11 +459,12 @@ fn startImpl(allocator: Allocator, mode: HandlerMode, app_name_arg: []const u8, 
     // from `startServer`, once a Service has installed its task fd and
     // advertised its callbacks.  A client that connected in between would
     // otherwise finish the handshake with an empty method list.
-    {
+    const conn_num = blk: {
         slots_mutex.lock();
         defer slots_mutex.unlock();
-        slot_entries[conn_num] = .{ .msgpool = rt.msgpool, .server_handler = rt.server_handler, .runtime = rt };
-    }
+        slots[index].runtime = rt;
+        break :blk slots[index].handle(index);
+    };
     for (configs) |config| {
         log.debug("{s}[{s}] listening on {s}:{d} conn_num={d} model={s}", .{
             @tagName(mode),
@@ -522,7 +510,7 @@ fn bindAll(allocator: Allocator, configs: []const ServerConnection.Config, faile
     for (binds, configs) |*bind, config| {
         bind.* = .{};
         // A lone listener, or one no thread could be spawned for, binds inline.
-        if (configs.len > 1) bind.thread = std.Thread.spawn(.{}, Bind.run, .{ bind, allocator, config }) catch null;
+        if (configs.len > 1) bind.thread = std.Thread.spawn(.{ .stack_size = thread_stack_size }, Bind.run, .{ bind, allocator, config }) catch null;
         if (bind.thread == null) bind.run(allocator, config);
     }
     for (binds) |bind| if (bind.thread) |thread| thread.join();
@@ -571,31 +559,44 @@ fn destroyListeners(allocator: Allocator, listeners: []Listener) void {
 }
 
 /// Stop the server: stop accepting, interrupt every connection, wait until
-/// none of them can touch the server any more, then free everything and
-/// release the slot.  Blocks until done, so the port can be rebound at once.
+/// none of them (and no caller of the public functions) can touch the server
+/// any more, then free everything and release the slot.  Blocks until done,
+/// so the port can be rebound at once.
 pub fn stop(conn_num: usize) void {
-    if (conn_num >= MAX_SERVERS) return;
+    const index = conn_num % MAX_SERVERS;
     const rt = blk: {
         slots_mutex.lock();
         defer slots_mutex.unlock();
-        const entry = slot_entries[conn_num] orelse return;
-        // Withdraw the entry first so no new caller picks the server up.
-        slot_entries[conn_num] = null;
-        break :blk entry.runtime;
+        const slot = &slots[index];
+        if (slot.handle(index) != conn_num) return;
+        const rt = slot.runtime orelse return;
+        // Withdraw the server first so no new caller picks it up.
+        slot.runtime = null;
+        break :blk rt;
     };
-    defer releaseSlot(conn_num);
+    defer releaseSlot(index);
 
     rt.live_mutex.lock();
     rt.stopping = true;
     rt.live_mutex.unlock();
+    // Wakes callers blocked writing to a peer, so they release soon.
+    rt.interruptAllLive();
+    const deadline = misc.monotonicMs() + DRAIN_TIMEOUT_MS;
+    while (rt.users.load(.acquire) != 0) {
+        if (misc.monotonicMs() > deadline) {
+            log.err("{s}[{s}] callers are still inside the server; leaking server state", .{ @tagName(rt.mode), rt.app_name });
+            return;
+        }
+        sleepMs(1);
+    }
     rt.stopAccepting();
     rt.waitBackoffs();
+    rt.closeListeners();
     log.debug("{s}[{s}] stopped accepting on {d} listener(s) conn_num={d}", .{ @tagName(rt.mode), rt.app_name, rt.listeners.len, conn_num });
 
     rt.interruptAllLive();
-    const deadline = misc.milliTimestamp() + DRAIN_TIMEOUT_MS;
     while (rt.active_connections.load(.acquire) != 0) {
-        if (misc.milliTimestamp() > deadline) {
+        if (misc.monotonicMs() > deadline) {
             // Freeing now would hand the stragglers dangling pointers.  Leaking a
             // few structs is the lesser evil.
             log.err("{s}[{s}] {d} connection(s) did not finish; leaking server state", .{ @tagName(rt.mode), rt.app_name, rt.active_connections.load(.acquire) });
@@ -677,7 +678,7 @@ fn onListenerReadable(source: *EventLoop.Source, _: []u8) EventLoop.Action {
         return .keep;
     };
     loop.disarm(source);
-    const thread = std.Thread.spawn(.{}, rearmListener, .{listener}) catch {
+    const thread = std.Thread.spawn(.{ .stack_size = thread_stack_size }, rearmListener, .{listener}) catch {
         sleepMs(ACCEPT_BACKOFF_MS);
         listener.backoff.store(0, .release);
         loop.register(source) catch |err| log.warn("listener stayed paused: {}", .{err});
@@ -817,14 +818,14 @@ fn restoreUnixListener(listener: *Listener) void {
     if (listener.loop) |loop| {
         var swap = UnixSwap{ .listener = listener, .new_fd = new_fd };
         loop.call(UnixSwap.run, &swap);
-        if (swap.new_fd >= 0) _ = std.c.close(swap.new_fd);
+        if (swap.new_fd >= 0) closeListeningFd(swap.new_fd);
     } else if (replaceListeningFd(listener.connection.handle(), new_fd)) {
         rememberBoundPath(listener);
         listener.path_taken = false;
         listener.rebind_logged = false;
         log.info("restored unix listener {s}", .{@as([]const u8, path)});
     } else {
-        _ = std.c.close(new_fd);
+        closeListeningFd(new_fd);
         if (!listener.rebind_logged) {
             listener.rebind_logged = true;
             log.warn("unix listener {s} is gone and replacing its socket failed", .{@as([]const u8, path)});
@@ -887,9 +888,15 @@ fn rewatchUnixListener(listener: *Listener) void {
 /// Make `current` refer to the socket `new_fd`, and close `new_fd`.
 fn replaceListeningFd(current: c_int, new_fd: c_int) bool {
     if (std.c.dup2(new_fd, current) < 0) return false;
-    _ = std.c.close(new_fd);
+    closeListeningFd(new_fd);
     _ = std.c.fcntl(current, std.c.F.SETFD, @as(c_int, std.c.FD_CLOEXEC));
     return true;
+}
+
+/// Close a socket made by `bindUnix`, which counted it in `nofile`.
+fn closeListeningFd(fd: c_int) void {
+    _ = std.c.close(fd);
+    nofile.release(1);
 }
 
 /// The listener never removes itself; `stop` detaches it.
@@ -919,7 +926,7 @@ fn startConnection(comptime mode: HandlerMode, rt: *Runtime, listener: *ServerCo
         }
     }.main;
     switch (runtime.model()) {
-        .threads => (try std.Thread.spawn(.{}, main, .{ rt, listener, raw })).detach(),
+        .threads => (try std.Thread.spawn(.{ .stack_size = thread_stack_size }, main, .{ rt, listener, raw })).detach(),
         .evented => try runtime.spawnBlocking(main, .{ rt, listener, raw }),
     }
 }
@@ -948,7 +955,7 @@ fn connectionMain(comptime mode: HandlerMode, rt: *Runtime, listener: *ServerCon
     if (client.is_websocket) {
         serverWsLoop(client, rt.msgpool, handler);
     } else {
-        serverLoop(client, rt.msgpool, handler);
+        serverLoop(client, rt.allocator, handler);
     }
     releaseConnection(rt, client);
 }
@@ -1059,26 +1066,30 @@ fn dispatchMessage(conn: *ServerHandler.ConnectionT, message: *Message, msg_hand
     return true;
 }
 
-fn serverLoop(conn: *ServerHandler.ConnectionT, msgpool: *MessagePool, msg_handler: anytype) void {
+fn serverLoop(conn: *ServerHandler.ConnectionT, allocator: Allocator, msg_handler: anytype) void {
     if (conn.peer_addr) |addr|
         log.debug("serverLoop started for {f}", .{fmtNetAddr(addr)});
     defer if (conn.peer_addr) |addr| log.debug("serverLoop exiting for {f}", .{fmtNetAddr(addr)});
 
-    while (true) {
-        const message = msgpool.receiveMessage(conn) catch |err| {
-            if (conn.peer_addr) |addr| {
-                // Clean peer hang-up (short-lived clients) is expected — debug only.
-                // Unexpected recv failures stay at warn.
-                switch (err) {
-                    error.EOF => log.debug("serverLoop peer disconnected from {f}", .{fmtNetAddr(addr)}),
-                    else => log.warn("serverLoop recv error from {f}: {}", .{ fmtNetAddr(addr), err }),
-                }
+    const Ctx = struct {
+        conn: *ServerHandler.ConnectionT,
+        handler: @TypeOf(msg_handler),
+
+        fn dispatch(self: *const @This(), message: *Message) bool {
+            return dispatchMessage(self.conn, message, self.handler);
+        }
+    };
+    const ctx = Ctx{ .conn = conn, .handler = msg_handler };
+    serde.receiveLoop(allocator, conn, &ctx, Ctx.dispatch) catch |err| if (err != error.Stopped) {
+        if (conn.peer_addr) |addr| {
+            // Clean peer hang-up (short-lived clients) is expected — debug only.
+            switch (err) {
+                error.EOF => log.debug("serverLoop peer disconnected from {f}", .{fmtNetAddr(addr)}),
+                else => log.warn("serverLoop recv error from {f}: {}", .{ fmtNetAddr(addr), err }),
             }
-            msg_handler.handleErr(conn, err) catch {};
-            break;
-        };
-        if (!dispatchMessage(conn, message, msg_handler)) break;
-    }
+        }
+        msg_handler.handleErr(conn, err) catch {};
+    };
     finishConnection(conn, msg_handler);
 }
 
@@ -1106,22 +1117,35 @@ fn finishConnection(conn: *ServerHandler.ConnectionT, msg_handler: anytype) void
 }
 
 pub fn sendMessage(data: []const u8, uuid: u16, flag: MessageFlag, decoder: MessageDecoder, is_bytes: bool, return_result: bool, receiver: []const u8, func_name: []const u8, conn_num: usize) !MessageIdentifier {
-    return try (try getEntry(conn_num)).sendMessageServerEntry(data, uuid, flag, decoder, is_bytes, return_result, receiver, func_name);
+    const rt = try acquire(conn_num);
+    defer rt.release();
+    return rt.sendMessage(data, uuid, flag, decoder, is_bytes, return_result, receiver, func_name);
 }
 
 pub fn getMessageForServerWorker(conn_num: usize) !?*Message {
-    return try (try getEntry(conn_num)).getMessageForServerWorkerServerEntry();
+    const rt = try acquire(conn_num);
+    defer rt.release();
+    return switch (rt.server_handler.*) {
+        .Service => |*s| s.tasks_queue.getMessageFromQueue(),
+        .Router => error.QueueNotSupported,
+    };
 }
 
 /// Start accepting on every listener.  Call once, after a Service has set
 /// its request fd and callback list, so the first handshake already carries
 /// those callbacks.
 pub fn beginAccepting(conn_num: usize) !void {
-    const rt = (try getEntry(conn_num)).runtime;
+    const rt = try acquire(conn_num);
+    defer rt.release();
     if (rt.acceptor != null) return;
     try rt.startAccepting();
 }
 
 pub fn setServiceMethods(methods: []const u8, conn_num: usize) !void {
-    return try (try getEntry(conn_num)).setServiceMethodsServerEntry(methods);
+    const rt = try acquire(conn_num);
+    defer rt.release();
+    return switch (rt.server_handler.*) {
+        .Service => |*s| s.setServiceMethods(methods),
+        .Router => error.MethodsNotSupported,
+    };
 }

@@ -2,6 +2,7 @@ const std = @import("std");
 const net = @import("posix_net.zig");
 const ascii = std.ascii;
 const misc = @import("../misc.zig");
+const Mutex = misc.Mutex;
 const Allocator = std.mem.Allocator;
 const serde = @import("../serde.zig");
 const tls_impl = @import("tls.zig");
@@ -36,50 +37,47 @@ pub const WriteError = anyerror;
 const CLOSE_NORMAL = ([_]u8{ @backingInt(OpCode.close), 2, 3, 232 })[0..]; // code: 1000
 const CLOSE_PROTOCOL_ERROR = ([_]u8{ @backingInt(OpCode.close), 2, 3, 234 })[0..]; //code: 1002
 
-buffer_pool: buffer.Pool,
 buffer_provider: buffer.Provider,
 reader: Reader,
 stream: net.Stream,
 addr: ?net.Address,
 allocator: Allocator,
 /// Non-null when the WebSocket connection runs over TLS (WSS).
-/// The ssl object is owned by this WebConnection and freed in close().
+/// The ssl object is owned by this WebConnection and freed in destroy().
 ssl: ?*tls_impl.SslConn = null,
 /// Set by close() once the socket has been shut down (see ClientConnection).
 interrupted: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+/// Keeps frames whole: control frames written by the reader (pong, close)
+/// and data frames written by senders share the socket.
+write_mutex: Mutex = .{},
 
 pub const Config = struct {};
 
 pub fn init(allocator: Allocator, stream: net.Stream, addr: net.Address, _: Config) !*WebConnection {
-    const self = try allocator.create(WebConnection);
-    errdefer allocator.destroy(self);
-    // Assign fields directly into the heap struct so that the internal
-    // pointers (buffer_provider.pool → buffer_pool, reader.bp → buffer_provider)
-    // reference stable heap addresses rather than local stack variables that
-    // would become dangling as soon as this function returns.
-    self.allocator = allocator;
-    self.stream = stream;
-    self.addr = addr;
-    self.ssl = null;
-    self.interrupted = std.atomic.Value(bool).init(false);
-    self.buffer_pool = try buffer.Pool.init(allocator, 32, 32768);
-    self.buffer_provider = buffer.Provider.init(allocator, &self.buffer_pool, 32768);
-    self.reader = try Reader.init(5120, serde.MAX_BYTES_MESSAGE, &self.buffer_provider);
-    return self;
+    return create(allocator, stream, addr, null);
 }
 
 /// Create a WSS (WebSocket Secure) connection from an already-completed TLS handshake.
-/// Takes ownership of `ssl`; it will be freed in close().
+/// Takes ownership of `ssl`; it will be freed in destroy().
 pub fn initWithTls(allocator: Allocator, stream: net.Stream, addr: net.Address, _: Config, ssl: *tls_impl.SslConn) !*WebConnection {
+    return create(allocator, stream, addr, ssl);
+}
+
+fn create(allocator: Allocator, stream: net.Stream, addr: net.Address, ssl: ?*tls_impl.SslConn) !*WebConnection {
     const self = try allocator.create(WebConnection);
     errdefer allocator.destroy(self);
-    self.allocator = allocator;
-    self.stream = stream;
-    self.addr = addr;
-    self.ssl = ssl;
-    self.interrupted = std.atomic.Value(bool).init(false);
-    self.buffer_pool = try buffer.Pool.init(allocator, 32, 32768);
-    self.buffer_provider = buffer.Provider.init(allocator, &self.buffer_pool, 32768);
+    // Fields are assigned in place: `reader` keeps a pointer to
+    // `buffer_provider`, so both must live in the heap struct.
+    self.* = .{
+        .buffer_provider = buffer.Provider.initNoPool(allocator),
+        .reader = undefined,
+        .stream = stream,
+        .addr = addr,
+        .allocator = allocator,
+        .ssl = ssl,
+    };
+    // Messages larger than the static buffer get a buffer of their own,
+    // freed once handled; nothing is reserved up front.
     self.reader = try Reader.init(5120, serde.MAX_BYTES_MESSAGE, &self.buffer_provider);
     return self;
 }
@@ -137,64 +135,59 @@ fn readMessageFromStream(self: *WebConnection) !WsMessage {
     return self.reader.readMessage(self.stream);
 }
 
+/// Next text or binary message, or null once the peer closed.  Pings are
+/// answered and pongs skipped without ending the session.
 fn readInternal(self: *WebConnection) !?[]const u8 {
-    const message = self.readMessageFromStream() catch |err| {
-        switch (err) {
-            error.LargeControl => try self.writeAllBuf(CLOSE_PROTOCOL_ERROR),
-            error.ReservedFlags => try self.writeAllBuf(CLOSE_PROTOCOL_ERROR),
-            else => {},
-        }
-        return null;
-    };
-    switch (message.type) {
-        .text, .binary => {
-            self.reader.handled();
-            return message.data;
-        },
-        .pong => {
-            // Unsolicited pong from the browser — ignore silently.
-        },
-        .ping => {
-            // Respond to keep-alive pings from the browser.
-            const data = message.data;
-            if (data.len > 0) {
-                try self.writeFrame(.pong, data);
+    while (true) {
+        const message = self.readMessageFromStream() catch |err| {
+            switch (err) {
+                error.LargeControl, error.ReservedFlags => self.writeRaw(CLOSE_PROTOCOL_ERROR) catch {},
+                else => {},
             }
-        },
-        .close => {
-            // Browser initiated close handshake: validate the payload and echo
-            // back an appropriate close frame, then return null so the receive
-            // loop breaks and triggers the normal disconnect path.
-            const data = message.data;
-            const l = data.len;
-            if (l == 0) {
-                self.writeClose() catch {};
-                return null;
-            }
-            if (l == 1) {
-                // close payload must be either empty or at least 2 bytes (status code)
-                self.writeAllBuf(CLOSE_PROTOCOL_ERROR) catch {};
-                return null;
-            }
-            const code = @as(u16, @intCast(data[1])) | (@as(u16, @intCast(data[0])) << 8);
-            if (code < 1000 or code == 1004 or code == 1005 or code == 1006 or (code > 1013 and code < 3000)) {
-                self.writeAllBuf(CLOSE_PROTOCOL_ERROR) catch {};
-                return null;
-            }
-            if (l == 2) {
-                self.writeAllBuf(CLOSE_NORMAL) catch {};
-                return null;
-            }
-            const payload = data[2..];
-            if (!std.unicode.utf8ValidateSlice(payload)) {
-                self.writeAllBuf(CLOSE_PROTOCOL_ERROR) catch {};
-                return null;
-            }
-            self.writeClose() catch {};
             return null;
-        },
+        };
+        switch (message.type) {
+            .text, .binary => {
+                self.reader.handled();
+                return message.data;
+            },
+            .pong => {},
+            .ping => try self.writeFrame(.pong, message.data),
+            .close => {
+                self.answerClose(message.data);
+                return null;
+            },
+        }
     }
-    return null;
+}
+
+/// Echo the close handshake the browser started, with the status RFC 6455
+/// asks for.
+fn answerClose(self: *WebConnection, data: []const u8) void {
+    const l = data.len;
+    if (l == 0) {
+        self.writeClose() catch {};
+        return;
+    }
+    // A close payload is either empty or starts with a 2-byte status code.
+    if (l == 1) {
+        self.writeRaw(CLOSE_PROTOCOL_ERROR) catch {};
+        return;
+    }
+    const code = @as(u16, @intCast(data[1])) | (@as(u16, @intCast(data[0])) << 8);
+    if (code < 1000 or code == 1004 or code == 1005 or code == 1006 or (code > 1013 and code < 3000)) {
+        self.writeRaw(CLOSE_PROTOCOL_ERROR) catch {};
+        return;
+    }
+    if (l == 2) {
+        self.writeRaw(CLOSE_NORMAL) catch {};
+        return;
+    }
+    if (!std.unicode.utf8ValidateSlice(data[2..])) {
+        self.writeRaw(CLOSE_PROTOCOL_ERROR) catch {};
+        return;
+    }
+    self.writeClose() catch {};
 }
 
 fn writeBin(self: *WebConnection, data: []const u8) !void {
@@ -206,7 +199,14 @@ fn writeText(self: *WebConnection, data: []const u8) !void {
 }
 
 fn writeClose(self: *WebConnection) !void {
-    return self.writeAllBuf(CLOSE_NORMAL);
+    return self.writeRaw(CLOSE_NORMAL);
+}
+
+/// Write one pre-built frame.
+fn writeRaw(self: *WebConnection, frame: []const u8) !void {
+    self.write_mutex.lock();
+    defer self.write_mutex.unlock();
+    try self.writeAllBuf(frame);
 }
 
 fn writeCloseWithCode(self: *WebConnection, code: u16) !void {
@@ -215,43 +215,44 @@ fn writeCloseWithCode(self: *WebConnection, code: u16) !void {
     return self.writeFrame(.close, &buf);
 }
 
+/// Frames up to this size go out in a single write.
+const coalesce_limit: usize = 16 * 1024;
+
 fn writeFrame(self: *WebConnection, op_code: WebConnection.OpCode, data: []const u8) !void {
     const l = data.len;
 
     // maximum possible prefix length. op_code + length_type + 8byte length
-    var buf: [10]u8 = undefined;
-    buf[0] = @backingInt(op_code);
+    var head: [10]u8 = undefined;
+    head[0] = @backingInt(op_code);
+    const head_len: usize = if (l <= 125) blk: {
+        head[1] = @intCast(l);
+        break :blk 2;
+    } else if (l < 65536) blk: {
+        head[1] = 126;
+        std.mem.writeInt(u16, head[2..4], @intCast(l), .big);
+        break :blk 4;
+    } else blk: {
+        head[1] = 127;
+        std.mem.writeInt(u64, head[2..10], l, .big);
+        break :blk 10;
+    };
 
-    if (l <= 125) {
-        buf[1] = @intCast(l);
-        try self.writeAllBuf(buf[0..2]);
-    } else if (l < 65536) {
-        buf[1] = 126;
-        buf[2] = @intCast((l >> 8) & 0xFF);
-        buf[3] = @intCast(l & 0xFF);
-        try self.writeAllBuf(buf[0..4]);
-    } else {
-        buf[1] = 127;
-        buf[2] = @intCast((l >> 56) & 0xFF);
-        buf[3] = @intCast((l >> 48) & 0xFF);
-        buf[4] = @intCast((l >> 40) & 0xFF);
-        buf[5] = @intCast((l >> 32) & 0xFF);
-        buf[6] = @intCast((l >> 24) & 0xFF);
-        buf[7] = @intCast((l >> 16) & 0xFF);
-        buf[8] = @intCast((l >> 8) & 0xFF);
-        buf[9] = @intCast(l & 0xFF);
-        try self.writeAllBuf(buf[0..]);
+    self.write_mutex.lock();
+    defer self.write_mutex.unlock();
+    if (l <= coalesce_limit) {
+        var frame: [head.len + coalesce_limit]u8 = undefined;
+        @memcpy(frame[0..head_len], head[0..head_len]);
+        @memcpy(frame[head_len..][0..l], data);
+        return self.writeAllBuf(frame[0 .. head_len + l]);
     }
-    if (l > 0) {
-        try self.writeAllBuf(data);
-    }
+    try self.writeAllBuf(head[0..head_len]);
+    try self.writeAllBuf(data);
 }
 
 /// Free the reader, buffer pool and the struct.  Does not touch the socket or
 /// TLS session — see destroy().
 pub fn deinit(self: *WebConnection) void {
     self.reader.deinit();
-    self.buffer_pool.deinit();
     self.allocator.destroy(self);
 }
 
@@ -276,72 +277,38 @@ pub fn destroy(ctx: *anyopaque) void {
 }
 
 pub const SynParser = struct {
-    handshake_pool: *HandshakePool,
+    allocator: Allocator,
+    /// Monotonic ms by which the probe (and an HTTP upgrade) must be done.
+    deadline: i64,
+    /// Only browsers need it, so it is created on the first "GET".
+    handshake_pool: ?*HandshakePool = null,
 
-    pub fn init(allocator: Allocator) !SynParser {
-        // 8 KiB is enough for any real browser upgrade request.
-        // Chrome sends Sec-Fetch-* headers that push the total well past 512 B.
-        const handshake_pool = try HandshakePool.init(allocator, 1, 8192, 10);
-        return .{
-            .handshake_pool = handshake_pool,
-        };
+    pub fn init(allocator: Allocator, deadline: i64) SynParser {
+        return .{ .allocator = allocator, .deadline = deadline };
     }
 
     pub fn deinit(self: *SynParser) void {
-        self.handshake_pool.deinit();
+        if (self.handshake_pool) |pool| pool.deinit();
     }
 
-    /// Read the full HTTP upgrade request from `stream`, starting at `initial_pos` in `buf`.
-    ///
-    /// Works with any stream that provides `.read([]u8) !usize`.
-    /// Socket-level timeouts (SO_RCVTIMEO) are only set when the stream has a `.handle`
-    /// field (plain `net.Stream`); TLS streams rely on the underlying TCP timeout instead.
-    fn readHandshakeRequest(_: *SynParser, stream: anytype, buf: []u8, initial_pos: usize, timeout: ?u32) ![]u8 {
-        const StreamT = @TypeOf(stream);
-        var deadline: ?i64 = null;
-        var read_timeout: ?[@sizeOf(std.posix.timeval)]u8 = null;
-        if (timeout) |ms| {
-            if (comptime @hasField(StreamT, "handle")) {
-                read_timeout = std.mem.toBytes(std.posix.timeval{
-                    .sec = @intCast(@divTrunc(ms, 1000)),
-                    .usec = @intCast(@mod(ms, 1000) * 1000),
-                });
-            }
-            deadline = misc.milliTimestamp() + ms;
-        }
+    fn checkDeadline(self: *const SynParser) !void {
+        if (misc.monotonicMs() > self.deadline) return error.Timeout;
+    }
 
+    /// Read the full HTTP upgrade request from `stream`, starting at
+    /// `initial_pos` in `buf`.  Each read is bounded by the socket timeout
+    /// (plain) or the session deadline (TLS); the whole request by
+    /// `self.deadline`.
+    fn readHandshakeRequest(self: *SynParser, stream: anytype, buf: []u8, initial_pos: usize) ![]u8 {
         var total: usize = initial_pos;
         while (true) {
-            if (total == buf.len) {
-                return error.TooLarge;
-            }
-
-            if (comptime @hasField(StreamT, "handle")) {
-                if (read_timeout) |to| {
-                    try std.posix.setsockopt(stream.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, &to);
-                }
-            }
+            if (total == buf.len) return error.TooLarge;
             const n = try stream.read(buf[total..]);
-            if (n == 0) {
-                return error.Invalid;
-            }
+            if (n == 0) return error.Invalid;
             total += n;
             const request = buf[0..total];
-            if (std.mem.endsWith(u8, request, "\r\n\r\n")) {
-                if (comptime @hasField(StreamT, "handle")) {
-                    if (read_timeout != null) {
-                        const read_no_timeout = std.mem.toBytes(std.posix.timeval{ .sec = 0, .usec = 0 });
-                        try std.posix.setsockopt(stream.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, &read_no_timeout);
-                    }
-                }
-                return request;
-            }
-
-            if (deadline) |dl| {
-                if (misc.milliTimestamp() > dl) {
-                    return error.Timeout;
-                }
-            }
+            if (std.mem.endsWith(u8, request, "\r\n\r\n")) return request;
+            try self.checkDeadline();
         }
     }
 
@@ -366,14 +333,22 @@ pub const SynParser = struct {
             const n = try stream.read(buf[got..]);
             if (n == 0) return error.EOF;
             got += n;
+            if (got < buf.len) try self.checkDeadline();
         }
         if (ascii.startsWithIgnoreCase(&buf, "get")) {
-            var handshake_state = try self.handshake_pool.acquire();
-            defer self.handshake_pool.release(handshake_state);
+            // 8 KiB is enough for any real browser upgrade request.
+            // Chrome sends Sec-Fetch-* headers that push the total well past 512 B.
+            const pool = self.handshake_pool orelse blk: {
+                const created = try HandshakePool.init(self.allocator, 1, 8192, 10);
+                self.handshake_pool = created;
+                break :blk created;
+            };
+            var handshake_state = try pool.acquire();
+            defer pool.release(handshake_state);
 
             var handshake_buffer = handshake_state.buffer;
             @memcpy(handshake_buffer[0..buf.len], &buf);
-            const request = self.readHandshakeRequest(stream, handshake_buffer, serde.HEADER_SIZE, 5000) catch |err| {
+            const request = self.readHandshakeRequest(stream, handshake_buffer, serde.HEADER_SIZE) catch |err| {
                 const s: []const u8 = switch (err) {
                     error.Invalid => "HTTP/1.1 400 Invalid\r\nerror: invalid\r\ncontent-length: 0\r\n\r\n",
                     error.TooLarge => "HTTP/1.1 400 Invalid\r\nerror: too large\r\ncontent-length: 0\r\n\r\n",

@@ -14,13 +14,11 @@ from . import dfcore
 
 from daffi.utils import colors
 from daffi.utils.logger import get_daffi_logger, sync_native_log_level
-from daffi.exceptions import InitializationError
+from daffi.exceptions import Evicted, InitializationError
 from daffi.utils.misc import string_uuid
-from daffi._bindings import set_lifecycle_fd, set_response_fd
 from daffi._rpc_proxy import (
     RpcProxy,
     ClientConnection,
-    ResponseNotifier,
     system_exception_handler,
 )
 from daffi._signals import set_signal_handler
@@ -296,7 +294,11 @@ class Application(EventsMixin, ABC):
         # level the caller configured (e.g. logging.basicConfig(level=DEBUG)).
         sync_native_log_level()
 
-        set_signal_handler(self.stop)
+        set_signal_handler(self._signal_stop)
+
+    def _signal_stop(self) -> None:
+        """Stop on SIGINT / SIGTERM / interpreter exit."""
+        self.stop()
 
     def _add_native_listeners(self) -> int:
         """Bind every transport at once and return the node's one conn_num.
@@ -348,13 +350,15 @@ class Application(EventsMixin, ABC):
                         RpcProxy._process_service_handshake(self._conn_num)
                     else:
                         return
-                except (ValueError, OSError):
-                    # Native connection no longer valid — remove this stale
-                    # subscriber so it does not fire again.
-                    try:
-                        EXECUTOR_REGISTRY.subscribers.remove(registry_subscriber)
-                    except ValueError:
-                        pass
+                except Exception as exc:
+                    # Raised at the user's @callback line otherwise.
+                    if getattr(self, "_disconnected", False):
+                        try:
+                            EXECUTOR_REGISTRY.subscribers.remove(registry_subscriber)
+                        except ValueError:
+                            pass
+                    else:
+                        self.logger.warning(f"Could not announce {executor}: {exc}")
                     return
                 self.logger.debug(f"{executor} registered.")
 
@@ -632,11 +636,6 @@ class Client(Application[SingleTransportMixin]):
             raise InitializationError(
                 f"Failed to connect to the server. connection info: {self.info}"
             )
-        # Register the response notifier *before* the handshake so the
-        # handshake's own RpcResult also benefits from event-driven wakeups
-        # rather than polling.  ``register`` clears any stale notifier left
-        # over from a previous (e.g. failed) connect on the same handle.
-        ResponseNotifier.register(self._conn_num)
         try:
             handshake = RpcProxy._process_client_handshake(self._conn_num)
         except Exception as exc:
@@ -645,7 +644,6 @@ class Client(Application[SingleTransportMixin]):
             # InitializationError so mTLS / TLS rejects look like a failed
             # connect (TLS 1.3 can let startClient succeed before the server
             # alert is visible).
-            ResponseNotifier.unregister(self._conn_num)
             try:
                 dfcore.stopClient(self._conn_num)
             except Exception:
@@ -668,9 +666,8 @@ class Client(Application[SingleTransportMixin]):
         to reconnect at the same time.  The second thread to acquire the lock
         finds ``_disconnected`` already cleared and returns immediately.
 
-        Resets all internal state so :meth:`_do_connect` starts from a clean
-        slate (fresh :class:`~daffi._task_dispatcher.TaskDispatcher`, cleared
-        stop-event, no stale error).
+        The dead connection is released first, then all internal state is
+        reset so :meth:`_do_connect` starts from a clean slate.
 
         Returns:
             ``True`` when the reconnect succeeded, ``False`` otherwise.
@@ -679,13 +676,15 @@ class Client(Application[SingleTransportMixin]):
             if not self._disconnected:
                 # Another thread already reconnected while we were waiting.
                 return self._conn_num is not None
+            if isinstance(self._connection_error, Evicted):
+                # The name now belongs to a newer connection.
+                return False
             try:
+                with self._stop_lock:
+                    self._release_connection()
                 self._stop_event.clear()
                 self._connection_error = None
                 self._disconnected = False
-                # Drop our handle. The process-wide poller restarts on the
-                # next connect if this was the last connection using it.
-                self._task_dispatcher = None
                 self._do_connect()
                 return True
             except Exception as exc:
@@ -739,23 +738,16 @@ class Client(Application[SingleTransportMixin]):
           ``_conn_num`` is still set.
         """
         with self._stop_lock:
-            if self._conn_num is not None:
-                try:
-                    set_lifecycle_fd(self._conn_num, -1)
-                except Exception:
-                    pass
-                try:
-                    set_response_fd(self._conn_num, -1)
-                except Exception:
-                    pass
-            if self._task_dispatcher:
-                self._task_dispatcher.stop_for_connection(self)
-            if self._conn_num is not None:
-                # Tear the notifier thread down before freeing the native
-                # slot — its select on the wakeup fd does not hold a
-                # reference to conn_num, but we want the thread to exit
-                # cleanly so it doesn't observe a freed Zig-side fd.
-                ResponseNotifier.unregister(self._conn_num)
-                dfcore.stopClient(self._conn_num)
-                self._conn_num = None
+            self._release_connection()
             self._stop_event.set()
+
+    def _release_connection(self) -> None:
+        """Detach from the dispatcher and free the native connection.
+
+        Callers hold ``_stop_lock``.
+        """
+        if self._task_dispatcher:
+            self._task_dispatcher.stop_for_connection(self)
+        if self._conn_num is not None:
+            dfcore.stopClient(self._conn_num)
+            self._conn_num = None

@@ -252,6 +252,8 @@ pub const Message = struct {
     data: []u8,
     allocator: Allocator,
     metadata: Metadata = .{},
+    /// Link in a `TasksQueue`.  A message is in at most one queue.
+    queue_node: std.DoublyLinkedList.Node = .{},
 
     pub fn format(self: Message, _: []const u8, _: fmt.FormatOptions, writer: anytype) !void {
         const h = self.header;
@@ -393,10 +395,15 @@ pub const Message = struct {
         try self.setData(data);
     }
 
+    /// Turn this message into an ERROR reply raised natively.  The body uses
+    /// the JSON error layout the Python side decodes for every serde.
     pub fn writeErrorMessage(self: *Message, comptime fmt_format: []const u8, args: anytype) !void {
-        // For setting errors outside of python
-        try self.writeData(fmt_format, args);
-        self.setDecoder(.OPAQUE);
+        const text = try fmt.allocPrint(self.allocator, fmt_format, args);
+        defer self.allocator.free(text);
+        const body = try errorPayload(self.allocator, "DaffiError", text);
+        defer self.allocator.free(body);
+        try self.setData(body);
+        self.setDecoder(.JSON);
         self.setFlag(.ERROR);
     }
 
@@ -552,6 +559,20 @@ pub const RawMessage = struct {
         _ = try writer.write(self.data);
     }
 };
+
+/// JSON body of a natively raised error, in the `[name, module, message,
+/// traceback]` layout Python decodes into a `RemoteCallError` subclass.
+pub fn errorPayload(allocator: Allocator, name: []const u8, text: []const u8) ![]u8 {
+    const Body = struct { args: [1][4]?[]const u8, kwargs: struct {} };
+    return std.json.Stringify.valueAlloc(allocator, Body{ .args = .{.{ name, "daffi", text, null }}, .kwargs = .{} }, .{});
+}
+
+/// Framed ERROR reply to `request`, addressed back to its sender.
+pub fn createErrorReply(allocator: Allocator, request: *Message, name: []const u8, text: []const u8) !RawMessage {
+    const body = try errorPayload(allocator, name, text);
+    defer allocator.free(body);
+    return RawMessage.create(allocator, body, request.getUuid(), .ERROR, .JSON, false, false, request.getReceiver(), request.getTransmitter(), request.getFuncName());
+}
 
 pub fn createHandshakeMessage(allocator: Allocator, memberdata: []serde.Handshake.MemberData, uuid: @FieldType(Header, "uuid"), comptime hstype: []const u8) !*Message {
     // gonna be using arena allocator to free dynamically allocated memory for json related stuff

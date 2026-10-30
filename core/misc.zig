@@ -17,6 +17,19 @@ pub fn milliTimestamp() i64 {
     _ = std.c.clock_gettime(.REALTIME, &ts);
     return ts.sec * 1000 + @divTrunc(ts.nsec, std.time.ns_per_ms);
 }
+/// Milliseconds on a clock that wall-clock changes do not move.
+pub fn monotonicMs() i64 {
+    if (is_wasm) return 0;
+    var ts: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(.MONOTONIC, &ts);
+    return ts.sec * 1000 + @divTrunc(ts.nsec, std.time.ns_per_ms);
+}
+
+/// Stack for native worker threads (connections, accept loops, the blocking
+/// pool).  They run no Python, and OpenSSL needs far less than the 16 MiB
+/// default, which adds up when every connection has a thread.
+pub const thread_stack_size = 512 * 1024;
+
 pub const print = if (is_wasm) @import("wasm.zig").consoleLog else std.debug.print;
 
 /// Like `print` but compiled away in non-Debug builds.
@@ -46,8 +59,39 @@ pub const Mutex = if (is_wasm) struct {
     }
 };
 
-/// pthread condition variable paired with `Mutex`.  Native targets only.
-pub const Condition = struct {
+/// Readers share the lock; a writer holds it alone.  No-op on wasm.
+pub const RwLock = if (is_wasm) struct {
+    pub fn lockShared(_: *@This()) void {}
+    pub fn unlockShared(_: *@This()) void {}
+    pub fn lock(_: *@This()) void {}
+    pub fn unlock(_: *@This()) void {}
+} else struct {
+    inner: std.c.pthread_rwlock_t = .{},
+
+    pub fn lockShared(self: *@This()) void {
+        _ = std.c.pthread_rwlock_rdlock(&self.inner);
+    }
+    pub fn unlockShared(self: *@This()) void {
+        _ = std.c.pthread_rwlock_unlock(&self.inner);
+    }
+    pub fn lock(self: *@This()) void {
+        _ = std.c.pthread_rwlock_wrlock(&self.inner);
+    }
+    pub fn unlock(self: *@This()) void {
+        _ = std.c.pthread_rwlock_unlock(&self.inner);
+    }
+};
+
+/// pthread condition variable paired with `Mutex`.  On wasm (single
+/// threaded) nothing can signal, so waits return at once.
+pub const Condition = if (is_wasm) struct {
+    pub fn wait(_: *@This(), _: *Mutex) void {}
+    pub fn timedWait(_: *@This(), _: *Mutex, _: u32) bool {
+        return false;
+    }
+    pub fn signal(_: *@This()) void {}
+    pub fn broadcast(_: *@This()) void {}
+} else struct {
     inner: std.c.pthread_cond_t = std.c.PTHREAD_COND_INITIALIZER,
 
     pub fn wait(self: *Condition, mutex: *Mutex) void {

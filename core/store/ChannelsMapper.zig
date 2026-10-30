@@ -52,7 +52,9 @@ pub fn ChannelsMapper(comptime ConnectionT: type) type {
             /// Clear all method entries without freeing the BufSet struct itself.
             /// Used when a handshake update replaces the method list in-place.
             pub fn clear(self: *Channel) void {
-                self.methods.hash_map.clearAndFree();
+                const set_allocator = self.methods.allocator();
+                self.methods.deinit();
+                self.methods.* = std.BufSet.init(set_allocator);
             }
 
             pub fn joinedMethods(self: *Channel, allocator: Allocator, sep: u8) ![]const u8 {

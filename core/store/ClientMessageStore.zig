@@ -1,105 +1,163 @@
 const std = @import("std");
 const serde = @import("../serde.zig");
-const Mutex = @import("../misc.zig").Mutex;
+const misc = @import("../misc.zig");
+const Mutex = misc.Mutex;
+const Condition = misc.Condition;
 const Message = serde.Message;
 const Allocator = std.mem.Allocator;
 
 const ClientMessageStore = @This();
 
-/// HashMap from uuid → *Message.  Replaces the old modulo-2048 fixed array
-/// which silently dropped responses when two in-flight RPCs happened to share
-/// the same (uuid % 2048) slot.  AutoHashMap grows dynamically and has O(1)
-/// amortised insert/lookup with no collision limit.
+/// Responses that arrived before anyone waited for them, by uuid.
 map: std.AutoHashMap(u16, *Message),
-/// uuids whose caller already gave up (timed out) before the response arrived.
-/// A response that shows up later is dropped instead of being parked in `map`
-/// forever (nobody will ever fetch it), and `clearExpired` forgets a uuid when
-/// it is handed out again so the u16 wrap-around cannot drop a live response.
+/// uuids whose caller already gave up before the response arrived.  A late
+/// response is dropped instead of being parked in `map` forever, and
+/// `reserve` forgets a uuid when it is handed out again.
 expired: std.AutoHashMap(u16, void),
+/// Callers blocked in `wait`, by uuid.  `insert` hands a response straight to
+/// its waiter, so it is never parked in `map`.
+waiters: std.AutoHashMap(u16, *Waiter),
+/// Set once the connection is gone: every waiter wakes, and `wait` no longer
+/// blocks.
+closed: bool = false,
 mutex: Mutex = .{},
 allocator: Allocator,
-/// File descriptor (eventfd or pipe write-end) signalled whenever a new
-/// response is inserted into the store.  Python's RpcResult waiters block
-/// on the corresponding read end so they don't have to poll.
-/// Set once by Python via dfcore.setClientResponseFd() before any
-/// responses can arrive; -1 means no wakeup is registered (e.g. WASM).
-/// Plain i32 so this struct compiles on every target (including wasm32).
+/// Eventfd or pipe write end signalled when a response is parked in `map`.
+/// Only the asyncio client sets it; blocking callers use `wait`.  Guarded by
+/// `mutex`, so Python can set it to -1 and then close the descriptor.
 response_fd: i32 = -1,
 
-/// POSIX write(2) from libc.  Declared here because std.posix.write was
-/// removed in Zig 0.16; the extern works on any POSIX target (Linux, macOS)
-/// as long as we link -lc, which we always do for the Python extension.
+const Waiter = struct {
+    cond: Condition = .{},
+    msg: ?*Message = null,
+};
+
+pub const WaitResult = union(enum) {
+    message: *Message,
+    timeout,
+    closed,
+};
+
+pub const InsertResult = enum {
+    /// Handed to a caller blocked in `wait`.
+    delivered,
+    /// Parked in `map` until fetched.
+    parked,
+};
+
 extern fn write(fd: c_int, buf: [*]const u8, count: usize) isize;
 
-/// Write a single uint64(1) to response_fd.  Non-blocking: if the fd is full
-/// or invalid we drop the signal silently (Python's select() will pick up
-/// the next signal anyway).  No-op on freestanding targets (wasm32).
-inline fn signalWakeup(self: *ClientMessageStore) void {
+pub fn init(allocator: Allocator) ClientMessageStore {
+    return .{
+        .allocator = allocator,
+        .map = .init(allocator),
+        .expired = .init(allocator),
+        .waiters = .init(allocator),
+    };
+}
+
+pub fn deinit(self: *ClientMessageStore) void {
+    var it = self.map.valueIterator();
+    while (it.next()) |msg_ptr| msg_ptr.*.deinit();
+    self.map.deinit();
+    self.expired.deinit();
+    self.waiters.deinit();
+}
+
+/// Store a response, or hand it to the caller waiting for it.
+/// `error.Expired`: that caller already gave up.  `error.StoreFull`: a
+/// response for this uuid is already pending.  On error the caller still
+/// owns `msg`.
+pub fn insert(self: *ClientMessageStore, msg: *Message) !InsertResult {
+    const uuid = msg.getUuid();
+    self.mutex.lock();
+    defer self.mutex.unlock();
+    if (self.expired.remove(uuid)) return error.Expired;
+    if (self.waiters.get(uuid)) |waiter| {
+        if (waiter.msg != null) return error.StoreFull;
+        waiter.msg = msg;
+        waiter.cond.signal();
+        return .delivered;
+    }
+    const result = try self.map.getOrPut(uuid);
+    if (result.found_existing) return error.StoreFull;
+    result.value_ptr.* = msg;
+    return .parked;
+}
+
+/// Wake asyncio waiters after a response was parked.
+pub fn triggerWakeup(self: *ClientMessageStore) void {
     if (comptime @import("builtin").target.os.tag == .freestanding) return;
+    self.mutex.lock();
+    defer self.mutex.unlock();
     if (self.response_fd < 0) return;
     const val: u64 = 1;
     _ = write(@intCast(self.response_fd), @as([*]const u8, @ptrCast(&val)), @sizeOf(u64));
 }
 
-pub fn init(allocator: Allocator) ClientMessageStore {
-    return .{ .allocator = allocator, .map = std.AutoHashMap(u16, *Message).init(allocator), .expired = std.AutoHashMap(u16, void).init(allocator) };
-}
-
-pub fn deinit(self: *ClientMessageStore) void {
-    // Free any messages still in the store (e.g. on abrupt shutdown).
-    var it = self.map.valueIterator();
-    while (it.next()) |msg_ptr| msg_ptr.*.deinit();
-    self.map.deinit();
-    self.expired.deinit();
-}
-
-/// Store a response message.
-/// Returns error.StoreFull when another message already occupies this uuid
-/// slot (i.e. two in-flight RPCs with the same uuid, which should not happen
-/// under normal operation).
-pub fn insert(self: *ClientMessageStore, msg: *Message) !void {
+pub fn setResponseFd(self: *ClientMessageStore, fd: i32) void {
     self.mutex.lock();
     defer self.mutex.unlock();
-    // The waiter already timed out: refuse (the caller frees the message).
-    if (self.expired.remove(msg.getUuid())) return error.Expired;
-    const result = try self.map.getOrPut(msg.getUuid());
-    if (result.found_existing) return error.StoreFull;
-    result.value_ptr.* = msg;
+    self.response_fd = fd;
 }
 
-/// Explicitly notify Python ``RpcResult`` waiters that a new response may
-/// be available.  Called by ``ClientHandler.wakeupFn`` *after* the
-/// dispatcher has finished inspecting ``message.metadata.durable``.
-pub fn triggerWakeup(self: *ClientMessageStore) void {
-    self.signalWakeup();
-}
-
-/// Retrieve and remove the response for uuid.
-/// Returns null if no message is present for that uuid.
+/// Retrieve and remove the response for uuid, if it arrived.
 pub fn fetch(self: *ClientMessageStore, uuid: u16) ?*Message {
     self.mutex.lock();
     defer self.mutex.unlock();
-    const msg = self.map.get(uuid) orelse return null;
-    _ = self.map.remove(uuid);
-    return msg;
+    const kv = self.map.fetchRemove(uuid) orelse return null;
+    return kv.value;
 }
 
-/// Called when the waiter for `uuid` gives up.  Frees a response that already
-/// arrived, or remembers the uuid so one that arrives later is discarded.
-pub fn setTimeoutError(self: *ClientMessageStore, uuid: u16) !void {
+/// Block until the response for `uuid` arrives, `timeout_ms` passes, or the
+/// connection closes.  A response that arrived earlier is returned at once.
+pub fn wait(self: *ClientMessageStore, uuid: u16, timeout_ms: u32) !WaitResult {
     self.mutex.lock();
-    if (self.map.fetchRemove(uuid)) |kv| {
-        self.mutex.unlock();
-        kv.value.deinit();
+    defer self.mutex.unlock();
+    if (self.map.fetchRemove(uuid)) |kv| return .{ .message = kv.value };
+    if (self.closed) return .closed;
+    var waiter = Waiter{};
+    try self.waiters.put(uuid, &waiter);
+    defer _ = self.waiters.remove(uuid);
+    const deadline = misc.monotonicMs() + timeout_ms;
+    while (waiter.msg == null and !self.closed) {
+        const now = misc.monotonicMs();
+        if (now >= deadline) break;
+        _ = waiter.cond.timedWait(&self.mutex, @intCast(deadline - now));
+    }
+    if (waiter.msg) |msg| return .{ .message = msg };
+    return if (self.closed) .closed else .timeout;
+}
+
+/// Wake every waiter: no further response can arrive.
+pub fn close(self: *ClientMessageStore) void {
+    self.mutex.lock();
+    defer self.mutex.unlock();
+    self.closed = true;
+    var it = self.waiters.valueIterator();
+    while (it.next()) |waiter| waiter.*.cond.signal();
+}
+
+/// The caller gave up on `uuid`.  Frees a response that already arrived, or
+/// remembers the uuid so one that arrives later is discarded.
+pub fn expire(self: *ClientMessageStore, uuid: u16) !void {
+    self.mutex.lock();
+    const kv = self.map.fetchRemove(uuid);
+    if (kv == null) {
+        defer self.mutex.unlock();
+        if (!self.closed) try self.expired.put(uuid, {});
         return;
     }
-    defer self.mutex.unlock();
-    try self.expired.put(uuid, {});
+    self.mutex.unlock();
+    kv.?.value.deinit();
 }
 
-/// Forget that `uuid` was ever expired; call when it is issued to a new request.
-pub fn clearExpired(self: *ClientMessageStore, uuid: u16) void {
+/// `uuid` is being issued to a new request: forget the previous owner's
+/// expiry and free any response of its that is still parked.
+pub fn reserve(self: *ClientMessageStore, uuid: u16) void {
     self.mutex.lock();
-    defer self.mutex.unlock();
     _ = self.expired.remove(uuid);
+    const stale = self.map.fetchRemove(uuid);
+    self.mutex.unlock();
+    if (stale) |kv| kv.value.deinit();
 }

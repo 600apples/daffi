@@ -121,10 +121,11 @@ pub fn initFromTlsHandshake(allocator: Allocator, fd: posix.socket_t, ssl: *tls_
     return self;
 }
 
+/// Block until some bytes arrive; returns how many (0 at end-of-stream).
 pub fn read(ctx: *anyopaque, buf: []u8) !usize {
     const self: *ClientConnection = @ptrCast(@alignCast(ctx));
-    if (self.ssl) |ssl| return tls_impl.sslReadAll(ssl, buf);
-    return try self.stream.readAll(buf);
+    if (self.ssl) |ssl| return tls_impl.sslRead(ssl, buf);
+    return try self.stream.read(buf);
 }
 
 pub fn readSome(ctx: *anyopaque, buf: []u8) !usize {

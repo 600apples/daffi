@@ -48,6 +48,50 @@ All notable changes to this project are documented in this file.
 - Server slots are reused after `stop()`, so a process can start and stop
   servers any number of times (the limit of 256 is now on servers running
   at the same time).
+- **Signals:** the native layer no longer installs SIGINT/SIGTERM handlers
+  that ended the process with `_exit(0)`. Python stops every running app and
+  then defers to the handler that was installed before: Ctrl+C raises
+  `KeyboardInterrupt` as usual, a user handler is called, and a default
+  action (e.g. SIGTERM) terminates the process with that signal.
+- Waiting for a response happens in the native layer with the GIL released.
+  Each response wakes only the call it belongs to (in `daffi.aio`, only that
+  call's future), instead of every waiter on the client.
+- A service whose task queue is full answers further requests with a
+  `ServiceOverloaded` error instead of queueing them without limit.
+- The Router answers a request it cannot deliver with a `ReceiverNotFound`
+  or `DeliveryFailed` error, so the caller no longer waits out its timeout.
+- An error raised by an `OPAQUE` callback is sent back as JSON.
+- In `daffi.aio`, synchronous callbacks run in the default executor so a slow
+  one does not block the event loop; `async def` callbacks are awaited.
+- Writes to a peer that makes no progress for 5 s fail and drop that
+  connection. TLS handshakes and protocol detection of an accepted
+  connection must finish within 5 s overall.
+- The evented runtime runs at most 1024 blocking jobs (TLS handshakes,
+  WebSocket sessions) at once; further connections are refused.
+
+### Fixed
+
+- One callback, serialization, send or event-handler error no longer stops
+  the dispatcher for every connection in the process; the caller gets the
+  error.
+- A response that arrives after its call was cancelled, interrupted or
+  failed is dropped; it can no longer reach a later call that reuses the
+  request id.
+- A reply is decoded only with the serialization format of its request (or
+  JSON for errors), so a peer cannot make a JSON caller unpickle data.
+- More than 1024 open descriptors no longer break waiting for responses or
+  tasks.
+- `stop()` no longer races a send on the same connection, writes to a closed
+  descriptor, or deadlocks against a stop started by a server shutdown.
+- A WebSocket ping no longer disconnects the client, and control frames are
+  never written into the middle of another frame.
+- Eviction (another connection took this client's name) is reported as
+  `Evicted`, and a disconnect during a call as `Disconnected`. An evicted
+  client no longer reconnects and takes its name back.
+- Automatic reconnect releases the previous connection; re-handshakes, Unix
+  socket restores and failed writes no longer leak memory or descriptors.
+- A connection whose write failed partway is closed instead of left with a
+  corrupt stream.
 
 
 ## 3.0.1

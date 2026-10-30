@@ -137,7 +137,8 @@ export fn parseAndStoreMessage(data: [*:0]const u8, len: u32, conn_num: u32) voi
     defer free(data);
     var actual_data = data[0..len];
     actual_data.len = len;
-    var entry = Client.getClientEntry(conn_num) catch throwError("failed to get client entry\n");
+    var entry = Client.acquireClientEntry(conn_num) catch throwError("failed to get client entry\n");
+    defer entry.release();
     var client_handler = entry.client_handler;
     const connection = entry.connection;
     var msg = entry.msgpool.buildWsMessage(actual_data) catch throwError("failed to build framed message\n");

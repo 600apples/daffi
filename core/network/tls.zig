@@ -15,7 +15,8 @@
 
 const std = @import("std");
 const net = @import("posix_net.zig");
-const Mutex = @import("../misc.zig").Mutex;
+const misc = @import("../misc.zig");
+const Mutex = misc.Mutex;
 
 const c = @import("openssl_c");
 
@@ -30,7 +31,7 @@ pub const SslCtx = opaque {};
 
 /// Longest we wait for the socket to become writable before giving up on a
 /// stalled peer.
-const WRITE_STALL_TIMEOUT_MS: c_int = 30_000;
+const WRITE_STALL_TIMEOUT_MS: c_int = @intCast(net.SEND_STALL_TIMEOUT_MS);
 /// Longest a TLS handshake may take on a still-blocking socket.
 pub const HANDSHAKE_TIMEOUT_MS: u32 = 5_000;
 
@@ -38,6 +39,19 @@ const Session = struct {
     ssl: *c.SSL,
     fd: c_int,
     mutex: Mutex = .{},
+    /// Monotonic ms after which a read waiting for the peer gives up.  Set
+    /// while an accepted connection is still being upgraded; 0 afterwards.
+    deadline: i64 = 0,
+
+    /// How long a WANT_READ/WANT_WRITE wait may block, or null when the
+    /// deadline has passed.
+    fn waitBudget(self: *const Session, cap: c_int) ?c_int {
+        if (self.deadline == 0) return cap;
+        const left = self.deadline - misc.monotonicMs();
+        if (left <= 0) return null;
+        const bounded: c_int = @intCast(@min(left, std.math.maxInt(c_int)));
+        return if (cap < 0) bounded else @min(cap, bounded);
+    }
 };
 
 fn session(conn: *SslConn) *Session {
@@ -217,23 +231,36 @@ fn newSession(ctx: *SslCtx, fd: c_int) !*Session {
 
 /// Perform the server-side TLS handshake on an already-accepted TCP fd.
 ///
-/// The socket must still be in blocking mode (ideally with I/O timeouts set);
-/// call `finishHandshake` once any further blocking probing is done.
+/// The socket is switched to non-blocking mode and the handshake, plus any
+/// probing reads after it, must finish before the monotonic `deadline`
+/// (ms).  Call `finishHandshake` once probing is done.
 /// The returned SslConn must be freed with sslClose() when the connection ends.
 /// The SslCtx is still owned by the caller (the ServerConnection).
-pub fn serverHandshake(ctx: *SslCtx, fd: c_int) !*SslConn {
+pub fn serverHandshake(ctx: *SslCtx, fd: c_int, deadline: i64) !*SslConn {
     const real_ctx: *c.SSL_CTX = @ptrCast(@alignCast(ctx));
     const s = try newSession(ctx, fd);
     errdefer {
         c.SSL_free(s.ssl);
         allocator.destroy(s);
     }
+    s.deadline = deadline;
     // Re-apply the CTX verify mode on the SSL object (defensive; normally
     // inherited by SSL_new) so mTLS cannot be silently dropped.
     const mode = c.SSL_CTX_get_verify_mode(real_ctx);
     c.SSL_set_verify(s.ssl, mode, null);
-    c.ERR_clear_error();
-    if (c.SSL_accept(s.ssl) <= 0) return error.TlsHandshakeFailed;
+    net.setNonBlocking(fd);
+    while (true) {
+        c.ERR_clear_error();
+        const rc = c.SSL_accept(s.ssl);
+        if (rc > 0) break;
+        const events = switch (c.SSL_get_error(s.ssl, rc)) {
+            c.SSL_ERROR_WANT_READ => net.WAIT_READ,
+            c.SSL_ERROR_WANT_WRITE => net.WAIT_WRITE,
+            else => return error.TlsHandshakeFailed,
+        };
+        const budget = s.waitBudget(-1) orelse return error.TlsHandshakeTimeout;
+        if (!net.waitFd(fd, events, budget)) return error.TlsHandshakeTimeout;
+    }
     if ((mode & c.SSL_VERIFY_FAIL_IF_NO_PEER_CERT) != 0) {
         const peer = c.SSL_get_peer_certificate(s.ssl);
         if (peer == null) return error.TlsHandshakeFailed;
@@ -293,6 +320,7 @@ fn isIpLiteral(host: []const u8) bool {
 /// blocking probe reads.
 pub fn finishHandshake(conn: *SslConn) void {
     const s = session(conn);
+    s.deadline = 0;
     (net.Stream{ .handle = s.fd }).setIoTimeout(0);
     net.setNonBlocking(s.fd);
 }
@@ -315,8 +343,16 @@ pub fn sslRead(conn: *SslConn, buf: []u8) !usize {
         if (n > 0) return @intCast(n);
         switch (err) {
             c.SSL_ERROR_ZERO_RETURN => return 0,
-            c.SSL_ERROR_WANT_READ => _ = net.waitFd(s.fd, net.WAIT_READ, -1),
-            c.SSL_ERROR_WANT_WRITE => _ = net.waitFd(s.fd, net.WAIT_WRITE, WRITE_STALL_TIMEOUT_MS),
+            // Without a deadline this waits for the peer's next message;
+            // shutting the socket down (close) wakes it.
+            c.SSL_ERROR_WANT_READ => {
+                const budget = s.waitBudget(-1) orelse return error.Timeout;
+                if (!net.waitFd(s.fd, net.WAIT_READ, budget)) return error.Timeout;
+            },
+            c.SSL_ERROR_WANT_WRITE => {
+                const budget = s.waitBudget(WRITE_STALL_TIMEOUT_MS) orelse return error.Timeout;
+                if (!net.waitFd(s.fd, net.WAIT_WRITE, budget)) return error.Timeout;
+            },
             // Peer closed the socket without a close_notify (or we shut it
             // down to interrupt this read): report as end-of-stream.
             c.SSL_ERROR_SYSCALL => return 0,
@@ -344,20 +380,6 @@ pub fn sslReadSome(conn: *SslConn, buf: []u8) !usize {
         c.SSL_ERROR_ZERO_RETURN, c.SSL_ERROR_SYSCALL => 0,
         else => error.TlsReadError,
     };
-}
-
-/// Read exactly buf.len bytes from a TLS connection (blocking loop).
-///
-/// Use this when you must fill the entire buffer before proceeding
-/// (e.g. reading a fixed-size daffi message header or payload).
-pub fn sslReadAll(conn: *SslConn, buf: []u8) !usize {
-    var total: usize = 0;
-    while (total < buf.len) {
-        const n = try sslRead(conn, buf[total..]);
-        if (n == 0) break; // clean close before buffer full
-        total += n;
-    }
-    return total;
 }
 
 /// Write all bytes in data to a TLS connection (blocking).

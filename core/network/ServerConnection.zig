@@ -74,24 +74,18 @@ pub fn init(allocator: Allocator, config: Config) !*ServerConnection {
         listener = addr.listen(options);
     }
 
-    const l = try listener;
+    var l = try listener;
+    errdefer l.deinit();
     const self = try allocator.create(ServerConnection);
+    errdefer allocator.destroy(self);
     self.* = ServerConnection{ .listener = l, .allocator = allocator };
 
     if (config.tls) {
         // Asking for TLS but providing no certificate must fail loudly, not
         // quietly fall back to serving plaintext.
-        if (config.cert.len == 0 or config.key.len == 0) {
-            self.listener.deinit();
-            allocator.destroy(self);
-            return error.TlsCertRequired;
-        }
+        if (config.cert.len == 0 or config.key.len == 0) return error.TlsCertRequired;
         tls_impl.init();
-        self.ssl_ctx = tls_impl.serverCtx(config.cert, config.key, config.ca) catch |err| {
-            self.listener.deinit();
-            allocator.destroy(self);
-            return err;
-        };
+        self.ssl_ctx = try tls_impl.serverCtx(config.cert, config.key, config.ca);
     }
 
     return self;
@@ -134,20 +128,25 @@ pub fn accept(ctx: *anyopaque, timeout_ms: c_int) !AcceptedConnection {
     };
 }
 
-/// Nothing to interrupt: the accept loop polls with a timeout and notices the
-/// owning Connection's `suspended` flag by itself.  (Closing a listening fd
-/// from another thread does not reliably wake a blocked accept().)
-pub fn close(_: *anyopaque) void {}
+/// Close the listening socket, keeping the SSL_CTX for connections still
+/// being upgraded.  Only once nothing polls or accepts on it: closing a
+/// listening fd does not reliably wake a blocked accept().
+pub fn close(ctx: *anyopaque) void {
+    const self: *ServerConnection = @ptrCast(@alignCast(ctx));
+    if (self.listener.handle < 0) return;
+    self.listener.deinit();
+    self.listener.handle = -1;
+}
 
-/// Close the listening socket, free the shared
-/// SSL_CTX (TLS mode) and the struct.  Called once, by the accept-loop owner.
+/// Close the listening socket if still open, free the shared SSL_CTX (TLS
+/// mode) and the struct.
 pub fn destroy(ctx: *anyopaque) void {
     const self: *ServerConnection = @ptrCast(@alignCast(ctx));
     if (self.ssl_ctx) |sc| {
         tls_impl.freeCtx(sc);
         self.ssl_ctx = null;
     }
-    self.listener.deinit();
+    close(ctx);
     self.allocator.destroy(self);
 }
 

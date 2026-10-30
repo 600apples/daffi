@@ -251,6 +251,39 @@ def test_plaintext_and_garbage_do_not_hurt_tls_server(tls_service):
     assert proc.is_alive()
 
 
+def test_peer_silent_after_tls_handshake_is_dropped(tls_service):
+    """Finishing the TLS handshake and then saying nothing used to pin a
+    server thread forever; the whole upgrade now has a deadline."""
+    import ssl
+
+    proc, port, ca = tls_service
+    ctx = ssl.create_default_context(cafile=ca)
+    silent = []
+    try:
+        for _ in range(3):
+            raw = socket.create_connection((HOST, port), timeout=15)
+            silent.append(ctx.wrap_socket(raw, server_hostname="localhost"))
+        started = time.monotonic()
+        for sock in silent:
+            try:
+                data = sock.recv(1)
+            except (ssl.SSLError, OSError):
+                data = b""
+            assert data == b"", "server sent data to a peer that never spoke"
+        assert time.monotonic() - started < 12, "silent TLS peers were not dropped"
+    finally:
+        for sock in silent:
+            sock.close()
+
+    client, conn = _connect(port, ca, name="tls-after-silent")
+    try:
+        conn.wait_for_members("tls-service", timeout=15)
+        assert conn.rpc(timeout=TIMEOUT).add(3, 4) == 7
+    finally:
+        client.stop()
+    assert proc.is_alive()
+
+
 def test_server_tls_without_certificate_is_an_error(free_port):
     q = mp.Queue()
     proc = mp.Process(

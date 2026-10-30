@@ -11,21 +11,18 @@ Execution model
 * The sync poller thread becomes a single ``asyncio.Task`` —
   :meth:`AsyncTaskDispatcher.handle_task_queue`.
 * The sync worker-thread pool becomes a pool of ``asyncio.Task`` objects.
-* Fd readability is awaited via a one-shot ``asyncio.Future`` resolved by an
-  ``add_reader`` callback; the first readable fd resolves a shared future and
-  a non-blocking ``select.select(timeout=0)`` discovers the full set.
-* Registered callbacks are run in the default executor (thread-pool) so that
-  slow sync callbacks never stall the event loop.  Coroutine callbacks are
-  ``await``ed directly.
+* Every fd has its own ``add_reader`` callback that records the fd as ready
+  and wakes the poller, which then services exactly those fds.
+* Coroutine callbacks are ``await``ed directly.  Sync callbacks run in the
+  default executor so a slow one never stalls the event loop.
 """
 
 from __future__ import annotations
 
 import asyncio
+import functools
 import json
-import select as _select
-import sys
-from typing import Any, TYPE_CHECKING
+from typing import Any
 
 from .. import dfcore
 from daffi.registry._executor_registry import EXECUTOR_REGISTRY
@@ -36,124 +33,45 @@ from daffi._bindings import (
     set_lifecycle_fd,
     MessageFlag,
 )
-from daffi.exceptions import Disconnected, Evicted
+from daffi.exceptions import Evicted
+from daffi._rpc_proxy import connection_lost_error
 from daffi._task_dispatcher import (
     _ConnEntry,
     EventType,
-    _SENDERS,
-    _tblib_installed,
+    _error_result,
+    _send_reply,
 )
 
-if TYPE_CHECKING:
-    from daffi.aio._rpc_proxy import AsyncResponseNotifier, AsyncRpcProxy
 
-
-# ---------------------------------------------------------------------------
-# Async callback executor
-# ---------------------------------------------------------------------------
-
-
-async def _execute_task_async(
+async def _invoke_callback_async(
     func_name: str,
     serde: SerdeFormat,
     data: bytes,
 ) -> tuple:
-    """Invoke a registered callback and return ``(result, flag, serde)``.
-
-    Coroutine callbacks are ``await``ed directly.  Sync callbacks are run in
-    the default executor so they never block the event loop.
-    """
-    cb = EXECUTOR_REGISTRY.get(func_name)
-    args, kwargs = Serializer.deserialize(serde, data)
+    """Async counterpart of :func:`daffi._task_dispatcher._invoke_callback`."""
     try:
-        # cb is an Executor wrapper whose __call__ may return a plain value or
-        # a coroutine (when the registered function is async def).  We cannot
-        # use asyncio.iscoroutinefunction(cb) here because Executor.__call__ is
-        # always a plain method — check the return value instead.
-        raw = cb(*args, **kwargs)
-        if asyncio.iscoroutine(raw):
-            result = await raw
+        cb = EXECUTOR_REGISTRY.get(func_name)
+        if cb is None:
+            raise LookupError(f"Callback {func_name!r} is not registered.")
+        args, kwargs = Serializer.deserialize(serde, data)
+        if cb.is_coroutine:
+            result = await cb(*args, **kwargs)
         else:
-            result = raw
+            result = await asyncio.get_running_loop().run_in_executor(
+                None, functools.partial(cb, *args, **kwargs)
+            )
         return result, MessageFlag.RESPONSE, serde
     except asyncio.CancelledError:
         raise
-    except Exception:
-        if serde == SerdeFormat.OPAQUE:
-            serde = SerdeFormat.PICKLE
-        err_type, err_obj, tb = sys.exc_info()
-        include_tb = _tblib_installed and serde == SerdeFormat.PICKLE
-        result = (
-            err_type.__name__,
-            err_type.__module__,
-            str(err_obj),
-            tb if include_tb else None,
-        )
-        return result, MessageFlag.ERROR, serde
-
-
-# ---------------------------------------------------------------------------
-# Lifecycle signal handler (async version)
-# ---------------------------------------------------------------------------
-
-
-async def _handle_lifecycle_signal_async(
-    conn: Any,
-    conn_num: int,
-    reason: bytes,
-) -> None:
-    """Async counterpart of ``_task_dispatcher._handle_lifecycle_signal``.
-
-    Called from :meth:`AsyncTaskDispatcher.handle_task_queue` on the event
-    loop when the Zig native layer writes a lifecycle byte.
-    """
-    # Import here to avoid a module-level circular import.
-    from daffi.aio._rpc_proxy import AsyncResponseNotifier, AsyncRpcProxy
-
-    if reason == LifecycleSignal.INIT:
-        # Re-run handshake (blocking call) without blocking the event loop.
-        loop = asyncio.get_running_loop()
-        handshake = await loop.run_in_executor(
-            None, AsyncRpcProxy._process_client_handshake, conn_num
-        )
-        conn._register_executors()
-        return
-
-    if reason == LifecycleSignal.NORMAL:
-        await conn.stop()
-        return
-
-    if reason == LifecycleSignal.EVICTED:
-        err: Exception = Evicted(
-            f"This client (app_name={conn.app_name!r}) was evicted — "
-            "a new connection with the same app_name took over its slot."
-        )
-    else:  # DISCONNECTED or unknown
-        err = Disconnected(
-            "Server disconnected unexpectedly.\n\n"
-            "  The router or service this client was connected to has stopped."
-        )
-
-    AsyncResponseNotifier.signal_lifecycle_error(conn_num, err)
-    conn._connection_error = err
-    conn._disconnected = True
-
-    if conn._joining:
-        await conn.stop()
-    else:
-        conn.logger.error(f"Error in connection {conn_num}: {err}")
-
-
-# ---------------------------------------------------------------------------
-# AsyncTaskDispatcher
-# ---------------------------------------------------------------------------
+    except:  # noqa: E722
+        return _error_result(serde)
 
 
 class AsyncTaskDispatcher:
     """Async counterpart of :class:`~daffi._task_dispatcher.TaskDispatcher`.
 
-    Uses ``asyncio.Task`` for the poller and worker pool, ``asyncio.Event``
-    for the stop signal, and ``asyncio.Queue`` for inter-task work delivery.
+    Uses ``asyncio.Task`` for the poller and worker pool and ``asyncio.Queue``
+    for inter-task work delivery.
 
     The public API (``start_for_connection`` / ``stop_for_connection``) mirrors
     the sync version except that ``stop_for_connection`` is ``async def``.
@@ -170,99 +88,98 @@ class AsyncTaskDispatcher:
             dfcore.getMessageForClientWorker,
             dfcore.getMessageForServerWorker,
         )
-
-        self.stop_event: asyncio.Event = asyncio.Event()
         self.queue: asyncio.Queue = asyncio.Queue()
 
         self._workers: list[asyncio.Task] = []
         self._poller: asyncio.Task | None = None
+        # Background stop() calls started by lifecycle signals.
+        self._stop_tasks: set[asyncio.Task] = set()
 
         self._conns: dict[int, _ConnEntry] = {}
         self._rfd_to_conn_num: dict[int, int] = {}
-        # Readers stay registered across wakeups. Each wait uses a fresh future
-        # because a Future resolves only once.
-        self._readers: set[int] = set()
-        self._wake: asyncio.Future | None = None
+        self._ready: set[int] = set()
+        self._kick: asyncio.Future | None = None
 
     # ------------------------------------------------------------------
     # Worker pool
     # ------------------------------------------------------------------
 
     def _start_workers(self) -> None:
-        """Create worker tasks if not already running (workers >= 2 only).
-
-        Spawns ``workers`` asyncio tasks — matching the sync TaskDispatcher
-        pool size for ``workers=N``.
-        """
+        """Create ``workers`` worker tasks if not already running
+        (``workers >= 2`` only)."""
         if self._workers or self.workers == 1:
             return
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         for i in range(self.workers):
             t = loop.create_task(self._worker_loop(), name=f"daffi-aio-worker-{i}")
             self._workers.append(t)
 
     async def _worker_loop(self) -> None:
-        """Pull tasks from the async queue and execute them."""
-        while True:
+        me = asyncio.current_task()
+        queue = self.queue
+        while me in self._workers:
+            task = await queue.get()
             try:
-                task = await self.queue.get()
-            except asyncio.CancelledError:
-                break
-            if task is None:
-                self.queue.task_done()
-                break
-            (
-                uuid,
-                data,
-                _flag,
-                serde,
-                transmitter,
-                func_name,
-                return_result,
-                conn_num,
-                server_mode_bool,
-            ) = task
-            try:
-                result, flag, out_serde = await _execute_task_async(
-                    func_name, serde, data
-                )
-                if return_result:
-                    result_bytes, is_bytes = Serializer.serialize(out_serde, result)
-                    _SENDERS[server_mode_bool](
-                        data=result_bytes,
-                        flag=flag,
-                        serde=out_serde,
-                        receiver=transmitter,
-                        func_name=func_name,
-                        return_result=False,
-                        conn_num=conn_num,
-                        is_bytes=is_bytes,
-                        uuid=uuid,
-                    )
-            except asyncio.CancelledError:
-                raise
+                await self._run_task(*task)
             except Exception:
-                pass
+                task[-1].exception("Task execution failed")
             finally:
-                self.queue.task_done()
+                queue.task_done()
+
+    @staticmethod
+    async def _run_task(
+        uuid: int,
+        data: bytes,
+        serde: SerdeFormat,
+        transmitter: str,
+        func_name: str,
+        return_result: bool,
+        conn_num: int,
+        server_mode: bool,
+        logger,
+    ) -> None:
+        outcome = await _invoke_callback_async(func_name, serde, data)
+        if return_result:
+            _send_reply(server_mode, conn_num, uuid, transmitter, func_name, outcome, logger)
 
     # ------------------------------------------------------------------
-    # Fd management (mirrors sync version exactly)
+    # Fd management
     # ------------------------------------------------------------------
+
+    def _watch(self, fd: int, conn_num: int) -> None:
+        self._rfd_to_conn_num[fd] = conn_num
+        asyncio.get_running_loop().add_reader(fd, self._on_readable, fd)
+
+    def _unwatch(self, fd: int) -> None:
+        self._rfd_to_conn_num.pop(fd, None)
+        self._ready.discard(fd)
+        try:
+            asyncio.get_running_loop().remove_reader(fd)
+        except (OSError, ValueError):
+            pass
+
+    def _on_readable(self, fd: int) -> None:
+        self._ready.add(fd)
+        self._wake_poller()
+
+    def _wake_poller(self) -> None:
+        kick = self._kick
+        if kick is not None and not kick.done():
+            kick.set_result(None)
 
     def _deregister_fds(self, conn_num: int | None) -> None:
-        if conn_num is None:
-            return
-        entry = self._conns.get(conn_num)
-        if entry is not None:
-            self._rfd_to_conn_num.pop(entry.wakeup.read_fd, None)
-            entry.wakeup.close()
-
-    def _close_lifecycle(self, conn_num: int | None) -> None:
+        """The native layer gives the fd up first, so it never writes to a
+        closed (or reused) descriptor."""
         entry = self._conns.pop(conn_num, None)
-        if entry is not None:
-            self._rfd_to_conn_num.pop(entry.lifecycle.read_fd, None)
-            entry.lifecycle.close()
+        if entry is None:
+            return
+        set_request_fd(conn_num, -1, server_mode=bool(entry.conn.server_mode))
+        self._unwatch(entry.wakeup.read_fd)
+        entry.wakeup.close()
+        if entry.conn.server_mode is None:
+            set_lifecycle_fd(conn_num, -1)
+        self._unwatch(entry.lifecycle.read_fd)
+        entry.lifecycle.close()
 
     # ------------------------------------------------------------------
     # Connection registration
@@ -271,15 +188,13 @@ class AsyncTaskDispatcher:
     def start_for_connection(self, connection: Any) -> None:
         """Register *connection* and start the poller task if not running."""
         assert connection._conn_num is not None
-        self.connections.add(connection)
         conn_num: int = connection._conn_num
 
         wakeup = WakeupFd()
         lc = WakeupFd(pipe=True)
-
         self._conns[conn_num] = _ConnEntry(conn=connection, wakeup=wakeup, lifecycle=lc)
-        self._rfd_to_conn_num[wakeup.read_fd] = conn_num
-        self._rfd_to_conn_num[lc.read_fd] = conn_num
+        self._watch(wakeup.read_fd, conn_num)
+        self._watch(lc.read_fd, conn_num)
 
         set_request_fd(
             conn_num, wakeup.write_fd, server_mode=bool(connection.server_mode)
@@ -287,208 +202,159 @@ class AsyncTaskDispatcher:
         if connection.server_mode is None:
             set_lifecycle_fd(conn_num, lc.write_fd)
 
+        self.connections.add(connection)
         self._start_workers()
-
         if self._poller is None:
-            loop = asyncio.get_event_loop()
-            self._poller = loop.create_task(
+            self._poller = asyncio.get_running_loop().create_task(
                 self.handle_task_queue(), name="daffi-aio-poller"
             )
 
     async def stop_for_connection(self, connection: Any) -> None:
-        """Deregister *connection* and — when no connections remain — tear
-        down all tasks and release fd resources."""
+        """Deregister *connection*; the last one also stops every task."""
         self.connections.discard(connection)
-        conn_num: int | None = getattr(connection, "_conn_num", None)
+        self._deregister_fds(getattr(connection, "_conn_num", None))
+        if self.connections:
+            return
 
-        if not self.connections:
-            self.stop_event.set()
-            in_poller = asyncio.current_task() is self._poller
-
-            if not in_poller:
-                # Wake the poller so it sees stop_event on its next iteration.
-                entry = self._conns.get(conn_num)
-                if entry is not None:
-                    entry.lifecycle.write(LifecycleSignal.STOP)
-
-            # Cancel worker tasks.
-            for w in self._workers:
+        current = asyncio.current_task()
+        # A new poller may start while this one winds down; the old one exits
+        # as soon as it sees it is no longer the current poller.
+        poller, self._poller = self._poller, None
+        workers, self._workers = self._workers, []
+        self.queue = asyncio.Queue()
+        self._wake_poller()
+        for w in workers:
+            if w is not current:
                 w.cancel()
-            if self._workers:
-                await asyncio.gather(*self._workers, return_exceptions=True)
-            self._workers.clear()
-
-            if self._poller is not None and not in_poller:
-                self._poller.cancel()
-                try:
-                    await self._poller
-                except (asyncio.CancelledError, Exception):
-                    pass
-                self._poller = None
-
-            # Close lifecycle fd only after the poller has exited.
-            self._close_lifecycle(conn_num)
-
-        # Always deregister the wakeup fd.
-        self._deregister_fds(conn_num)
+        waiting = [t for t in (*workers, poller) if t is not None and t is not current]
+        if waiting:
+            await asyncio.gather(*waiting, return_exceptions=True)
 
     # ------------------------------------------------------------------
     # Poller coroutine
     # ------------------------------------------------------------------
 
     async def handle_task_queue(self) -> None:
-        """Core event loop: wait for any fd to become readable, dispatch.
-
-        Uses ``loop.add_reader()`` + a shared ``asyncio.Future`` instead of
-        ``selectors.DefaultSelector``.  Readers stay registered until the fd
-        leaves the map, so a call does not pay ``add_reader`` / ``remove_reader``
-        on every wakeup.  After the future resolves, a non-blocking
-        ``select.select(timeout=0)`` discovers the full set of currently
-        readable fds — the same dispatch logic as the sync version then runs
-        inline.
-        """
+        """Service ready fds one at a time until this task is retired."""
         loop = asyncio.get_running_loop()
-        inline = self.workers == 1
-
-        try:
-            while not self.stop_event.is_set():
-                self._sync_readers(loop)
-                if not self._readers:
-                    await asyncio.sleep(0.001)
-                    continue
-
-                wake = loop.create_future()
-                self._wake = wake
+        me = asyncio.current_task()
+        while self._poller is me:
+            if not self._ready:
+                self._kick = loop.create_future()
                 try:
-                    await wake
-                except asyncio.CancelledError:
-                    break
+                    await self._kick
                 finally:
-                    self._wake = None
-
-                if self.stop_event.is_set():
-                    break
-
-                all_fds = list(self._readers)
-                try:
-                    readable_list, _, _ = _select.select(all_fds, [], [], 0)
-                    readable = set(readable_list)
-                except (OSError, ValueError):
-                    continue
-
-                lifecycle_stop = False
-                notified: set = set()
-                for rfd in readable:
-                    conn_num = self._rfd_to_conn_num.get(rfd)
-                    if conn_num is None:
-                        continue
-                    entry = self._conns.get(conn_num)
-                    if entry is None:
-                        continue
-                    if rfd == entry.lifecycle.read_fd:
-                        reason = entry.lifecycle.read(1)
-                        if not reason or reason == LifecycleSignal.STOP:
-                            lifecycle_stop = True
-                            break
-                        await _handle_lifecycle_signal_async(
-                            entry.conn, conn_num, reason
-                        )
-                    elif rfd == entry.wakeup.read_fd:
-                        entry.wakeup.drain()
-                        notified.add(entry.conn)
-
-                if lifecycle_stop:
-                    break
-
-                for conn in list(self.connections):
-                    if conn not in notified:
-                        continue
-                    poller = self.pollers[bool(conn.server_mode)]
-                    while not self.stop_event.is_set():
-                        task = poller(conn._conn_num)
-                        if task is None:
-                            break
-                        (
-                            uuid,
-                            data,
-                            flag,
-                            serde,
-                            transmitter,
-                            _receiver,
-                            func_name,
-                            return_result,
-                        ) = task
-
-                        if flag == MessageFlag.EVENTS:
-                            await self._dispatch_event(conn, json.loads(data))
-                        elif inline:
-                            result, out_flag, out_serde = await _execute_task_async(
-                                func_name, serde, data
-                            )
-                            if return_result:
-                                result_bytes, is_bytes = Serializer.serialize(
-                                    out_serde, result
-                                )
-                                _SENDERS[bool(conn.server_mode)](
-                                    data=result_bytes,
-                                    flag=out_flag,
-                                    serde=out_serde,
-                                    receiver=transmitter,
-                                    func_name=func_name,
-                                    return_result=False,
-                                    conn_num=conn._conn_num,
-                                    is_bytes=is_bytes,
-                                    uuid=uuid,
-                                )
-                        else:
-                            await self.queue.put(
-                                (
-                                    uuid,
-                                    data,
-                                    flag,
-                                    serde,
-                                    transmitter,
-                                    func_name,
-                                    return_result,
-                                    conn._conn_num,
-                                    bool(conn.server_mode),
-                                )
-                            )
-        finally:
-            self._drop_readers(loop)
-
-    def _on_readable(self) -> None:
-        wake = self._wake
-        if wake is not None and not wake.done():
-            wake.set_result(None)
-
-    def _sync_readers(self, loop: asyncio.AbstractEventLoop) -> None:
-        current = set(self._rfd_to_conn_num)
-        for fd in self._readers - current:
-            self._remove_reader(loop, fd)
-        for fd in current - self._readers:
-            try:
-                loop.add_reader(fd, self._on_readable)
-            except (OSError, ValueError):
+                    self._kick = None
                 continue
-            self._readers.add(fd)
+            await self._service(self._ready.pop())
 
-    def _remove_reader(self, loop: asyncio.AbstractEventLoop, fd: int) -> None:
-        self._readers.discard(fd)
-        try:
-            loop.remove_reader(fd)
-        except (OSError, ValueError):
-            pass
+    async def _service(self, fd: int) -> None:
+        conn_num = self._rfd_to_conn_num.get(fd)
+        entry = self._conns.get(conn_num) if conn_num is not None else None
+        if entry is None:
+            return
+        if fd == entry.lifecycle.read_fd:
+            reason = entry.lifecycle.read(1)
+            if reason:
+                try:
+                    await self._handle_lifecycle_signal(entry.conn, conn_num, reason)
+                except Exception:
+                    entry.conn.logger.exception("Lifecycle handling failed")
+        else:
+            entry.wakeup.drain()
+            await self._drain_tasks(entry.conn, conn_num)
 
-    def _drop_readers(self, loop: asyncio.AbstractEventLoop) -> None:
-        for fd in list(self._readers):
-            self._remove_reader(loop, fd)
+    async def _drain_tasks(self, conn: Any, conn_num: int) -> None:
+        """Take every queued task of *conn*.
+
+        The native layer signals the fd once and not again until the queue
+        has been seen empty, so this must keep going until it is.
+        """
+        poller = self.pollers[bool(conn.server_mode)]
+        while conn in self.connections:
+            task = poller(conn_num)
+            if task is None:
+                return
+            try:
+                await self._dispatch_task(conn, conn_num, task)
+            except Exception:
+                conn.logger.exception("Task dispatch failed")
+
+    async def _dispatch_task(self, conn: Any, conn_num: int, task: tuple) -> None:
+        (
+            uuid,
+            data,
+            flag,
+            serde,
+            transmitter,
+            _receiver,
+            func_name,
+            return_result,
+        ) = task
+        if flag == MessageFlag.EVENTS:
+            await self._dispatch_event(conn, json.loads(data))
+            return
+        task_item = (
+            uuid,
+            data,
+            serde,
+            transmitter,
+            func_name,
+            return_result,
+            conn_num,
+            bool(conn.server_mode),
+            conn.logger,
+        )
+        if self.workers == 1:
+            await self._run_task(*task_item)
+        else:
+            self.queue.put_nowait(task_item)
+
+    async def _handle_lifecycle_signal(
+        self, conn: Any, conn_num: int, reason: bytes
+    ) -> None:
+        """Async counterpart of ``_task_dispatcher._handle_lifecycle_signal``.
+
+        ``stop()`` awaits this dispatcher, so it runs as its own task.
+        """
+        from daffi.aio._rpc_proxy import AsyncResponseNotifier, AsyncRpcProxy
+
+        if reason == LifecycleSignal.INIT:
+            await asyncio.get_running_loop().run_in_executor(
+                None, AsyncRpcProxy._process_client_handshake, conn_num
+            )
+            conn._register_executors()
+            return
+
+        if reason == LifecycleSignal.NORMAL:
+            self._stop_in_background(conn)
+            return
+
+        evicted = reason == LifecycleSignal.EVICTED
+        if not evicted and isinstance(conn._connection_error, Evicted):
+            # The server closes an evicted connection; that close is not news.
+            return
+        err = connection_lost_error(evicted, conn.app_name)
+        AsyncResponseNotifier.signal_lifecycle_error(conn_num, err)
+        conn._connection_error = err
+        conn._disconnected = True
+
+        if conn._joining:
+            self._stop_in_background(conn)
+        else:
+            conn.logger.error(f"Error in connection {conn_num}: {err}")
+
+    def _stop_in_background(self, conn: Any) -> None:
+        task = asyncio.ensure_future(conn.stop())
+        self._stop_tasks.add(task)
+        task.add_done_callback(self._stop_tasks.discard)
 
     @staticmethod
     async def _dispatch_event(conn: Any, payload: dict) -> None:
         """Route an EVENTS payload to the connection's typed handlers.
 
-        Both sync and coroutine handlers are supported.
+        Both sync and coroutine handlers are supported; one failing handler
+        does not stop the others.
         """
         event_type: str = payload["type"]
         member: str = payload["member"]
@@ -499,6 +365,9 @@ class AsyncTaskDispatcher:
         else:
             return
         for handler in handlers:
-            result = handler(member)
-            if asyncio.iscoroutine(result):
-                await result
+            try:
+                result = handler(member)
+                if asyncio.iscoroutine(result):
+                    await result
+            except Exception:
+                conn.logger.exception(f"Event handler {handler!r} failed")

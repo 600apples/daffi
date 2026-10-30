@@ -5,15 +5,13 @@ Async RPC proxies and the :class:`AsyncClientConnection` handle returned by
 Design notes
 ------------
 ``AsyncResponseNotifier``
-    Replaces the sync :class:`~daffi._rpc_proxy.ResponseNotifier`.  A
-    permanent ``loop.add_reader`` callback signals an ``asyncio.Condition``
-    whenever Zig writes to the response fd.  Multiple concurrent
-    ``AsyncRpcResult`` waiters all subscribe to that condition — the same
-    fd, zero conflicts.
+    One per connection.  The native layer signals its fd whenever a
+    response is parked; a ``loop.add_reader`` callback then takes the parked
+    responses of the uuids being awaited and resolves their futures.  Only
+    those waiters wake.
 
 ``AsyncRpcResult``
-    Awaits the condition (with a liveness-check timeout cap) instead of
-    blocking in ``select.select``.
+    Awaits its future (with a liveness-check timeout cap).
 
 Proxy classes (``AsyncRpcProxy``, ``AsyncBroadcastProxy``, ``AsyncStreamProxy``,
 ``AsyncStreamNowaitProxy``)
@@ -38,8 +36,8 @@ if TYPE_CHECKING:
 from daffi._serialization import SerdeFormat, Serializer
 from daffi.exceptions import (
     CallTimeout,
+    Evicted,
     TransmissionFailure,
-    RemoteCallError,
     InitializationError,
 )
 from daffi.utils.misc import iterable
@@ -48,7 +46,7 @@ from daffi.registry._executor_registry import EXECUTOR_REGISTRY
 from daffi._bindings import (
     send_message_from_client,
     get_message_from_client_store,
-    mark_message_as_expired,
+    expire_message,
     set_service_methods,
     send_handshake_from_client,
     set_response_fd,
@@ -58,7 +56,9 @@ from daffi._bindings import (
 from daffi._rpc_proxy import (
     METADATA_SEPARATOR,
     system_exception_handler,
-    RpcResult,  # _unpack_response is reused as a classmethod
+    RpcResult,
+    connection_lost_error,
+    unpack_response,
 )
 
 # ---------------------------------------------------------------------------
@@ -67,15 +67,10 @@ from daffi._rpc_proxy import (
 
 
 class AsyncResponseNotifier:
-    """Per-connection async response notifier.
+    """Per-connection response router for asyncio waiters.
 
-    A single permanent ``loop.add_reader`` watches the native wakeup fd.
-    When Zig signals a new response, every waiting :class:`AsyncRpcResult`
-    is notified via its own ``asyncio.Event`` — one event per waiter, no
-    shared lock, no interaction issues with ``asyncio.wait_for``.
-
-    Class-level registry mirrors :class:`~daffi._rpc_proxy.ResponseNotifier`
-    so the rest of the code can switch between the two transparently.
+    Lives on the event loop: futures are created, resolved and dropped only
+    from the loop thread, so no lock is needed around them.
     """
 
     _instances: dict[int, "AsyncResponseNotifier"] = {}
@@ -84,85 +79,55 @@ class AsyncResponseNotifier:
     def __init__(self, conn_num: int, loop: asyncio.AbstractEventLoop) -> None:
         self._conn_num = conn_num
         self._wakeup = WakeupFd()
-        self._lifecycle_error: Optional[Exception] = None
         self._loop = loop
-        # Each active waiter registers its own Event here.
-        self._waiters: list[asyncio.Event] = []
-        self._waiters_lock = threading.Lock()
+        self._futures: dict[int, asyncio.Future] = {}
         set_response_fd(conn_num, self._wakeup.write_fd)
         loop.add_reader(self._wakeup.read_fd, self._on_readable)
 
-    # ------------------------------------------------------------------
-    # Internal notification pipeline
-    # ------------------------------------------------------------------
-
     def _on_readable(self) -> None:
-        """Called on the event-loop thread when the response fd fires."""
         self._wakeup.drain()
-        # Set every registered waiter event from the event-loop thread.
-        # asyncio.Event.set() is thread-safe when called from the same
-        # thread as the running loop (which is the case here, since
-        # add_reader callbacks run on the loop thread).
-        with self._waiters_lock:
-            for ev in self._waiters:
-                ev.set()
+        for uuid, fut in list(self._futures.items()):
+            if fut.done():
+                continue
+            res = get_message_from_client_store(uuid, self._conn_num)
+            if res is not None:
+                fut.set_result(res)
 
-    # ------------------------------------------------------------------
-    # Waiter API (used by AsyncRpcResult)
-    # ------------------------------------------------------------------
+    def expect(self, uuid: int) -> asyncio.Future:
+        """A future resolved with the native result tuple (or reason string,
+        or lifecycle error) for *uuid*."""
+        fut = self._loop.create_future()
+        self._futures[uuid] = fut
+        # The response may have been parked before this future existed.
+        res = get_message_from_client_store(uuid, self._conn_num)
+        if res is not None:
+            fut.set_result(res)
+        return fut
 
-    async def wait(self, timeout: Optional[float] = None) -> bool:
-        """Suspend until Zig signals a new response (or *timeout* elapses).
-
-        Each caller gets its own ``asyncio.Event`` that is set by
-        ``_on_readable`` — no shared lock, no ``asyncio.Condition``
-        interaction issues with ``asyncio.wait_for``.
-
-        Returns:
-            ``True`` if woken by a signal, ``False`` if *timeout* elapsed.
-        """
-        ev = asyncio.Event()
-        with self._waiters_lock:
-            self._waiters.append(ev)
-        signaled = False
-        try:
-            try:
-                await asyncio.wait_for(ev.wait(), timeout=timeout)
-                signaled = True
-            except (asyncio.TimeoutError, TimeoutError):
-                pass
-        finally:
-            with self._waiters_lock:
-                try:
-                    self._waiters.remove(ev)
-                except ValueError:
-                    pass
-        return signaled
-
-    # ------------------------------------------------------------------
-    # Class-level registry
-    # ------------------------------------------------------------------
+    def forget(self, uuid: int) -> None:
+        self._futures.pop(uuid, None)
 
     @classmethod
     def register(cls, conn_num: int) -> "AsyncResponseNotifier":
-        """Create and register a notifier, closing any stale one first."""
-        loop = asyncio.get_running_loop()
+        """Create and register a notifier.  A stale one for the same handle
+        is closed after the new fd is installed, so the native layer never
+        holds a closed descriptor."""
+        notifier = cls(conn_num, asyncio.get_running_loop())
         with cls._instances_lock:
             old = cls._instances.pop(conn_num, None)
-        if old is not None:
-            old.close()
-        notifier = cls(conn_num, loop)
-        with cls._instances_lock:
             cls._instances[conn_num] = notifier
+        if old is not None:
+            old._close()
         return notifier
 
     @classmethod
     def unregister(cls, conn_num: int) -> None:
-        """Close and forget the notifier for *conn_num*."""
+        """Withdraw the fd from the native layer, then close the notifier."""
         with cls._instances_lock:
             n = cls._instances.pop(conn_num, None)
         if n is not None:
-            n.close()
+            set_response_fd(conn_num, -1)
+            n._close()
 
     @classmethod
     def for_conn(cls, conn_num: int) -> Optional["AsyncResponseNotifier"]:
@@ -171,27 +136,21 @@ class AsyncResponseNotifier:
 
     @classmethod
     def signal_lifecycle_error(cls, conn_num: int, err: Exception) -> None:
-        """Wake all waiters with a lifecycle error (disconnect / eviction)."""
+        """Fail every pending waiter of *conn_num* with *err*."""
         with cls._instances_lock:
             n = cls._instances.get(conn_num)
         if n is None:
             return
-        n._lifecycle_error = err
-        # Wake every waiting AsyncRpcResult so it re-checks _lifecycle_error.
-        with n._waiters_lock:
-            for ev in n._waiters:
-                ev.set()
+        for fut in n._futures.values():
+            if not fut.done():
+                fut.set_result(err)
 
-    def close(self) -> None:
-        """Release the wakeup fd and remove the reader."""
+    def _close(self) -> None:
         try:
             self._loop.remove_reader(self._wakeup.read_fd)
         except Exception:
             pass
-        try:
-            self._wakeup.close()
-        except Exception:
-            pass
+        self._wakeup.close()
 
 
 # ---------------------------------------------------------------------------
@@ -200,14 +159,9 @@ class AsyncResponseNotifier:
 
 
 class AsyncRpcResult:
-    """Async counterpart of :class:`~daffi._rpc_proxy.RpcResult`.
-
-    ``await result.result()`` waits on :class:`AsyncResponseNotifier`'s
-    ``asyncio.Condition`` instead of blocking in ``select.select``.
-    """
+    """Async counterpart of :class:`~daffi._rpc_proxy.RpcResult`."""
 
     _LIVENESS_INTERVAL = RpcResult._LIVENESS_INTERVAL
-    _FALLBACK_POLL_INTERVAL = RpcResult._FALLBACK_POLL_INTERVAL
 
     def __init__(
         self,
@@ -217,6 +171,7 @@ class AsyncRpcResult:
         timeout: int,
         receivers: Optional[set] = None,
         proxy=None,
+        serde: Optional[int] = None,
     ) -> None:
         self.conn_num = conn_num
         self.uuid = uuid
@@ -224,89 +179,64 @@ class AsyncRpcResult:
         self.timeout = timeout
         self.receivers = receivers
         self.proxy = proxy
+        self.serde = serde
+        self._started = time.monotonic()
 
     async def result(self) -> Tuple[bytes, int, int]:
-        """Await the response and return ``(data, flag, serde)``."""
+        """Await the response and return ``(data, flag, serde)``.
+
+        Every exit other than a delivered response, cancellation included,
+        expires the uuid so a late response is dropped instead of parked.
+        """
         notifier = AsyncResponseNotifier.for_conn(self.conn_num)
-        deadline = (self.send_ts + self.timeout) if self.timeout > 0 else None
+        if notifier is None:
+            raise connection_lost_error(False)
+        fut = notifier.expect(self.uuid)
+        deadline = self._started + self.timeout if self.timeout > 0 else None
+        try:
+            while not fut.done():
+                wait = self._LIVENESS_INTERVAL if self.receivers else None
+                if deadline is not None:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise CallTimeout(
+                            call=str(self.proxy) if self.proxy else f"(uuid: {self.uuid})",
+                            timeout=self.timeout,
+                            elapsed=time.monotonic() - self._started,
+                            receivers=self.receivers or None,
+                        )
+                    wait = remaining if wait is None else min(wait, remaining)
+                if wait is None:
+                    await fut
+                else:
+                    await asyncio.wait((fut,), timeout=wait)
+                if not fut.done() and self.receivers:
+                    self._check_receivers()
+        except BaseException:
+            expire_message(self.uuid, self.conn_num)
+            raise
+        finally:
+            notifier.forget(self.uuid)
+        return self._outcome(fut.result())
 
-        while True:
-            # 1. Check message store first (response may already be there).
-            if res := get_message_from_client_store(self.uuid, self.conn_num):
-                return self._unpack_response(res)
+    def _outcome(self, res) -> Tuple[bytes, int, int]:
+        if isinstance(res, BaseException):
+            raise res
+        if isinstance(res, str):
+            app_name = self.proxy.conn.client.app_name if self.proxy else None
+            raise connection_lost_error(res == "evicted", app_name)
+        return unpack_response(res, self.serde)
 
-            # 2. Raise lifecycle error when there is nothing waiting in store.
-            if notifier is not None and (_err := notifier._lifecycle_error) is not None:
-                notifier._lifecycle_error = None
-                raise _err
-
-            # 3. Deadline check.
-            remaining = (deadline - time.time()) if deadline else None
-            if remaining is not None and remaining <= 0:
-                mark_message_as_expired(self.uuid, self.conn_num)
-                raise CallTimeout(
-                    call=str(self.proxy) if self.proxy else f"(uuid: {self.uuid})",
-                    timeout=self.timeout,
-                    elapsed=time.time() - self.send_ts,
-                    receivers=self.receivers or None,
-                )
-
-            # 4. Compute how long to wait this iteration.
-            if remaining is None:
-                wait_chunk = self._LIVENESS_INTERVAL if self.receivers else None
-            elif self.receivers:
-                wait_chunk = min(remaining, self._LIVENESS_INTERVAL)
-            else:
-                wait_chunk = remaining
-
-            # 5. Wait for a Zig signal or a timeout.
-            signaled = True
-            if notifier is not None:
-                signaled = await notifier.wait(timeout=wait_chunk)
-            else:
-                interval = (
-                    self._FALLBACK_POLL_INTERVAL
-                    if wait_chunk is None
-                    else min(wait_chunk, self._FALLBACK_POLL_INTERVAL)
-                )
-                await asyncio.sleep(interval)
-                signaled = False
-
-            # 6. After waking, loop back to step 1 to check the store.
-            # NOTE: Do NOT call get_message_from_client_store here — the
-            # native store is a destructive pop-on-read; a second call would
-            # consume the response before step 1 in the next iteration sees it.
-            #
-            # Liveness check: only when we timed out (not signaled) and we
-            # have a fixed receiver — detect a disconnected peer early.
-            if not signaled and self.receivers:
-                if missing := self.receivers - {
-                    m["name"] for m in get_available_members(self.conn_num)
-                }:
-                    raise TransmissionFailure(
-                        f"The anticipated receivers(s) {missing} unexpectedly"
-                        f" disconnected, causing an interruption in the awaiting"
-                        f" result of {self.proxy}."
-                        f" All receivers: {self.receivers}"
-                    )
-
-    @staticmethod
-    def _unpack_response(res: Tuple) -> Tuple[bytes, int, int]:
-        """Decode a native store tuple — mirrors :meth:`RpcResult._unpack_response`."""
-        if len(res) == 1:
-            raise RemoteCallError(f"Unexpected response: {res[0]}")
-        data, flag, serde = res
-        if flag == MessageFlag.ERROR:
-            (error_tuple,), _ = Serializer.deserialize(serde, data)
-            err_name, err_module, err_msg, tb = error_tuple
-            restored_exc = type(
-                err_name, (RemoteCallError,), {"__module__": err_module}
+    def _check_receivers(self) -> None:
+        if missing := self.receivers - {
+            m["name"] for m in get_available_members(self.conn_num)
+        }:
+            raise TransmissionFailure(
+                f"The anticipated receivers(s) {missing} unexpectedly"
+                f" disconnected, causing an interruption in the awaiting"
+                f" result of {self.proxy}."
+                f" All receivers: {self.receivers}"
             )
-            if tb:
-                raise restored_exc(err_msg).with_traceback(tb)
-            else:
-                raise restored_exc(err_msg)
-        return data, flag, serde
 
 
 # ---------------------------------------------------------------------------
@@ -442,6 +372,7 @@ class AsyncRpcProxy:
             timeout=self.timeout,
             receivers=found_receivers,
             proxy=self,
+            serde=self.serde,
         )
         data, flag, serde = await result.result()
         return Serializer.deserialize(serde, data)[0][0]
@@ -488,11 +419,8 @@ class AsyncRpcProxy:
         """Sync handshake — delegates to the sync ``RpcProxy`` implementation.
 
         Called via ``loop.run_in_executor`` so it does not block the event
-        loop.  The :class:`AsyncResponseNotifier` is already registered before
-        this runs, so the notifier's ``add_reader`` fires when Zig responds.
-        However, inside the executor thread the sync :class:`RpcResult` is
-        used (which polls via ``select.select``) — this is correct because
-        ``run_in_executor`` runs in a thread separate from the event loop.
+        loop.  The executor thread waits in the native layer, which hands it
+        the response directly.
         """
         from daffi._rpc_proxy import RpcProxy as _SyncRpcProxy
 
@@ -614,6 +542,7 @@ class AsyncBroadcastProxy:
                     ts=ts,
                     timeout=self.timeout,
                     receivers={receiver_name},
+                    serde=self.serde,
                 )
             else:
                 self.logger.warning(
@@ -775,6 +704,7 @@ class _AsyncBoundStreamBlocking(_AsyncBoundStream):
                 timeout=self._proxy.timeout,
                 receivers=self._proxy._receiver or None,
                 proxy=self._proxy,
+                serde=self._proxy.serde,
             ).result()
 
 
@@ -832,6 +762,9 @@ class AsyncClientConnection:
         client = self.client
         if not client._disconnected:
             return
+        if isinstance(client._connection_error, Evicted):
+            # Reconnecting would evict the connection that took the name.
+            raise client._connection_error
         client.logger.info(
             "Connection was lost in the background; attempting one reconnect..."
         )

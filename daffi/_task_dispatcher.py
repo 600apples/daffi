@@ -50,8 +50,8 @@ from daffi._bindings import (
     set_lifecycle_fd,
     MessageFlag,
 )
-from daffi.exceptions import Disconnected, Evicted
-from daffi._rpc_proxy import ResponseNotifier, RpcProxy
+from daffi.exceptions import Evicted
+from daffi._rpc_proxy import RpcProxy, connection_lost_error
 
 _tblib_installed = False
 try:
@@ -166,18 +166,10 @@ def _handle_lifecycle_signal(conn, conn_num: int, reason: bytes) -> None:
 
     ``LifecycleSignal.INIT`` re-runs the handshake and returns normally.
 
-    All disconnect variants (DISCONNECTED, EVICTED, NORMAL) wake in-flight
-    RPC waiters, store the error on *conn*, then either:
-
-    * **joining path** — call ``conn.stop()`` so ``join()`` unblocks.
-      ``stop_for_connection`` detects it is being called from the poller
-      thread and skips joining itself, avoiding a deadlock.
-    * **non-joining path** — log the error and return.  ``conn.stop()`` is
-      intentionally *not* called here: the user's thread may still be inside
-      a Zig RPC call, and calling ``dfcore.stopClient`` concurrently from the
-      poller would deadlock on the per-connection Zig lock.  The in-flight
-      waiter is already woken by ``signal_lifecycle_error``; the user's
-      ``finally`` block is responsible for calling ``client.stop()``.
+    A disconnect or eviction stores the error on *conn*; in-flight calls
+    already learnt it from the native wait.  When a thread is parked in
+    ``join()`` the connection is stopped so ``join()`` returns.  ``stop()``
+    joins the dispatcher, so it runs on its own thread, never here.
     """
     if reason == LifecycleSignal.INIT:
         RpcProxy._process_client_handshake(conn_num)
@@ -185,30 +177,44 @@ def _handle_lifecycle_signal(conn, conn_num: int, reason: bytes) -> None:
         return
 
     if reason == LifecycleSignal.NORMAL:
-        # Graceful server-side shutdown — mirror a user-initiated stop():
-        # tear down cleanly, unblock join() if waiting, surface no error.
-        conn.stop()
+        _stop_in_background(conn)
         return
 
-    if reason == LifecycleSignal.EVICTED:
-        err: Exception = Evicted(
-            f"This client (app_name={conn.app_name!r}) was evicted — "
-            "a new connection with the same app_name took over its slot."
-        )
-    else:  # DISCONNECTED or any unknown byte
-        err = Disconnected(
-            "Server disconnected unexpectedly.\n\n"
-            "  The router or service this client was connected to has stopped."
-        )
-
-    ResponseNotifier.signal_lifecycle_error(conn_num, err)
+    evicted = reason == LifecycleSignal.EVICTED
+    if not evicted and isinstance(conn._connection_error, Evicted):
+        # The server closes an evicted connection; that close is not news.
+        return
+    err = connection_lost_error(evicted, conn.app_name)
     conn._connection_error = err
     conn._disconnected = True
 
     if conn._joining:
-        conn.stop()
+        _stop_in_background(conn)
     else:
         conn.logger.error(f"Error in connection {conn_num}: {err}")
+
+
+def _stop_in_background(conn) -> None:
+    Thread(target=conn.stop, name="daffi-stop", daemon=True).start()
+
+
+def _error_result(serde: "SerdeFormat") -> "tuple[tuple, int, SerdeFormat]":
+    """Describe the exception being handled as an ERROR reply.
+
+    OPAQUE has no structure to carry it, so OPAQUE errors go out as JSON.
+    """
+    if serde == SerdeFormat.OPAQUE:
+        serde = SerdeFormat.JSON
+    err_type, err_obj, tb = sys.exc_info()
+    # Without tblib a traceback cannot be pickled.
+    include_tb = _tblib_installed and serde == SerdeFormat.PICKLE
+    result = (
+        err_type.__name__,
+        err_type.__module__,
+        str(err_obj),
+        tb if include_tb else None,
+    )
+    return result, MessageFlag.ERROR, serde
 
 
 def _invoke_callback(
@@ -220,39 +226,60 @@ def _invoke_callback(
 
     Returns:
         ``(result, flag, serde)`` where *flag* is ``MessageFlag.RESPONSE`` on
-        success or ``MessageFlag.ERROR`` on failure, and *serde* may have been
-        promoted from ``OPAQUE`` to ``PICKLE`` when an exception is raised
-        (error payloads must always be picklable).
+        success or ``MessageFlag.ERROR`` on failure (see :func:`_error_result`).
     """
-    import asyncio as _asyncio
-
-    cb = EXECUTOR_REGISTRY.get(func_name)
-    args, kwargs = Serializer.deserialize(serde, data)
     try:
-        if _asyncio.iscoroutinefunction(cb):
+        cb = EXECUTOR_REGISTRY.get(func_name)
+        if cb is None:
+            raise LookupError(f"Callback {func_name!r} is not registered.")
+        if cb.is_coroutine:
             raise TypeError(
                 f"Callback {func_name!r} is an async def coroutine and cannot be "
                 "used with the synchronous dispatcher. "
                 "Use daffi.aio (AsyncClient / AsyncService) instead."
             )
-        result = cb(*args, **kwargs)
-        return result, MessageFlag.RESPONSE, serde
+        args, kwargs = Serializer.deserialize(serde, data)
+        return cb(*args, **kwargs), MessageFlag.RESPONSE, serde
     except:  # noqa: E722
-        if serde == SerdeFormat.OPAQUE:
-            serde = SerdeFormat.PICKLE
-        err_type, err_obj, tb = sys.exc_info()
-        # Include the raw traceback only when tblib is installed; without it
-        # pickle.dumps(tb) raises PicklingError and would silently kill the
-        # worker thread, leaving the caller to time out instead of getting
-        # the remote error message.
-        include_tb = _tblib_installed and serde == SerdeFormat.PICKLE
-        result = (
-            err_type.__name__,
-            err_type.__module__,
-            str(err_obj),
-            tb if include_tb else None,
+        return _error_result(serde)
+
+
+def _encode_reply(result: Any, flag: int, serde: "SerdeFormat") -> tuple:
+    """``(data, is_bytes, flag, serde)`` for a reply.  A result that cannot
+    be serialised becomes a JSON error describing why."""
+    try:
+        data, is_bytes = Serializer.serialize(serde, result)
+        return data, is_bytes, flag, serde
+    except Exception:
+        error, flag, serde = _error_result(SerdeFormat.JSON)
+        data, is_bytes = Serializer.serialize(serde, error)
+        return data, is_bytes, flag, serde
+
+
+def _send_reply(
+    server_mode: bool,
+    conn_num: int,
+    uuid: int,
+    transmitter: str,
+    func_name: str,
+    outcome: tuple,
+    logger,
+) -> None:
+    data, is_bytes, flag, serde = _encode_reply(*outcome)
+    try:
+        _SENDERS[server_mode](
+            data=data,
+            flag=flag,
+            serde=serde,
+            receiver=transmitter,
+            func_name=func_name,
+            return_result=False,
+            conn_num=conn_num,
+            is_bytes=is_bytes,
+            uuid=uuid,
         )
-        return result, MessageFlag.ERROR, serde
+    except Exception as exc:
+        logger.warning(f"Could not send the result of {func_name!r} to {transmitter!r}: {exc}")
 
 
 def _execute_task(
@@ -269,20 +296,16 @@ def _execute_task(
     Called only for regular RPC tasks on the inline (workers=1) path.
     EVENTS dispatching and worker-pool routing are handled by the caller.
     """
-    result, flag, serde = _invoke_callback(func_name, serde, data)
-
+    outcome = _invoke_callback(func_name, serde, data)
     if return_result:
-        result, is_bytes = Serializer.serialize(serde, result)
-        _SENDERS[bool(conn.server_mode)](
-            data=result,
-            flag=flag,
-            serde=serde,
-            receiver=transmitter,
-            func_name=func_name,
-            return_result=False,
-            conn_num=conn._conn_num,
-            is_bytes=is_bytes,
-            uuid=uuid,
+        _send_reply(
+            bool(conn.server_mode),
+            conn._conn_num,
+            uuid,
+            transmitter,
+            func_name,
+            outcome,
+            conn.logger,
         )
 
 
@@ -355,7 +378,11 @@ class TaskDispatcher:
         self._pools[conn_num] = pool
 
     def _stop_connection_workers(self, conn_num) -> None:
-        """Stop the private pool for *conn_num*, if it has one."""
+        """Stop the private pool for *conn_num*, if it has one.
+
+        A callback that stops its own connection runs on one of these
+        threads; that one is not joined.
+        """
         pool = self._pools.get(conn_num)
         if pool is None:
             return
@@ -367,8 +394,10 @@ class TaskDispatcher:
                     pool.queue.put_nowait(None)
                 except Exception:
                     pass
+        current = threading.current_thread()
         for thread in pool.threads:
-            thread.join(timeout=3)
+            if thread is not current:
+                thread.join(timeout=3)
 
     def stop_for_connection(self, connection) -> None:
         """Deregister *connection* and, if no connections remain, stop all workers.
@@ -379,36 +408,29 @@ class TaskDispatcher:
         (the fd number may be reused, causing select to report activity on the
         wrong resource, or a SIGSEGV from kqueue's internal state).
 
-        The poller blocks indefinitely on ``DefaultSelector.select(timeout=None)``.
-        It is woken by writing ``LifecycleSignal.STOP`` to the connection's
-        lifecycle fd — every connection always has one (created in
-        :meth:`start_for_connection`).
+        The poller blocks indefinitely on ``DefaultSelector.select(timeout=None)``
+        and is woken through the dispatcher's control pipe.
         """
-        self.connections.discard(connection)
         conn_num = getattr(connection, "_conn_num", None)
         # This connection's callback threads stop with it. Other connections
         # keep theirs. The poller stays up while anyone is left.
         if conn_num is not None:
             self._stop_connection_workers(conn_num)
-        if not self.connections:
-            # 1. flip stop_event so the loop exits after the next wakeup.
-            # 2. write b"s" to the lifecycle fd to unblock select (skip when
-            #    called from the poller thread itself to avoid a deadlock —
-            #    the poller will exit naturally because stop_event is set).
-            # 3. join workers and poller (skip poller join when inside it).
-            # 4. close fds (safe — poller has fully exited or will exit).
-            # The snapshot is taken under the same lock that starts a new
-            # poller, so a later client restarts a fresh thread instead of
-            # this join waiting on that new thread.
-            with self._poller_lock:
+        # Deciding to stop and adding a connection share one lock, so a
+        # connection added meanwhile either keeps this poller or starts a
+        # new one; it is never left with a poller that is exiting.
+        with self._poller_lock:
+            self.connections.discard(connection)
+            last = not self.connections
+            if last:
                 self.stop_event.set()
                 poller = self._poller
                 in_poller = threading.current_thread() is poller
-            if not in_poller:
-                entry = self._conns.get(conn_num)
-                if entry is not None:
-                    entry.lifecycle.write(LifecycleSignal.STOP)
+        if last:
+            # Wake the poller so it sees stop_event, then wait for it to exit
+            # (not from the poller itself), and only then close its fds.
             if poller is not None and not in_poller:
+                self._control.signal()
                 poller.join()
         # Wakeup first, then lifecycle. While the poller is still running it
         # unregisters the fd and only then is the fd closed.
@@ -461,14 +483,16 @@ class TaskDispatcher:
     def _deregister_fds(self, conn_num) -> None:
         """Close the wakeup fd for *conn_num* and remove it from the reverse map.
 
-        Safe to call at any time (including from the poller thread during
-        reconnect).  The lifecycle fd is intentionally left open here — it is
-        closed by :meth:`_close_lifecycle` only after the poller has exited.
+        The native layer gives the fd up first, so it never writes to a
+        closed (or reused) descriptor.  The lifecycle fd is left open here —
+        it is closed by :meth:`_close_lifecycle` only after the poller has
+        exited.
         """
         if conn_num is None:
             return
         entry = self._conns.get(conn_num)
         if entry is not None:
+            set_request_fd(conn_num, -1, server_mode=bool(entry.conn.server_mode))
             fd = entry.wakeup.read_fd
             self._rfd_to_conn_num.pop(fd, None)
             self._retire(fd, entry.wakeup.close)
@@ -481,6 +505,8 @@ class TaskDispatcher:
         """
         entry = self._conns.pop(conn_num, None)
         if entry is not None:
+            if entry.conn.server_mode is None:
+                set_lifecycle_fd(conn_num, -1)
             fd = entry.lifecycle.read_fd
             self._rfd_to_conn_num.pop(fd, None)
             self._retire(fd, entry.lifecycle.close)
@@ -493,20 +519,22 @@ class TaskDispatcher:
         """
         assert connection._conn_num is not None
         self._start_connection_workers(connection)
-        self.connections.add(connection)
 
         conn_num: int = connection._conn_num
 
         wakeup = WakeupFd()
         # Lifecycle fd is always a pipe so reason bytes survive the round-trip.
-        # Service connections use it only for b"s" (STOP); Client connections
-        # also have the write-end handed to the native layer so Zig can write
-        # LifecycleSignal bytes directly into the poller's fd set.
+        # Only Client connections hand the write end to the native layer.
         lc = WakeupFd(pipe=True)
 
         self._conns[conn_num] = _ConnEntry(conn=connection, wakeup=wakeup, lifecycle=lc)
         self._rfd_to_conn_num[wakeup.read_fd] = conn_num
         self._rfd_to_conn_num[lc.read_fd] = conn_num
+
+        # The connection is registered before the native layer gets the fd:
+        # a wakeup for a connection the poller does not know yet would be
+        # drained and lost, and the queue signals only once.
+        self._admit(connection)
 
         set_request_fd(
             conn_num, wakeup.write_fd, server_mode=bool(connection.server_mode)
@@ -517,9 +545,16 @@ class TaskDispatcher:
         # new fds are registered before the next wait.
         self._control.signal()
 
+    def _admit(self, connection) -> None:
+        """Add *connection* and make sure a poller is running for it."""
         with self._poller_lock:
-            # The previous generation is joined before stop_for_connection
-            # returns, so a dead poller here has already closed its selector.
+            self.connections.add(connection)
+            poller = self._poller
+            if poller is not None and poller.is_alive() and self.stop_event.is_set():
+                # The last connection is stopping this poller; let it finish.
+                if poller is not threading.current_thread():
+                    self._control.signal()
+                    poller.join()
             if self._poller is None or not self._poller.is_alive():
                 self.stop_event.clear()
                 self._poller = Thread(
@@ -567,9 +602,8 @@ class TaskDispatcher:
         the selector is discarded and the next iteration registers whatever
         is still in the map.
 
-        Shutdown is signalled by writing ``LifecycleSignal.STOP`` to the
-        connection's lifecycle fd, which causes the selector to return; the
-        loop then checks ``stop_event.is_set()``.
+        Shutdown sets ``stop_event`` and signals the control pipe, which makes
+        the selector return; the loop then sees ``stop_event``.
         """
         try:
             self._poll_loop()
@@ -601,7 +635,6 @@ class TaskDispatcher:
                 readable.discard(self._control.read_fd)
 
             # --- Dispatch all readable fds in one pass ---
-            lifecycle_stop = False
             notified: set = set()
             for rfd in readable:
                 conn_num = self._rfd_to_conn_num.get(rfd)
@@ -612,69 +645,82 @@ class TaskDispatcher:
                     continue
                 if rfd == entry.lifecycle.read_fd:
                     reason = entry.lifecycle.read(1)
-                    if not reason or reason == LifecycleSignal.STOP:
-                        lifecycle_stop = True
-                        break
-                    _handle_lifecycle_signal(entry.conn, conn_num, reason)
+                    if not reason:
+                        continue
+                    try:
+                        _handle_lifecycle_signal(entry.conn, conn_num, reason)
+                    except Exception:
+                        entry.conn.logger.exception("Lifecycle handling failed")
                 elif rfd == entry.wakeup.read_fd:
                     entry.wakeup.drain()
                     notified.add(entry.conn)
-            if lifecycle_stop:
-                break
 
-            for conn in list(self.connections):
-                if conn not in notified:
-                    continue
+            for conn in notified:
+                if conn in self.connections:
+                    self._drain_tasks(conn)
 
-                poller = self.pollers[bool(conn.server_mode)]
-                while not self.stop_event.is_set():
-                    task = poller(conn._conn_num)
-                    if task is None:
-                        break
-                    (
-                        uuid,
-                        data,
-                        flag,
-                        serde,
-                        transmitter,
-                        receiver,
-                        func_name,
-                        return_result,
-                    ) = task
+    def _drain_tasks(self, conn) -> None:
+        """Take every queued task of *conn*.
 
-                    if flag == MessageFlag.EVENTS:
-                        self._dispatch_event(conn, json.loads(data))
-                        continue
-                    pool = self._pools.get(conn._conn_num)
-                    if pool is None:
-                        # No private pool means this connection runs inline.
-                        # A pool that was just removed belongs to a connection
-                        # that is stopping; leave that callback alone.
-                        if _pool_size(conn) == 1 and conn in self.connections:
-                            _execute_task(
-                                uuid,
-                                data,
-                                serde,
-                                transmitter,
-                                func_name,
-                                return_result,
-                                conn,
-                            )
-                        continue
-                    task_item = (
-                        uuid,
-                        data,
-                        flag,
-                        serde,
-                        transmitter,
-                        func_name,
-                        return_result,
-                        conn._conn_num,
-                        bool(conn.server_mode),
-                    )
-                    with pool.lock:
-                        if not pool.closed:
-                            pool.queue.put(task_item)
+        The native layer signals the fd once and not again until the queue
+        has been seen empty, so this must keep going until it is: one failing
+        task is logged and the rest still run.
+        """
+        poller = self.pollers[bool(conn.server_mode)]
+        while not self.stop_event.is_set():
+            task = poller(conn._conn_num)
+            if task is None:
+                return
+            try:
+                self._dispatch_task(conn, task)
+            except Exception:
+                conn.logger.exception("Task dispatch failed")
+
+    def _dispatch_task(self, conn, task: tuple) -> None:
+        (
+            uuid,
+            data,
+            flag,
+            serde,
+            transmitter,
+            receiver,
+            func_name,
+            return_result,
+        ) = task
+
+        if flag == MessageFlag.EVENTS:
+            self._dispatch_event(conn, json.loads(data))
+            return
+        pool = self._pools.get(conn._conn_num)
+        if pool is None:
+            # No private pool means this connection runs inline.
+            # A pool that was just removed belongs to a connection
+            # that is stopping; leave that callback alone.
+            if _pool_size(conn) == 1 and conn in self.connections:
+                _execute_task(
+                    uuid,
+                    data,
+                    serde,
+                    transmitter,
+                    func_name,
+                    return_result,
+                    conn,
+                )
+            return
+        task_item = (
+            uuid,
+            data,
+            serde,
+            transmitter,
+            func_name,
+            return_result,
+            conn._conn_num,
+            bool(conn.server_mode),
+            conn.logger,
+        )
+        with pool.lock:
+            if not pool.closed:
+                pool.queue.put(task_item)
 
     def _sync_selector(self) -> bool:
         """Make the long-lived selector match ``_rfd_to_conn_num``.
@@ -731,11 +777,16 @@ class TaskDispatcher:
         member: str = payload["member"]
 
         if event_type == EventType.CONNECTED:
-            for handler in conn._on_member_added_handlers:
-                handler(member)
+            handlers = conn._on_member_added_handlers
         elif event_type == EventType.DISCONNECTED:
-            for handler in conn._on_member_removed_handlers:
+            handlers = conn._on_member_removed_handlers
+        else:
+            return
+        for handler in handlers:
+            try:
                 handler(member)
+            except Exception:
+                conn.logger.exception(f"{event_type} handler {handler!r} failed")
 
     def _worker_loop(self, queue: Queue) -> None:
         """Thread-pool worker body for one connection.
@@ -749,29 +800,14 @@ class TaskDispatcher:
             (
                 uuid,
                 data,
-                flag,
                 serde,
                 transmitter,
                 func_name,
                 return_result,
                 conn_num,
-                server_mode_bool,
+                server_mode,
+                logger,
             ) = task
-
-            result, flag, serde = _invoke_callback(func_name, serde, data)
-
-            if not return_result:
-                continue
-
-            result_bytes, is_bytes = Serializer.serialize(serde, result)
-            _SENDERS[server_mode_bool](
-                data=result_bytes,
-                flag=flag,
-                serde=serde,
-                receiver=transmitter,
-                func_name=func_name,
-                return_result=False,
-                conn_num=conn_num,
-                is_bytes=is_bytes,
-                uuid=uuid,
-            )
+            outcome = _invoke_callback(func_name, serde, data)
+            if return_result:
+                _send_reply(server_mode, conn_num, uuid, transmitter, func_name, outcome, logger)

@@ -153,7 +153,7 @@ def router_thread(free_port):
         daemon=True,
     )
     wproc.start()
-    time.sleep(0.4)
+    wait_for_members(free_port, {"worker-thread"}, timeout=15.0, probe_name="tw-router-probe")
     yield free_port
     quiet_kill(wproc)
     quiet_kill(rproc)

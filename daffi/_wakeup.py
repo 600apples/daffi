@@ -3,8 +3,8 @@ Notification channel shared across the Python <-> Zig boundary.
 
 Zig writes to :attr:`WakeupFd.write_fd` to signal that some new state is
 available (a task on the task queue, a response in the message store, a
-disconnect, ...).  Python blocks on :attr:`WakeupFd.read_fd` via
-``select.select`` and consumes the notification with :meth:`drain`.
+disconnect, ...).  Python watches :attr:`WakeupFd.read_fd` with a selector
+or the asyncio loop and consumes the notification with :meth:`drain`.
 
 On Linux the underlying primitive is an ``os.eventfd`` (single fd, counter
 semantics) **unless** *pipe=True* is passed.  On macOS / BSD and whenever
@@ -84,10 +84,6 @@ class LifecycleSignal(bytes, Enum):
         if signal == LifecycleSignal.EVICTED:
             ...
 
-    ``STOP`` is never written by Zig — it is written by Python's
-    :meth:`stop` to signal the poller thread for a clean, user-initiated
-    shutdown.
-
     ``NORMAL`` signals a graceful server-side disconnect (planned shutdown).
     ``INIT``   signals that the client should re-run its init/handshake
                sequence without tearing down the connection.
@@ -97,7 +93,6 @@ class LifecycleSignal(bytes, Enum):
     EVICTED = b"e"
     NORMAL = b"n"
     INIT = b"i"
-    STOP = b"s"
 
 
 class WakeupFd:
@@ -216,11 +211,15 @@ class WakeupFd:
             note_descriptors(-1)
 
     def close(self) -> None:
-        """Release both ends of the channel."""
-        try:
-            os.close(self.read_fd)
-        except OSError:
-            pass
+        """Release both ends of the channel.  Idempotent."""
+        if self.read_fd >= 0:
+            try:
+                os.close(self.read_fd)
+            except OSError:
+                pass
+            self.read_fd = -1
+            if self._is_eventfd:
+                self.write_fd = -1
         if not self._is_eventfd and self.write_fd >= 0:
             try:
                 os.close(self.write_fd)

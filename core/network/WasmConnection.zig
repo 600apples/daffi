@@ -38,7 +38,7 @@ pub fn destroy(ctx: *anyopaque) void {
 /// Stub SynParser so that connection.zig can reference WebConnection.SynParser
 /// on wasm targets (where WebConnection is aliased to WasmConnection).
 pub const SynParser = struct {
-    pub fn init(_: std.mem.Allocator) !@This() {
+    pub fn init(_: std.mem.Allocator, _: i64) @This() {
         return .{};
     }
     pub fn deinit(_: *@This()) void {}

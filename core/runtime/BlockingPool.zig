@@ -3,8 +3,9 @@
 //! probe of a fresh connection, WebSocket sessions).
 //!
 //! A job never waits behind another one: when no worker is idle a new one is
-//! started.  Idle workers exit after `idle_timeout_ms`, so the pool shrinks
-//! back once a burst is over.
+//! started, up to `max_workers`; beyond that `spawn` fails and the caller
+//! drops the work.  Idle workers exit after `idle_timeout_ms`, so the pool
+//! shrinks back once a burst is over.
 
 const std = @import("std");
 const misc = @import("../misc.zig");
@@ -14,6 +15,9 @@ const log = std.log.scoped(.blocking_pool);
 const allocator = std.heap.c_allocator;
 
 const idle_timeout_ms: u32 = 10_000;
+/// Bounds the threads a flood of slow handshakes or WebSocket sessions can
+/// pin (each reserves `misc.thread_stack_size` of address space).
+pub const max_workers: usize = 1024;
 
 const Job = struct {
     run: *const fn (job: *Job) void,
@@ -27,6 +31,7 @@ tail: ?*Job = null,
 queued: usize = 0,
 /// Workers waiting for a job, including ones started but not yet running.
 idle: usize = 0,
+workers: usize = 0,
 
 /// Run `func(args...)` on a pool thread.
 pub fn spawn(self: *BlockingPool, comptime func: anytype, args: std.meta.ArgsTuple(@TypeOf(func))) !void {
@@ -50,9 +55,11 @@ pub fn spawn(self: *BlockingPool, comptime func: anytype, args: std.meta.ArgsTup
     defer self.mutex.unlock();
     // Every queued job has an idle worker reserved for it.
     if (self.queued >= self.idle) {
-        const thread = try std.Thread.spawn(.{}, worker, .{self});
+        if (self.workers >= max_workers) return error.BlockingPoolExhausted;
+        const thread = try std.Thread.spawn(.{ .stack_size = misc.thread_stack_size }, worker, .{self});
         thread.detach();
         self.idle += 1;
+        self.workers += 1;
     }
     if (self.tail) |t| t.next = &closure.job else self.head = &closure.job;
     self.tail = &closure.job;
@@ -66,6 +73,7 @@ fn worker(self: *BlockingPool) void {
         while (self.head == null) {
             if (!self.cond.timedWait(&self.mutex, idle_timeout_ms) and self.head == null) {
                 self.idle -= 1;
+                self.workers -= 1;
                 self.mutex.unlock();
                 return;
             }

@@ -33,11 +33,8 @@ from daffi.app import (
     ServerMode,
     SingleTransportMixin,
 )
-from daffi.exceptions import InitializationError
-from daffi._bindings import set_lifecycle_fd, set_response_fd
-from daffi._rpc_proxy import RpcProxy, system_exception_handler
-from daffi._signals import set_signal_handler
-from daffi._task_dispatcher import TaskDispatcher
+from daffi.exceptions import Evicted, InitializationError
+from daffi._rpc_proxy import RpcProxy
 from daffi.transports import TCPTransport, UnixTransport
 
 from daffi.aio._rpc_proxy import (
@@ -66,21 +63,24 @@ class AsyncApplication(Application):
         self._stop_event: asyncio.Event = asyncio.Event()
         self._stop_lock: asyncio.Lock = asyncio.Lock()
         self._reconnect_lock: asyncio.Lock = asyncio.Lock()
-        # Application.__init__ registered `self.stop` (the sync method) via
-        # atexit/signal.  Remove it and replace with a sync wrapper that
-        # safely schedules stop() on the event loop.
-        import atexit as _atexit
+        # The loop that started this application; signals schedule stop() on it.
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._stop_tasks: set[asyncio.Task] = set()
 
-        _atexit.unregister(self.stop)
-        set_signal_handler(self._sync_signal_stop)
-
-    def _sync_signal_stop(self, *_args, **_kwargs) -> None:
-        """Sync signal handler — schedules ``stop()`` on the event loop."""
+    def _signal_stop(self) -> None:
+        """Schedule ``stop()`` on the application's loop, from any thread."""
+        loop = self._loop
+        if loop is None or loop.is_closed():
+            return
         try:
-            loop = asyncio.get_running_loop()
-            loop.create_task(self.stop())
+            loop.call_soon_threadsafe(self._schedule_stop)
         except RuntimeError:
             pass
+
+    def _schedule_stop(self) -> None:
+        task = asyncio.ensure_future(self.stop())
+        self._stop_tasks.add(task)
+        task.add_done_callback(self._stop_tasks.discard)
 
     async def join(self) -> None:
         """Block until :meth:`stop` is called or a signal fires."""
@@ -113,6 +113,7 @@ class AsyncServerMixin:
         """
         if self._conn_num is not None:
             raise RuntimeError(f"{self.__class__.__name__} is already started")
+        self._loop = asyncio.get_running_loop()
         try:
             if self.server_mode == ServerMode.SERVICE:
                 if not self._task_dispatcher:
@@ -158,8 +159,11 @@ class AsyncServerMixin:
                 if self._task_dispatcher:
                     await self._task_dispatcher.stop_for_connection(self)
                 if conn_num is not None:
-                    dfcore.stopServer(conn_num)
                     self._conn_num = None
+                    # Waits for every connection to drain; keep the loop running.
+                    await asyncio.get_running_loop().run_in_executor(
+                        None, dfcore.stopServer, conn_num
+                    )
             finally:
                 self._stop_event.set()
 
@@ -242,6 +246,7 @@ class AsyncClient(AsyncApplication[SingleTransportMixin]):
         """
         if self._conn_num is not None:
             raise RuntimeError("Client is already connected")
+        self._loop = asyncio.get_running_loop()
         await self._do_connect()
         return AsyncClientConnection(self)
 
@@ -279,22 +284,23 @@ class AsyncClient(AsyncApplication[SingleTransportMixin]):
         """
         self._unregister_executor_subscriber()
         async with self._stop_lock:
-            if self._conn_num is not None:
-                try:
-                    set_lifecycle_fd(self._conn_num, -1)
-                except Exception:
-                    pass
-                try:
-                    set_response_fd(self._conn_num, -1)
-                except Exception:
-                    pass
-            if self._task_dispatcher:
-                await self._task_dispatcher.stop_for_connection(self)
-            if self._conn_num is not None:
-                AsyncResponseNotifier.unregister(self._conn_num)
-                dfcore.stopClient(self._conn_num)
-                self._conn_num = None
+            await self._release_connection()
             self._stop_event.set()
+
+    async def _release_connection(self) -> None:
+        """Detach from the dispatcher and free the native connection.
+
+        Callers hold ``_stop_lock``.
+        """
+        if self._task_dispatcher:
+            await self._task_dispatcher.stop_for_connection(self)
+        if self._conn_num is not None:
+            AsyncResponseNotifier.unregister(self._conn_num)
+            conn_num, self._conn_num = self._conn_num, None
+            # Joins the native receiver thread; keep the loop running.
+            await asyncio.get_running_loop().run_in_executor(
+                None, dfcore.stopClient, conn_num
+            )
 
     # ------------------------------------------------------------------
     # Internal connect / reconnect
@@ -327,16 +333,11 @@ class AsyncClient(AsyncApplication[SingleTransportMixin]):
                 f"Failed to connect to the server. connection info: {self.info}"
             )
 
-        # Register the async notifier BEFORE the handshake so the handshake's
-        # own RpcResult benefits from event-driven wakeups.
         AsyncResponseNotifier.register(self._conn_num)
 
         try:
-            # The handshake uses the sync RpcResult internally but runs in a
-            # thread-pool executor so it does not block the event loop.
-            # AsyncResponseNotifier's add_reader fires when Zig sends the
-            # handshake response — the executor thread sees it via its own
-            # select.select on the same fd.
+            # The handshake waits in the native layer; an executor thread
+            # keeps that wait off the event loop.
             loop = asyncio.get_running_loop()
             handshake = await loop.run_in_executor(
                 None, AsyncRpcProxy._process_client_handshake, self._conn_num
@@ -356,12 +357,6 @@ class AsyncClient(AsyncApplication[SingleTransportMixin]):
         self.logger.debug(
             f"has been connected successfully. connection info: {self.info}"
         )
-        # The sync handshake (run in executor) creates its own ResponseNotifier
-        # which calls set_response_fd(), overwriting ours.  Re-point the native
-        # layer at our async notifier's fd so RPC responses wake the event loop.
-        notifier = AsyncResponseNotifier.for_conn(self._conn_num)
-        if notifier is not None:
-            set_response_fd(self._conn_num, notifier._wakeup.write_fd)
         self._task_dispatcher.start_for_connection(self)
         self._register_executors()
 
@@ -374,7 +369,12 @@ class AsyncClient(AsyncApplication[SingleTransportMixin]):
         async with self._reconnect_lock:
             if not self._disconnected:
                 return self._conn_num is not None
+            if isinstance(self._connection_error, Evicted):
+                # The name now belongs to a newer connection.
+                return False
             try:
+                async with self._stop_lock:
+                    await self._release_connection()
                 self._stop_event.clear()
                 self._connection_error = None
                 self._disconnected = False

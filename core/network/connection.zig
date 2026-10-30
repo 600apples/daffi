@@ -85,6 +85,7 @@ pub const AcceptedConnection = struct {
 };
 
 pub const OperationTable = struct {
+    /// Block until some bytes arrive; 0 means end-of-stream.
     read: *const fn (ctx: *anyopaque, buf: []u8) anyerror!usize,
     /// Non-blocking read of whatever is available: 0 means end-of-stream,
     /// `error.WouldBlock` that nothing is pending yet (evented model).
@@ -159,10 +160,30 @@ pub fn Connection(comptime contype: ConnectionType) type {
         }
 
         pub fn write(self: *Self, data: []const u8) anyerror!void {
-            comptime if (is_wasm or contype != .ClientConnectionType) @compileError("write() not available for this connection type");
             self.wlock.lock();
             defer self.wlock.unlock();
-            try self.op_table.write(self.ctx, data);
+            try self.writeHeld(data);
+        }
+
+        /// Hold the write side: writes from other threads wait until
+        /// `unlockWrites`.
+        pub fn lockWrites(self: *Self) void {
+            self.wlock.lock();
+        }
+
+        pub fn unlockWrites(self: *Self) void {
+            self.wlock.unlock();
+        }
+
+        /// `write` for a caller that holds `lockWrites`.  A failed write may
+        /// have sent part of a frame and the stream cannot be resynchronised,
+        /// so the connection is closed.
+        pub fn writeHeld(self: *Self, data: []const u8) anyerror!void {
+            comptime if (is_wasm or contype != .ClientConnectionType) @compileError("write() not available for this connection type");
+            self.op_table.write(self.ctx, data) catch |err| {
+                self.close();
+                return err;
+            };
         }
 
         /// Increment the reference count.  Call before releasing a lock that
@@ -211,10 +232,14 @@ pub fn Connection(comptime contype: ConnectionType) type {
             var fd_owned = false;
             errdefer if (!fd_owned) stream.close();
 
-            // Bound the blocking probe/handshake reads and writes.
+            // macOS hands out accepted sockets with the listener's O_NONBLOCK.
+            posix_net.setBlocking(conn.fd);
+            // Each read and write is bounded, and so is the whole upgrade: a
+            // peer trickling one byte at a time cannot hold this thread.
             stream.setIoTimeout(tls_impl.HANDSHAKE_TIMEOUT_MS);
+            const deadline = @import("../misc.zig").monotonicMs() + tls_impl.HANDSHAKE_TIMEOUT_MS;
 
-            var sync_parser = try SynParser.init(self.allocator);
+            var sync_parser = SynParser.init(self.allocator, deadline);
             defer sync_parser.deinit();
             const pnet_addr = posix_net.Address{};
 
@@ -226,7 +251,7 @@ pub fn Connection(comptime contype: ConnectionType) type {
                 // 1. Complete the TLS handshake to get a per-connection ssl object.
                 //    The SSL_CTX belongs to the ServerConnection and must not be freed here.
                 const ssl_ctx: *tls_impl.SslCtx = @ptrCast(@alignCast(conn.ssl_ctx.?));
-                const ssl = try tls_impl.serverHandshake(ssl_ctx, @intCast(conn.fd));
+                const ssl = try tls_impl.serverHandshake(ssl_ctx, @intCast(conn.fd), deadline);
                 var ssl_owned = false;
                 errdefer if (!ssl_owned) tls_impl.sslClose(ssl, false);
 
@@ -247,7 +272,8 @@ pub fn Connection(comptime contype: ConnectionType) type {
             } else {
                 // Non-TLS path: SYN bytes distinguish WebSocket (browser) from plain TCP.
                 is_websocket = try sync_parser.tryWebSocket(stream);
-                stream.setIoTimeout(0);
+                stream.setReadTimeout(0);
+                stream.setWriteTimeout(posix_net.SEND_STALL_TIMEOUT_MS);
                 if (is_websocket) {
                     ctx = try WebConnection.init(self.allocator, stream, pnet_addr, .{});
                     table = WebConnection.op_table;

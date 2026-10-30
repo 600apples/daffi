@@ -187,19 +187,29 @@ const client_methods = [_]PyMethodDef{
         .ml_meth  = cffi.getMessageFromClientStore,
         .ml_flags = 1,
         .ml_doc   =
-            \\getMessageFromClientStore(uuid, conn_num) -> (data, flag, serde) | None
+            \\getMessageFromClientStore(uuid, conn_num) -> (data, flag, serde) | None | "disconnected"
             \\
-            \\Poll the client message store for a response to uuid.
+            \\Take the response to uuid if it already arrived.
         ,
     },
     .{
-        .ml_name  = "setTimeoutError",
-        .ml_meth  = cffi.setTimeoutError,
+        .ml_name  = "waitMessageFromClientStore",
+        .ml_meth  = cffi.waitMessageFromClientStore,
         .ml_flags = 1,
         .ml_doc   =
-            \\setTimeoutError(uuid, conn_num)
+            \\waitMessageFromClientStore(uuid, timeout_ms, conn_num) -> (data, flag, serde) | None | "disconnected" | "evicted"
             \\
-            \\Mark a pending message as timed-out so its slot can be reclaimed.
+            \\Wait without the GIL for the response to uuid.  None means timeout.
+        ,
+    },
+    .{
+        .ml_name  = "expireMessage",
+        .ml_meth  = cffi.expireMessage,
+        .ml_flags = 1,
+        .ml_doc   =
+            \\expireMessage(uuid, conn_num)
+            \\
+            \\Stop waiting for uuid; a response that arrives later is dropped.
         ,
     },
     .{

@@ -20,26 +20,6 @@ const print = std.debug.print;
 /// lazily by the OS, so resident memory still follows the bytes received.
 const INITIAL_RECV_CHUNK: usize = 64 * 1024;
 
-pub const StreamReadError = error{
-    IncompleteMessage,
-    EOF,
-};
-
-/// Read exactly buf.len bytes from reader, looping over partial reads.
-/// A single read() syscall on a TCP socket may return fewer bytes than
-/// requested even on localhost at high message rates.  The original
-/// single-read implementation would leave the tail of buf uninitialised,
-/// causing Header.fromBytes() to parse garbage and eventually leading to
-/// an enormous alloc() → OutOfMemory → ConnectionLost chain.
-fn mustRead(reader: anytype, buf: []u8) !void {
-    var total: usize = 0;
-    while (total < buf.len) {
-        const n = try reader.read(buf[total..]);
-        if (n == 0) return StreamReadError.EOF;
-        total += n;
-    }
-}
-
 pub const MessagePool = struct {
     allocator: Allocator,
     // web_connection: ?*WebConnection,
@@ -114,33 +94,6 @@ pub const MessagePool = struct {
         _ = try writer.write(&fulfillment);
     }
 
-    /// Receive one framed message from `reader`.
-    ///
-    /// The header comes from an untrusted peer, so it is validated before it is
-    /// used (`Header.parse`), and the payload buffer is only sized from the
-    /// claimed `msg_len` once the first `INITIAL_RECV_CHUNK` bytes have arrived.
-    /// Otherwise any peer that can reach the port could make us reserve up to
-    /// 32 MiB per connection just by sending a 9-byte header.
-    pub fn receiveMessage(self: *Self, reader: anytype) !*Message {
-        var header_buf: [serde.HEADER_SIZE]u8 = undefined;
-        try mustRead(reader, &header_buf);
-        const header = try Header.parse(&header_buf);
-        const total: usize = @as(usize, serde.HEADER_SIZE) + header.msg_len;
-
-        var buf = try self.allocator.alloc(u8, @min(total, INITIAL_RECV_CHUNK));
-        errdefer self.allocator.free(buf);
-        @memcpy(buf[0..header_buf.len], &header_buf);
-        var filled: usize = header_buf.len;
-        while (filled < total) {
-            if (filled == buf.len) {
-                buf = try self.allocator.realloc(buf, total);
-            }
-            try mustRead(reader, buf[filled..]);
-            filled = buf.len;
-        }
-        return try Message.create(self.allocator, header, buf);
-    }
-
     pub fn receiveWsMessage(self: *Self, reader: anytype) !?*Message {
         const data = (try reader.readNoBuffer()) orelse return null;
         return try self.buildWsMessage(data);
@@ -155,10 +108,11 @@ pub const MessagePool = struct {
     }
 };
 
-/// Push-based counterpart of `MessagePool.receiveMessage` for the evented
-/// model: bytes are fed as they arrive and complete messages come out.  Same
-/// guarantees — the header is validated before anything is allocated and the
-/// body buffer is sized from it only after `INITIAL_RECV_CHUNK` bytes arrived.
+/// Incremental frame decoder: bytes are fed as they arrive and complete
+/// messages come out.  The header comes from an untrusted peer, so it is
+/// validated before anything is allocated, and the body buffer is sized from
+/// it only after `INITIAL_RECV_CHUNK` bytes arrived: a bare header must not
+/// make us reserve up to 32 MiB per connection.
 pub const FrameDecoder = struct {
     allocator: Allocator,
     header_buf: [serde.HEADER_SIZE]u8 = undefined,
@@ -207,6 +161,29 @@ pub const FrameDecoder = struct {
             input.* = input.*[n..];
         }
 
+        return try self.finish();
+    }
+
+    /// The unfilled tail of the current body when at least `min` bytes are
+    /// still missing, so a large body can be read into place instead of
+    /// through a scratch buffer.  Follow with `commit`.
+    pub fn directBuffer(self: *FrameDecoder, min: usize) !?[]u8 {
+        if (self.frame.len == 0) return null;
+        const total: usize = @as(usize, serde.HEADER_SIZE) + self.header.msg_len;
+        if (total - self.filled < min) return null;
+        if (self.filled == self.frame.len) self.frame = try self.allocator.realloc(self.frame, total);
+        return self.frame[self.filled..];
+    }
+
+    /// Account for `n` bytes read into `directBuffer`; returns the message
+    /// once its body is complete.
+    pub fn commit(self: *FrameDecoder, n: usize) !?*Message {
+        self.filled += n;
+        if (self.filled < @as(usize, serde.HEADER_SIZE) + self.header.msg_len) return null;
+        return try self.finish();
+    }
+
+    fn finish(self: *FrameDecoder) !*Message {
         const frame = self.frame;
         self.frame = &.{};
         self.header_filled = 0;
@@ -215,6 +192,32 @@ pub const FrameDecoder = struct {
         return try Message.create(self.allocator, self.header, frame);
     }
 };
+
+/// Read messages from a blocking connection until it fails or the peer
+/// closes it, calling `dispatch(ctx, message)` for each one (it returns
+/// false to stop).  Reads in chunks, so a burst of small messages costs one
+/// read; a large body is read straight into its own buffer.
+pub fn receiveLoop(allocator: Allocator, conn: anytype, ctx: anytype, comptime dispatch: anytype) anyerror!void {
+    var decoder = FrameDecoder.init(allocator);
+    defer decoder.deinit();
+    var scratch: [16 * 1024]u8 = undefined;
+    while (true) {
+        if (try decoder.directBuffer(scratch.len)) |dst| {
+            const n = try conn.read(dst);
+            if (n == 0) return error.EOF;
+            if (try decoder.commit(n)) |message| {
+                if (!dispatch(ctx, message)) return error.Stopped;
+            }
+            continue;
+        }
+        const n = try conn.read(&scratch);
+        if (n == 0) return error.EOF;
+        var input: []const u8 = scratch[0..n];
+        while (try decoder.next(&input)) |message| {
+            if (!dispatch(ctx, message)) return error.Stopped;
+        }
+    }
+}
 
 test "FrameDecoder reassembles messages split at arbitrary points" {
     const allocator = std.testing.allocator;

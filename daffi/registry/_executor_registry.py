@@ -2,6 +2,7 @@
 Global executor registry — maps callback names to :class:`Executor` wrappers.
 """
 
+import inspect
 from typing import Callable, Any, Optional, Dict, List
 
 from daffi.exceptions import InitializationError
@@ -16,6 +17,7 @@ class Executor:
         self.func = func
         self.name = name
         self.cls = cls
+        self.is_coroutine = inspect.iscoroutinefunction(func)
 
     def __str__(self):
         if self.cls:
@@ -73,7 +75,7 @@ class ExecutorRegistry:
 
     def unregister(self, name: str) -> None:
         """Remove the executor registered under *name*.  No-op if absent."""
-        del self.registry[name]
+        self.registry.pop(name, None)
 
     def get(self, name: str) -> Optional[Executor]:
         """Look up an executor by *name*, returning ``None`` if not found."""
