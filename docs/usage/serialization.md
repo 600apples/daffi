@@ -59,6 +59,29 @@ print(result.status)   # Status.DONE
 !!! warning
     PICKLE is Python-only. Use JSON or MSGPACK when interoperating with non-Python processes.
 
+!!! danger "Only accept PICKLE from peers you trust"
+    Unpickling a payload runs code its sender chooses. A node decodes each
+    request in the format the caller picked, so by default any peer that can
+    reach a `Service` (or a `Client` with callbacks) can run code in it.
+
+    PICKLE from a WebSocket peer is always refused: any web page can open a
+    WebSocket to a server on the user's machine. For TCP and Unix-socket
+    peers, restrict the accepted formats with `serdes=`:
+
+    ```python
+    svc = Service(
+        app_name="public-service",
+        serdes=[SerdeFormat.JSON, SerdeFormat.MSGPACK],
+        transport=TCPTransport("0.0.0.0", 5004),
+    )
+    ```
+
+    A request in any other format is answered with a `SerdeNotAllowed`
+    error (a `RemoteCallError` on the caller) and its payload is never
+    decoded. The same argument works on `Client` and on the `daffi.aio`
+    classes. TLS with client certificates (`cert` / `key` / `ca` on
+    `TCPTransport`) limits who can connect at all.
+
 ---
 
 ## JSON

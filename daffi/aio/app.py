@@ -59,6 +59,9 @@ class AsyncApplication(Application):
     """
 
     def __init__(self, *args, **kwargs) -> None:
+        # Concurrent by default: a request waiting on I/O must not hold up
+        # the next one.  ``workers=1`` runs one request at a time.
+        kwargs.setdefault("workers", AsyncTaskDispatcher.DEFAULT_WORKERS)
         super().__init__(*args, **kwargs)
         # Replace threading.Event / threading.Lock with asyncio equivalents.
         self._stop_event: asyncio.Event = asyncio.Event()
@@ -122,22 +125,23 @@ class AsyncServerMixin:
         if self._conn_num is not None:
             raise RuntimeError(f"{self.__class__.__name__} is already started")
         self._loop = asyncio.get_running_loop()
+        # A server can start again after stop(); stop() must then work again.
+        self._stop_event.clear()
         try:
             if self.server_mode == ServerMode.SERVICE:
                 if not self._task_dispatcher:
                     self._task_dispatcher = AsyncTaskDispatcher(workers=self.workers)
-                self._task_dispatcher._start_workers()
             self._conn_num = self._add_native_listeners()
             self.logger.debug(
                 f"has been started successfully. connection info: {self.info}"
             )
             if self.server_mode == ServerMode.SERVICE:
                 self._task_dispatcher.start_for_connection(self)
-                RpcProxy._advertise_service_methods(self._conn_num)
+                RpcProxy._advertise_service_methods(self._conn_num, self._exposed_names())
             dfcore.startServer(self._conn_num)
             self._register_executors()
             if self.server_mode == ServerMode.SERVICE:
-                RpcProxy._process_service_handshake(self._conn_num)
+                RpcProxy._process_service_handshake(self._conn_num, self._exposed_names())
         except BaseException:
             await self._abort_start()
             raise
@@ -255,6 +259,10 @@ class AsyncClient(AsyncApplication[SingleTransportMixin]):
         if self._conn_num is not None:
             raise RuntimeError("Client is already connected")
         self._loop = asyncio.get_running_loop()
+        # A client can connect again after stop().
+        self._stop_event.clear()
+        self._connection_error = None
+        self._disconnected = False
         await self._do_connect()
         return AsyncClientConnection(self)
 
@@ -319,7 +327,6 @@ class AsyncClient(AsyncApplication[SingleTransportMixin]):
         dispatcher → executors."""
         if self._task_dispatcher is None:
             self._task_dispatcher = AsyncTaskDispatcher(workers=self.workers)
-        self._task_dispatcher._start_workers()
 
         t = self.transport
         try:
@@ -331,6 +338,8 @@ class AsyncClient(AsyncApplication[SingleTransportMixin]):
                 t.ca,
                 t.cert,
                 t.key,
+                t.verify,
+                self.auth_token,
             )
         except Exception as exc:
             raise InitializationError(
@@ -348,7 +357,7 @@ class AsyncClient(AsyncApplication[SingleTransportMixin]):
             # keeps that wait off the event loop.
             loop = asyncio.get_running_loop()
             handshake = await loop.run_in_executor(
-                None, AsyncRpcProxy._process_client_handshake, self._conn_num
+                None, AsyncRpcProxy._process_client_handshake, self._conn_num, self._exposed_names()
             )
         except Exception as exc:
             AsyncResponseNotifier.unregister(self._conn_num)

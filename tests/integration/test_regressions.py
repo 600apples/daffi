@@ -268,7 +268,7 @@ def _proc_stop_while_sending(runtime: str, port: int, q) -> None:
     """Stop a client while eight threads are sending on it."""
     silence_subprocess(runtime)
     from daffi import Client, TCPTransport
-    from daffi.exceptions import BaseException as DaffiError
+    from daffi.exceptions import DaffiError
 
     try:
         for round_ in range(5):
@@ -728,7 +728,7 @@ def _swallow(fn) -> None:
 
 @pytest.mark.parametrize("workers", [1, 2], ids=["inline", "pool"])
 def test_callback_can_stop_its_own_client(router_port, workers):
-    from daffi.exceptions import BaseException as DaffiError
+    from daffi.exceptions import DaffiError
 
     q = mp.Queue()
     proc = mp.Process(

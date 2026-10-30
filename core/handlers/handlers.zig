@@ -19,7 +19,9 @@ const MessageHandler = handlers.MessageHandler;
 const ClientMessageStore = store.ClientMessageStore;
 const ChannelsMapper = store.ChannelsMapper;
 const TasksQueue = store.TasksQueue;
+const ReplyRoutes = store.ReplyRoutes;
 const misc = @import("../misc.zig");
+const runtime = @import("../runtime.zig");
 const Mutex = misc.Mutex;
 
 // Scoped loggers — each handler module gets a distinctive scope so log lines
@@ -68,6 +70,26 @@ fn replyError(comptime log: type, allocator: Allocator, conn: anytype, request: 
     conn.write(reply.data) catch |err| log.debug("error reply not delivered: {}", .{err});
 }
 
+/// A browser can open a WebSocket to any local server from any page, so a
+/// PICKLE payload from a WebSocket peer is never passed on: unpickling it
+/// would run code chosen by that page.
+fn isPickleFromWeb(conn: anytype, message: *Message) bool {
+    return conn.is_websocket and message.getDecoder() == .PICKLE;
+}
+
+const PICKLE_FROM_WEB = "PICKLE is not accepted from WebSocket peers";
+
+const UNKNOWN_SENDER = "a request must come from the peer that handshook under its sender name";
+const UNAUTHORIZED = "Unauthorized: wrong or missing auth_token";
+
+/// uuid 0 is never issued, and a reply carries its request's uuid, so a
+/// request with uuid 0 could not be answered.
+fn hasNoUuid(comptime log: type, message: *Message) bool {
+    if (message.getUuid() != 0) return false;
+    log.warn("dropping {s} with uuid 0", .{@tagName(message.getFlag())});
+    return true;
+}
+
 const CommonHandlers = struct {
     pub fn onEmpty(ctx: *anyopaque, message: *Message) !void {
         _ = ctx;
@@ -86,16 +108,22 @@ pub fn ServerHandler(comptime HandlerConnectionT: ConnectionType) type {
         const HandlerUnion = @This();
         pub const ConnectionT = Connection(HandlerConnectionT);
         const ChannelsMapperT = ChannelsMapper(ConnectionT);
+        const ReplyRoutesT = ReplyRoutes(ConnectionT);
 
-        pub fn init(mode: HandlerMode, allocator: Allocator, app_name: []const u8) !*HandlerUnion {
+        /// `auth_token`, when given, is copied; a peer's handshake must carry
+        /// it.
+        pub fn init(mode: HandlerMode, allocator: Allocator, app_name: []const u8, auth_token: ?[]const u8) !*HandlerUnion {
             const self = try allocator.create(HandlerUnion);
+            errdefer allocator.destroy(self);
+            const token = if (auth_token) |t| try allocator.dupe(u8, t) else null;
+            errdefer if (token) |t| allocator.free(t);
             return switch (mode) {
                 .Service => blk: {
-                    self.* = .{ .Service = .{ .allocator = allocator, .chan_mapper = try ChannelsMapperT.init(allocator), .tasks_queue = .{}, .app_name = app_name } };
+                    self.* = .{ .Service = .{ .allocator = allocator, .chan_mapper = try ChannelsMapperT.init(allocator), .tasks_queue = .{}, .routes = .init(allocator), .app_name = app_name, .auth_token = token } };
                     break :blk self;
                 },
                 .Router => blk: {
-                    self.* = .{ .Router = .{ .allocator = allocator, .chan_mapper = try ChannelsMapperT.init(allocator), .app_name = app_name } };
+                    self.* = .{ .Router = .{ .allocator = allocator, .chan_mapper = try ChannelsMapperT.init(allocator), .routes = .init(allocator), .app_name = app_name, .auth_token = token } };
                     break :blk self;
                 },
             };
@@ -105,23 +133,49 @@ pub fn ServerHandler(comptime HandlerConnectionT: ConnectionType) type {
             const allocator = switch (self.*) {
                 .Service => |*s| blk: {
                     s.tasks_queue.deinit();
+                    s.routes.deinit();
                     s.chan_mapper.deinit();
                     if (s.methods) |m| s.allocator.free(m);
+                    if (s.auth_token) |t| s.allocator.free(t);
                     break :blk s.allocator;
                 },
                 .Router => |*r| blk: {
+                    r.routes.deinit();
                     r.chan_mapper.deinit();
+                    if (r.auth_token) |t| r.allocator.free(t);
                     break :blk r.allocator;
                 },
             };
             allocator.destroy(self);
         }
 
+        /// Answer a handshake that lacks the server's `auth_token` with a
+        /// rejection and close the connection.  Call without the handler
+        /// mutex: the write may stall.
+        fn refuseUnauthorized(comptime log: anytype, allocator: Allocator, conn: *ConnectionT, message: *Message, comptime node_type: []const u8) !void {
+            log.warn("refusing handshake from '{s}': wrong or missing auth_token", .{message.getTransmitter()});
+            var rejection = try Handshake.createRejection(allocator, node_type, UNAUTHORIZED);
+            try message.setData(try rejection.toJson(allocator));
+            message.sendTo(conn) catch {};
+            conn.close();
+        }
+
+        /// Whether `name` is registered to `conn`, i.e. `conn` handshook
+        /// under it.
+        fn sentBy(chan_mapper: *ChannelsMapperT, conn: *ConnectionT, name: []const u8) bool {
+            const chan = chan_mapper.getChannel(name) catch return false;
+            return chan.conn == conn;
+        }
+
         const ServiceHandler = struct {
             chan_mapper: *ChannelsMapperT,
             tasks_queue: TasksQueue,
+            /// Who gets the reply to each request still being served.
+            routes: ReplyRoutesT,
             allocator: Allocator,
             app_name: []const u8,
+            /// Owned.  When set, handshakes must carry it.
+            auth_token: ?[]const u8 = null,
             methods: ?[]const u8 = null, // comma separated list of service methods
             task_cycle_position: usize = 0,
             mutex: Mutex = .{},
@@ -145,9 +199,15 @@ pub fn ServerHandler(comptime HandlerConnectionT: ConnectionType) type {
                 };
             }
 
+            /// `onHandshake` reads the list under `mutex`, so it is replaced
+            /// under it too.
             pub fn setServiceMethods(self: *Self, methods: []const u8) !void {
-                if (self.methods) |m| self.allocator.free(m);
-                self.methods = try self.allocator.dupe(u8, methods);
+                const copy = try self.allocator.dupe(u8, methods);
+                self.mutex.lock();
+                const old = self.methods;
+                self.methods = copy;
+                self.mutex.unlock();
+                if (old) |m| self.allocator.free(m);
             }
 
             fn sendToConnection(_: *Self, comptime MessageT: type, conn: *ParentConnT, message: *MessageT) !void {
@@ -182,6 +242,11 @@ pub fn ServerHandler(comptime HandlerConnectionT: ConnectionType) type {
                     return;
                 };
                 defer client_hs.deinit();
+                if (!Handshake.tokenMatches(self.auth_token, client_hs.value.meta.token)) {
+                    self.mutex.unlock();
+                    locked = false;
+                    return refuseUnauthorized(log_service, allocator, conn, message, "service");
+                }
                 const connection_name = try allocator.dupe(u8, message.getTransmitter());
 
                 // Last-connection-wins: if a slot for this name already exists
@@ -238,16 +303,41 @@ pub fn ServerHandler(comptime HandlerConnectionT: ConnectionType) type {
                 // No handler mutex: the queue has its own, and taking
                 // ``self.mutex`` serialised every client reader thread.
                 // Once pushed, Python may free the message at any moment.
+                if (hasNoUuid(log_service, message)) return;
+                if (isPickleFromWeb(conn, message)) {
+                    log_service.warn("refusing PICKLE request uuid={d} from a WebSocket peer", .{message.getUuid()});
+                    if (message.getReturnResult()) replyError(log_service, self.allocator, conn, message, "SerdeNotAllowed", PICKLE_FROM_WEB);
+                    return;
+                }
+                const wants_reply = message.getReturnResult();
+                const uuid = message.getUuid();
+                // Callbacks run for peers that handshook, under the name
+                // they handshook with.
+                if (!sentBy(self.chan_mapper, conn, message.getTransmitter())) {
+                    log_service.warn("refusing request uuid={d} from a peer not registered as '{s}'", .{ uuid, message.getTransmitter() });
+                    if (wants_reply) replyError(log_service, self.allocator, conn, message, "UnknownSender", UNKNOWN_SENDER);
+                    return;
+                }
+                const id = if (wants_reply) self.routes.add(conn, uuid, null) catch {
+                    replyError(log_service, self.allocator, conn, message, "ServiceOverloaded", "the service has too many pending requests");
+                    return;
+                } else uuid;
+                message.setUuid(id);
                 if (self.tasks_queue.tryPushRequest(message)) {
                     consumed.* = true;
                     return;
                 }
-                log_service.warn("task queue full ({d} pending), refusing request uuid={d}", .{ TasksQueue.max_pending, message.getUuid() });
-                if (message.getReturnResult()) replyError(log_service, self.allocator, conn, message, "ServiceOverloaded", "the service has too many pending requests");
+                log_service.warn("task queue full ({d} pending), refusing request uuid={d}", .{ TasksQueue.max_pending, uuid });
+                message.setUuid(uuid);
+                if (wants_reply) {
+                    self.routes.remove(null, id);
+                    replyError(log_service, self.allocator, conn, message, "ServiceOverloaded", "the service has too many pending requests");
+                }
             }
 
             // ---------------------- SERVICE CONNECTION LIFECYCLE ------------------------
             fn diconnectionHandler(self: *Self, conn: *ParentConnT) !void {
+                self.routes.dropConnection(conn);
                 self.mutex.lock();
                 defer self.mutex.unlock();
                 // One connection can hold several channels (a peer may
@@ -276,7 +366,11 @@ pub fn ServerHandler(comptime HandlerConnectionT: ConnectionType) type {
 
         const RouterHandler = struct {
             chan_mapper: *ChannelsMapperT,
+            /// Who asked, and who must answer, each forwarded request.
+            routes: ReplyRoutesT,
             app_name: []const u8,
+            /// Owned.  When set, handshakes must carry it.
+            auth_token: ?[]const u8 = null,
             allocator: Allocator,
             mutex: Mutex = .{},
 
@@ -295,13 +389,27 @@ pub fn ServerHandler(comptime HandlerConnectionT: ConnectionType) type {
                 };
             }
 
-            fn findChannel(self: *Self, method: ?[]const u8, receiver: []const u8) ?ChannelsMapperT.Channel {
-                var chan = self.chan_mapper.getChannel(receiver) catch {
-                    log_router.debug("no channel for receiver: {s}", .{receiver});
-                    return null;
-                };
-                if (method == null or chan.containsMethod(method.?)) return chan;
-                return null;
+            const Route = struct {
+                /// Retained; the caller releases it.
+                target: ?*ParentConnT,
+                /// The sender handshook under the name it sends as.
+                sender_known: bool,
+            };
+
+            /// Where a request goes, in one pass under `self.mutex`.  The
+            /// router changes its channels only under that mutex, so they are
+            /// read here without the mapper's own lock.
+            fn lookupRoute(self: *Self, conn: *ParentConnT, message: *Message) Route {
+                self.mutex.lock();
+                defer self.mutex.unlock();
+                const channels = &self.chan_mapper.channels;
+                const target: ?*ParentConnT = if (channels.getPtr(message.getReceiver())) |chan|
+                    (if (chan.containsMethod(message.getFuncName())) chan.conn else null)
+                else
+                    null;
+                if (target) |t| t.retain();
+                const sender = channels.getPtr(message.getTransmitter());
+                return .{ .target = target, .sender_known = sender != null and sender.?.conn == conn };
             }
 
             fn sendToConnection(_: *Self, comptime MessageT: type, conn: *ParentConnT, message: *MessageT) !void {
@@ -337,6 +445,13 @@ pub fn ServerHandler(comptime HandlerConnectionT: ConnectionType) type {
                     try self.sendToConnection(Message, conn, message);
                     return;
                 };
+                // Before any eviction: a peer without the token must not
+                // take over anyone's name.
+                if (!Handshake.tokenMatches(self.auth_token, client_hs.value.meta.token)) {
+                    self.mutex.unlock();
+                    locked = false;
+                    return refuseUnauthorized(log_router, alloc, conn, message, "router");
+                }
                 // Evict stale slots (last-connection-wins).  Only the bookkeeping
                 // happens under the mutex; the "evicted" notifications and the
                 // close are done after it is released (see below).
@@ -411,11 +526,24 @@ pub fn ServerHandler(comptime HandlerConnectionT: ConnectionType) type {
                 // taken first: a concurrent handshake that already sees this
                 // peer queues its broadcast behind the list instead of
                 // overtaking it (the list rebuilds the peer's routing table).
-                conn.lockWrites();
-                self.mutex.unlock();
-                locked = false;
-                const list_sent = conn.writeHeld(message.data);
-                conn.unlockWrites();
+                // Never wait for it under the mutex, though: a peer that
+                // handshakes again while a write to it is stalled would hold
+                // up all routing.  Only in that case can a broadcast overtake
+                // the list.  On an event loop writes never wait, so the
+                // list is simply queued before the mutex is released.
+                const list_sent = if (runtime.onLoopThread()) blk: {
+                    const sent = conn.write(message.data);
+                    self.mutex.unlock();
+                    locked = false;
+                    break :blk sent;
+                } else blk: {
+                    const held = conn.tryLockWrites();
+                    self.mutex.unlock();
+                    locked = false;
+                    if (!held) conn.lockWrites();
+                    defer conn.unlockWrites();
+                    break :blk conn.writeHeld(message.data);
+                };
                 list_sent catch |err| log_router.debug("member list not delivered to {s}: {}", .{ connection_name, err });
 
                 // 0. Tell everyone (and the evicted peer itself) that stale slots
@@ -440,52 +568,64 @@ pub fn ServerHandler(comptime HandlerConnectionT: ConnectionType) type {
 
             fn onRequest(self: *Self, conn: *ParentConnT, message: *Message, _: *bool) !void {
                 log_router.debug("onRequest func={s} receiver={s}", .{ message.getFuncName(), message.getReceiver() });
-                self.mutex.lock();
-                const target_conn: ?*ParentConnT = blk: {
-                    if (self.findChannel(message.getFuncName(), message.getReceiver())) |c| {
-                        c.conn.retain();
-                        break :blk c.conn;
-                    }
-                    break :blk null;
-                };
-                self.mutex.unlock();
-
-                const target = target_conn orelse {
+                if (hasNoUuid(log_router, message)) return;
+                if (isPickleFromWeb(conn, message)) {
+                    log_router.warn("refusing PICKLE request uuid={d} from a WebSocket peer", .{message.getUuid()});
+                    if (message.getReturnResult()) replyError(log_router, self.allocator, conn, message, "SerdeNotAllowed", PICKLE_FROM_WEB);
+                    return;
+                }
+                const route = self.lookupRoute(conn, message);
+                const target = route.target orelse {
                     log_router.debug("no route for request to: {s}", .{message.getReceiver()});
                     if (message.getReturnResult()) replyError(log_router, self.allocator, conn, message, "ReceiverNotFound", "no connected peer with that name exposes the requested callback");
                     return;
                 };
                 defer target.release();
+                const wants_reply = message.getReturnResult();
+                const uuid = message.getUuid();
+                // The receiver sees the sender's name: it must be the one
+                // the sender handshook with.
+                if (!route.sender_known) {
+                    log_router.warn("refusing request uuid={d} from a peer not registered as '{s}'", .{ uuid, message.getTransmitter() });
+                    if (wants_reply) replyError(log_router, self.allocator, conn, message, "UnknownSender", UNKNOWN_SENDER);
+                    return;
+                }
+                const id = if (wants_reply) self.routes.add(conn, uuid, target) catch {
+                    replyError(log_router, self.allocator, conn, message, "RouterOverloaded", "the router has too many requests in flight");
+                    return;
+                } else uuid;
+                message.setUuid(id);
                 target.write(message.data) catch |err| {
                     log_router.debug("onRequest: send to {s} failed: {}", .{ message.getReceiver(), err });
-                    if (message.getReturnResult()) replyError(log_router, self.allocator, conn, message, "DeliveryFailed", "the router could not forward the request to its receiver");
+                    message.setUuid(uuid);
+                    if (wants_reply) {
+                        self.routes.remove(target, id);
+                        replyError(log_router, self.allocator, conn, message, "DeliveryFailed", "the router could not forward the request to its receiver");
+                    }
                 };
             }
 
-            fn onResponse(self: *Self, _: *ParentConnT, message: *Message, _: *bool) !void {
+            fn onResponse(self: *Self, conn: *ParentConnT, message: *Message, _: *bool) !void {
                 log_router.debug("onResponse receiver={s} uuid={}", .{ message.getReceiver(), message.getUuid() });
-                // Same retain/release pattern as onRequest — see its comment.
-                self.mutex.lock();
-                const target_conn: ?*ParentConnT = blk: {
-                    if (self.findChannel(null, message.getReceiver())) |c| {
-                        c.conn.retain();
-                        break :blk c.conn;
-                    }
-                    break :blk null;
-                };
-                self.mutex.unlock();
-
-                if (target_conn) |c| {
-                    defer c.release();
-                    self.sendToConnection(Message, c, message) catch |err|
-                        log_router.debug("onResponse: send to {s} failed: {}", .{ message.getReceiver(), err });
-                } else {
-                    log_router.debug("no route for response to: {s}", .{message.getReceiver()});
+                if (isPickleFromWeb(conn, message)) {
+                    log_router.warn("dropping PICKLE response uuid={d} from a WebSocket peer", .{message.getUuid()});
+                    return;
                 }
+                // Only the peer the request went to may answer it, and the
+                // answer goes to the connection that asked.
+                const reply = self.routes.take(conn, message.getUuid()) orelse {
+                    log_router.debug("dropping response uuid={d} for '{s}': no such request in flight to this peer", .{ message.getUuid(), message.getReceiver() });
+                    return;
+                };
+                defer reply.requester.release();
+                message.setUuid(reply.uuid);
+                self.sendToConnection(Message, reply.requester, message) catch |err|
+                    log_router.debug("onResponse: send to {s} failed: {}", .{ message.getReceiver(), err });
             }
 
             // --------------------- ROUTER CONNECTION LIFECYCLE ----------------------
             fn diconnectionHandler(self: *Self, conn: *ParentConnT) !void {
+                self.routes.dropConnection(conn);
                 self.mutex.lock();
                 var locked = true;
                 defer if (locked) self.mutex.unlock();
@@ -558,6 +698,8 @@ pub const ClientHandler = struct {
     tasks_queue: TasksQueue,
     chan_mapper: *ChannelsMapperT,
     app_name: []const u8,
+    /// Owned.  Sent in every handshake.
+    auth_token: ?[]const u8 = null,
     methods: ?[]const u8 = null, // comma separated list of service methods
     allocator: Allocator,
     mutex: Mutex = .{},
@@ -575,12 +717,15 @@ pub const ClientHandler = struct {
     const MessageHandlerT = MessageHandler(Self);
     const ChannelsMapperT = ChannelsMapper(ParentConnT);
 
-    pub fn init(allocator: Allocator, app_name: []const u8) !*ClientHandler {
+    pub fn init(allocator: Allocator, app_name: []const u8, auth_token: ?[]const u8) !*ClientHandler {
         const self = try allocator.create(ClientHandler);
         errdefer allocator.destroy(self);
         const chan_mapper = try ChannelsMapperT.init(allocator);
         errdefer chan_mapper.deinit();
-        self.* = .{ .chan_mapper = chan_mapper, .tasks_queue = .{}, .allocator = allocator, .msg_store = ClientMessageStore.init(allocator), .app_name = try allocator.dupe(u8, app_name) };
+        const name = try allocator.dupe(u8, app_name);
+        errdefer allocator.free(name);
+        const token = if (auth_token) |t| try allocator.dupe(u8, t) else null;
+        self.* = .{ .chan_mapper = chan_mapper, .tasks_queue = .{}, .allocator = allocator, .msg_store = ClientMessageStore.init(allocator), .app_name = name, .auth_token = token };
         return self;
     }
 
@@ -588,6 +733,8 @@ pub const ClientHandler = struct {
         self.tasks_queue.deinit();
         self.chan_mapper.deinit();
         self.msg_store.deinit();
+        if (self.methods) |m| self.allocator.free(m);
+        if (self.auth_token) |t| self.allocator.free(t);
         self.allocator.free(self.app_name);
         self.allocator.destroy(self);
     }
@@ -712,8 +859,12 @@ pub const ClientHandler = struct {
     }
 
     pub fn setClientMethods(self: *Self, methods: []const u8) !void {
-        if (self.methods) |m| self.allocator.free(m);
-        self.methods = try self.allocator.dupe(u8, methods);
+        const copy = try self.allocator.dupe(u8, methods);
+        self.mutex.lock();
+        const old = self.methods;
+        self.methods = copy;
+        self.mutex.unlock();
+        if (old) |m| self.allocator.free(m);
     }
 
     // ----------------------------- CLIENT HANDLERS -----------------------------
@@ -845,6 +996,7 @@ pub const ClientHandler = struct {
     }
 
     pub fn onRequest(self: *Self, conn: *ParentConnT, message: *Message, consumed: *bool) !void {
+        if (hasNoUuid(log_client, message)) return;
         if (self.tasks_queue.tryPushRequest(message)) {
             consumed.* = true;
             self.task_pushed = true;
@@ -873,3 +1025,72 @@ pub const ClientHandler = struct {
         }
     }
 };
+
+test "a service's handshake reply never sees its method list half replaced" {
+    const c = @import("posix_c");
+    const alloc = std.testing.allocator;
+    const Handlers = ServerHandler(.ClientConnectionType);
+    const handler = try Handlers.init(.Service, alloc, "svc", null);
+    defer handler.deinit();
+    const service = &handler.Service;
+    try service.setServiceMethods("a,b");
+
+    var fds: [2]c_int = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), c.socketpair(c.AF_UNIX, c.SOCK_STREAM, 0, &fds));
+    defer _ = c.close(fds[1]);
+    const ClientConnection = network.ClientConnection;
+    const conn = try alloc.create(Handlers.ConnectionT);
+    conn.* = .{ .ctx = try ClientConnection.initFromAccepted(alloc, fds[0]), .op_table = ClientConnection.op_table, .allocator = alloc };
+    // Stream.close() releases a descriptor this socketpair never counted.
+    @import("../nofile.zig").acquire(1);
+    defer conn.release();
+
+    const Publisher = struct {
+        fn run(s: @TypeOf(service), stop: *std.atomic.Value(bool)) void {
+            var i: usize = 0;
+            while (!stop.load(.acquire)) : (i += 1) {
+                s.setServiceMethods(if (i % 2 == 0) "xx,yy,zz" else "a,b") catch return;
+            }
+        }
+    };
+    var stop = std.atomic.Value(bool).init(false);
+    const publisher = try std.Thread.spawn(.{}, Publisher.run, .{ service, &stop });
+    defer publisher.join();
+    defer stop.store(true, .release);
+
+    var arena = ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    var peer_hs = try Handshake.create(arena.allocator(), &[_]Handshake.MemberData{.{ .name = "peer", .methods = "m" }}, "client");
+    const peer_data = try peer_hs.toJson(arena.allocator());
+
+    var reply: [4096]u8 = undefined;
+    for (0..500) |_| {
+        var raw = try RawMessage.create(alloc, peer_data, 1, .HANDSHAKE, .JSON, false, true, "peer", serde.PLACEHOLDER, serde.PLACEHOLDER);
+        const message = try Message.fromRawMessage(alloc, &raw);
+        defer message.deinit();
+        var keep = true;
+        try service.onHandshake(conn, message, &keep);
+
+        const header_n = c.read(fds[1], &reply, serde.HEADER_SIZE);
+        try std.testing.expectEqual(@as(isize, @intCast(serde.HEADER_SIZE)), header_n);
+        const header = try serde.Header.parse(reply[0..serde.HEADER_SIZE]);
+        var got: usize = 0;
+        while (got < header.msg_len) {
+            const n = c.read(fds[1], reply[got..].ptr, header.msg_len - got);
+            try std.testing.expect(n > 0);
+            got += @intCast(n);
+        }
+        const data = reply[header.metadata_len..header.msg_len];
+        const whole = std.mem.indexOf(u8, data, "\"methods\":[\"a\",\"b\"]") != null or
+            std.mem.indexOf(u8, data, "\"methods\":[\"xx\",\"yy\",\"zz\"]") != null;
+        if (!whole) std.debug.print("handshake reply: {s}\n", .{data});
+        try std.testing.expect(whole);
+    }
+}
+
+test "ClientHandler frees its method list and token" {
+    const handler = try ClientHandler.init(std.testing.allocator, "client", "s3cret");
+    try handler.setClientMethods("a,b");
+    try handler.setClientMethods("a,b,c");
+    handler.deinit();
+}

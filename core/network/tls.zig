@@ -199,16 +199,22 @@ pub fn serverCtx(cert: []const u8, key: []const u8, ca: []const u8) !*SslCtx {
 ///
 /// When `cert` and `key` are non-empty, they are presented as the client
 /// identity (mutual TLS).
-pub fn clientCtx(ca: []const u8, cert: []const u8, key: []const u8) !*SslCtx {
+/// The server's certificate is checked against `ca` when given, otherwise
+/// against the system trust store; `verify` false skips the check.
+pub fn clientCtx(ca: []const u8, cert: []const u8, key: []const u8, verify: bool) !*SslCtx {
     const method = c.TLS_client_method() orelse return error.TlsInitFailed;
     const ctx = c.SSL_CTX_new(method) orelse return error.TlsInitFailed;
     errdefer c.SSL_CTX_free(ctx);
     configureCtx(ctx);
-    if (ca.len > 0) {
-        try loadCa(ctx, ca);
-        c.SSL_CTX_set_verify(ctx, c.SSL_VERIFY_PEER, null);
-    } else {
+    if (!verify) {
         c.SSL_CTX_set_verify(ctx, c.SSL_VERIFY_NONE, null);
+    } else {
+        if (ca.len > 0) {
+            try loadCa(ctx, ca);
+        } else if (c.SSL_CTX_set_default_verify_paths(ctx) != 1) {
+            return error.TlsTrustStoreUnavailable;
+        }
+        c.SSL_CTX_set_verify(ctx, c.SSL_VERIFY_PEER, null);
     }
     if (cert.len > 0 or key.len > 0) {
         if (cert.len == 0 or key.len == 0) return error.TlsCertRequired;
@@ -274,7 +280,7 @@ pub fn serverHandshake(ctx: *SslCtx, fd: c_int, deadline: i64) !*SslConn {
 ///
 /// `host` is sent as SNI and, when the context verifies peers, checked against
 /// the certificate (as an IP address if it parses as one, else as a DNS name).
-/// Unix-domain socket paths (containing ``/``) skip SNI / hostname checks —
+/// An empty `host` (a Unix-domain socket) skips SNI / hostname checks —
 /// peer authentication is the certificate / CA alone.
 /// The returned SslConn must be freed with sslClose() when the connection ends.
 /// The SslCtx is still owned by the caller (the ClientConnection).
@@ -284,8 +290,7 @@ pub fn clientHandshake(ctx: *SslCtx, fd: c_int, host: []const u8) !*SslConn {
         c.SSL_free(s.ssl);
         allocator.destroy(s);
     }
-    const is_unix_path = std.mem.indexOfScalar(u8, host, '/') != null;
-    if (host.len > 0 and !is_unix_path) {
+    if (host.len > 0) {
         var host_buf: [256]u8 = undefined;
         if (host.len >= host_buf.len) return error.NameTooLong;
         @memcpy(host_buf[0..host.len], host);
@@ -380,6 +385,14 @@ pub fn sslReadSome(conn: *SslConn, buf: []u8) !usize {
         c.SSL_ERROR_ZERO_RETURN, c.SSL_ERROR_SYSCALL => 0,
         else => error.TlsReadError,
     };
+}
+
+/// Whether the session holds decrypted bytes not yet read.
+pub fn sslPending(conn: *SslConn) bool {
+    const s = session(conn);
+    s.mutex.lock();
+    defer s.mutex.unlock();
+    return c.SSL_pending(s.ssl) > 0;
 }
 
 /// Write all bytes in data to a TLS connection (blocking).

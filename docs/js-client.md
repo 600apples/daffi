@@ -51,6 +51,7 @@ const client = new DaffiClient(options);
 | `options.wsUrl` | `string` | **required** | WebSocket URL of the Python backend. No default — must always be provided explicitly (e.g. `"ws://127.0.0.1:5000"`). |
 | `options.autoreconnect` | `boolean` | `false` | Reconnect automatically when the server drops the link. |
 | `options.reconnectDelay` | `number` (ms) | `2000` | Base delay before the first retry. Doubles after each failure, capped at 60 s. |
+| `options.authToken` | `string` | `""` | Token of a server started with `auth_token=`. Anyone who can read the page can read it. |
 
 !!! note
     `app.wasm` is loaded automatically from the CDN release that matches the `daffi.js` version — there is no `wasmPath` option.
@@ -232,8 +233,7 @@ auto-reconnect loop.
 
 ## Securing the connection
 
-Authentication and confidentiality are delegated to TLS — there is no
-application-level password. Run the Python backend with a TLS
+Confidentiality is delegated to TLS. Run the Python backend with a TLS
 `TCPTransport` (`tls=True` plus `cert` / `key`) and connect from the
 browser using a `wss://` URL:
 
@@ -244,6 +244,20 @@ const conn   = await client.connect();
 
 The browser will refuse the upgrade unless the server presents a
 certificate that chains to a CA the browser already trusts.
+
+Any web page the user opens can try to connect to a WebSocket on their
+machine. Limit which pages may connect with `allowed_origins` on the
+listening transport; an upgrade from another `Origin`, or without one, is
+refused with 403. Native daffi clients don't use WebSocket and are not
+affected:
+
+```python
+TCPTransport("0.0.0.0", 5000, allowed_origins=["https://app.example.com"])
+```
+
+A server started with `auth_token=` also needs the token from the page
+(`authToken` option). It only keeps out clients that don't have it: anyone
+who can load the page can read it.
 
 ---
 

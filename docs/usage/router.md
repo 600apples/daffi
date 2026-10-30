@@ -26,6 +26,12 @@ if __name__ == "__main__":
 |---|---|---|
 | `transport` | transport or sequence | One `TCPTransport` or `UnixTransport`, or several. Every listener shares this router's membership. `start()` brings all of them up at once or none of them. TLS (`tls`, `cert`, `key`) is set on each `TCPTransport`. |
 | `runtime` | `Runtime` | `THREADS` or `EVENTED` for this process. Omit for `threads`. One process, one choice. |
+| `auth_token` | `str` | Shared secret. Every peer must send the same token in its handshake (`auth_token=` on `Client`, `authToken` in the JS client); a peer without it is disconnected before it can call anything or take a name. Omit to accept any peer. |
+
+Requests are only accepted from peers that have completed the handshake, under
+the name they registered; a request that names another peer as its sender is
+answered with `UnknownSender`. A reply is only accepted from the peer the
+request was routed to.
 
 ---
 

@@ -99,15 +99,23 @@ const ClientEntry = struct {
         _ = self.users.fetchSub(1, .release);
     }
 
-    /// Next request uuid (never 0, wraps at 65535).  Whatever the previous
-    /// owner of that uuid left behind is cleared.
-    pub fn generateUUID(self: *ClientEntry) u16 {
-        while (true) {
-            const next = self.uuid.fetchAdd(1, .monotonic) +% 1;
-            if (next == 0) continue; // 0 is reserved
-            self.client_handler.msg_store.reserve(next);
-            return next;
+    /// Next request uuid (never 0, wraps at 65535).  With `reply` the uuid is
+    /// one no other request still waits on, and it stays taken until its
+    /// response is fetched or expired; whatever an earlier owner left behind
+    /// is cleared.  uuids whose caller gave up are only reused once no other
+    /// one is free.
+    pub fn generateUUID(self: *ClientEntry, reply: bool) !u16 {
+        const msg_store = &self.client_handler.msg_store;
+        for ([_]bool{ false, true }) |reuse_expired| {
+            var tries: u32 = 0;
+            while (tries < std.math.maxInt(u16)) : (tries += 1) {
+                const next = self.uuid.fetchAdd(1, .monotonic) +% 1;
+                if (next == 0) continue; // 0 is reserved
+                if (!reply) return next;
+                if (try msg_store.claim(next, reuse_expired)) return next;
+            }
         }
+        return error.TooManyPendingRequests;
     }
 
     /// Close the connection and free everything.  The handle is already out
@@ -205,11 +213,12 @@ const ClientEntry = struct {
         if (flag == .REQUEST) {
             const actual_receiver = try self.client_handler.findReceiverForMethod(func_name, if (!std.mem.eql(u8, receiver, "")) receiver else null);
             errdefer self.client_handler.allocator.free(actual_receiver);
-            const actual_uuid = self.generateUUID();
+            const actual_uuid = try self.generateUUID(return_result);
+            errdefer if (return_result) self.client_handler.msg_store.unclaim(actual_uuid);
             const msg = try self.msgpool.createMessage(allocator, data, actual_uuid, flag, decoder, is_bytes, return_result, self.client_handler.app_name, actual_receiver, func_name);
             return .{ .message = .{ .receiver = actual_receiver, .uuid = actual_uuid, .timestamp = ts }, .data = msg };
         } else {
-            std.debug.assert(uuid != 0);
+            if (uuid == 0) return error.InvalidUuid;
             const msg = try self.msgpool.createMessage(allocator, data, uuid, flag, decoder, is_bytes, return_result, self.client_handler.app_name, receiver, func_name);
             return .{ .message = .{ .receiver = receiver, .uuid = uuid, .timestamp = ts }, .data = msg };
         }
@@ -221,12 +230,13 @@ const ClientEntry = struct {
         if (flag == .REQUEST) {
             const actual_receiver = try self.client_handler.findReceiverForMethod(func_name, if (!std.mem.eql(u8, receiver, "")) receiver else null);
             errdefer self.client_handler.allocator.free(actual_receiver);
-            const actual_uuid = self.generateUUID();
+            const actual_uuid = try self.generateUUID(return_result);
+            errdefer if (return_result) self.client_handler.msg_store.unclaim(actual_uuid);
             log.debug("[{s}] sendMessage REQUEST func={s} uuid={d} receiver={s}", .{ self.client_handler.app_name, func_name, actual_uuid, actual_receiver });
             try self.msgpool.sendMessage(self.connection, data, actual_uuid, flag, decoder, is_bytes, return_result, self.client_handler.app_name, actual_receiver, func_name);
             return .{ .receiver = actual_receiver, .uuid = actual_uuid, .timestamp = misc.timestamp() };
         } else {
-            std.debug.assert(uuid != 0);
+            if (uuid == 0) return error.InvalidUuid;
             log.debug("[{s}] sendMessage RESPONSE func={s} uuid={d} receiver={s}", .{ self.client_handler.app_name, func_name, uuid, receiver });
             try self.msgpool.sendMessage(self.connection, data, uuid, flag, decoder, is_bytes, return_result, self.client_handler.app_name, receiver, func_name);
             return .{ .receiver = receiver, .uuid = uuid, .timestamp = misc.timestamp() };
@@ -236,8 +246,10 @@ const ClientEntry = struct {
     pub fn createHandshakeClientEntry(self: *ClientEntry, allocator: Allocator, methods: []const u8) !MessageAndDataIndentifier {
         try self.client_handler.setClientMethods(methods);
         var handshake = try Handshake.create(allocator, &[_]Handshake.MemberData{.{ .name = self.client_handler.app_name, .methods = methods }}, "client");
+        handshake.meta.token = self.client_handler.auth_token;
         const data = try handshake.toJson(allocator);
-        const uuid = self.generateUUID();
+        const uuid = try self.generateUUID(true);
+        errdefer self.client_handler.msg_store.unclaim(uuid);
         const msg = try self.msgpool.createMessage(allocator, data, uuid, .HANDSHAKE, .JSON, false, true, self.client_handler.app_name, PLACEHOLDER, PLACEHOLDER);
         const ts = if (is_wasm) 0 else misc.timestamp();
         return .{ .message = .{ .receiver = PLACEHOLDER, .uuid = uuid, .timestamp = ts }, .data = msg };
@@ -249,8 +261,10 @@ const ClientEntry = struct {
         const allocator = arena.allocator();
         try self.client_handler.setClientMethods(methods);
         var handshake = try Handshake.create(allocator, &[_]Handshake.MemberData{.{ .name = self.client_handler.app_name, .methods = methods }}, "client");
+        handshake.meta.token = self.client_handler.auth_token;
         const data = try handshake.toJson(allocator);
-        const uuid = self.generateUUID();
+        const uuid = try self.generateUUID(true);
+        errdefer self.client_handler.msg_store.unclaim(uuid);
         try self.msgpool.sendMessage(self.connection, data, uuid, .HANDSHAKE, .JSON, false, true, self.client_handler.app_name, PLACEHOLDER, PLACEHOLDER);
         return .{
             .receiver = PLACEHOLDER,
@@ -303,32 +317,25 @@ const ClientSource = struct {
         return self;
     }
 
-    /// Reads until the socket is drained: a TLS session may hold decrypted
-    /// bytes that no further socket readiness would report.
     fn onReadable(source: *EventLoop.Source, scratch: []u8) EventLoop.Action {
         const self: *ClientSource = @alignCast(@fieldParentPtr("source", source));
         const entry = self.entry;
         const msg_handler = entry.client_handler.handler();
-        while (true) {
-            const n = entry.connection.readSome(scratch) catch |err| switch (err) {
-                error.WouldBlock => return .keep,
-                else => {
-                    entry.connectionEnded(msg_handler, err);
-                    return .remove;
-                },
-            };
-            if (n == 0) {
-                entry.connectionEnded(msg_handler, error.EOF);
+        const Ctx = struct {
+            entry: *ClientEntry,
+            handler: @TypeOf(msg_handler),
+            fn dispatch(ctx: *const @This(), message: *Message) bool {
+                return ctx.entry.dispatch(ctx.handler, message);
+            }
+        };
+        const ctx = Ctx{ .entry = entry, .handler = msg_handler };
+        switch (serde.drainReadable(&self.decoder, entry.connection, scratch, &ctx, Ctx.dispatch)) {
+            .keep => return .keep,
+            .stopped => return .remove,
+            .failed => |err| {
+                entry.connectionEnded(msg_handler, err);
                 return .remove;
-            }
-            var input: []const u8 = scratch[0..n];
-            while (true) {
-                const message = (self.decoder.next(&input) catch |err| {
-                    entry.connectionEnded(msg_handler, err);
-                    return .remove;
-                }) orelse break;
-                if (!entry.dispatch(msg_handler, message)) return .remove;
-            }
+            },
         }
     }
 
@@ -340,12 +347,12 @@ const ClientSource = struct {
     }
 };
 
-pub fn init(allocator: std.mem.Allocator, app_name: []const u8, config: ClientConnection.Config) !usize {
+pub fn init(allocator: std.mem.Allocator, app_name: []const u8, config: ClientConnection.Config, auth_token: ?[]const u8) !usize {
     const conn = try ClientConnection.init(allocator, config);
     errdefer conn.destroy();
     const msgpool = try MessagePool.init(allocator);
     errdefer msgpool.deinit();
-    const client_handler = try ClientHandler.init(allocator, app_name);
+    const client_handler = try ClientHandler.init(allocator, app_name, auth_token);
     errdefer client_handler.deinit();
     if (!is_wasm) {
         // The SYN probe is sent by every daffi TCP client (plain and TLS alike).
@@ -467,6 +474,13 @@ pub fn getAvailableMembers(allocator: Allocator, conn_num: usize) ![]const u8 {
     const entry = try ClientEntry.acquire(conn_num, .any);
     defer entry.release();
     return entry.getAvailableMembersClientEntry(allocator);
+}
+
+/// Whether a peer named `name` is connected.
+pub fn hasMember(conn_num: usize, name: []const u8) !bool {
+    const entry = try ClientEntry.acquire(conn_num, .any);
+    defer entry.release();
+    return entry.client_handler.chan_mapper.hasChannel(name);
 }
 
 /// Install (or with -1, withdraw) the descriptor signalled when the task

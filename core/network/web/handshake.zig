@@ -134,6 +134,23 @@ pub const Handshake = struct {
         };
     }
 
+    /// `allowed` is a newline-separated list of origins; empty allows any.
+    /// With a list, a request without an Origin header is refused too:
+    /// browsers always send one, so only other clients omit it.
+    pub fn originAllowed(self: Handshake, allowed: []const u8) bool {
+        if (allowed.len == 0) return true;
+        const origin = self.headers.get("origin") orelse return false;
+        var it = mem.splitScalar(u8, allowed, '\n');
+        while (it.next()) |entry| {
+            if (entry.len > 0 and ascii.eqlIgnoreCase(entry, origin)) return true;
+        }
+        return false;
+    }
+
+    pub fn refuseOrigin(stream: anytype) !void {
+        try stream.writeAll("HTTP/1.1 403 Forbidden\r\nerror: origin not allowed\r\ncontent-length: 0\r\n\r\n");
+    }
+
     pub fn close(stream: anytype, err: anyerror) !void {
         try stream.writeAll("HTTP/1.1 400 Invalid\r\nerror: ");
         const s = switch (err) {
@@ -170,6 +187,23 @@ pub const Handshake = struct {
         try stream.writeAll(&buf);
     }
 };
+
+test "origin allow-list" {
+    var headers = try KeyValue.init(std.testing.allocator, 10);
+    defer headers.deinit(std.testing.allocator);
+    var request = "GET /x HTTP/1.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nOrigin: https://App.example\r\n\r\n".*;
+    const h = try Handshake.parse(&request, &headers);
+    try std.testing.expect(h.originAllowed(""));
+    try std.testing.expect(h.originAllowed("https://other.example\nhttps://app.example"));
+    try std.testing.expect(!h.originAllowed("https://other.example"));
+    try std.testing.expect(!h.originAllowed("https://app.example.evil"));
+
+    headers.reset();
+    var anonymous = "GET /x HTTP/1.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n".*;
+    const no_origin = try Handshake.parse(&anonymous, &headers);
+    try std.testing.expect(no_origin.originAllowed(""));
+    try std.testing.expect(!no_origin.originAllowed("https://app.example"));
+}
 
 fn toLower(str: []u8) []u8 {
     for (str, 0..) |c, i| {

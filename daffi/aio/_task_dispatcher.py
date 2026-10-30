@@ -10,7 +10,11 @@ Execution model
 ---------------
 * The sync poller thread becomes a single ``asyncio.Task`` —
   :meth:`AsyncTaskDispatcher.handle_task_queue`.
-* The sync worker-thread pool becomes a pool of ``asyncio.Task`` objects.
+* Every request runs in its own ``asyncio.Task``; at most ``workers`` of
+  them run at once.  With every slot taken the poller leaves the rest in
+  the native queue (which then reports ``ServiceOverloaded`` when full) and
+  picks them up as slots free.  The poller never waits on a callback, so
+  lifecycle signals and member events are handled while callbacks run.
 * Every fd has its own ``add_reader`` callback that records the fd as ready
   and wakes the poller, which then services exactly those fds.
 * Coroutine callbacks are ``await``ed directly.  Sync callbacks run on
@@ -30,7 +34,6 @@ import threading
 from typing import Any
 
 from .. import dfcore
-from daffi.registry._executor_registry import EXECUTOR_REGISTRY
 from daffi._serialization import Serializer, SerdeFormat
 from daffi._wakeup import WakeupFd, LifecycleSignal
 from daffi._bindings import (
@@ -43,7 +46,12 @@ from daffi._rpc_proxy import connection_lost_error
 from daffi._task_dispatcher import (
     _ConnEntry,
     EventType,
+    _accepted,
+    _exposed,
+    _lookup,
+    _check_serde,
     _error_result,
+    _reply_serde,
     _send_reply,
 )
 
@@ -104,12 +112,13 @@ async def _invoke_callback_async(
     func_name: str,
     serde: SerdeFormat,
     data: bytes,
+    accepted: frozenset = SerdeFormat.ALL,
+    exposed: "frozenset | None" = None,
 ) -> tuple:
     """Async counterpart of :func:`daffi._task_dispatcher._invoke_callback`."""
     try:
-        cb = EXECUTOR_REGISTRY.get(func_name)
-        if cb is None:
-            raise LookupError(f"Callback {func_name!r} is not registered.")
+        _check_serde(serde, accepted)
+        cb = _lookup(func_name, exposed)
         args, kwargs = Serializer.deserialize(serde, data)
         if cb.is_coroutine:
             result = await cb(*args, **kwargs)
@@ -121,20 +130,20 @@ async def _invoke_callback_async(
     except asyncio.CancelledError:
         raise
     except:  # noqa: E722
-        return _error_result(serde)
+        return _error_result(_reply_serde(serde, accepted))
 
 
 class AsyncTaskDispatcher:
     """Async counterpart of :class:`~daffi._task_dispatcher.TaskDispatcher`.
 
-    Uses ``asyncio.Task`` for the poller and worker pool and ``asyncio.Queue``
-    for inter-task work delivery.
+    Uses one ``asyncio.Task`` for the poller and one per request, at most
+    ``workers`` of them at a time.
 
     The public API (``start_for_connection`` / ``stop_for_connection``) mirrors
     the sync version except that ``stop_for_connection`` is ``async def``.
     """
 
-    DEFAULT_WORKERS = 1
+    DEFAULT_WORKERS = 64
 
     def __init__(self, workers: int = DEFAULT_WORKERS) -> None:
         if workers < 1:
@@ -145,12 +154,15 @@ class AsyncTaskDispatcher:
             dfcore.getMessageForClientWorker,
             dfcore.getMessageForServerWorker,
         )
-        self.queue: asyncio.Queue = asyncio.Queue()
 
-        self._workers: list[asyncio.Task] = []
         self._poller: asyncio.Task | None = None
         # Background stop() calls started by lifecycle signals.
         self._stop_tasks: set[asyncio.Task] = set()
+        # Request tasks still running, with the conn_num they answer.
+        self._running: dict[asyncio.Task, int] = {}
+        # Connections left with queued requests because every slot was taken.
+        # The native layer will not signal them again, so a freed slot does.
+        self._starved: set[int] = set()
 
         self._conns: dict[int, _ConnEntry] = {}
         self._rfd_to_conn_num: dict[int, int] = {}
@@ -158,30 +170,24 @@ class AsyncTaskDispatcher:
         self._kick: asyncio.Future | None = None
 
     # ------------------------------------------------------------------
-    # Worker pool
+    # Request tasks
     # ------------------------------------------------------------------
 
-    def _start_workers(self) -> None:
-        """Create ``workers`` worker tasks if not already running
-        (``workers >= 2`` only)."""
-        if self._workers or self.workers == 1:
-            return
-        loop = asyncio.get_running_loop()
-        for i in range(self.workers):
-            t = loop.create_task(self._worker_loop(), name=f"daffi-aio-worker-{i}")
-            self._workers.append(t)
+    def _spawn(self, conn_num: int, task_item: tuple) -> None:
+        task = asyncio.get_running_loop().create_task(self._run_task(*task_item))
+        self._running[task] = conn_num
+        task.add_done_callback(self._finished)
 
-    async def _worker_loop(self) -> None:
-        me = asyncio.current_task()
-        queue = self.queue
-        while me in self._workers:
-            task = await queue.get()
-            try:
-                await self._run_task(*task)
-            except Exception:
-                task[-1].exception("Task execution failed")
-            finally:
-                queue.task_done()
+    def _finished(self, task: asyncio.Task) -> None:
+        self._running.pop(task, None)
+        if not self._starved or len(self._running) >= self.workers:
+            return
+        for conn_num in self._starved:
+            entry = self._conns.get(conn_num)
+            if entry is not None:
+                self._ready.add(entry.wakeup.read_fd)
+        self._starved.clear()
+        self._wake_poller()
 
     async def _run_task(
         self,
@@ -194,11 +200,16 @@ class AsyncTaskDispatcher:
         conn_num: int,
         server_mode: bool,
         logger,
+        accepted: frozenset,
+        exposed: "frozenset | None",
     ) -> None:
-        outcome = await _invoke_callback_async(func_name, serde, data)
-        # A connection stopped during the callback gets no reply.
-        if return_result and conn_num in self._conns:
-            _send_reply(server_mode, conn_num, uuid, transmitter, func_name, outcome, logger)
+        try:
+            outcome = await _invoke_callback_async(func_name, serde, data, accepted, exposed)
+            # A connection stopped during the callback gets no reply.
+            if return_result and conn_num in self._conns:
+                _send_reply(server_mode, conn_num, uuid, transmitter, func_name, outcome, logger)
+        except Exception:
+            logger.exception("Task execution failed")
 
     # ------------------------------------------------------------------
     # Fd management
@@ -261,7 +272,6 @@ class AsyncTaskDispatcher:
             set_lifecycle_fd(conn_num, lc.write_fd)
 
         self.connections.add(connection)
-        self._start_workers()
         if self._poller is None:
             self._poller = asyncio.get_running_loop().create_task(
                 self.handle_task_queue(), name="daffi-aio-poller"
@@ -273,21 +283,25 @@ class AsyncTaskDispatcher:
         Nothing is awaited: a callback still running is cancelled, or, if it
         is sync, abandoned on its thread, and its reply is dropped.
         """
+        conn_num = getattr(connection, "_conn_num", None)
         self.connections.discard(connection)
-        self._deregister_fds(getattr(connection, "_conn_num", None))
-        if self.connections:
+        self._deregister_fds(conn_num)
+        self._starved.discard(conn_num)
+        current = asyncio.current_task()
+        last = not self.connections
+        for task, owner in list(self._running.items()):
+            if (last or owner == conn_num) and task is not current:
+                task.cancel()
+        if not last:
             return
 
-        current = asyncio.current_task()
         # A new poller may start while this one winds down; the old one exits
         # as soon as it sees it is no longer the current poller.
         poller, self._poller = self._poller, None
-        workers, self._workers = self._workers, []
-        self.queue = asyncio.Queue()
+        self._starved.clear()
         self._wake_poller()
-        for task in (*workers, poller):
-            if task is not None and task is not current:
-                task.cancel()
+        if poller is not None and poller is not current:
+            poller.cancel()
 
     # ------------------------------------------------------------------
     # Poller coroutine
@@ -327,11 +341,20 @@ class AsyncTaskDispatcher:
         """Take every queued task of *conn*.
 
         The native layer signals the fd once and not again until the queue
-        has been seen empty, so this must keep going until it is.
+        has been seen empty, so this must keep going until it is, or until
+        every slot is taken: then :meth:`_finished` brings it back here.
         """
         poller = self.pollers[bool(conn.server_mode)]
         while conn in self.connections:
-            task = poller(conn_num)
+            if len(self._running) >= self.workers:
+                self._starved.add(conn_num)
+                return
+            try:
+                task = poller(conn_num)
+            except Exception:
+                # The native layer has already dropped that message.
+                conn.logger.exception("Could not read a queued task")
+                continue
             if task is None:
                 return
             try:
@@ -363,11 +386,10 @@ class AsyncTaskDispatcher:
             conn_num,
             bool(conn.server_mode),
             conn.logger,
+            _accepted(conn),
+            _exposed(conn),
         )
-        if self.workers == 1:
-            await self._run_task(*task_item)
-        else:
-            self.queue.put_nowait(task_item)
+        self._spawn(conn_num, task_item)
 
     async def _handle_lifecycle_signal(
         self, conn: Any, conn_num: int, reason: bytes
@@ -380,7 +402,7 @@ class AsyncTaskDispatcher:
 
         if reason == LifecycleSignal.INIT:
             await asyncio.get_running_loop().run_in_executor(
-                None, AsyncRpcProxy._process_client_handshake, conn_num
+                None, AsyncRpcProxy._process_client_handshake, conn_num, conn._exposed_names()
             )
             conn._register_executors()
             return

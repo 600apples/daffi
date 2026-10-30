@@ -263,16 +263,42 @@ class TestAlias:
         with pytest.raises(ValueError):
             alias(123)
 
-    def test_callback_uses_function_name_not_alias(self):
-        """Current impl: @callback registers under __name__, not .alias."""
+    def test_callback_registers_under_the_alias(self):
+        """@alias used to set an attribute nothing read: the callback stayed
+        registered under its own name."""
 
         @callback
         @alias("alias_key")
         def alias_test_fn() -> int:
             return 99
 
-        assert "alias_test_fn" in EXECUTOR_REGISTRY.registry
-        assert "alias_key" not in EXECUTOR_REGISTRY.registry
+        assert "alias_key" in EXECUTOR_REGISTRY.registry
+        assert "alias_test_fn" not in EXECUTOR_REGISTRY.registry
+        assert EXECUTOR_REGISTRY.get("alias_key")() == 99
+
+    def test_alias_above_callback_renames_it(self):
+        @alias("renamed_key")
+        @callback
+        def alias_outer_fn() -> int:
+            return 7
+
+        assert "renamed_key" in EXECUTOR_REGISTRY.registry
+        assert "alias_outer_fn" not in EXECUTOR_REGISTRY.registry
+        assert alias_outer_fn.names == ["renamed_key"]
+
+    def test_alias_on_a_class_method(self):
+        @callback
+        class AliasedOps:
+            @alias("mul")
+            def multiply(self, a, b):
+                return a * b
+
+            def plus(self, a, b):
+                return a + b
+
+        assert EXECUTOR_REGISTRY.get("mul")(3, 4) == 12
+        assert EXECUTOR_REGISTRY.get("plus")(3, 4) == 7
+        assert "multiply" not in EXECUTOR_REGISTRY.registry
 
     def test_stacking_outer_wins(self):
         """When applied twice, the outermost decorator's value is stored."""

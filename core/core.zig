@@ -183,6 +183,16 @@ const client_methods = [_]PyMethodDef{
         ,
     },
     .{
+        .ml_name  = "missingMembers",
+        .ml_meth  = cffi.missingMembers,
+        .ml_flags = 1,
+        .ml_doc   =
+            \\missingMembers(conn_num, names) -> list[str]
+            \\
+            \\The names in *names* that are not connected peers.
+        ,
+    },
+    .{
         .ml_name  = "getMessageFromClientStore",
         .ml_meth  = cffi.getMessageFromClientStore,
         .ml_flags = 1,
@@ -346,6 +356,11 @@ const util_methods = [_]PyMethodDef{
 test {
     _ = @import("serde.zig");
     _ = @import("runtime.zig");
+    _ = @import("misc.zig");
+    _ = @import("network.zig");
+    _ = @import("store.zig");
+    _ = @import("handlers/handlers.zig");
+    _ = @import("Server.zig");
 }
 
 // ── Combined method table ─────────────────────────────────────────────────────

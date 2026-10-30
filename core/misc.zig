@@ -98,14 +98,40 @@ pub const Condition = if (is_wasm) struct {
         _ = std.c.pthread_cond_wait(&self.inner, &mutex.inner);
     }
 
-    /// Returns false when `timeout_ms` elapsed without a signal.
+    /// Returns false when `timeout_ms` elapsed without a signal.  The
+    /// timeout is measured on the monotonic clock: setting the wall clock
+    /// neither stretches nor cuts it.
     pub fn timedWait(self: *Condition, mutex: *Mutex, timeout_ms: u32) bool {
-        var ts: std.c.timespec = undefined;
-        _ = std.c.clock_gettime(.REALTIME, &ts);
-        const ns: i64 = @as(i64, ts.nsec) + @as(i64, timeout_ms % 1000) * std.time.ns_per_ms;
-        ts.sec += @intCast(timeout_ms / 1000 + @as(u32, @intCast(@divTrunc(ns, std.time.ns_per_s))));
-        ts.nsec = @intCast(@mod(ns, std.time.ns_per_s));
-        return std.c.pthread_cond_timedwait(&self.inner, &mutex.inner, &ts) != .TIMEDOUT;
+        if (builtin.target.os.tag.isDarwin()) {
+            const rel = msTimespec(timeout_ms);
+            return pthread_cond_timedwait_relative_np(&self.inner, &mutex.inner, &rel) != @intFromEnum(std.c.E.TIMEDOUT);
+        }
+        // pthread_cond_timedwait takes a wall-clock deadline here; wait in
+        // short slices so a clock step moves the end by at most one slice.
+        const deadline = monotonicMs() + timeout_ms;
+        while (true) {
+            const left = deadline - monotonicMs();
+            if (left <= 0) return false;
+            var ts: std.c.timespec = undefined;
+            _ = std.c.clock_gettime(.REALTIME, &ts);
+            const slice = msTimespec(@intCast(@min(left, max_wall_slice_ms)));
+            const ns: i64 = @as(i64, ts.nsec) + slice.nsec;
+            ts.sec += slice.sec + @as(@TypeOf(ts.sec), @intCast(@divTrunc(ns, std.time.ns_per_s)));
+            ts.nsec = @intCast(@mod(ns, std.time.ns_per_s));
+            if (std.c.pthread_cond_timedwait(&self.inner, &mutex.inner, &ts) != .TIMEDOUT) return true;
+        }
+    }
+
+    const max_wall_slice_ms = 1000;
+
+    extern "c" fn pthread_cond_timedwait_relative_np(
+        cond: *std.c.pthread_cond_t,
+        mutex: *std.c.pthread_mutex_t,
+        reltime: *const std.c.timespec,
+    ) c_int;
+
+    fn msTimespec(ms: u32) std.c.timespec {
+        return .{ .sec = @intCast(ms / 1000), .nsec = @intCast(@as(u64, ms % 1000) * std.time.ns_per_ms) };
     }
 
     pub fn signal(self: *Condition) void {
@@ -136,3 +162,15 @@ pub const Event = struct {
         while (!self.is_set) self.cond.wait(&self.mutex);
     }
 };
+
+test "Condition.timedWait times out on the monotonic clock" {
+    if (is_wasm) return;
+    var mutex: Mutex = .{};
+    var cond: Condition = .{};
+    mutex.lock();
+    defer mutex.unlock();
+    const start = monotonicMs();
+    try std.testing.expect(!cond.timedWait(&mutex, 1200));
+    const took = monotonicMs() - start;
+    try std.testing.expect(took >= 1190 and took < 3000);
+}

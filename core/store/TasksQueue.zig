@@ -9,9 +9,14 @@ const TasksQueue = @This();
 /// reply.  Blocking the reader instead could deadlock two peers that call
 /// each other.
 pub const max_pending: usize = 65_536;
+/// The same for the bytes the waiting requests hold: a few peers sending
+/// large messages faster than Python takes them must not exhaust memory.
+pub const max_pending_bytes: usize = 256 * 1024 * 1024;
 
 queue: std.DoublyLinkedList = .{},
 len: usize = 0,
+bytes: usize = 0,
+byte_limit: usize = max_pending_bytes,
 mutex: Mutex = .{},
 /// Guards both descriptors.  Python sets one to -1 before closing it, so a
 /// write never lands on a reused descriptor number.
@@ -38,6 +43,7 @@ pub fn deinit(self: *TasksQueue) void {
         msg.deinit();
     }
     self.len = 0;
+    self.bytes = 0;
 }
 
 /// Tell Python the queue has work, unless an earlier wakeup is still
@@ -93,29 +99,61 @@ pub fn getMessageFromQueue(self: *TasksQueue) ?*Message {
         return null;
     };
     self.len -= 1;
-    return @alignCast(@fieldParentPtr("queue_node", node));
+    const msg: *Message = @alignCast(@fieldParentPtr("queue_node", node));
+    self.bytes -= msg.data.len;
+    return msg;
 }
 
 /// Queue a message whatever the backlog (events, lifecycle notices).
 pub fn pushMessageToQueue(self: *TasksQueue, message: *Message) void {
     self.mutex.lock();
     defer self.mutex.unlock();
-    self.queue.append(&message.queue_node);
-    self.len += 1;
+    self.append(message);
 }
 
-/// Queue a request unless `max_pending` are already waiting.
+/// Queue a request unless `max_pending` requests or `byte_limit` bytes are
+/// already waiting.  One request is always taken into an empty queue, so a
+/// single message larger than the limit is not refused forever.
 pub fn tryPushRequest(self: *TasksQueue, message: *Message) bool {
     self.mutex.lock();
     defer self.mutex.unlock();
     if (self.len >= max_pending) return false;
+    if (self.len > 0 and self.bytes + message.data.len > self.byte_limit) return false;
+    self.append(message);
+    return true;
+}
+
+fn append(self: *TasksQueue, message: *Message) void {
     self.queue.append(&message.queue_node);
     self.len += 1;
-    return true;
+    self.bytes += message.data.len;
 }
 
 pub fn pending(self: *TasksQueue) usize {
     self.mutex.lock();
     defer self.mutex.unlock();
     return self.len;
+}
+
+fn testRequest(body: []const u8) !*Message {
+    var raw = try serde.RawMessage.create(std.testing.allocator, body, 1, .REQUEST, .JSON, false, true, "caller", "svc", "f");
+    return Message.fromRawMessage(std.testing.allocator, &raw);
+}
+
+test "TasksQueue refuses requests past its byte limit" {
+    var q = TasksQueue{ .byte_limit = 1000 };
+    defer q.deinit();
+
+    const body: [1500]u8 = @splat('1');
+    const big = try testRequest(&body);
+    try std.testing.expect(q.tryPushRequest(big));
+
+    const small = try testRequest("1");
+    try std.testing.expect(!q.tryPushRequest(small));
+    try std.testing.expectEqual(@as(usize, 1), q.pending());
+
+    q.getMessageFromQueue().?.deinit();
+    try std.testing.expectEqual(@as(usize, 0), q.bytes);
+    try std.testing.expect(q.tryPushRequest(small));
+    try std.testing.expect(q.bytes > 0);
 }

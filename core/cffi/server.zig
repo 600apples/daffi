@@ -24,8 +24,11 @@ const allocator = std.heap.c_allocator;
 ///
 /// Each listener is either `(host, port)` (plaintext),
 /// `(host, port, tls, cert, key)`, or
-/// `(host, port, tls, cert, key, ca)`.  A non-empty `ca` on a TLS listener
-/// enables mutual TLS (clients must present a cert chaining to that CA).
+/// `(host, port, tls, cert, key, ca)`, or
+/// `(host, port, tls, cert, key, ca, allowed_origins)`.  A non-empty `ca` on
+/// a TLS listener enables mutual TLS (clients must present a cert chaining to
+/// that CA).  `allowed_origins` is a newline-separated list of the origins a
+/// WebSocket upgrade may come from; empty allows any.
 /// `cert` / `key` / `ca` are a filesystem path or PEM material.
 ///
 /// All or nothing: when a listener cannot be bound nothing stays bound, and
@@ -34,7 +37,8 @@ pub fn addListeners(_: [*c]PyObject, args: [*c]PyObject) callconv(.c) [*c]PyObje
     var listeners: *PyObject = undefined;
     var mode: c_short = undefined;
     var app_name: [*:0]u8 = undefined;
-    if (PyArg_ParseTuple(args, "Ohs", &listeners, &mode, &app_name) == 0) return null;
+    var auth_token: ?[*:0]u8 = null;
+    if (PyArg_ParseTuple(args, "Ohs|z", &listeners, &mode, &app_name, &auth_token) == 0) return null;
     // Validate everything that comes from Python: an out-of-range value used to
     // hit `@intCast`/`unreachable`, i.e. abort the whole interpreter.
     const pmode: HandlerMode = switch (mode) {
@@ -68,6 +72,7 @@ pub fn addListeners(_: [*c]PyObject, args: [*c]PyObject) callconv(.c) [*c]PyObje
         var cert: [*:0]u8 = undefined;
         var key: [*:0]u8 = undefined;
         var ca: [*:0]u8 = undefined;
+        var origins: [*:0]u8 = undefined;
         const nitems = py.PyTuple_Size(item);
         if (nitems == 2) {
             if (PyArg_ParseTuple(item, "sl", &host, &port) == 0) return null;
@@ -75,8 +80,10 @@ pub fn addListeners(_: [*c]PyObject, args: [*c]PyObject) callconv(.c) [*c]PyObje
             if (PyArg_ParseTuple(item, "slpss", &host, &port, &tls_enabled, &cert, &key) == 0) return null;
         } else if (nitems == 6) {
             if (PyArg_ParseTuple(item, "slpsss", &host, &port, &tls_enabled, &cert, &key, &ca) == 0) return null;
+        } else if (nitems == 7) {
+            if (PyArg_ParseTuple(item, "slpssss", &host, &port, &tls_enabled, &cert, &key, &ca, &origins) == 0) return null;
         } else {
-            PyErr_SetString(py.PyExc_TypeError, "listener must be (host, port), (host, port, tls, cert, key), or (host, port, tls, cert, key, ca)");
+            PyErr_SetString(py.PyExc_TypeError, "listener must be (host, port), (host, port, tls, cert, key), (host, port, tls, cert, key, ca), or (host, port, tls, cert, key, ca, allowed_origins)");
             return null;
         }
         if (port < 0 or port > std.math.maxInt(u16)) {
@@ -89,14 +96,15 @@ pub fn addListeners(_: [*c]PyObject, args: [*c]PyObject) callconv(.c) [*c]PyObje
             .tls = tls_enabled != 0,
             .cert = if (nitems >= 5) std.mem.span(cert) else "",
             .key = if (nitems >= 5) std.mem.span(key) else "",
-            .ca = if (nitems == 6) std.mem.span(ca) else "",
+            .ca = if (nitems >= 6) std.mem.span(ca) else "",
+            .allowed_origins = if (nitems == 7) std.mem.span(origins) else "",
         };
     }
 
     // Binding (and resolving hosts) may block: release the GIL meanwhile.
     var failed: ?usize = null;
     const py_state = py.PyEval_SaveThread();
-    const started = Server.start(allocator, pmode, std.mem.span(app_name), configs, &failed);
+    const started = Server.start(allocator, pmode, std.mem.span(app_name), configs, &failed, if (auth_token) |t| std.mem.span(t) else null);
     py.PyEval_RestoreThread(py_state);
     const conn_num = started catch |err| {
         if (failed) |i| {

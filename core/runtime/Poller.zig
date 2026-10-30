@@ -9,6 +9,7 @@ const builtin = @import("builtin");
 const c = std.c;
 const nofile = @import("../nofile.zig");
 const net = @import("../network/posix_net.zig");
+const log = std.log.scoped(.poller);
 
 const os_tag = builtin.target.os.tag;
 const use_kqueue = os_tag.isDarwin() or os_tag.isBSD();
@@ -97,19 +98,39 @@ pub fn remove(self: *Poller, fd: c_int) void {
     }
 }
 
+/// Pause after a failed wait other than EINTR (ENOMEM, ...), so a failure
+/// that persists does not spin a core.
+const ERROR_BACKOFF_MS = 10;
+
 /// Block until at least one watched descriptor is ready and return the
-/// `udata` of each ready one in `out`.
+/// `udata` of each ready one in `out`.  Returns 0 after a failed wait.
 pub fn wait(self: *Poller, out: *[max_events]usize) usize {
     while (true) {
         const n = if (use_kqueue)
             c.kevent(self.fd, @ptrCast(&self.events), 0, @ptrCast(&self.events), max_events, null)
         else
             c.epoll_wait(self.fd, @ptrCast(&self.events), max_events, -1);
-        if (n < 0) continue; // EINTR
+        if (n < 0) {
+            const err = c._errno().*;
+            if (err == @intFromEnum(c.E.INTR)) continue;
+            log.warn("{s} failed (errno {d}); retrying in {d} ms", .{ if (use_kqueue) "kevent" else "epoll_wait", err, ERROR_BACKOFF_MS });
+            const pause = c.timespec{ .sec = 0, .nsec = ERROR_BACKOFF_MS * std.time.ns_per_ms };
+            _ = c.nanosleep(&pause, null);
+            return 0;
+        }
         const count: usize = @intCast(n);
         for (self.events[0..count], 0..) |ev, i| {
             out[i] = if (use_kqueue) ev.udata else ev.data.ptr;
         }
         return count;
     }
+}
+
+test "Poller.wait returns after a failed wait instead of spinning" {
+    var poller = try Poller.init();
+    // A closed descriptor fails every wait with EBADF.
+    _ = c.close(poller.fd);
+    nofile.release(1);
+    var out: [max_events]usize = undefined;
+    try std.testing.expectEqual(@as(usize, 0), poller.wait(&out));
 }

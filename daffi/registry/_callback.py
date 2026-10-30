@@ -61,6 +61,8 @@ class callback:
     def __init__(self, func_or_class):
         cls = None
         self._func_or_class = func_or_class
+        # The names this registered, for ``callbacks=`` and ``@alias``.
+        self.names: list[str] = []
         if isclass(func_or_class):
             # Inspect the *instance* so bound methods are discovered correctly.
             cls = func_or_class()
@@ -85,7 +87,9 @@ class callback:
                     f"Not supported. {name!r} is an async generator (async def + yield) — "
                     f"use a regular or async function instead."
                 )
+            name = getattr(func, "alias", name)
             EXECUTOR_REGISTRY.register(name=name, func=func, cls=cls)
+            self.names.append(name)
 
     def __call__(self, *args, **kwargs):
         """Delegate calls to the wrapped function or class."""

@@ -45,6 +45,8 @@ if __name__ == "__main__":
 | `transport` | transport or sequence | One `TCPTransport` or `UnixTransport`, or several. Every listener shares this node's membership. `start()` brings all of them up at once or none of them. TLS (`tls`, `cert`, `key`) is set on each `TCPTransport`. |
 | `workers` | `int` | Concurrency level for callback execution. Default: `1` (inline). |
 | `runtime` | `Runtime` | `THREADS` or `EVENTED` for this process. Omit for `threads`. One process, one choice. |
+| `auth_token` | `str` | Shared secret every client must send in its handshake. Omit to accept any client. |
+| `callbacks` | list | The `@callback` functions (or their names) this node offers. Default: every registered callback. A request for another one is answered with an error, as if it did not exist. |
 
 ### Concurrent callback execution
 
@@ -127,6 +129,8 @@ if __name__ == "__main__":
 | `app_name` | `str` | Unique name for this node. |
 | `transport` | `TCPTransport` or `UnixTransport` | The one address this client connects to. |
 | `runtime` | `Runtime` | `THREADS` or `EVENTED` for this process. A client uses the same runtime as the server. Omit for `threads`. |
+| `auth_token` | `str` | The token of a server started with `auth_token=`. |
+| `callbacks` | list | For a client acting as a worker: the callbacks it offers. Default: every registered callback. |
 
 ### `conn.rpc()`
 
@@ -138,7 +142,7 @@ result = rpc.add(3, 4)
 | Option | Type | Description |
 |---|---|---|
 | `timeout` | `float \| None` | Seconds to wait for a result before raising. `None` = wait forever. |
-| `receiver` | `str \| None` | Pin the call to a specific node by name. In the Service topology there is only one Service so this is optional. |
+| `receiver` | `str \| list[str] \| None` | Pin the call to a specific node by name, or to whichever of the listed nodes is connected (taking turns). In the Service topology there is only one Service so this is optional. |
 | `serde` | `SerdeFormat` | Serialisation format (default: `PICKLE`). |
 
 ### `conn.rpc_nowait()`

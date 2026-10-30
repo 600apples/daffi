@@ -24,8 +24,11 @@ pub const op_table = OperationTable{
     .readSome = readSome,
     .readNoBuffer = readNoBuffer,
     .write = write,
+    .writeParts = writeParts,
+    .writeNonBlocking = writeNonBlocking,
     .accept = accept,
     .handle = handle,
+    .hasPendingInput = hasPendingInput,
     .close = close,
     .destroy = destroy,
     .getAddr = getAddr,
@@ -96,6 +99,11 @@ pub fn handle(ctx: *anyopaque) std.posix.socket_t {
     return self.stream.handle;
 }
 
+/// WebSocket sessions are served by blocking reads, never by the event loop.
+pub fn hasPendingInput(_: *anyopaque) bool {
+    return false;
+}
+
 pub fn readNoBuffer(ctx: *anyopaque) !?[]const u8 {
     const self: *WebConnection = @ptrCast(@alignCast(ctx));
     return try self.readInternal();
@@ -104,6 +112,16 @@ pub fn readNoBuffer(ctx: *anyopaque) !?[]const u8 {
 pub fn write(ctx: *anyopaque, data: []const u8) !void {
     const self: *WebConnection = @ptrCast(@alignCast(ctx));
     try self.writeBin(data);
+}
+
+/// A frame header is only known for the whole message: always queued.
+pub fn writeNonBlocking(_: *anyopaque, _: []const u8) !usize {
+    return 0;
+}
+
+pub fn writeParts(ctx: *anyopaque, head: []const u8, body: []const u8) !void {
+    const self: *WebConnection = @ptrCast(@alignCast(ctx));
+    try self.writeFrameParts(.binary, head, body);
 }
 
 pub fn accept(_: *anyopaque, _: c_int) !@import("../network/connection.zig").AcceptedConnection {
@@ -136,8 +154,11 @@ fn readMessageFromStream(self: *WebConnection) !WsMessage {
 }
 
 /// Next text or binary message, or null once the peer closed.  Pings are
-/// answered and pongs skipped without ending the session.
+/// answered and pongs skipped without ending the session.  The message
+/// stays valid until the next call: a fragmented one lives in the
+/// reassembly buffer, which is only freed then.
 fn readInternal(self: *WebConnection) !?[]const u8 {
+    self.reader.handled();
     while (true) {
         const message = self.readMessageFromStream() catch |err| {
             switch (err) {
@@ -147,10 +168,7 @@ fn readInternal(self: *WebConnection) !?[]const u8 {
             return null;
         };
         switch (message.type) {
-            .text, .binary => {
-                self.reader.handled();
-                return message.data;
-            },
+            .text, .binary => return message.data,
             .pong => {},
             .ping => try self.writeFrame(.pong, message.data),
             .close => {
@@ -219,7 +237,12 @@ fn writeCloseWithCode(self: *WebConnection, code: u16) !void {
 const coalesce_limit: usize = 16 * 1024;
 
 fn writeFrame(self: *WebConnection, op_code: WebConnection.OpCode, data: []const u8) !void {
-    const l = data.len;
+    return self.writeFrameParts(op_code, data, "");
+}
+
+/// One frame whose payload is `first` followed by `second`.
+fn writeFrameParts(self: *WebConnection, op_code: WebConnection.OpCode, first: []const u8, second: []const u8) !void {
+    const l = first.len + second.len;
 
     // maximum possible prefix length. op_code + length_type + 8byte length
     var head: [10]u8 = undefined;
@@ -242,11 +265,20 @@ fn writeFrame(self: *WebConnection, op_code: WebConnection.OpCode, data: []const
     if (l <= coalesce_limit) {
         var frame: [head.len + coalesce_limit]u8 = undefined;
         @memcpy(frame[0..head_len], head[0..head_len]);
-        @memcpy(frame[head_len..][0..l], data);
+        @memcpy(frame[head_len..][0..first.len], first);
+        @memcpy(frame[head_len + first.len ..][0..second.len], second);
         return self.writeAllBuf(frame[0 .. head_len + l]);
     }
-    try self.writeAllBuf(head[0..head_len]);
-    try self.writeAllBuf(data);
+    if (first.len <= coalesce_limit) {
+        var lead: [head.len + coalesce_limit]u8 = undefined;
+        @memcpy(lead[0..head_len], head[0..head_len]);
+        @memcpy(lead[head_len..][0..first.len], first);
+        try self.writeAllBuf(lead[0 .. head_len + first.len]);
+    } else {
+        try self.writeAllBuf(head[0..head_len]);
+        try self.writeAllBuf(first);
+    }
+    try self.writeAllBuf(second);
 }
 
 /// Free the reader, buffer pool and the struct.  Does not touch the socket or
@@ -282,9 +314,12 @@ pub const SynParser = struct {
     deadline: i64,
     /// Only browsers need it, so it is created on the first "GET".
     handshake_pool: ?*HandshakePool = null,
+    /// Newline-separated origins a browser upgrade may come from; empty
+    /// allows any.  Not owned.
+    allowed_origins: []const u8,
 
-    pub fn init(allocator: Allocator, deadline: i64) SynParser {
-        return .{ .allocator = allocator, .deadline = deadline };
+    pub fn init(allocator: Allocator, deadline: i64, allowed_origins: []const u8) SynParser {
+        return .{ .allocator = allocator, .deadline = deadline, .allowed_origins = allowed_origins };
     }
 
     pub fn deinit(self: *SynParser) void {
@@ -363,6 +398,10 @@ pub const SynParser = struct {
                 try WebConnection.Handshake.close(stream, err);
                 return error.HandshakeFailed;
             };
+            if (!h.originAllowed(self.allowed_origins)) {
+                try WebConnection.Handshake.refuseOrigin(stream);
+                return error.OriginNotAllowed;
+            }
             try h.reply(stream);
             return true;
         }

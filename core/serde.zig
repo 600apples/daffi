@@ -12,6 +12,7 @@ pub const RawMessage = @import("serde/message.zig").RawMessage;
 pub const MessagePool = @import("serde/message_pool.zig").MessagePool;
 pub const FrameDecoder = @import("serde/message_pool.zig").FrameDecoder;
 pub const receiveLoop = @import("serde/message_pool.zig").receiveLoop;
+pub const drainReadable = @import("serde/message_pool.zig").drainReadable;
 pub const concatenateSlicesAlloc = @import("serde/slices.zig").concatenateSlicesAlloc;
 pub const concatenateSlicesAllocZ = @import("serde/slices.zig").concatenateSlicesAllocZ;
 pub const concatenateSlicesBuf = @import("serde/slices.zig").concatenateSlicesBuf;

@@ -151,6 +151,39 @@ def test_tls_round_trip(tls_service):
         client.stop()
 
 
+def test_tls_without_ca_checks_the_system_trust_store(tls_service):
+    """A client without ``ca`` used to accept any certificate, so anyone on
+    the path could pose as the server.  The test certificate is self-signed
+    and in no system store."""
+    from daffi import Client, TCPTransport
+    from daffi.exceptions import InitializationError
+
+    _, port, _ = tls_service
+    client = Client(
+        app_name="tls-no-ca", transport=TCPTransport(HOST, port, tls=True), runtime=active_runtime()
+    )
+    with pytest.raises(InitializationError):
+        client.connect()
+    client.stop()
+
+
+def test_tls_verify_false_accepts_any_certificate(tls_service):
+    from daffi import Client, TCPTransport
+
+    _, port, _ = tls_service
+    client = Client(
+        app_name="tls-unverified",
+        transport=TCPTransport(HOST, port, tls=True, verify=False),
+        runtime=active_runtime(),
+    )
+    conn = client.connect()
+    try:
+        conn.wait_for_members("tls-service", timeout=15)
+        assert conn.rpc(timeout=TIMEOUT).add(2, 3) == 5
+    finally:
+        client.stop()
+
+
 def test_tls_large_payload(tls_service):
     """Exercises the non-blocking read/write + poll loops with partial writes."""
     _, port, ca = tls_service

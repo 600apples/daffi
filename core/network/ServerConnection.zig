@@ -17,8 +17,11 @@ pub const op_table = OperationTable{
     .readSome = readSome,
     .readNoBuffer = readNoBuffer,
     .write = write,
+    .writeParts = writeParts,
+    .writeNonBlocking = writeNonBlocking,
     .accept = accept,
     .handle = handle,
+    .hasPendingInput = hasPendingInput,
     .close = close,
     .destroy = destroy,
     .getAddr = getAddr,
@@ -29,6 +32,8 @@ allocator: Allocator,
 /// Non-null when this server is in TLS mode.  Shared across all accepted
 /// connections; freed by close().
 ssl_ctx: ?*tls_impl.SslCtx = null,
+/// Owned copy of `Config.allowed_origins`.
+allowed_origins: []const u8 = "",
 
 pub const Config = struct {
     host: ?[]const u8,
@@ -40,45 +45,38 @@ pub const Config = struct {
     key: []const u8 = "",
     /// When non-empty with tls, require and verify client certificates (mTLS).
     ca: []const u8 = "",
+    /// Newline-separated origins a WebSocket upgrade may come from; empty
+    /// allows any.
+    allowed_origins: []const u8 = "",
 };
 
 pub fn init(allocator: Allocator, config: Config) !*ServerConnection {
     const host = config.host orelse "0.0.0.0";
     const options = net.ListenOptions{ .kernel_backlog = 512 };
 
-    // A host containing '/' can only be a Unix-domain socket path; never hand
-    // it to the resolver (what it answers for such a name is platform-specific).
-    const is_unix_path = std.mem.indexOfScalar(u8, host, '/') != null;
-    const resolved: ?*net.AddressList =
-        if (is_unix_path) null else (net.getAddressList(allocator, host, config.port) catch null);
-
-    var listener: anyerror!net.Server = undefined;
-    if (resolved) |addrlist| {
+    var l = if (net.unixPath(host)) |path| blk: {
+        if (path.len == 0) return error.InvalidPath;
+        try net.removeStaleSocket(path);
+        var addr = try net.Address.initUnix(path);
+        break :blk try addr.listen(options);
+    } else blk: {
+        const addrlist = try net.getAddressList(allocator, host, config.port);
         defer addrlist.deinit();
-        listener = error.ConnectionRefused;
+        var last_err: anyerror = error.UnknownHostName;
         for (addrlist.addrs) |*addr| {
-            const l = addr.listen(options);
-            if (!std.meta.isError(l)) {
-                listener = l;
-                break;
-            }
+            break :blk addr.listen(options) catch |err| {
+                last_err = err;
+                continue;
+            };
         }
-    } else {
-        // host is a Unix socket path — remove any stale socket file first
-        var path_buf: [256]u8 = undefined;
-        if (host.len >= path_buf.len) return error.NameTooLong;
-        @memcpy(path_buf[0..host.len], host);
-        path_buf[host.len] = 0;
-        _ = std.c.unlink(@ptrCast(&path_buf));
-        var addr = try net.Address.initUnix(host);
-        listener = addr.listen(options);
-    }
-
-    var l = try listener;
+        return last_err;
+    };
     errdefer l.deinit();
     const self = try allocator.create(ServerConnection);
     errdefer allocator.destroy(self);
     self.* = ServerConnection{ .listener = l, .allocator = allocator };
+    if (config.allowed_origins.len > 0) self.allowed_origins = try allocator.dupe(u8, config.allowed_origins);
+    errdefer allocator.free(self.allowed_origins);
 
     if (config.tls) {
         // Asking for TLS but providing no certificate must fail loudly, not
@@ -104,11 +102,23 @@ pub fn handle(ctx: *anyopaque) std.posix.socket_t {
     return self.listener.handle;
 }
 
+pub fn hasPendingInput(_: *anyopaque) bool {
+    return false;
+}
+
 pub fn readNoBuffer(_: *anyopaque) !?[]const u8 {
     @panic("server connection does not support readNoBuffer");
 }
 
 pub fn write(_: *anyopaque, _: []const u8) !void {
+    @panic("server connection does not support write");
+}
+
+pub fn writeParts(_: *anyopaque, _: []const u8, _: []const u8) !void {
+    @panic("server connection does not support write");
+}
+
+pub fn writeNonBlocking(_: *anyopaque, _: []const u8) !usize {
     @panic("server connection does not support write");
 }
 
@@ -125,6 +135,7 @@ pub fn accept(ctx: *anyopaque, timeout_ms: c_int) !AcceptedConnection {
         .fd = conn.stream.handle,
         .address = na,
         .ssl_ctx = @ptrCast(self.ssl_ctx),
+        .allowed_origins = self.allowed_origins,
     };
 }
 
@@ -147,6 +158,7 @@ pub fn destroy(ctx: *anyopaque) void {
         self.ssl_ctx = null;
     }
     close(ctx);
+    self.allocator.free(self.allowed_origins);
     self.allocator.destroy(self);
 }
 

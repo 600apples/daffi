@@ -18,6 +18,43 @@ const assert = std.debug.assert;
 const misc    = @import("../misc.zig");
 const is_wasm = misc.is_wasm;
 const Mutex   = misc.Mutex;
+const runtime = @import("../runtime.zig");
+const log = std.log.scoped(.connection);
+
+/// Writes queued for a peer that is not reading, past which it is dropped.
+pub const max_outbox_bytes: usize = 64 * 1024 * 1024;
+
+/// Write side of a connection: one writer at a time.  Unlike a pthread
+/// mutex it may be released by another thread than the one that took it,
+/// so a frame an event loop only partly sent can be finished elsewhere
+/// without any other writer getting in between.
+pub const WriteGate = struct {
+    mutex: Mutex = .{},
+    cond: misc.Condition = .{},
+    busy: bool = false,
+
+    pub fn lock(self: *WriteGate) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        while (self.busy) self.cond.wait(&self.mutex);
+        self.busy = true;
+    }
+
+    pub fn tryLock(self: *WriteGate) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.busy) return false;
+        self.busy = true;
+        return true;
+    }
+
+    pub fn unlock(self: *WriteGate) void {
+        self.mutex.lock();
+        self.busy = false;
+        self.mutex.unlock();
+        self.cond.signal();
+    }
+};
 
 pub const ConnectionType = enum {
     ClientConnectionType,
@@ -82,6 +119,9 @@ pub const AcceptedConnection = struct {
     /// The pointer is cast to *anyopaque here to keep connection.zig free of
     /// TLS headers — ClientConnection.initFromAccepted() casts it back.
     ssl_ctx: ?*anyopaque = null,
+    /// The listener's WebSocket Origin allow-list (newline-separated, empty
+    /// allows any).  Owned by the listener, which outlives every upgrade.
+    allowed_origins: []const u8 = "",
 };
 
 pub const OperationTable = struct {
@@ -92,11 +132,19 @@ pub const OperationTable = struct {
     readSome: *const fn (ctx: *anyopaque, buf: []u8) anyerror!usize,
     readNoBuffer: *const fn (ctx: *anyopaque) anyerror!?[]const u8,
     write: *const fn (ctx: *anyopaque, data: []const u8) anyerror!void,
+    /// Send what the socket takes without blocking and return how much that
+    /// was; 0 when the transport cannot (TLS, WebSocket).
+    writeNonBlocking: *const fn (ctx: *anyopaque, data: []const u8) anyerror!usize,
+    /// Write `head` then `body` as one message (one WebSocket frame).
+    writeParts: *const fn (ctx: *anyopaque, head: []const u8, body: []const u8) anyerror!void,
     /// Wait up to `timeout_ms` for an inbound connection; `error.Timeout`
     /// means none arrived.
     accept: *const fn (ctx: *anyopaque, timeout_ms: c_int) anyerror!AcceptedConnection,
     /// Descriptor to watch for readiness (evented model).
     handle: *const fn (ctx: *anyopaque) posix.socket_t,
+    /// Input already taken off the socket but not yet read (decrypted TLS
+    /// bytes), which no readiness event will report.
+    hasPendingInput: *const fn (ctx: *anyopaque) bool,
     /// close: shut down OS resources (socket/fd) and mark suspended.
     /// Does NOT free the ctx struct — call destroy() for that.
     close: *const fn (ctx: *anyopaque) void,
@@ -115,9 +163,16 @@ pub fn Connection(comptime contype: ConnectionType) type {
         ctx: *anyopaque,
         op_table: OperationTable,
         allocator: Allocator,
-        /// Write-side mutex — prevents concurrent writes to the same socket.
-        /// Uses pthread_mutex_t (OS futex) instead of a busy-spin bool.
-        wlock: Mutex = .{},
+        /// One writer at a time on the socket.
+        wlock: WriteGate = .{},
+        /// Event-loop threads never block on a write: what the socket does
+        /// not take at once is queued here, in order, and a blocking-pool
+        /// worker sends it (see `post`).
+        outbox_mutex: Mutex = .{},
+        outbox: std.ArrayList([]u8) = .empty,
+        outbox_bytes: usize = 0,
+        /// A worker owns the write side and is sending the outbox.
+        outbox_draining: bool = false,
         /// True once the connection has been interrupted/closed.  Atomic: it is
         /// written by whichever thread tears the connection down and polled by
         /// reader/accept loops.
@@ -131,9 +186,29 @@ pub fn Connection(comptime contype: ConnectionType) type {
         /// that need the connection to outlive a mutex release call retain()
         /// before releasing the mutex and release() when done.
         refcount: std.atomic.Value(u32) = std.atomic.Value(u32).init(1),
+        /// Monotonic ms of the last read that left a frame unfinished; 0 when
+        /// no frame is in progress.  The server closes a connection whose
+        /// frame stops making progress (see `frameStalled`).
+        frame_progress_ms: std.atomic.Value(i64) = .init(0),
 
         pub const Self = @This();
         pub const Config = T.Config;
+
+        pub fn noteFrameProgress(self: *Self, partial: bool) void {
+            if (comptime is_wasm) return;
+            if (!partial) {
+                if (self.frame_progress_ms.load(.monotonic) != 0) self.frame_progress_ms.store(0, .monotonic);
+                return;
+            }
+            self.frame_progress_ms.store(@import("../misc.zig").monotonicMs(), .monotonic);
+        }
+
+        /// Whether a frame has been unfinished, with no bytes arriving, for
+        /// longer than `limit_ms`.
+        pub fn frameStalled(self: *const Self, now_ms: i64, limit_ms: i64) bool {
+            const since = self.frame_progress_ms.load(.monotonic);
+            return since != 0 and now_ms - since > limit_ms;
+        }
 
         // ClientConnectionType non-wasm: Reader/Writer infrastructure
         pub const ReadError = anyerror;
@@ -154,21 +229,141 @@ pub fn Connection(comptime contype: ConnectionType) type {
             return self.op_table.handle(self.ctx);
         }
 
+        pub fn hasPendingInput(self: *Self) bool {
+            comptime if (is_wasm) @compileError("hasPendingInput() not available on wasm");
+            return self.op_table.hasPendingInput(self.ctx);
+        }
+
         pub fn readNoBuffer(self: *Self) anyerror!?[]const u8 {
             comptime if (is_wasm or contype != .ClientConnectionType) @compileError("readNoBuffer() not available for this connection type");
             return self.op_table.readNoBuffer(self.ctx);
         }
 
         pub fn write(self: *Self, data: []const u8) anyerror!void {
+            if (comptime !is_wasm and contype == .ClientConnectionType) {
+                if (runtime.onLoopThread()) return self.post(&.{data});
+            }
             self.wlock.lock();
             defer self.wlock.unlock();
             try self.writeHeld(data);
+        }
+
+        /// `write` that never blocks, for event-loop threads.  Sends at once
+        /// when nothing is queued and the socket takes it all; otherwise the
+        /// rest is queued for a blocking-pool worker.  Writes keep their order.
+        fn post(self: *Self, parts: []const []const u8) anyerror!void {
+            comptime if (is_wasm or contype != .ClientConnectionType) @compileError("post() not available for this connection type");
+            self.outbox_mutex.lock();
+            defer self.outbox_mutex.unlock();
+            if (self.outbox_draining) return self.enqueue(parts, 0);
+            if (!self.wlock.tryLock()) {
+                // Another thread is writing: queue, and wait for it elsewhere.
+                try self.enqueue(parts, 0);
+                return self.startDrain(false);
+            }
+            var skip: usize = 0;
+            for (parts) |part| {
+                const sent = self.op_table.writeNonBlocking(self.ctx, part) catch |err| {
+                    self.wlock.unlock();
+                    self.close();
+                    return err;
+                };
+                skip += sent;
+                if (sent < part.len) break;
+            } else {
+                self.wlock.unlock();
+                return;
+            }
+            // Part of a frame may be out: keep the write side, and hand it
+            // to the worker that sends the rest.
+            self.enqueue(parts, skip) catch |err| {
+                self.wlock.unlock();
+                return err;
+            };
+            return self.startDrain(true);
+        }
+
+        /// Queue `parts` minus their first `skip` bytes as one entry.  Call
+        /// with `outbox_mutex` held.
+        fn enqueue(self: *Self, parts: []const []const u8, skip: usize) !void {
+            var len: usize = 0;
+            for (parts) |part| len += part.len;
+            len -= skip;
+            if (self.outbox_bytes + len > max_outbox_bytes) {
+                log.warn("closing a connection whose peer is not reading ({d} bytes queued)", .{self.outbox_bytes});
+                self.close();
+                return error.OutboxFull;
+            }
+            const buf = try self.allocator.alloc(u8, len);
+            errdefer self.allocator.free(buf);
+            var at: usize = 0;
+            var left = skip;
+            for (parts) |part| {
+                const from = @min(left, part.len);
+                left -= from;
+                @memcpy(buf[at..][0 .. part.len - from], part[from..]);
+                at += part.len - from;
+            }
+            try self.outbox.append(self.allocator, buf);
+            self.outbox_bytes += len;
+        }
+
+        /// Start the worker that sends the outbox.  Call with `outbox_mutex`
+        /// held; with `holds_gate` the caller's write side passes to it.
+        fn startDrain(self: *Self, holds_gate: bool) !void {
+            self.retain();
+            runtime.spawnBlocking(drainOutbox, .{ self, holds_gate }) catch |err| {
+                self.release();
+                if (holds_gate) self.wlock.unlock();
+                self.dropOutbox();
+                self.close();
+                return err;
+            };
+            self.outbox_draining = true;
+        }
+
+        fn drainOutbox(self: *Self, holds_gate: bool) void {
+            defer self.release();
+            if (!holds_gate) self.wlock.lock();
+            while (true) {
+                self.outbox_mutex.lock();
+                if (self.outbox.items.len == 0) {
+                    self.outbox_draining = false;
+                    self.wlock.unlock();
+                    self.outbox_mutex.unlock();
+                    return;
+                }
+                const buf = self.outbox.orderedRemove(0);
+                self.outbox_bytes -= buf.len;
+                self.outbox_mutex.unlock();
+                defer self.allocator.free(buf);
+                self.writeHeld(buf) catch {
+                    self.outbox_mutex.lock();
+                    self.dropOutbox();
+                    self.outbox_draining = false;
+                    self.wlock.unlock();
+                    self.outbox_mutex.unlock();
+                    return;
+                };
+            }
+        }
+
+        /// Free everything queued.  Call with `outbox_mutex` held.
+        fn dropOutbox(self: *Self) void {
+            for (self.outbox.items) |buf| self.allocator.free(buf);
+            self.outbox.clearRetainingCapacity();
+            self.outbox_bytes = 0;
         }
 
         /// Hold the write side: writes from other threads wait until
         /// `unlockWrites`.
         pub fn lockWrites(self: *Self) void {
             self.wlock.lock();
+        }
+
+        /// `lockWrites` if no other thread holds the write side.
+        pub fn tryLockWrites(self: *Self) bool {
+            return self.wlock.tryLock();
         }
 
         pub fn unlockWrites(self: *Self) void {
@@ -186,6 +381,18 @@ pub fn Connection(comptime contype: ConnectionType) type {
             };
         }
 
+        /// `write` of `head` followed by `body`, without joining them first.
+        pub fn writeParts(self: *Self, head: []const u8, body: []const u8) anyerror!void {
+            comptime if (is_wasm or contype != .ClientConnectionType) @compileError("writeParts() not available for this connection type");
+            if (runtime.onLoopThread()) return self.post(&.{ head, body });
+            self.wlock.lock();
+            defer self.wlock.unlock();
+            self.op_table.writeParts(self.ctx, head, body) catch |err| {
+                self.close();
+                return err;
+            };
+        }
+
         /// Increment the reference count.  Call before releasing a lock that
         /// protects this connection pointer when another thread may destroy it.
         pub fn retain(self: *Self) void {
@@ -198,6 +405,10 @@ pub fn Connection(comptime contype: ConnectionType) type {
         /// so every `init`/`accept` must be matched by exactly one final release.
         pub fn release(self: *Self) void {
             if (self.refcount.fetchSub(1, .acq_rel) == 1) {
+                if (comptime !is_wasm) {
+                    self.dropOutbox();
+                    self.outbox.deinit(self.allocator);
+                }
                 self.op_table.destroy(self.ctx);
                 self.allocator.destroy(self);
             }
@@ -239,7 +450,7 @@ pub fn Connection(comptime contype: ConnectionType) type {
             stream.setIoTimeout(tls_impl.HANDSHAKE_TIMEOUT_MS);
             const deadline = @import("../misc.zig").monotonicMs() + tls_impl.HANDSHAKE_TIMEOUT_MS;
 
-            var sync_parser = SynParser.init(self.allocator, deadline);
+            var sync_parser = SynParser.init(self.allocator, deadline, conn.allowed_origins);
             defer sync_parser.deinit();
             const pnet_addr = posix_net.Address{};
 
@@ -324,4 +535,117 @@ pub fn Connection(comptime contype: ConnectionType) type {
             return self.op_table.getAddr(self.ctx);
         }
     };
+}
+
+const TestPeer = struct {
+    const c = @import("posix_c");
+    const Conn = Connection(.ClientConnectionType);
+
+    conn: *Conn,
+    /// The far end, read by the test.
+    fd: c_int,
+
+    extern "c" fn signal(sig: c_int, handler: usize) usize;
+
+    fn open() !TestPeer {
+        // The drainer's write to a shut-down socket must fail, not kill the test.
+        _ = signal(13, 1); // SIGPIPE, SIG_IGN
+        var fds: [2]c_int = undefined;
+        try std.testing.expectEqual(@as(c_int, 0), c.socketpair(c.AF_UNIX, c.SOCK_STREAM, 0, &fds));
+        const ctx = try ClientConnection.initFromAccepted(std.testing.allocator, fds[0]);
+        // Stream.close() releases a descriptor this socketpair never counted.
+        @import("../nofile.zig").acquire(1);
+        // Bound a write if the far end is not reading, so a stuck drainer
+        // fails the test instead of hanging the suite.
+        ctx.stream.setWriteTimeout(2000);
+        const conn = try std.testing.allocator.create(Conn);
+        conn.* = .{ .ctx = ctx, .op_table = ClientConnection.op_table, .allocator = std.testing.allocator };
+        return .{ .conn = conn, .fd = fds[1] };
+    }
+
+    fn draining(self: TestPeer) bool {
+        self.conn.outbox_mutex.lock();
+        defer self.conn.outbox_mutex.unlock();
+        return self.conn.outbox_draining;
+    }
+
+    fn waitDrained(self: TestPeer) !void {
+        const deadline = misc.monotonicMs() + 5_000;
+        while (self.draining()) {
+            try std.testing.expect(misc.monotonicMs() < deadline);
+            std.Thread.yield() catch {};
+        }
+        // The drainer drops its reference just after it stops draining.
+        while (self.conn.refcount.load(.acquire) > 1) {
+            try std.testing.expect(misc.monotonicMs() < deadline);
+            std.Thread.yield() catch {};
+        }
+    }
+
+    /// Wait for the drainer to finish, then free everything.
+    fn close(self: TestPeer) !void {
+        try self.waitDrained();
+        self.conn.release();
+        _ = c.close(self.fd);
+    }
+};
+
+test "post does not wait for a slow peer and keeps the order of writes" {
+    if (comptime is_wasm) return;
+    const peer = try TestPeer.open();
+    const chunk = 256 * 1024;
+    const count = 32;
+    var buf: [chunk]u8 = undefined;
+
+    // Nobody reads yet: far more than the socket buffer holds is posted.
+    const started = misc.monotonicMs();
+    for (0..count) |i| {
+        @memset(&buf, @truncate(i));
+        try peer.conn.post(&.{ buf[0..16], buf[16..] });
+    }
+    try std.testing.expect(misc.monotonicMs() - started < 1000);
+    try std.testing.expect(peer.draining());
+
+    const Reader = struct {
+        fn run(fd: c_int, out: *bool) void {
+            var got: [chunk]u8 = undefined;
+            for (0..count) |i| {
+                var at: usize = 0;
+                while (at < chunk) {
+                    const n = TestPeer.c.read(fd, got[at..].ptr, chunk - at);
+                    if (n <= 0) return;
+                    at += @intCast(n);
+                }
+                for (got) |b| if (b != @as(u8, @truncate(i))) return;
+            }
+            out.* = true;
+        }
+    };
+    var in_order = false;
+    const reader = try std.Thread.spawn(.{}, Reader.run, .{ peer.fd, &in_order });
+    reader.join();
+    try std.testing.expect(in_order);
+    try peer.close();
+}
+
+test "post closes a peer that stops reading once max_outbox_bytes are queued" {
+    if (comptime is_wasm) return;
+    const peer = try TestPeer.open();
+    const chunk = try std.testing.allocator.alloc(u8, 1024 * 1024);
+    defer std.testing.allocator.free(chunk);
+    @memset(chunk, 1);
+
+    // Fill the outbox without a drainer so the cap is what we measure, not
+    // a race against a write that times out.
+    peer.conn.outbox_mutex.lock();
+    var posted: usize = 0;
+    const err = while (posted <= max_outbox_bytes + chunk.len) {
+        peer.conn.enqueue(&.{chunk}, 0) catch |e| break e;
+        posted += chunk.len;
+    } else error.TestUnexpectedResult;
+    peer.conn.outbox_mutex.unlock();
+    try std.testing.expectEqual(error.OutboxFull, err);
+    try std.testing.expect(posted >= max_outbox_bytes);
+    try std.testing.expect(peer.conn.isSuspended());
+    try peer.close();
 }

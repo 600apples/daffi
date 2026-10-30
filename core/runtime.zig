@@ -63,6 +63,12 @@ pub fn loop() !*EventLoop {
     return loops[next_loop.fetchAdd(1, .monotonic) % loop_count].?;
 }
 
+/// Whether the calling thread is an event-loop thread, which must not block.
+pub fn onLoopThread() bool {
+    if (comptime misc.is_wasm) return false;
+    return EventLoop.current != null;
+}
+
 /// Run `func(args...)` on the blocking pool.
 pub fn spawnBlocking(comptime func: anytype, args: std.meta.ArgsTuple(@TypeOf(func))) !void {
     return blocking_pool.spawn(func, args);

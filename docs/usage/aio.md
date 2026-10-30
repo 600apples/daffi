@@ -127,9 +127,8 @@ The event loop is never blocked.
 from daffi.aio import AsyncClient
 
 client = AsyncClient(
-    app_name="my-client",
-    workers=1,              # asyncio task concurrency for *incoming* callbacks
-,   # unique name on the network
+    app_name="my-client",   # unique name on the network
+    workers=64,             # incoming callbacks that may run at once (default)
     transport=TCPTransport("127.0.0.1", 6001))
 
 conn   = await client.connect()   # returns an AsyncClientConnection
@@ -144,13 +143,19 @@ this node.
 
 | Value | Behaviour |
 |---|---|
-| `1` (default) | Inline: each callback is awaited before the next is dispatched. |
-| `N > 1` | Pool of `N` asyncio tasks; up to `N` callbacks run concurrently. |
+| `64` (default) | Up to 64 callbacks run concurrently, each in its own `asyncio.Task`. |
+| `N` | Up to `N` callbacks run concurrently. |
+| `1` | One callback at a time, in arrival order. |
+
+Requests beyond the limit stay queued in the native layer and start as
+running ones finish; once that queue is full, callers get
+`ServiceOverloaded`.  Lifecycle notices (disconnect, eviction) are handled
+even while every slot is busy.
 
 !!! tip
-    Because the worker pool uses `asyncio.Task` (not OS threads), the
-    `workers` parameter has **zero thread-creation overhead** — you can safely
-    set `workers=200` or higher without the memory cost of 200 OS stacks.
+    Each running callback is an `asyncio.Task`, not an OS thread, so
+    `workers=200` or higher costs no thread stacks.  Sync callbacks still
+    run on a shared pool of daemon threads.
 
 ---
 
@@ -199,9 +204,9 @@ result = await conn.rpc(timeout=10).my_function(arg1, arg2)
 # Cast — broadcast to all workers; await the dict of results
 results = await conn.cast(timeout=10).my_function(arg1)
 
-# Fire-and-forget variants — return immediately
-conn.rpc_nowait().my_function(arg1)
-conn.cast_nowait().my_function(arg1)
+# Fire-and-forget variants — await the send, not the result
+await conn.rpc_nowait().my_function(arg1)
+await conn.cast_nowait().my_function(arg1)
 
 # Stream a sequence (OPAQUE serde; each chunk sent as a separate message)
 await conn.stream(serde=SerdeFormat.OPAQUE).my_callback(chunk)
@@ -252,10 +257,10 @@ added in front of the blocking ones:
 |---|---|---|
 | `rpc()` | `await conn.rpc(timeout=N).fn(args)` | Single result |
 | `cast()` | `await conn.cast(timeout=N).fn(args)` | `{name: result}` dict |
-| `rpc_nowait()` | `conn.rpc_nowait().fn(args)` | `None` immediately |
-| `cast_nowait()` | `conn.cast_nowait().fn(args)` | `None` immediately |
+| `rpc_nowait()` | `await conn.rpc_nowait().fn(args)` | `None` once sent |
+| `cast_nowait()` | `await conn.cast_nowait().fn(args)` | `None` once sent |
 | `stream()` | `await conn.stream(serde=…).fn(chunk)` | Single result |
-| `stream_nowait()` | `conn.stream_nowait(serde=…).fn(chunk)` | `None` immediately |
+| `stream_nowait()` | `await conn.stream_nowait(serde=…).fn(chunk)` | `None` once sent |
 
 ---
 

@@ -14,13 +14,13 @@ Five call styles are available on every :class:`ClientConnection`:
 
 from __future__ import annotations
 
+import itertools
 import json
 import math
 import time
 import logging
 import threading
-from itertools import repeat
-from typing import TYPE_CHECKING, Union, Tuple, List, Optional
+from typing import TYPE_CHECKING, Callable, Union, Tuple, List, Optional
 from contextlib import contextmanager
 
 if TYPE_CHECKING:
@@ -49,6 +49,12 @@ from daffi._bindings import (
 from . import dfcore
 
 METADATA_SEPARATOR = ","
+
+
+def _names(names: "list[str] | None") -> "list[str]":
+    if names is None:
+        return [name for name, _ in EXECUTOR_REGISTRY]
+    return names
 
 
 def connection_lost_error(evicted: bool, app_name: Optional[str] = None) -> Exception:
@@ -87,6 +93,44 @@ def unpack_response(res: Tuple, request_serde: Optional[int]) -> Tuple[bytes, in
             raise restored_exc(err_msg).with_traceback(tb)
         raise restored_exc(err_msg)
     return data, flag, serde
+
+
+class _Receivers:
+    """Where a single call may go: any worker (no names), or one of the named
+    workers, tried in turn starting from the next one along."""
+
+    def __init__(self, receiver: Union[str, List[str], None]) -> None:
+        if receiver is None or receiver == "":
+            names: List[str] = []
+        elif isinstance(receiver, str):
+            names = [receiver]
+        elif iterable(receiver):
+            names = list(receiver)
+            if not names or not all(isinstance(n, str) and n for n in names):
+                raise ValueError(f"receiver must list one or more names, not {receiver!r}")
+        else:
+            raise TypeError(f"receiver must be a name or a list of names, not {receiver!r}")
+        self.names = names
+        self._turn = itertools.count()
+
+    def __str__(self) -> str:
+        return METADATA_SEPARATOR.join(self.names)
+
+    def send(self, send: Callable[[str], tuple]) -> tuple:
+        """``send(name)`` to the first of the names that is connected and
+        offers the callback; ``send("")`` lets the native layer pick."""
+        names = self.names
+        if not names:
+            return send("")
+        start = next(self._turn) % len(names)
+        order = names[start:] + names[:start]
+        for name in order[:-1]:
+            try:
+                return send(name)
+            except ValueError as e:
+                if str(e) != "ReceiverNotFound":
+                    raise
+        return send(order[-1])
 
 
 @contextmanager
@@ -209,7 +253,7 @@ class _BoundRpc:
         if self._proxy.return_result:
             return self._proxy._process_rpc(self._func_name, *args, **kwargs)
         else:
-            self._proxy._process_stream(self._func_name, *args, **kwargs)
+            self._proxy._process_nowait(self._func_name, *args, **kwargs)
 
 
 class RpcProxy:
@@ -239,13 +283,11 @@ class RpcProxy:
     ):
         self.conn = conn
         self.timeout = int(timeout or 0)
-        self.receiver = (
-            METADATA_SEPARATOR.join(receiver) if iterable(receiver) else receiver or ""
-        )
+        self._to = _Receivers(receiver)
+        self.receiver = str(self._to)
         self.serde = serde
         self.return_result = return_result
         self.logger = logger
-        self._receiver = {receiver} if receiver else set()
 
     def __str__(self) -> str:
         req_name = "rpc call" if self.return_result else "rpc_nowait"
@@ -263,16 +305,18 @@ class RpcProxy:
         conn_num = self.conn.client._conn_num
         data, is_bytes = Serializer.serialize(self.serde, *args, **kwargs)
         try:
-            uuid, ts, found_receiver = dfcore.sendMessageFromClient(
-                data,
-                0,
-                MessageFlag.REQUEST,
-                self.serde,
-                is_bytes,
-                self.receiver,
-                func_name,
-                True,
-                conn_num,
+            uuid, ts, found_receiver = self._to.send(
+                lambda receiver: dfcore.sendMessageFromClient(
+                    data,
+                    0,
+                    MessageFlag.REQUEST,
+                    self.serde,
+                    is_bytes,
+                    receiver,
+                    func_name,
+                    True,
+                    conn_num,
+                )
             )
         except (SystemError, ValueError):
             label = f"rpc call(fn: {func_name!r})"
@@ -289,11 +333,7 @@ class RpcProxy:
             raise TransmissionFailure(
                 f"No receivers found for rpc call(fn: {func_name!r})." + members
             )
-        found_receivers = set(found_receiver.split(METADATA_SEPARATOR))
-        if self._receiver and (missing_receivers := self._receiver - found_receivers):
-            self.logger.warning(
-                f"Receiver(s): {missing_receivers} seems to be offline."
-            )
+        found_receivers = {found_receiver}
         data, flag, serde = RpcResult(
             conn_num=conn_num,
             uuid=uuid,
@@ -305,56 +345,42 @@ class RpcProxy:
         ).result()
         return Serializer.deserialize(serde, data)[0][0]
 
-    def _process_stream(self, func_name: str, *args, **kwargs):
-        """Send one or more fire-and-forget messages without waiting for replies."""
+    def _process_nowait(self, func_name: str, *args, **kwargs):
+        """Send one fire-and-forget call with exactly these arguments."""
         conn_num = self.conn.client._conn_num
-        if args:
-            data = args[0]
-        elif kwargs:
-            data = kwargs[next(iter(kwargs))]
-        else:
-            data = None
-        if not iterable(data):
-            items = [(args, kwargs)]
-        else:
-            items = iter(zip(data, repeat({})))
         label = f"rpc_nowait(fn: {func_name!r})"
-        for a, k in items:
-            data, is_bytes = Serializer.serialize(self.serde, *a, **k)
-            with system_exception_handler(
-                f"Unable to proceed with {label}: {{}}", TransmissionFailure, conn_num
-            ):
-                uuid, ts, found_receiver = send_message_from_client(
+        data, is_bytes = Serializer.serialize(self.serde, *args, **kwargs)
+        with system_exception_handler(
+            f"Unable to proceed with {label}: {{}}", TransmissionFailure, conn_num
+        ):
+            uuid, ts, found_receiver = self._to.send(
+                lambda receiver: send_message_from_client(
                     data=data,
                     flag=MessageFlag.REQUEST,
                     serde=self.serde,
-                    receiver=self.receiver,
+                    receiver=receiver,
                     func_name=func_name,
                     return_result=self.return_result,
                     conn_num=conn_num,
                     is_bytes=is_bytes,
                 )
-            if not found_receiver:
-                members = (
-                    ""
-                    if not (_memebers := get_available_members(conn_num))
-                    else f"\nAvailable receivers: {_memebers}"
-                )
-                raise TransmissionFailure(f"No receivers found for {label}." + members)
-            elif missing_receivers := self._receiver - set(
-                found_receiver.split(METADATA_SEPARATOR)
-            ):
-                self.logger.warning(
-                    f"Receiver(s): {missing_receivers} seems to be offline."
-                )
+            )
+        if not found_receiver:
+            members = (
+                ""
+                if not (_memebers := get_available_members(conn_num))
+                else f"\nAvailable receivers: {_memebers}"
+            )
+            raise TransmissionFailure(f"No receivers found for {label}." + members)
 
     @classmethod
-    def _process_client_handshake(cls, conn_num: int) -> dict:
+    def _process_client_handshake(cls, conn_num: int, names: "list[str] | None" = None) -> dict:
         """Perform the initial client→server handshake and return the parsed
         JSON response (contains ``meta.type`` indicating router vs service).
 
         Args:
             conn_num: Native connection handle.
+            names:    The callbacks to announce (default: every registered one).
 
         Raises:
             TransmissionFailure: If the handshake times out or the native layer
@@ -367,7 +393,7 @@ class RpcProxy:
         with system_exception_handler(
             "unable to establish handshake: {}", TransmissionFailure
         ):
-            data = METADATA_SEPARATOR.join([name for name, _ in EXECUTOR_REGISTRY])
+            data = METADATA_SEPARATOR.join(_names(names))
             uuid, ts, found_receiver = send_handshake_from_client(
                 methods=data,
                 conn_num=conn_num,
@@ -394,19 +420,20 @@ class RpcProxy:
             return payload
 
     @classmethod
-    def _advertise_service_methods(cls, conn_num: int) -> None:
+    def _advertise_service_methods(cls, conn_num: int, names: "list[str] | None" = None) -> None:
         """Publish this service's callback names before any client connects."""
-        data = METADATA_SEPARATOR.join([name for name, _ in EXECUTOR_REGISTRY])
+        data = METADATA_SEPARATOR.join(_names(names))
         set_service_methods(data, conn_num)
 
     @classmethod
-    def _process_service_handshake(cls, conn_num: int) -> None:
+    def _process_service_handshake(cls, conn_num: int, names: "list[str] | None" = None) -> None:
         """Notify the native layer of this service's exported method names.
 
         Args:
             conn_num: Native connection handle.
+            names:    The callbacks to announce (default: every registered one).
         """
-        cls._advertise_service_methods(conn_num)
+        cls._advertise_service_methods(conn_num, names)
 
 
 class RpcResult:
@@ -452,9 +479,15 @@ class RpcResult:
             CallTimeout: If *timeout* seconds elapse with no response.
         """
         deadline = self._started + self.timeout if self.timeout > 0 else None
+        current = threading.current_thread()
+        hand_off = getattr(current, "_daffi_hand_off", None)
+        if hand_off is not None:
+            # A callback running on the dispatcher's poller: the answer may
+            # need that poller, so it must not wait on it.
+            hand_off()
         step = (
             self._MAIN_THREAD_SLICE
-            if threading.current_thread() is threading.main_thread()
+            if current is threading.main_thread()
             else self._LIVENESS_INTERVAL
         )
         check_at = self._started + self._LIVENESS_INTERVAL
@@ -493,8 +526,7 @@ class RpcResult:
         )
 
     def _check_receivers(self) -> None:
-        current = {m["name"] for m in get_available_members(self.conn_num)}
-        if missing_receivers := self.receivers - current:
+        if missing_receivers := set(dfcore.missingMembers(self.conn_num, self.receivers)):
             raise TransmissionFailure(
                 f"The anticipated receivers(s) {missing_receivers}"
                 f" unexpectedly disconnected, causing an interruption in the awaiting result of {self.proxy}."
@@ -608,44 +640,51 @@ class BroadcastProxy:
             )
         # Send to each receiver and collect (uuid → name) handles.
         pending: dict[str, RpcResult] = {}
-        for receiver_name in receivers:
-            with system_exception_handler(
-                f"Unable to dispatch call_all to {receiver_name!r}: {{}}",
-                TransmissionFailure,
-                conn_num,
-            ):
-                uuid, ts, found = send_message_from_client(
-                    data=data,
-                    flag=MessageFlag.REQUEST,
-                    serde=self.serde,
-                    receiver=receiver_name,
-                    func_name=func_name,
-                    return_result=True,
-                    conn_num=conn_num,
-                    is_bytes=is_bytes,
-                )
-            if found:
-                pending[receiver_name] = RpcResult(
-                    conn_num=conn_num,
-                    uuid=uuid,
-                    ts=ts,
-                    timeout=self.timeout,
-                    receivers={receiver_name},
-                    serde=self.serde,
-                )
-            else:
-                self.logger.warning(
-                    f"call_all: receiver {receiver_name!r} not reachable, skipping."
-                )
-        # Wait for every response and collect into a dict.
-        results: dict = {}
-        for name, rpc_result in pending.items():
-            try:
-                result_data, _, serde_r = rpc_result.result()
-                results[name] = Serializer.deserialize(serde_r, result_data)[0][0]
-            except Exception as exc:
-                results[name] = exc
-        return results
+        try:
+            for receiver_name in receivers:
+                with system_exception_handler(
+                    f"Unable to dispatch call_all to {receiver_name!r}: {{}}",
+                    TransmissionFailure,
+                    conn_num,
+                ):
+                    uuid, ts, found = send_message_from_client(
+                        data=data,
+                        flag=MessageFlag.REQUEST,
+                        serde=self.serde,
+                        receiver=receiver_name,
+                        func_name=func_name,
+                        return_result=True,
+                        conn_num=conn_num,
+                        is_bytes=is_bytes,
+                    )
+                if found:
+                    pending[receiver_name] = RpcResult(
+                        conn_num=conn_num,
+                        uuid=uuid,
+                        ts=ts,
+                        timeout=self.timeout,
+                        receivers={receiver_name},
+                        serde=self.serde,
+                    )
+                else:
+                    self.logger.warning(
+                        f"call_all: receiver {receiver_name!r} not reachable, skipping."
+                    )
+            # Wait for every response and collect into a dict.
+            results: dict = {}
+            for name in list(pending):
+                rpc_result = pending.pop(name)
+                try:
+                    result_data, _, serde_r = rpc_result.result()
+                    results[name] = Serializer.deserialize(serde_r, result_data)[0][0]
+                except Exception as exc:
+                    results[name] = exc
+            return results
+        finally:
+            # Requests nobody will wait for any more keep their uuid taken
+            # until expired.
+            for rpc_result in pending.values():
+                expire_message(rpc_result.uuid, conn_num)
 
     def _process_cast_all(self, func_name: str, *args, **kwargs) -> None:
         """Fan out to all matching peers, fire-and-forget."""
@@ -892,7 +931,7 @@ class ClientConnection:
     def rpc(
         self,
         timeout: Union[int, None] = None,
-        receiver: Union[str, None] = None,
+        receiver: Union[str, List[str], None] = None,
         serde: SerdeFormat = SerdeFormat.PICKLE,
     ) -> RpcProxy:
         """Configure a **blocking** call to a single worker and return a proxy.
@@ -905,9 +944,10 @@ class ClientConnection:
         Args:
             timeout:  Seconds to wait for the response.  ``None`` (or ``0``)
                       means wait indefinitely.
-            receiver: Name of the target worker.  ``None`` picks a worker
-                      using round-robin among all peers that expose the
-                      requested method.
+            receiver: Name of the target worker, or a list of names to send
+                      to whichever of them is connected (taking turns).
+                      ``None`` picks a worker using round-robin among all
+                      peers that expose the requested method.
             serde:    Serialisation format.  Defaults to
                       :attr:`~daffi.serialization.SerdeFormat.PICKLE`.
 
@@ -927,7 +967,7 @@ class ClientConnection:
 
     def rpc_nowait(
         self,
-        receiver: Union[str, None] = None,
+        receiver: Union[str, List[str], None] = None,
         serde: SerdeFormat = SerdeFormat.PICKLE,
     ) -> RpcProxy:
         """Configure a **fire-and-forget** call to a single worker and return a proxy.
@@ -936,8 +976,9 @@ class ClientConnection:
         No result is returned.
 
         Args:
-            receiver: Name of the target worker.  ``None`` picks one using
-                      round-robin.
+            receiver: Name of the target worker, or a list of names to send
+                      to whichever of them is connected (taking turns).
+                      ``None`` picks one using round-robin.
             serde:    Serialisation format.  Defaults to
                       :attr:`~daffi.serialization.SerdeFormat.PICKLE`.
 

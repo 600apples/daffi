@@ -38,6 +38,7 @@ tests = [
     "pytest>=7.0",
     "pytest-asyncio>=0.23",
     "msgpack>=1.0",
+    "wasmtime>=20",
 ]
 
 [project.urls]

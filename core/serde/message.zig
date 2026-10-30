@@ -538,6 +538,20 @@ pub const RawMessage = struct {
         serde.concatenateSlicesBuf(buf, slices);
     }
 
+    /// Encode the frame up to the payload (header and metadata) into `buf`
+    /// and return its length; the frame is that prefix followed by `data`.
+    pub fn encodePrefixInto(buf: []u8, data: []const u8, uuid: u16, flag: MessageFlag, decoder: MessageDecoder, is_bytes: bool, return_result: bool, transmitter: ?[]const u8, receiver: ?[]const u8, func_name: ?[]const u8) !usize {
+        const framed = try parts(data, transmitter, receiver, func_name);
+        const prefix_len = framed.total - data.len;
+        if (buf.len < prefix_len) return error.NoSpace;
+        const header = try Header.create(uuid, flag, decoder, is_bytes, return_result, framed.msg_len, framed.metadata_len);
+        var backed_header_bytes: [serde.HEADER_SIZE]u8 = undefined;
+        header.toBytes(&backed_header_bytes);
+        const slices = &[_][]const u8{ &backed_header_bytes, framed.transmitter, SECTION_SEPARATOR_SEQ, framed.receiver, SECTION_SEPARATOR_SEQ, framed.func_name };
+        serde.concatenateSlicesBuf(buf, slices);
+        return prefix_len;
+    }
+
     pub fn encodedLen(data: []const u8, transmitter: ?[]const u8, receiver: ?[]const u8, func_name: ?[]const u8) !usize {
         return (try parts(data, transmitter, receiver, func_name)).total;
     }
@@ -812,4 +826,16 @@ test "Message.create validates lengths and leaves ownership with the caller" {
     @memset(data, 'x');
     header.toBytes(data[0..serde.HEADER_SIZE]);
     try std.testing.expectError(error.InvalidMetadata, Message.create(alloc, header, data));
+}
+
+test "encodePrefixInto plus the payload is the whole frame" {
+    const data = "payload bytes";
+    const n = try RawMessage.encodedLen(data, "tx", "rx", "fn");
+    var whole: [128]u8 = undefined;
+    try RawMessage.encodeInto(whole[0..n], data, 9, .REQUEST, .PICKLE, true, true, "tx", "rx", "fn");
+    var prefix: [128]u8 = undefined;
+    const p = try RawMessage.encodePrefixInto(&prefix, data, 9, .REQUEST, .PICKLE, true, true, "tx", "rx", "fn");
+    try std.testing.expectEqual(n - data.len, p);
+    try std.testing.expectEqualSlices(u8, whole[0..p], prefix[0..p]);
+    try std.testing.expectEqualSlices(u8, data, whole[p..n]);
 }

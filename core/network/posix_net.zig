@@ -13,6 +13,14 @@ const O_NONBLOCK: c_int = switch (@import("builtin").target.os.tag) {
 };
 extern "c" fn fcntl(fd: c_int, cmd: c_int, ...) c_int;
 
+/// Keeps a write to a closed peer an error instead of a SIGPIPE (Linux; on
+/// macOS the process ignores SIGPIPE, as Python does).
+const no_sigpipe: c_int = if (@import("builtin").target.os.tag == .linux) std.c.MSG.NOSIGNAL else 0;
+
+/// `struct iovec` for writev (same layout on every POSIX target).
+const IoVec = extern struct { base: [*]const u8, len: usize };
+extern "c" fn writev(fd: c_int, iov: [*]const IoVec, iovcnt: c_int) isize;
+
 const F_SETFD: c_int = 2;
 const FD_CLOEXEC: c_int = 1;
 
@@ -127,6 +135,7 @@ pub const SEND_STALL_TIMEOUT_MS: u32 = 5_000;
 
 const std = @import("std");
 const nofile = @import("../nofile.zig");
+const misc = @import("../misc.zig");
 
 /// Last connect/listen/accept failure on this thread. `Client.init` fails
 /// with a coarse Zig error (`ConnectionRefused`, `SocketCreateFailed`); the
@@ -159,27 +168,16 @@ fn noteLiteral(text: []const u8) void {
 }
 
 fn errnoLabel(code: c_int) []const u8 {
-    return switch (code) {
-        1 => "EPERM",
-        2 => "ENOENT",
-        12 => "ENOMEM",
-        13 => "EACCES",
-        22 => "EINVAL",
-        23 => "ENFILE",
-        24 => "EMFILE",
-        28 => "ENOSPC",
-        32 => "EPIPE",
-        48, 98 => "EADDRINUSE",
-        49, 99 => "EADDRNOTAVAIL",
-        54, 104 => "ECONNRESET",
-        55, 105 => "ENOBUFS",
-        60, 110 => "ETIMEDOUT",
-        61, 111 => "ECONNREFUSED",
-        64, 112 => "EHOSTDOWN",
-        65, 113 => "EHOSTUNREACH",
-        101 => "ENETUNREACH",
-        else => "",
+    const names = .{
+        "EPERM",         "ENOENT",       "ENOMEM",       "EACCES",      "EINVAL",
+        "ENFILE",        "EMFILE",       "ENOSPC",       "EPIPE",       "EADDRINUSE",
+        "EADDRNOTAVAIL", "ECONNRESET",   "ENOBUFS",      "ETIMEDOUT",   "ECONNREFUSED",
+        "EHOSTDOWN",     "EHOSTUNREACH", "ENETUNREACH",  "ENETDOWN",    "EAFNOSUPPORT",
     };
+    inline for (names) |name| {
+        if (code == @field(c, name)) return name;
+    }
+    return "";
 }
 
 pub fn connectFailure() []const u8 {
@@ -317,6 +315,58 @@ pub const Stream = struct {
         }
     }
 
+    /// Send what the socket buffer takes without waiting; returns how much.
+    /// The caller must be the only writer.
+    pub fn writeNonBlocking(self: Stream, data: []const u8) !usize {
+        // Darwin ignores MSG_DONTWAIT on send: make the socket non-blocking
+        // for the duration instead.
+        const darwin = comptime @import("builtin").target.os.tag.isDarwin();
+        const flags = if (darwin) fcntl(self.handle, F_GETFL, @as(c_int, 0)) else 0;
+        if (flags < 0) return 0;
+        if (darwin) _ = fcntl(self.handle, F_SETFL, flags | O_NONBLOCK);
+        defer if (darwin) {
+            _ = fcntl(self.handle, F_SETFL, flags);
+        };
+        var sent: usize = 0;
+        while (sent < data.len) {
+            const result = std.c.send(self.handle, data[sent..].ptr, data.len - sent, std.c.MSG.DONTWAIT | no_sigpipe);
+            if (result >= 0) {
+                sent += @intCast(result);
+                continue;
+            }
+            switch (lastErrno()) {
+                .INTR => continue,
+                .AGAIN => return sent,
+                else => return error.WriteError,
+            }
+        }
+        return sent;
+    }
+
+    /// `writeAll(head)` then `writeAll(body)` in as few system calls as the
+    /// socket takes (writev).
+    pub fn writeAllParts(self: Stream, head: []const u8, body: []const u8) !void {
+        var iov = [2]IoVec{ .{ .base = head.ptr, .len = head.len }, .{ .base = body.ptr, .len = body.len } };
+        var first: usize = 0;
+        while (first < iov.len) {
+            const result = writev(self.handle, iov[first..].ptr, @intCast(iov.len - first));
+            if (result < 0) switch (lastErrno()) {
+                .INTR => continue,
+                .AGAIN => return error.WriteTimeout,
+                else => return error.WriteError,
+            };
+            var sent: usize = @intCast(result);
+            while (first < iov.len and sent >= iov[first].len) {
+                sent -= iov[first].len;
+                first += 1;
+            }
+            if (first < iov.len) {
+                iov[first].base += sent;
+                iov[first].len -= sent;
+            }
+        }
+    }
+
     /// Set (or, with 0, clear) the receive and send timeouts of the socket.
     pub fn setIoTimeout(self: Stream, ms: u32) void {
         self.setReadTimeout(ms);
@@ -424,13 +474,24 @@ pub fn tcpConnectToHost(_: Allocator, host: []const u8, port: u16) !Stream {
             return Stream{ .handle = fd };
         }
 
-        // For non-blocking sockets, EINPROGRESS means "in progress" — use
-        // poll() to wait up to CONNECT_TIMEOUT_MS for the result.
-        // Any other errno (ECONNREFUSED, ENETUNREACH, …) causes poll() to
-        // return immediately with POLLERR, so SO_ERROR will be non-zero and
-        // we fall through to the failure path below without extra errno checks.
+        // EINPROGRESS (or EINTR, after which the attempt carries on) means the
+        // outcome is pending: poll() for it.  Any other errno is final, and
+        // poll() on that socket may not wake until the timeout (macOS).
+        const connect_err = std.c._errno().*;
+        if (connect_err != c.EINPROGRESS and connect_err != c.EINTR) {
+            noteCode("connect", connect_err);
+            _ = c.close(fd);
+            nofile.release(1);
+            continue;
+        }
         var pfd = PollFd{ .fd = fd, .events = POLLOUT, .revents = 0 };
-        const nready = poll(@as([*]PollFd, @ptrCast(&pfd)), 1, CONNECT_TIMEOUT_MS);
+        const deadline = misc.monotonicMs() + CONNECT_TIMEOUT_MS;
+        var nready: c_int = undefined;
+        while (true) {
+            const left: c_int = @intCast(@max(0, deadline - misc.monotonicMs()));
+            nready = poll(@as([*]PollFd, @ptrCast(&pfd)), 1, left);
+            if (nready >= 0 or std.c._errno().* != c.EINTR) break;
+        }
         if (nready <= 0) {
             // 0 = timeout, -1 = poll error. Record it before close().
             if (nready < 0) noteErrno("poll") else noteLiteral("connect: timed out");
@@ -457,6 +518,43 @@ pub fn tcpConnectToHost(_: Allocator, host: []const u8, port: u16) !Stream {
         return Stream{ .handle = fd };
     }
     return error.ConnectionRefused;
+}
+
+/// Scheme of a host that names a Unix-domain socket: `unix:<path>`.  A host
+/// without it is always resolved as a TCP host, so a name that fails to
+/// resolve is never mistaken for a socket file.
+pub const unix_scheme = "unix:";
+
+/// The socket path of a `unix:<path>` host, or null for a TCP host.
+pub fn unixPath(host: []const u8) ?[]const u8 {
+    if (!std.mem.startsWith(u8, host, unix_scheme)) return null;
+    return host[unix_scheme.len..];
+}
+
+/// Make way for a listener at `path`: remove a socket file left behind by a
+/// server that is gone.  Refuses to remove anything that is not a socket,
+/// or a socket some server still accepts on.
+pub fn removeStaleSocket(path: []const u8) !void {
+    var path_buf: [256]u8 = undefined;
+    if (path.len >= path_buf.len) return error.NameTooLong;
+    @memcpy(path_buf[0..path.len], path);
+    path_buf[path.len] = 0;
+    const path_z: [*:0]const u8 = @ptrCast(&path_buf);
+
+    var st: std.c.Stat = undefined;
+    // Nothing there (or not reachable): bind reports any real problem.
+    if (std.c.fstatat(std.c.AT.FDCWD, path_z, &st, std.c.AT.SYMLINK_NOFOLLOW) != 0) return;
+    if (!std.c.S.ISSOCK(@intCast(st.mode))) {
+        noteLiteral("the path exists and is not a socket");
+        return error.PathAlreadyExists;
+    }
+    if (connectUnixSocket(path)) |live| {
+        live.close();
+        noteLiteral("another server is listening on this socket");
+        return error.AddressInUse;
+    } else |_| {}
+    clearConnectFailure();
+    _ = c.unlink(path_z);
 }
 
 pub fn connectUnixSocket(path: []const u8) !Stream {
@@ -638,4 +736,54 @@ fn listenOn(addr: *const Address, options: ListenOptions) !Server {
     setNonBlocking(fd);
     clearConnectFailure();
     return Server{ .handle = fd, .listen_address = addr.* };
+}
+
+test "writeAllParts sends head then body across partial writes" {
+    var fds: [2]c_int = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), c.socketpair(c.AF_UNIX, c.SOCK_STREAM, 0, &fds));
+    defer for (fds) |fd| {
+        _ = c.close(fd);
+    };
+    const body = try std.testing.allocator.alloc(u8, 1 << 20);
+    defer std.testing.allocator.free(body);
+    for (body, 0..) |*b, i| b.* = @truncate(i *% 31);
+    const out = try std.testing.allocator.alloc(u8, 5 + body.len);
+    defer std.testing.allocator.free(out);
+
+    const Reader = struct {
+        fn run(fd: c_int, buf: []u8) void {
+            var got: usize = 0;
+            while (got < buf.len) {
+                const n = c.read(fd, buf[got..].ptr, buf.len - got);
+                if (n <= 0) return;
+                got += @intCast(n);
+            }
+        }
+    };
+    const reader = try std.Thread.spawn(.{}, Reader.run, .{ fds[1], out });
+    try (Stream{ .handle = fds[0] }).writeAllParts("head:", body);
+    reader.join();
+    try std.testing.expectEqualSlices(u8, "head:", out[0..5]);
+    try std.testing.expectEqualSlices(u8, body, out[5..]);
+}
+
+test "writeNonBlocking returns at a full buffer and leaves the socket blocking" {
+    var fds: [2]c_int = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), c.socketpair(c.AF_UNIX, c.SOCK_STREAM, 0, &fds));
+    defer for (fds) |fd| {
+        _ = c.close(fd);
+    };
+    // Bound the wait if the send does block, so a regression fails instead of hanging.
+    const stream = Stream{ .handle = fds[0] };
+    stream.setWriteTimeout(2000);
+    const flags_before = fcntl(fds[0], F_GETFL, @as(c_int, 0));
+
+    const data = try std.testing.allocator.alloc(u8, 8 << 20);
+    defer std.testing.allocator.free(data);
+    @memset(data, 7);
+    const started = misc.monotonicMs();
+    const sent = try stream.writeNonBlocking(data);
+    try std.testing.expect(sent < data.len);
+    try std.testing.expect(misc.monotonicMs() - started < 1000);
+    try std.testing.expectEqual(flags_before, fcntl(fds[0], F_GETFL, @as(c_int, 0)));
 }

@@ -34,8 +34,7 @@ class Executor:
     __repr__ = __str__
 
     def __call__(self, *args, **kwargs):
-        if self.cls:
-            return getattr(self.cls, self.name)(*args, **kwargs)
+        # For a class this is the bound method; ``name`` may be an alias.
         return self.func(*args, **kwargs)
 
 
@@ -72,6 +71,21 @@ class ExecutorRegistry:
         self.registry[name] = Executor(func, name, cls)
         for subscriber in self.subscribers:
             subscriber(self.registry[name])
+
+    def rename(self, old: str, new: str) -> None:
+        """Move the executor registered as *old* to *new*."""
+        if old == new:
+            return
+        executor = self.registry.get(old)
+        if executor is None:
+            raise InitializationError(f"No callback is registered as {old!r}.")
+        if existing := self.get(new):
+            raise InitializationError(
+                f"Callback {existing!r} is already registered. "
+                "Please use another name or set a custom alias."
+            )
+        del self.registry[old]
+        self.register(new, executor.func, executor.cls)
 
     def unregister(self, name: str) -> None:
         """Remove the executor registered under *name*.  No-op if absent."""

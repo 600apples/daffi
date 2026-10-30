@@ -21,6 +21,7 @@ pub const stopClient                = @import("cffi/client.zig").stopClient;
 pub const sendMessageFromClient     = @import("cffi/client.zig").sendMessageFromClient;
 pub const sendHandshakeFromClient   = @import("cffi/client.zig").sendHandshakeFromClient;
 pub const getAvailableMembers       = @import("cffi/client.zig").getAvailableMembers;
+pub const missingMembers            = @import("cffi/client.zig").missingMembers;
 pub const getMessageFromClientStore = @import("cffi/client.zig").getMessageFromClientStore;
 pub const waitMessageFromClientStore = @import("cffi/client.zig").waitMessageFromClientStore;
 pub const expireMessage             = @import("cffi/client.zig").expireMessage;

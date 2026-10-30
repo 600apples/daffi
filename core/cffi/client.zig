@@ -28,7 +28,9 @@ pub fn startClient(_: [*c]PyObject, args: [*c]PyObject) callconv(.c) [*c]PyObjec
     var ca: [*:0]u8 = undefined;
     var cert: [*:0]u8 = undefined;
     var key: [*:0]u8 = undefined;
-    if (py.PyArg_ParseTuple(args, "slspsss", &host, &port, &app_name, &tls_enabled, &ca, &cert, &key) == 0) return null;
+    var verify: c_int = 1;
+    var auth_token: ?[*:0]u8 = null;
+    if (py.PyArg_ParseTuple(args, "slspsss|pz", &host, &port, &app_name, &tls_enabled, &ca, &cert, &key, &verify, &auth_token) == 0) return null;
     if (port < 0 or port > std.math.maxInt(u16)) {
         PyErr_SetString(py.PyExc_ValueError, "port must be in range 0-65535");
         return null;
@@ -40,11 +42,12 @@ pub fn startClient(_: [*c]PyObject, args: [*c]PyObject) callconv(.c) [*c]PyObjec
         .ca = std.mem.span(ca),
         .cert = std.mem.span(cert),
         .key = std.mem.span(key),
+        .verify = verify != 0,
     };
     // Connecting (and a TLS handshake) can take seconds; the argument
     // strings stay alive because `args` holds them.
     const py_state = py.PyEval_SaveThread();
-    const result = Client.init(allocator, std.mem.span(app_name), config);
+    const result = Client.init(allocator, std.mem.span(app_name), config, if (auth_token) |t| std.mem.span(t) else null);
     py.PyEval_RestoreThread(py_state);
     const conn_num = result catch |err| return raiseConnectError(err);
     return Py_BuildValue("k", @as(c_ulong, conn_num));
@@ -175,14 +178,30 @@ pub fn sendHandshakeFromClient(_: [*c]PyObject, args: [*c]PyObject) callconv(.c)
     return Py_BuildValue("(Ils#)", @as(c_uint, msgident.uuid), @as(c_long, msgident.timestamp), msgident.receiver.ptr, @as(py.Py_ssize_t, @intCast(msgident.receiver.len)));
 }
 
+/// The payload of `msg` as a new reference.  A text payload that is not
+/// valid UTF-8 comes back as `bytes`: it is the peer's data, and failing
+/// here would lose the message (and, in a dispatcher, the dispatcher).
+fn payloadObject(msg: *serde.Message) [*c]PyObject {
+    const data: []const u8 = msg.getData();
+    const len: py.Py_ssize_t = @intCast(data.len);
+    if (!msg.isBytes()) {
+        if (py.PyUnicode_DecodeUTF8(data.ptr, len, null)) |text| return text;
+        py.PyErr_Clear();
+    }
+    return py.PyBytes_FromStringAndSize(data.ptr, len);
+}
+
+/// A name from the wire as a new `str` reference; invalid UTF-8 is replaced.
+fn nameObject(name: []const u8) [*c]PyObject {
+    return py.PyUnicode_DecodeUTF8(name.ptr, @intCast(name.len), "replace");
+}
+
 /// (data, flag, serde) for a response, or the reason no response can come.
 fn responseTuple(msg: *serde.Message) [*c]PyObject {
     defer msg.deinit();
-    const data: []const u8 = msg.getData();
     const flag: c_uint = @backingInt(msg.getFlag());
     const decoder: c_uint = @backingInt(msg.getDecoder());
-    const template = if (msg.isBytes()) "(y#II)" else "(s#II)";
-    return Py_BuildValue(template, data.ptr, @as(py.Py_ssize_t, @intCast(data.len)), flag, decoder);
+    return Py_BuildValue("(NII)", payloadObject(msg), flag, decoder);
 }
 
 fn reasonString(comptime reason: []const u8) [*c]PyObject {
@@ -249,27 +268,18 @@ pub fn getMessageForClientWorker(_: [*c]PyObject, args: [*c]PyObject) callconv(.
 pub fn taskTuple(msg: *serde.Message) [*c]PyObject {
     defer msg.deinit();
     const uuid: c_uint = msg.getUuid();
-    const data: []const u8 = msg.getData();
     const flag: c_uint = @backingInt(msg.getFlag());
     const decoder: c_uint = @backingInt(msg.getDecoder());
-    const transmitter: []const u8 = msg.getTransmitter();
-    const receiver: []const u8 = msg.getReceiver();
-    const func_name: []const u8 = msg.getFuncName();
     const return_result: c_int = @intFromBool(msg.getReturnResult());
-    const template = if (msg.isBytes()) "(Iy#IIs#s#s#i)" else "(Is#IIs#s#s#i)";
     return Py_BuildValue(
-        template,
+        "(INIINNNi)",
         uuid,
-        data.ptr,
-        @as(py.Py_ssize_t, @intCast(data.len)),
+        payloadObject(msg),
         flag,
         decoder,
-        transmitter.ptr,
-        @as(py.Py_ssize_t, @intCast(transmitter.len)),
-        receiver.ptr,
-        @as(py.Py_ssize_t, @intCast(receiver.len)),
-        func_name.ptr,
-        @as(py.Py_ssize_t, @intCast(func_name.len)),
+        nameObject(msg.getTransmitter()),
+        nameObject(msg.getReceiver()),
+        nameObject(msg.getFuncName()),
         return_result,
     );
 }
@@ -375,6 +385,35 @@ pub fn setRuntime(_: [*c]PyObject, args: [*c]PyObject) callconv(.c) [*c]PyObject
         return null;
     };
     return Py_BuildValue("");
+}
+
+/// The names in the iterable `names` that are not connected peers.  An
+/// unknown connection has none connected.
+pub fn missingMembers(_: [*c]PyObject, args: [*c]PyObject) callconv(.c) [*c]PyObject {
+    var conn_num: c_ulong = undefined;
+    var names: *PyObject = undefined;
+    if (py.PyArg_ParseTuple(args, "kO", &conn_num, &names) == 0) return null;
+    const iter = py.PyObject_GetIter(names) orelse return null;
+    defer py.Py_DECREF(iter);
+    const missing = py.PyList_New(0) orelse return null;
+    while (py.PyIter_Next(iter)) |name| {
+        defer py.Py_DECREF(name);
+        var size: py.Py_ssize_t = undefined;
+        const utf8 = py.PyUnicode_AsUTF8AndSize(name, &size) orelse {
+            py.Py_DECREF(missing);
+            return null;
+        };
+        const present = Client.hasMember(conn_num, utf8[0..@intCast(size)]) catch false;
+        if (!present and py.PyList_Append(missing, name) != 0) {
+            py.Py_DECREF(missing);
+            return null;
+        }
+    }
+    if (py.PyErr_Occurred() != null) {
+        py.Py_DECREF(missing);
+        return null;
+    }
+    return missing;
 }
 
 /// Return a JSON-encoded list of currently connected nodes, or None on error.

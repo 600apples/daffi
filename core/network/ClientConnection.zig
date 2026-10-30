@@ -16,8 +16,11 @@ pub const op_table = OperationTable{
     .readSome = readSome,
     .readNoBuffer = readNoBuffer,
     .write = write,
+    .writeParts = writeParts,
+    .writeNonBlocking = writeNonBlocking,
     .accept = accept,
     .handle = handle,
+    .hasPendingInput = hasPendingInput,
     .close = close,
     .destroy = destroy,
     .getAddr = getAddr,
@@ -39,11 +42,14 @@ pub const Config = struct {
     host: []const u8,
     port: u16,
     tls: bool = false,
-    /// CA trust: filesystem path or PEM material. Empty disables verification.
+    /// CA trust: filesystem path or PEM material.  Empty uses the system
+    /// trust store.
     ca: []const u8 = "",
     /// Client identity for mutual TLS (filesystem path or PEM material).
     cert: []const u8 = "",
     key: []const u8 = "",
+    /// False accepts any server certificate.
+    verify: bool = true,
 };
 
 const zero_timeout = std.mem.toBytes(posix.timeval{ .tv_sec = 0, .tv_usec = 0 });
@@ -51,24 +57,11 @@ const zero_timeout = std.mem.toBytes(posix.timeval{ .tv_sec = 0, .tv_usec = 0 })
 /// Initiate an outbound TCP (or Unix-socket) connection.
 /// If config.tls is true, a TLS client handshake is performed after the TCP connect.
 pub fn init(allocator: Allocator, config: Config) !*ClientConnection {
-    // '/' cannot occur in a host name, so such a host is a Unix socket path.
-    const stream = if (std.mem.indexOfScalar(u8, config.host, '/') != null)
-        try net.connectUnixSocket(config.host)
+    const unix_path = net.unixPath(config.host);
+    const stream = if (unix_path) |path|
+        try net.connectUnixSocket(path)
     else
-        net.tcpConnectToHost(allocator, config.host, config.port) catch |tcp_err| blk: {
-            // A Unix-socket fallback runs next and would replace the TCP
-            // errno (EMFILE, ECONNREFUSED, timeout) with its own. Keep the
-            // TCP reason for the Python traceback when the fallback fails.
-            var saved: [160]u8 = undefined;
-            const detail = net.connectFailure();
-            const n = @min(detail.len, saved.len);
-            @memcpy(saved[0..n], detail[0..n]);
-            const unix_stream = net.connectUnixSocket(config.host) catch {
-                if (n > 0) net.setConnectFailure(saved[0..n]);
-                return tcp_err;
-            };
-            break :blk unix_stream;
-        };
+        try net.tcpConnectToHost(allocator, config.host, config.port);
     errdefer stream.close();
 
     const self = try allocator.create(ClientConnection);
@@ -84,12 +77,13 @@ pub fn init(allocator: Allocator, config: Config) !*ClientConnection {
 
     if (config.tls) {
         tls_impl.init();
-        const ssl_ctx = try tls_impl.clientCtx(config.ca, config.cert, config.key);
+        const ssl_ctx = try tls_impl.clientCtx(config.ca, config.cert, config.key, config.verify);
         errdefer tls_impl.freeCtx(ssl_ctx);
         // Bound the blocking handshake so a server that accepts the TCP
         // connection but never answers cannot hang the caller forever.
         stream.setIoTimeout(tls_impl.HANDSHAKE_TIMEOUT_MS);
-        const ssl = try tls_impl.clientHandshake(ssl_ctx, @intCast(stream.handle), config.host);
+        // A Unix socket has no host name to check the certificate against.
+        const ssl = try tls_impl.clientHandshake(ssl_ctx, @intCast(stream.handle), if (unix_path == null) config.host else "");
         tls_impl.finishHandshake(ssl);
         self.ssl_ctx = ssl_ctx;
         self.ssl = ssl;
@@ -139,6 +133,11 @@ pub fn handle(ctx: *anyopaque) posix.socket_t {
     return self.stream.handle;
 }
 
+pub fn hasPendingInput(ctx: *anyopaque) bool {
+    const self: *ClientConnection = @ptrCast(@alignCast(ctx));
+    return if (self.ssl) |ssl| tls_impl.sslPending(ssl) else false;
+}
+
 pub fn readNoBuffer(_: *anyopaque) !?[]const u8 {
     @panic("readNoBuffer not supported for client connections");
 }
@@ -147,6 +146,22 @@ pub fn write(ctx: *anyopaque, data: []const u8) !void {
     const self: *ClientConnection = @ptrCast(@alignCast(ctx));
     if (self.ssl) |ssl| return tls_impl.sslWrite(ssl, data);
     return try self.stream.writeAll(data);
+}
+
+pub fn writeNonBlocking(ctx: *anyopaque, data: []const u8) !usize {
+    const self: *ClientConnection = @ptrCast(@alignCast(ctx));
+    // A TLS record cannot be half-written and resumed by another thread.
+    if (self.ssl != null) return 0;
+    return self.stream.writeNonBlocking(data);
+}
+
+pub fn writeParts(ctx: *anyopaque, head: []const u8, body: []const u8) !void {
+    const self: *ClientConnection = @ptrCast(@alignCast(ctx));
+    if (self.ssl) |ssl| {
+        try tls_impl.sslWrite(ssl, head);
+        return tls_impl.sslWrite(ssl, body);
+    }
+    return self.stream.writeAllParts(head, body);
 }
 
 pub fn accept(_: *anyopaque, _: c_int) anyerror!AcceptedConnection {

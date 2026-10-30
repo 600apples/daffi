@@ -15,6 +15,7 @@ from tests.conftest import active_runtime
 import asyncio
 import multiprocessing as mp
 import os
+import socket
 import sys
 import time
 
@@ -78,6 +79,20 @@ def _wait_for_socket(path: str, timeout: float = 15.0) -> None:
             return
         time.sleep(0.05)
     raise TimeoutError(f"{path} was not created")
+
+
+def _wait_for_listener(path: str, timeout: float = 15.0) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            probe.connect(path)
+            return
+        except OSError:
+            time.sleep(0.05)
+        finally:
+            probe.close()
+    raise TimeoutError(f"nothing is listening on {path}")
 
 
 def _sock_path(tmp_path, *, long: bool = False) -> str:
@@ -165,25 +180,14 @@ def test_stale_socket_file_is_replaced(tmp_path):
     from daffi import Client, UnixTransport, TCPTransport
 
     path = _sock_path(tmp_path)
-    open(path, "w").close()  # leftover from a crashed run
+    # A crashed run leaves its socket file behind with nobody listening.
+    leftover = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    leftover.bind(path)
+    leftover.close()
     proc = mp.Process(target=_service, args=(active_runtime(), path,), daemon=True)
     proc.start()
     try:
-        deadline = time.monotonic() + 15
-        import stat
-
-        # Bind unlinks the leftover file before creating the socket, so the
-        # path is briefly absent.  That gap is not a failed replacement.
-        replaced = False
-        while time.monotonic() < deadline:
-            try:
-                replaced = stat.S_ISSOCK(os.stat(path).st_mode)
-            except FileNotFoundError:
-                replaced = False
-            if replaced:
-                break
-            time.sleep(0.05)
-        assert replaced, "stale file was not replaced by a socket"
+        _wait_for_listener(path)
         client = Client(app_name="ux-client", transport=UnixTransport(path), runtime=active_runtime())
         conn = client.connect()
         try:
@@ -192,6 +196,48 @@ def test_stale_socket_file_is_replaced(tmp_path):
             client.stop()
     finally:
         quiet_kill(proc)
+
+
+def test_regular_file_at_the_socket_path_is_not_deleted(tmp_path):
+    path = _sock_path(tmp_path)
+    with open(path, "w") as f:
+        f.write("not a socket")
+    proc = mp.Process(target=_service, args=(active_runtime(), path,), daemon=True)
+    proc.start()
+    try:
+        proc.join(timeout=20)
+        assert proc.exitcode not in (None, 0), "the service started over a regular file"
+        with open(path) as f:
+            assert f.read() == "not a socket"
+    finally:
+        quiet_kill(proc)
+
+
+def test_second_server_does_not_take_over_a_live_socket(tmp_path):
+    from daffi import Client, UnixTransport
+
+    path = _sock_path(tmp_path)
+    first = mp.Process(target=_service, args=(active_runtime(), path,), daemon=True)
+    first.start()
+    second = None
+    try:
+        _wait_for_listener(path)
+        second = mp.Process(target=_router, args=(active_runtime(), path,), daemon=True)
+        second.start()
+        second.join(timeout=20)
+        assert second.exitcode not in (None, 0), "the second server started on a live socket"
+
+        client = Client(app_name="ux-client", transport=UnixTransport(path), runtime=active_runtime())
+        conn = client.connect()
+        try:
+            conn.wait_for_members("ux-service", timeout=15)
+            assert conn.rpc(timeout=15).add(1, 2) == 3
+        finally:
+            client.stop()
+    finally:
+        if second is not None:
+            quiet_kill(second)
+        quiet_kill(first)
 
 
 def test_missing_transport_is_rejected():

@@ -78,7 +78,7 @@ client = Client(
         "127.0.0.1",
         5443,
         tls=True,
-        # Optional: CA path or PEM. Empty = encrypt without verifying the peer.
+        # Optional: CA path or PEM. Empty = verify against the system trust store.
         ca="/path/to/ca.crt",
     ),
 )
@@ -97,7 +97,8 @@ client.stop()
 | `tls=True` | Both | Enable TLS on this transport. |
 | `cert` | Server / client | Path or PEM for the local certificate (server identity, or client identity for mTLS). |
 | `key` | Server / client | Path or PEM for the local private key. |
-| `ca` | Server / client | Path or PEM for the peer trust store. On a **listener**, non-empty `ca` enables **mutual TLS** (clients must present a cert). On a **client**, verifies the server. Empty on the client = encrypt without verifying. |
+| `ca` | Server / client | Path or PEM for the peer trust store. On a **listener**, non-empty `ca` enables **mutual TLS** (clients must present a cert). On a **client**, the trust store the server's certificate and host name are verified against. Empty on the client = the system trust store. |
+| `verify` | Client | `True` (default) verifies the server. `False` accepts any certificate: the traffic is encrypted, but anyone on the path can impersonate the server. |
 
 These options live on `TCPTransport` / `UnixTransport`, not on `Router` / `Service` / `Client`.
 
@@ -149,4 +150,6 @@ openssl x509 -req -days 365 -in server.csr -CA ca.crt -CAkey ca.key \
     -CAcreateserial -out server.crt
 ```
 
-Use `ca.crt` as the `ca` on the client side.
+Use `ca.crt` as the `ca` on the client side. A self-signed certificate is not
+in the system trust store, so a client without `ca` refuses it; pass
+`verify=False` only for throwaway local testing.

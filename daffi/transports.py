@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import os
 import sys
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from typing import TypeAlias
 
 from daffi.exceptions import InitializationError
@@ -51,12 +51,22 @@ class TCPTransport:
 
     Server-side (``Router`` / ``Service``) uses ``cert`` / ``key`` when
     ``tls=True``.  A non-empty ``ca`` on a listening transport enables
-    mutual TLS (clients must present a certificate).  Client-side uses
-    ``ca`` to verify the server and optional ``cert`` / ``key`` as the
-    client identity.
+    mutual TLS (clients must present a certificate).  Client-side checks
+    the server's certificate against ``ca``, or against the system trust
+    store when ``ca`` is empty, and uses optional ``cert`` / ``key`` as the
+    client identity.  ``verify=False`` accepts any server certificate, which
+    lets anyone on the network path impersonate the server.
 
     Each of ``cert``, ``key``, and ``ca`` may be a filesystem path or PEM
     material (detected natively by a leading ``-----BEGIN ``).
+
+    ``allowed_origins`` (listening transports only) restricts which web pages
+    may open a WebSocket to this listener, e.g.
+    ``["https://app.example.com"]``.  Upgrades with any other ``Origin``, or
+    with none, get ``403``.  ``None`` (the default) accepts every origin.
+    The check stops other sites' pages in a visitor's browser from reaching
+    the server; it is no defence against non-browser clients, which can send
+    any ``Origin``.
     """
 
     def __init__(
@@ -68,6 +78,8 @@ class TCPTransport:
         cert: TlsBlob = "",
         key: TlsBlob = "",
         ca: TlsBlob = "",
+        verify: bool = True,
+        allowed_origins: Iterable[str] | None = None,
     ) -> None:
         if (
             isinstance(port, bool)
@@ -87,6 +99,8 @@ class TCPTransport:
         self.cert = _tls_blob(cert, name="cert")
         self.key = _tls_blob(key, name="key")
         self.ca = _tls_blob(ca, name="ca")
+        self.verify = _verify(verify)
+        self.allowed_origins = _origins(allowed_origins)
 
     @property
     def native_host(self) -> str:
@@ -96,8 +110,9 @@ class TCPTransport:
     def native_port(self) -> int:
         return self.port
 
-    def native_listener(self) -> tuple[str, int, bool, str, str, str]:
-        """``(host, port, tls, cert, key, ca)`` for ``dfcore.addListeners``.
+    def native_listener(self) -> tuple[str, int, bool, str, str, str, str]:
+        """``(host, port, tls, cert, key, ca, allowed_origins)`` for
+        ``dfcore.addListeners``.
 
         A non-empty ``ca`` enables mutual TLS on this listener.
         """
@@ -108,6 +123,7 @@ class TCPTransport:
             self.cert,
             self.key,
             self.ca,
+            "\n".join(self.allowed_origins or ()),
         )
 
     def conn_info(self) -> tuple[str | None, int | None, str]:
@@ -128,6 +144,26 @@ class TCPTransport:
         )
 
 
+def _verify(value: bool) -> bool:
+    if not isinstance(value, bool):
+        raise InitializationError(f"verify must be a bool, got {type(value).__name__}")
+    return value
+
+
+def _origins(value: Iterable[str] | None) -> tuple[str, ...] | None:
+    if value is None:
+        return None
+    if isinstance(value, (str, bytes)):
+        raise InitializationError("allowed_origins must be a list of origins, not a single string")
+    origins = tuple(value)
+    for origin in origins:
+        if not isinstance(origin, str) or not origin or any(c in origin for c in "\r\n\0"):
+            raise InitializationError(f"invalid origin in allowed_origins: {origin!r}")
+    if not origins:
+        raise InitializationError("allowed_origins must name at least one origin (None allows all)")
+    return tuple(o.rstrip("/") for o in origins)
+
+
 def _short_blob(value: str) -> str:
     if value.startswith("-----BEGIN "):
         return "<pem>"
@@ -138,9 +174,10 @@ class UnixTransport:
     """A Unix-domain socket listen or connect address, with optional TLS.
 
     Server-side uses ``cert`` / ``key`` when ``tls=True``.  A non-empty
-    ``ca`` enables mutual TLS.  Client-side uses ``ca`` to verify the
-    server and optional ``cert`` / ``key`` as the client identity.
-    Hostname verification is skipped for Unix paths.
+    ``ca`` enables mutual TLS.  Client-side checks the server's certificate
+    against ``ca`` (the system trust store when empty; ``verify=False``
+    skips the check) and uses optional ``cert`` / ``key`` as the client
+    identity.  Hostname verification is skipped for Unix paths.
     """
 
     def __init__(
@@ -151,6 +188,7 @@ class UnixTransport:
         cert: TlsBlob = "",
         key: TlsBlob = "",
         ca: TlsBlob = "",
+        verify: bool = True,
     ) -> None:
         if sys.platform == "win32":
             raise InitializationError(
@@ -165,10 +203,13 @@ class UnixTransport:
         self.cert = _tls_blob(cert, name="cert")
         self.key = _tls_blob(key, name="key")
         self.ca = _tls_blob(ca, name="ca")
+        self.verify = _verify(verify)
 
     @property
     def native_host(self) -> str:
-        return self.path
+        # The scheme tells the native layer this is a path, so a TCP host
+        # that does not resolve is never taken for one.
+        return "unix:" + self.path
 
     @property
     def native_port(self) -> int:

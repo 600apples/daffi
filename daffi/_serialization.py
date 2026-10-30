@@ -60,6 +60,16 @@ class SerdeFormat:
     or tracebacks).  Requires the optional ``msgpack`` package — install with
     ``pip install 'daffi[msgpack]'``."""
 
+    ALL = frozenset((OPAQUE, JSON, PICKLE, MSGPACK))
+    """Every format; what a node accepts unless it is given ``serdes=``."""
+
+    _NAMES = {OPAQUE: "OPAQUE", JSON: "JSON", PICKLE: "PICKLE", MSGPACK: "MSGPACK"}
+
+    @classmethod
+    def name_of(cls, serde: int) -> str:
+        """``"PICKLE"`` for ``SerdeFormat.PICKLE``; the number itself if unknown."""
+        return cls._NAMES.get(serde, str(serde))
+
 
 class Serializer:
     """Dispatch-table based serializer/deserializer.

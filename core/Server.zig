@@ -38,6 +38,18 @@ const ACCEPT_BACKOFF_MS: u32 = 50;
 /// A missing file is bound again; a file that belongs to someone else is left
 /// alone.
 const UNIX_RESTORE_MS: c_int = 500;
+const HOUSEKEEPING_MS: c_int = UNIX_RESTORE_MS;
+
+/// A connection whose half-received message gets no further bytes for this
+/// long is closed.  `DAFFI_FRAME_STALL_MS` overrides it (read at start).
+const DEFAULT_FRAME_STALL_MS: i64 = 30_000;
+var frame_stall_setting: std.atomic.Value(i64) = .init(DEFAULT_FRAME_STALL_MS);
+
+fn readFrameStallSetting() void {
+    const raw = std.c.getenv("DAFFI_FRAME_STALL_MS") orelse return;
+    const ms = std.fmt.parseInt(i64, std.mem.span(raw), 10) catch return;
+    if (ms > 0) frame_stall_setting.store(ms, .monotonic);
+}
 
 /// How long stop waits for connections to finish before giving up and
 /// leaking the server's memory rather than freeing it under them.
@@ -117,10 +129,12 @@ const Runtime = struct {
     /// membership.
     listeners: []Listener,
     acceptor: ?Acceptor = null,
-    /// Wakes `unixWatch`, which restores Unix socket files that were deleted.
-    unix_watch: ?std.Thread = null,
-    unix_wake_read: c_int = -1,
-    unix_wake_write: c_int = -1,
+    /// Runs `housekeep`: closes stalled connections and, in the evented
+    /// model, restores Unix socket files that were deleted.  Writing to
+    /// `housekeeper_wake_write` stops it.
+    housekeeper: ?std.Thread = null,
+    housekeeper_wake_read: c_int = -1,
+    housekeeper_wake_write: c_int = -1,
     /// Accepted connections currently being served.  Used to interrupt them
     /// (by shutting their sockets down) when the server stops.
     live_mutex: Mutex = .{},
@@ -180,12 +194,8 @@ const Runtime = struct {
             .threads => try self.startThreadedAccept(),
             .evented => try self.startEventedAccept(),
         }
-        if (self.hasUnixPath()) {
-            self.rememberUnixPaths();
-            // The threaded acceptor checks the paths itself between polls.
-            // The evented one is blocked in kqueue, so a helper thread does it.
-            if (runtime.model() == .evented) try self.startUnixWatch();
-        }
+        if (self.hasUnixPath()) self.rememberUnixPaths();
+        try self.startHousekeeper();
     }
 
     /// Errdefers here cover only this function.  Once `acceptor` is set, the
@@ -241,7 +251,27 @@ const Runtime = struct {
         }
     }
 
-    fn startUnixWatch(self: *Runtime) !void {
+    /// Close every native connection whose unfinished frame has received
+    /// nothing for `frame_stall_ms`: a peer must not hold its share of the
+    /// partial-frame budget, or a reader thread, forever.
+    fn closeStalledFrames(self: *Runtime) void {
+        const now = misc.monotonicMs();
+        const frame_stall_ms = frame_stall_setting.load(.monotonic);
+        self.live_mutex.lock();
+        defer self.live_mutex.unlock();
+        for (self.live.items) |c| {
+            if (c.is_websocket or !c.frameStalled(now, frame_stall_ms)) continue;
+            c.frame_progress_ms.store(0, .monotonic);
+            if (c.peer_addr) |addr| {
+                log.warn("closing connection from {f}: a message stalled half-received for {d} ms", .{ fmtNetAddr(addr), frame_stall_ms });
+            } else {
+                log.warn("closing a connection: a message stalled half-received for {d} ms", .{frame_stall_ms});
+            }
+            c.close();
+        }
+    }
+
+    fn startHousekeeper(self: *Runtime) !void {
         var wake: [2]c_int = undefined;
         nofile.acquire(2);
         if (std.c.pipe(&wake) != 0) {
@@ -253,24 +283,24 @@ const Runtime = struct {
             nofile.release(2);
         }
         for (wake) |fd| _ = std.c.fcntl(fd, std.c.F.SETFD, @as(c_int, std.c.FD_CLOEXEC));
-        self.unix_wake_read = wake[0];
-        self.unix_wake_write = wake[1];
-        self.unix_watch = try std.Thread.spawn(.{ .stack_size = thread_stack_size }, unixWatch, .{self});
+        self.housekeeper_wake_read = wake[0];
+        self.housekeeper_wake_write = wake[1];
+        self.housekeeper = try std.Thread.spawn(.{ .stack_size = thread_stack_size }, housekeep, .{self});
     }
 
-    /// Stop the Unix-socket watchdog, then stop watching every listener at
-    /// once and wait until no accept is in progress.
+    /// Stop the housekeeper, then stop watching every listener at once and
+    /// wait until no accept is in progress.
     fn stopAccepting(self: *Runtime) void {
-        if (self.unix_watch) |thread| {
+        if (self.housekeeper) |thread| {
             const byte = [1]u8{1};
-            _ = std.c.write(self.unix_wake_write, &byte, byte.len);
+            _ = std.c.write(self.housekeeper_wake_write, &byte, byte.len);
             thread.join();
-            self.unix_watch = null;
-            _ = std.c.close(self.unix_wake_read);
-            _ = std.c.close(self.unix_wake_write);
+            self.housekeeper = null;
+            _ = std.c.close(self.housekeeper_wake_read);
+            _ = std.c.close(self.housekeeper_wake_write);
             nofile.release(2);
-            self.unix_wake_read = -1;
-            self.unix_wake_write = -1;
+            self.housekeeper_wake_read = -1;
+            self.housekeeper_wake_write = -1;
         }
         const acceptor = self.acceptor orelse return;
         self.acceptor = null;
@@ -310,14 +340,15 @@ const Runtime = struct {
     fn sendMessage(self: *Runtime, data: []const u8, uuid: u16, flag: MessageFlag, decoder: MessageDecoder, is_bytes: bool, return_result: bool, receiver: []const u8, func_name: []const u8) !MessageIdentifier {
         switch (self.server_handler.*) {
             .Service => |*s| {
-                std.debug.assert(uuid != 0);
-                // Hold a reference for the duration of the write: the channel (and
-                // the connection behind it) may be torn down by another thread as
-                // soon as the map lock is dropped.
-                const peer = try s.chan_mapper.retainConn(receiver);
+                if (uuid == 0) return error.InvalidUuid;
+                // `uuid` is the id the request got on arrival.  The reply
+                // goes to the connection the request came in on, with the
+                // sender's uuid; once that connection is gone nobody waits.
+                const reply = s.routes.take(null, uuid) orelse return error.NoPendingRequest;
+                const peer = reply.requester;
                 defer peer.release();
-                try self.msgpool.sendMessage(peer, data, uuid, flag, decoder, is_bytes, return_result, s.app_name, receiver, func_name);
-                return .{ .receiver = receiver, .uuid = uuid, .timestamp = misc.timestamp() };
+                try self.msgpool.sendMessage(peer, data, reply.uuid, flag, decoder, is_bytes, return_result, s.app_name, receiver, func_name);
+                return .{ .receiver = receiver, .uuid = reply.uuid, .timestamp = misc.timestamp() };
             },
             .Router => return error.MessagesNotSupported,
         }
@@ -402,9 +433,9 @@ pub fn setServiceRequestFd(conn_num: usize, fd: i32) !void {
 /// (conn_num).  All or nothing: if one listener cannot be bound, none stays
 /// bound and `failed` holds its index.  Sockets are not accepting yet;
 /// `startServer` (the native entry of that name) starts them all at once.
-pub fn start(allocator: Allocator, mode: HandlerMode, app_name: []const u8, configs: []const ServerConnection.Config, failed: *?usize) !usize {
+pub fn start(allocator: Allocator, mode: HandlerMode, app_name: []const u8, configs: []const ServerConnection.Config, failed: *?usize, auth_token: ?[]const u8) !usize {
     failed.* = null;
-    return startImpl(allocator, mode, app_name, configs, failed) catch |err| {
+    return startImpl(allocator, mode, app_name, configs, failed, auth_token) catch |err| {
         if (failed.*) |i| {
             log.err("{s}[{s}] failed to start on {s}:{d}: {}", .{ @tagName(mode), app_name, hostOf(configs[i]), configs[i].port, err });
         } else {
@@ -414,8 +445,9 @@ pub fn start(allocator: Allocator, mode: HandlerMode, app_name: []const u8, conf
     };
 }
 
-fn startImpl(allocator: Allocator, mode: HandlerMode, app_name_arg: []const u8, configs: []const ServerConnection.Config, failed: *?usize) !usize {
+fn startImpl(allocator: Allocator, mode: HandlerMode, app_name_arg: []const u8, configs: []const ServerConnection.Config, failed: *?usize, auth_token: ?[]const u8) !usize {
     if (configs.len == 0) return error.NoListeners;
+    readFrameStallSetting();
     for (configs, 0..) |config, i| {
         for (configs[0..i]) |earlier| {
             if (sameAddress(config, earlier)) {
@@ -440,7 +472,7 @@ fn startImpl(allocator: Allocator, mode: HandlerMode, app_name_arg: []const u8, 
         errdefer allocator.free(app_name);
         const msgpool = try MessagePool.init(allocator);
         errdefer msgpool.deinit();
-        const server_handler = try ServerHandler.init(mode, allocator, app_name);
+        const server_handler = try ServerHandler.init(mode, allocator, app_name, auth_token);
         errdefer server_handler.deinit();
         const created = try allocator.create(Runtime);
         created.* = .{
@@ -487,7 +519,7 @@ fn hostOf(config: ServerConnection.Config) []const u8 {
 fn sameAddress(a: ServerConnection.Config, b: ServerConnection.Config) bool {
     const host = hostOf(a);
     if (a.port != b.port or !std.mem.eql(u8, host, hostOf(b))) return false;
-    return a.port != 0 or std.mem.indexOfScalar(u8, host, '/') != null;
+    return a.port != 0 or net.unixPath(host) != null;
 }
 
 /// Bind every listener at once, one thread each.  All or nothing: on failure
@@ -545,9 +577,8 @@ fn bindAll(allocator: Allocator, configs: []const ServerConnection.Config, faile
 }
 
 fn duplicateUnixPath(allocator: Allocator, config: ServerConnection.Config) !?[:0]u8 {
-    const host = config.host orelse return null;
-    if (std.mem.indexOfScalar(u8, host, '/') == null) return null;
-    return try allocator.dupeSentinel(u8, host, 0);
+    const path = net.unixPath(config.host orelse return null) orelse return null;
+    return try allocator.dupeSentinel(u8, path, 0);
 }
 
 fn destroyListeners(allocator: Allocator, listeners: []Listener) void {
@@ -625,7 +656,7 @@ fn restoreDue(rt: *Runtime, now: i64, last: *i64) bool {
     if (!unix) return false;
     if (now - last.* >= UNIX_RESTORE_MS) {
         for (rt.listeners) |*listener| if (listener.unix_path != null) restoreUnixListener(listener);
-        last.* = misc.milliTimestamp();
+        last.* = misc.monotonicMs();
     }
     return true;
 }
@@ -634,10 +665,10 @@ fn restoreDue(rt: *Runtime, now: i64, last: *i64) bool {
 /// wake-up pipe in `pollfds[0]`.  A listener whose accept fails is left out
 /// of the poll for `ACCEPT_BACKOFF_MS`; the others are not.
 fn acceptLoop(rt: *Runtime, pollfds: []net.PollFd, quiet_until: []i64) void {
-    var unix_checked = misc.milliTimestamp();
+    var unix_checked = misc.monotonicMs();
     while (true) {
         var timeout: c_int = -1;
-        const now = misc.milliTimestamp();
+        const now = misc.monotonicMs();
         // Restore while not inside poll: dup2 replaces the file a blocked
         // poll is watching, and that poll would never see the new socket.
         if (restoreDue(rt, now, &unix_checked)) timeout = UNIX_RESTORE_MS;
@@ -661,7 +692,7 @@ fn acceptLoop(rt: *Runtime, pollfds: []net.PollFd, quiet_until: []i64) void {
         if (pollfds[0].revents != 0) return;
         for (pollfds[1..], quiet_until, rt.listeners) |pfd, *until, *listener| {
             if (pfd.fd < 0 or pfd.revents == 0) continue;
-            if (!listener.drain()) until.* = misc.milliTimestamp() + ACCEPT_BACKOFF_MS;
+            if (!listener.drain()) until.* = misc.monotonicMs() + ACCEPT_BACKOFF_MS;
         }
     }
 }
@@ -716,20 +747,26 @@ fn rearmListener(listener: *Listener) void {
     }
 }
 
-/// Replace a deleted Unix socket file, unless another process now owns the
-/// path.  Existing connections ride on the old socket and are not touched.
-fn unixWatch(rt: *Runtime) void {
-    var pfd = net.PollFd{ .fd = rt.unix_wake_read, .events = net.WAIT_READ, .revents = 0 };
+/// Periodic upkeep until `stopAccepting` wakes it: close connections whose
+/// frame stalled, and (evented model; the threaded acceptor does it between
+/// polls) replace a deleted Unix socket file unless another process now owns
+/// the path.  Existing connections ride on the old socket and are not touched.
+fn housekeep(rt: *Runtime) void {
+    var pfd = net.PollFd{ .fd = rt.housekeeper_wake_read, .events = net.WAIT_READ, .revents = 0 };
+    const restore_unix = runtime.model() == .evented and rt.hasUnixPath();
     while (true) {
         pfd.revents = 0;
-        if (net.poll(@as([*]net.PollFd, @ptrCast(&pfd)), 1, UNIX_RESTORE_MS) > 0) return;
+        if (net.poll(@as([*]net.PollFd, @ptrCast(&pfd)), 1, HOUSEKEEPING_MS) > 0) return;
         rt.live_mutex.lock();
         const stopping = rt.stopping;
         rt.live_mutex.unlock();
         if (stopping) return;
-        for (rt.listeners) |*listener| {
-            if (listener.unix_path != null) restoreUnixListener(listener);
+        if (restore_unix) {
+            for (rt.listeners) |*listener| {
+                if (listener.unix_path != null) restoreUnixListener(listener);
+            }
         }
+        rt.closeStalledFrames();
     }
 }
 
@@ -941,6 +978,16 @@ fn connectionMain(comptime mode: HandlerMode, rt: *Runtime, listener: *ServerCon
         _ = rt.active_connections.fetchSub(1, .release);
         return;
     };
+    // Evented: a WebSocket session keeps its blocking-pool worker for as long
+    // as it is open.  Leave room in the pool for upgrades and native peers.
+    const pooled_session = runtime.model() == .evented and client.is_websocket;
+    if (pooled_session and !ws_sessions.tryTake()) {
+        log.warn("{s}[{s}] refusing a WebSocket session: {d} are open", .{ @tagName(mode), rt.app_name, ws_sessions.max });
+        client.destroy();
+        _ = rt.active_connections.fetchSub(1, .release);
+        return;
+    }
+    defer if (pooled_session) ws_sessions.give();
     rt.registerLive(client) catch {
         client.destroy();
         _ = rt.active_connections.fetchSub(1, .release);
@@ -958,6 +1005,37 @@ fn connectionMain(comptime mode: HandlerMode, rt: *Runtime, listener: *ServerCon
         serverLoop(client, rt.allocator, handler);
     }
     releaseConnection(rt, client);
+}
+
+/// At most `max` holders at once.
+const Slots = struct {
+    used: std.atomic.Value(usize) = .init(0),
+    max: usize,
+
+    fn tryTake(self: *Slots) bool {
+        if (self.used.fetchAdd(1, .acq_rel) < self.max) return true;
+        _ = self.used.fetchSub(1, .acq_rel);
+        return false;
+    }
+
+    fn give(self: *Slots) void {
+        _ = self.used.fetchSub(1, .acq_rel);
+    }
+};
+
+/// WebSocket sessions served on blocking-pool workers, process-wide.
+var ws_sessions: Slots = .{ .max = runtime.BlockingPool.max_workers * 3 / 4 };
+
+test "WebSocket sessions leave blocking-pool workers for everything else" {
+    try std.testing.expect(ws_sessions.max > 0 and ws_sessions.max < runtime.BlockingPool.max_workers);
+    var sessions: Slots = .{ .max = 2 };
+    try std.testing.expect(sessions.tryTake());
+    try std.testing.expect(sessions.tryTake());
+    try std.testing.expect(!sessions.tryTake());
+    try std.testing.expectEqual(@as(usize, 2), sessions.used.load(.acquire));
+    sessions.give();
+    try std.testing.expect(sessions.tryTake());
+    try std.testing.expect(!sessions.tryTake());
 }
 
 /// Last step for every accepted connection.  Decrementing the counter must be
@@ -1001,28 +1079,26 @@ fn ConnectionSource(comptime mode: HandlerMode) type {
         fn onReadable(source: *EventLoop.Source, scratch: []u8) EventLoop.Action {
             const self: *Self = @alignCast(@fieldParentPtr("source", source));
             const handler = self.rt.handler(mode);
-            while (true) {
-                const n = self.conn.readSome(scratch) catch |err| switch (err) {
-                    error.WouldBlock => return .keep,
-                    else => {
-                        if (self.conn.peer_addr) |addr| log.warn("recv error from {f}: {}", .{ fmtNetAddr(addr), err });
-                        handler.handleErr(self.conn, err) catch {};
-                        return .remove;
-                    },
-                };
-                if (n == 0) {
-                    if (self.conn.peer_addr) |addr| log.debug("peer disconnected from {f}", .{fmtNetAddr(addr)});
-                    handler.handleErr(self.conn, error.EOF) catch {};
+            const Ctx = struct {
+                conn: *ServerHandler.ConnectionT,
+                handler: @TypeOf(handler),
+
+                fn dispatch(ctx: *const @This(), message: *Message) bool {
+                    return dispatchMessage(ctx.conn, message, ctx.handler);
+                }
+            };
+            const ctx = Ctx{ .conn = self.conn, .handler = handler };
+            switch (serde.drainReadable(&self.decoder, self.conn, scratch, &ctx, Ctx.dispatch)) {
+                .keep => return .keep,
+                .stopped => return .remove,
+                .failed => |err| {
+                    if (self.conn.peer_addr) |addr| switch (err) {
+                        error.EOF => log.debug("peer disconnected from {f}", .{fmtNetAddr(addr)}),
+                        else => log.warn("recv error from {f}: {}", .{ fmtNetAddr(addr), err }),
+                    };
+                    handler.handleErr(self.conn, err) catch {};
                     return .remove;
-                }
-                var input: []const u8 = scratch[0..n];
-                while (true) {
-                    const message = (self.decoder.next(&input) catch |err| {
-                        handler.handleErr(self.conn, err) catch {};
-                        return .remove;
-                    }) orelse break;
-                    if (!dispatchMessage(self.conn, message, handler)) return .remove;
-                }
+                },
             }
         }
 

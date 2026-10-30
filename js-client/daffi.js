@@ -63,6 +63,11 @@
  *
  *   options.reconnectDelay number (ms) — Base reconnect delay.  Default: 2000.
  *
+ *   options.authToken string — Shared secret for a server started with
+ *                              ``auth_token=``.  Anyone who can read this
+ *                              page can read it, so it only keeps out
+ *                              clients that were never given the page.
+ *
  * ─────────────────────────────────────────────────────────────────────────────
  * client.connect() → Promise<Connection>
  * ─────────────────────────────────────────────────────────────────────────────
@@ -242,6 +247,7 @@ function DaffiClient(name, options) {
     this.wasmPath       = _WASM_CANDIDATES[0];  // informational; actual load probes all candidates
     this.autoreconnect  = options.autoreconnect  || false;
     this.reconnectDelay = options.reconnectDelay != null ? options.reconnectDelay : 2000;
+    this.authToken      = options.authToken || '';
     this.pendingMessages = {};
     this.eventHandlers   = [];
     this.closed = true;
@@ -253,9 +259,8 @@ function DaffiClient(name, options) {
     let _wasmExports    = null;
     let _memory         = null;
     let _decodeString   = null;
-    let _encodeStringZ  = null;
+    let _encodeString   = null;
     let _encodeBuffer   = null;
-    let _encodeBufferZ  = null;
     // Current active WebSocket.
     let _socket = null;
     // Set to true when stop() is called so reconnect loop does not restart.
@@ -281,20 +286,10 @@ function DaffiClient(name, options) {
 
         if (!_module) _module = await _loadWasm();
 
-        const INITIAL_PAGES = 256; // 16 MB
-        _memory = new WebAssembly.Memory({ initial: INITIAL_PAGES, maximum: 65536 });
-        const indirectFunctionTable = new WebAssembly.Table({ initial: 128, element: 'anyfunc' });
-        const stackPointer = new WebAssembly.Global({ value: 'i32', mutable: true  }, INITIAL_PAGES * 65536);
-        const memoryBase   = new WebAssembly.Global({ value: 'i32', mutable: false }, 0);
-        const tableBase    = new WebAssembly.Global({ value: 'i32', mutable: false }, 0);
-
+        // The module defines and exports its own memory.  Always go through
+        // `_memory.buffer`: it is replaced whenever the memory grows.
         const { exports } = await WebAssembly.instantiate(_module, {
             env: {
-                memory: _memory,
-                __indirect_function_table: indirectFunctionTable,
-                __stack_pointer:           stackPointer,
-                __memory_base:             memoryBase,
-                __table_base:              tableBase,
                 _throwError(ptr, len) { throw new Error(_decodeString(ptr, len)); },
                 _consoleLog(ptr, len)  { console.log(_decodeString(ptr, len));   },
             },
@@ -370,33 +365,22 @@ function DaffiClient(name, options) {
         });
 
         _wasmExports = exports;
+        _memory = exports.memory;
         const { allocUint8 } = exports;
 
         _decodeString = (ptr, len) =>
             new TextDecoder().decode(new Uint8Array(_memory.buffer, ptr, len));
 
-        _encodeStringZ = (str) => {
-            const buf = new TextEncoder().encode(str);
-            const ptr = allocUint8(buf.length + 1);
-            const sl  = new Uint8Array(_memory.buffer, ptr, buf.length + 1);
-            sl.set(buf); sl[buf.length] = 0;
-            return ptr;
-        };
-
+        // Buffers cross into wasm as [ptr, len]: payloads may contain NUL
+        // bytes, and wasm frees them by length.
         _encodeBuffer = (buf) => {
             const len = buf.byteLength;
             const ptr = allocUint8(len);
             new Uint8Array(_memory.buffer, ptr, len).set(buf);
-            return ptr;
+            return [ptr, len];
         };
 
-        _encodeBufferZ = (buf) => {
-            const len = buf.byteLength;
-            const ptr = allocUint8(len + 1);
-            const sl  = new Uint8Array(_memory.buffer, ptr, len + 1);
-            sl.set(buf); sl[len] = 0;
-            return ptr;
-        };
+        _encodeString = (str) => _encodeBuffer(new TextEncoder().encode(str));
     };
 
     const _scheduleReconnect = () => {
@@ -433,25 +417,24 @@ function DaffiClient(name, options) {
         get(target, prop) {
             const handler = this;
             return async (...args) => {
-                const { sendMessage, free } = _wasmExports;
-                let argsZ;
+                const { sendMessage, freeSendResult } = _wasmExports;
+                let payload;
                 if (handler.serde === 1) {
-                    argsZ = _encodeStringZ(JSON.stringify({ args, kwargs: {} }));
+                    payload = _encodeString(JSON.stringify({ args, kwargs: {} }));
                 } else if (handler.serde === 3) {
                     const enc = _mp().encode([args, {}]);
-                    argsZ = _encodeBufferZ(enc instanceof Uint8Array ? enc : new Uint8Array(enc));
+                    payload = _encodeBuffer(enc instanceof Uint8Array ? enc : new Uint8Array(enc));
                 } else {
                     // OPAQUE — single buffer or string
                     if (args.length !== 1) throw new Error('OPAQUE serde expects exactly one argument.');
                     const buf = args[0] instanceof Uint8Array ? args[0] : new TextEncoder().encode(args[0]);
-                    argsZ = _encodeBufferZ(buf);
+                    payload = _encodeBuffer(buf);
                 }
 
-                const receiverZ = _encodeStringZ(handler.receiver);
-                const funcNameZ = _encodeStringZ(prop);
-                const msgPtr    = sendMessage(argsZ, receiverZ, funcNameZ, handler.serde, handler.returnResult, handler.connNum);
-
-                if (!handler.returnResult) { free(msgPtr); return; }
+                // sendMessage takes ownership of all three buffers.
+                const receiver = _encodeString(handler.receiver);
+                const funcName = _encodeString(prop);
+                const msgPtr   = sendMessage(...payload, ...receiver, ...funcName, handler.serde, handler.returnResult, handler.connNum);
 
                 const view           = new DataView(_memory.buffer, msgPtr, 16);
                 const uuid           = view.getUint32(0, true);
@@ -459,6 +442,9 @@ function DaffiClient(name, options) {
                 const ptr            = view.getUint32(8, true);
                 const isJsonFlag     = view.getUint32(12, true);
                 const actualReceiver = _decodeString(ptr, ptrLen);
+                freeSendResult(msgPtr);
+
+                if (!handler.returnResult) return;
 
                 const raw = handler.timeout
                     ? await handler._waitWithTimeout(uuid, handler.timeout, actualReceiver)
@@ -591,8 +577,9 @@ function DaffiClient(name, options) {
         _members() {
             const { getAvailableMembers, free } = _wasmExports;
             const ptr = getAvailableMembers(self.connNum);
-            const json = _decodeString(ptr, new Uint8Array(_memory.buffer, ptr).indexOf(0));
-            free(ptr);
+            const len = new Uint8Array(_memory.buffer, ptr).indexOf(0);
+            const json = _decodeString(ptr, len);
+            free(ptr, len + 1);
             return JSON.parse(json).members || [];
         }
 
@@ -726,7 +713,7 @@ function DaffiClient(name, options) {
 
         _socket.onmessage = (event) => {
             const buf = new Uint8Array(event.data);
-            _wasmExports.parseAndStoreMessage(_encodeBuffer(buf), buf.byteLength, self.connNum);
+            _wasmExports.parseAndStoreMessage(..._encodeBuffer(buf), self.connNum);
         };
 
         _socket.onclose = () => {
@@ -789,7 +776,8 @@ function DaffiClient(name, options) {
             try { _wasmExports.stopClient(self.connNum); } catch (_) {}
             self.connNum = null;
         }
-        const connNum = initClient(_encodeStringZ(self.name));
+        const token = self.authToken ? _encodeString(self.authToken) : [0, 0];
+        const connNum = initClient(..._encodeString(self.name), ...token);
         self.connNum  = connNum;
         const hsUuid  = sendHandshake(connNum);
         const hsResult = await new Handler('', null, 1, true)

@@ -66,6 +66,14 @@ Workers and Callers connect using the same path.
 
 ---
 
+## Existing socket files
+
+`start()` removes a socket file left behind by a server that is gone. It
+refuses to start, and leaves the path alone, when the path is something other
+than a socket, or a socket another server is still accepting on.
+
+---
+
 ## Example
 
 Full working example: `examples/service/08_unix_socket/`

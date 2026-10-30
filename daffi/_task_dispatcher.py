@@ -23,6 +23,9 @@ workers=1 (default)
     and the right choice for fast / I/O-bound callbacks.  A client connected
     to a Service never executes callbacks, so it always stays in this mode:
     the poller only waits for disconnect, eviction, and handshake notices.
+    A callback that makes a blocking call of its own first hands polling to
+    a new thread, so nodes in one process can call each other from
+    callbacks.
 
 workers=N (thread pool)
     N threads and a private queue are added for **that connection only**.
@@ -50,7 +53,7 @@ from daffi._bindings import (
     set_lifecycle_fd,
     MessageFlag,
 )
-from daffi.exceptions import Evicted
+from daffi.exceptions import Evicted, SerdeNotAllowed
 from daffi._rpc_proxy import RpcProxy, connection_lost_error
 
 _tblib_installed = False
@@ -132,13 +135,41 @@ if hasattr(os, "register_at_fork"):
 
 
 class _Pool:
-    """Worker threads that execute callbacks for one connection."""
+    """Worker threads that execute callbacks for one connection.
 
-    def __init__(self) -> None:
+    At most ``capacity`` tasks wait in ``queue``.  When it is full the poller
+    leaves the rest in the native queue, whose bound answers further
+    requests with ``ServiceOverloaded``, and sets ``stalled``.  The next
+    worker to take a task signals ``wakeup`` so the poller drains again: the
+    native layer does not signal a queue that was not seen empty.
+    """
+
+    def __init__(self, capacity: int) -> None:
         self.queue: Queue = Queue()
+        self.capacity = capacity
         self.threads: list[Thread] = []
         self.closed = False
+        self.stalled = False
+        self.wakeup: WakeupFd | None = None
         self.lock = threading.Lock()
+
+    def full(self) -> bool:
+        """Poller: whether to stop taking tasks; if so the pool is stalled."""
+        with self.lock:
+            if self.queue.qsize() < self.capacity:
+                return False
+            self.stalled = True
+            return True
+
+    def took_task(self) -> None:
+        """Worker: wake a poller that stopped because the queue was full."""
+        with self.lock:
+            if not self.stalled or self.closed or self.wakeup is None:
+                return
+            self.stalled = False
+            # Under the lock: the connection's fds are only closed after
+            # ``closed`` is set, so this never writes to a closed fd.
+            self.wakeup.signal()
 
 
 def _pool_size(connection) -> int:
@@ -160,6 +191,11 @@ def _pool_size(connection) -> int:
     return n if n >= 1 else 1
 
 
+def _accepted(connection) -> frozenset:
+    """The request formats *connection* accepts (``serdes=``)."""
+    return getattr(connection, "serdes", SerdeFormat.ALL)
+
+
 def _handle_lifecycle_signal(conn, conn_num: int, reason: bytes) -> None:
     """React to a lifecycle byte written by the native layer into a Client's
     lifecycle fd.  Executed inline on the poller thread.
@@ -172,7 +208,7 @@ def _handle_lifecycle_signal(conn, conn_num: int, reason: bytes) -> None:
     runs on its own thread, so the poller keeps serving other connections.
     """
     if reason == LifecycleSignal.INIT:
-        RpcProxy._process_client_handshake(conn_num)
+        RpcProxy._process_client_handshake(conn_num, conn._exposed_names())
         conn._register_executors()
         return
 
@@ -217,10 +253,40 @@ def _error_result(serde: "SerdeFormat") -> "tuple[tuple, int, SerdeFormat]":
     return result, MessageFlag.ERROR, serde
 
 
+def _exposed(connection) -> "frozenset | None":
+    """The callbacks *connection* offers (``callbacks=``); None for all."""
+    return getattr(connection, "callbacks", None)
+
+
+def _lookup(func_name: str, exposed: "frozenset | None"):
+    """The executor for *func_name*, if this node offers it."""
+    cb = EXECUTOR_REGISTRY.get(func_name) if exposed is None or func_name in exposed else None
+    if cb is None:
+        raise LookupError(f"Callback {func_name!r} is not registered.")
+    return cb
+
+
+def _check_serde(serde: int, accepted: frozenset) -> None:
+    """Refuse a request before its payload is decoded: unpickling is enough
+    to run the sender's code."""
+    if serde not in accepted:
+        raise SerdeNotAllowed(
+            f"This node does not accept {SerdeFormat.name_of(serde)} requests."
+        )
+
+
+def _reply_serde(serde: int, accepted: frozenset) -> int:
+    """Format for the reply to a request in *serde*: a refused format is
+    answered in JSON."""
+    return serde if serde in accepted else SerdeFormat.JSON
+
+
 def _invoke_callback(
     func_name: str,
     serde: "SerdeFormat",
     data: bytes,
+    accepted: frozenset = SerdeFormat.ALL,
+    exposed: "frozenset | None" = None,
 ) -> "tuple[Any, int, SerdeFormat]":
     """Deserialise *data*, call the registered callback, and return the outcome.
 
@@ -229,9 +295,8 @@ def _invoke_callback(
         success or ``MessageFlag.ERROR`` on failure (see :func:`_error_result`).
     """
     try:
-        cb = EXECUTOR_REGISTRY.get(func_name)
-        if cb is None:
-            raise LookupError(f"Callback {func_name!r} is not registered.")
+        _check_serde(serde, accepted)
+        cb = _lookup(func_name, exposed)
         if cb.is_coroutine:
             raise TypeError(
                 f"Callback {func_name!r} is an async def coroutine and cannot be "
@@ -241,7 +306,7 @@ def _invoke_callback(
         args, kwargs = Serializer.deserialize(serde, data)
         return cb(*args, **kwargs), MessageFlag.RESPONSE, serde
     except:  # noqa: E722
-        return _error_result(serde)
+        return _error_result(_reply_serde(serde, accepted))
 
 
 def _encode_reply(result: Any, flag: int, serde: "SerdeFormat") -> tuple:
@@ -329,6 +394,9 @@ class TaskDispatcher:
         # disappears out from under a wait (see handle_task_queue).
         self._selector: selectors.BaseSelector | None = None
         self._selector_fds: set[int] = set()
+        # Connections whose wakeup the poller has drained and whose queue it
+        # has not yet emptied.  Only the current poller thread touches it.
+        self._owed: set = set()
 
     def _start_connection_workers(self, connection) -> None:
         """Start *connection*'s private callback threads, if it asked for any.
@@ -342,7 +410,7 @@ class TaskDispatcher:
         n = _pool_size(connection)
         if n == 1:
             return
-        pool = _Pool()
+        pool = _Pool(capacity=n)
         for i in range(n):
             # Daemon: neither stop() nor interpreter exit waits for a
             # callback that is still running.
@@ -479,6 +547,10 @@ class TaskDispatcher:
         lc = WakeupFd(pipe=True)
 
         self._conns[conn_num] = _ConnEntry(conn=connection, wakeup=wakeup, lifecycle=lc)
+        pool = self._pools.get(conn_num)
+        if pool is not None:
+            with pool.lock:
+                pool.wakeup = wakeup
         self._rfd_to_conn_num[wakeup.read_fd] = conn_num
         self._rfd_to_conn_num[lc.read_fd] = conn_num
 
@@ -510,12 +582,37 @@ class TaskDispatcher:
                 self.stop_event.clear()
                 with self._retire_lock:
                     self._poller_running = True
-                self._poller = Thread(
-                    target=self.handle_task_queue,
-                    name="daffi-poller",
-                    daemon=True,
-                )
+                self._poller = self._new_poller()
                 self._poller.start()
+
+    def _new_poller(self) -> Thread:
+        poller = Thread(target=self.handle_task_queue, name="daffi-poller", daemon=True)
+        # RpcResult calls this before it blocks: see _hand_off.
+        poller._daffi_hand_off = self._hand_off
+        return poller
+
+    def _hand_off(self) -> None:
+        """Let a new thread poll while this one waits in a call of its own.
+
+        A callback that runs inline and makes a blocking call would otherwise
+        hold up every connection in the process, including the one that has
+        to answer that call.  The connections this thread still owed tasks
+        to are signalled again, so the new poller serves them at once; this
+        thread finishes its callback and then exits.
+        """
+        me = threading.current_thread()
+        with self._poller_lock:
+            if self._poller is not me or self.stop_event.is_set():
+                return
+            # Still the poller here, so none of these descriptors can have
+            # been closed yet: closing them is the poller's job.
+            for conn in self._owed:
+                entry = self._conns.get(getattr(conn, "_conn_num", None))
+                if entry is not None:
+                    entry.wakeup.signal()
+            self._owed = set()
+            self._poller = self._new_poller()
+            self._poller.start()
 
     # ------------------------------------------------------------------
 
@@ -561,16 +658,19 @@ class TaskDispatcher:
         try:
             self._poll_loop()
         finally:
-            self._close_selector()
-            # The selector is shut, so closing is no longer racing a wait.
-            with self._retire_lock:
-                self._poller_running = False
-                pending, self._retired = self._retired, []
-            for _, close in pending:
-                close()
+            # A thread that handed off leaves the selector to its successor.
+            if self._poller is threading.current_thread():
+                self._close_selector()
+                # The selector is shut, so closing is no longer racing a wait.
+                with self._retire_lock:
+                    self._poller_running = False
+                    pending, self._retired = self._retired, []
+                for _, close in pending:
+                    close()
 
     def _poll_loop(self) -> None:
-        while not self.stop_event.is_set():
+        me = threading.current_thread()
+        while not self.stop_event.is_set() and self._poller is me:
             if not self._sync_selector():
                 # No fds yet (or all of them failed to register). Don't spin.
                 self.stop_event.wait(0.001)
@@ -591,8 +691,13 @@ class TaskDispatcher:
                 readable.discard(self._control.read_fd)
 
             # --- Dispatch all readable fds in one pass ---
-            notified: set = set()
+            notified: list = []
+            self._owed = set()
             for rfd in readable:
+                if self._poller is not me:
+                    # Handed off: what is left unread stays readable for
+                    # the new poller.
+                    return
                 conn_num = self._rfd_to_conn_num.get(rfd)
                 if conn_num is None:
                     continue
@@ -609,23 +714,38 @@ class TaskDispatcher:
                         entry.conn.logger.exception("Lifecycle handling failed")
                 elif rfd == entry.wakeup.read_fd:
                     entry.wakeup.drain()
-                    notified.add(entry.conn)
+                    if entry.conn not in notified:
+                        self._owed.add(entry.conn)
+                        notified.append(entry.conn)
 
             for conn in notified:
+                if self._poller is not me:
+                    return
                 if conn in self.connections:
-                    self._drain_tasks(conn)
+                    self._drain_tasks(conn, me)
+                if self._poller is me:
+                    self._owed.discard(conn)
 
-    def _drain_tasks(self, conn) -> None:
+    def _drain_tasks(self, conn, me: Thread) -> None:
         """Take every queued task of *conn*.
 
         The native layer signals the fd once and not again until the queue
         has been seen empty, so this must keep going until it is: one failing
-        task is logged and the rest still run.
+        task is logged and the rest still run.  A thread that handed off
+        stops here; its successor was signalled to carry on.
         """
         poller = self.pollers[bool(conn.server_mode)]
         conn_num = conn._conn_num
-        while conn in self.connections and not self.stop_event.is_set():
-            task = poller(conn_num)
+        pool = self._pools.get(conn_num)
+        while conn in self.connections and not self.stop_event.is_set() and self._poller is me:
+            if pool is not None and pool.full():
+                return
+            try:
+                task = poller(conn_num)
+            except Exception:
+                # The native layer has already dropped that message.
+                conn.logger.exception("Could not read a queued task")
+                continue
             if task is None:
                 return
             try:
@@ -654,7 +774,7 @@ class TaskDispatcher:
             # A pool that was just removed belongs to a connection
             # that is stopping; leave that callback alone.
             if _pool_size(conn) == 1 and conn in self.connections:
-                outcome = _invoke_callback(func_name, serde, data)
+                outcome = _invoke_callback(func_name, serde, data, _accepted(conn), _exposed(conn))
                 # A connection stopped during the callback gets no reply.
                 if return_result and conn in self.connections:
                     _send_reply(
@@ -677,6 +797,8 @@ class TaskDispatcher:
             conn_num,
             bool(conn.server_mode),
             conn.logger,
+            _accepted(conn),
+            _exposed(conn),
         )
         with pool.lock:
             if not pool.closed:
@@ -760,6 +882,7 @@ class TaskDispatcher:
         for task in iter(pool.queue.get, None):
             if pool.closed:
                 continue
+            pool.took_task()
             (
                 uuid,
                 data,
@@ -770,7 +893,9 @@ class TaskDispatcher:
                 conn_num,
                 server_mode,
                 logger,
+                accepted,
+                exposed,
             ) = task
-            outcome = _invoke_callback(func_name, serde, data)
+            outcome = _invoke_callback(func_name, serde, data, accepted, exposed)
             if return_result and not pool.closed:
                 _send_reply(server_mode, conn_num, uuid, transmitter, func_name, outcome, logger)

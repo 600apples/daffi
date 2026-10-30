@@ -178,7 +178,11 @@ fn runCommands(self: *EventLoop) void {
     }
 }
 
+/// The loop the calling thread runs, if any.
+pub threadlocal var current: ?*EventLoop = null;
+
 fn run(self: *EventLoop, ready: *misc.Event) void {
+    current = self;
     self.thread_id = std.Thread.getCurrentId();
     ready.set();
     var ready_udata: [Poller.max_events]usize = undefined;

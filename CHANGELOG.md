@@ -18,6 +18,40 @@ All notable changes to this project are documented in this file.
   `stop()` stops every listener at the same moment. Duplicate transports are
   rejected. `dfcore.addListeners` binds the whole listener list and
   `dfcore.startServer` starts accepting; `dfcore.addListener` is gone.
+- **Security:** a `Service` or `Router` refuses PICKLE requests from
+  WebSocket peers with a `SerdeNotAllowed` error, and a `Router` drops PICKLE
+  replies from them. Any web page can open a WebSocket to a local server,
+  and unpickling runs code the sender chooses.
+- `AsyncService` and `AsyncClient` run up to 64 incoming callbacks at once
+  by default (`workers=64`); before, they ran one at a time. Pass
+  `workers=1` for the old order. Requests beyond the limit wait in the
+  native queue, which pushes back with `ServiceOverloaded` when full.
+- `rpc_nowait()` sends exactly one call with the arguments it is given.
+  It used to send one call per item when the first argument was a list or
+  other iterable, and dropped keyword arguments; use `stream_nowait()` to
+  send a sequence item by item.
+- **Security:** a request is only accepted from a peer that has completed
+  the handshake, under the name it registered; a request naming another
+  peer as its sender gets `UnknownSender`. A Router only accepts a reply
+  from the peer it routed the request to.
+- **TLS:** a client with `tls=True` and no `ca` verifies the server against
+  the system trust store; before, it encrypted without verifying. Pass
+  `verify=False` on the transport for the old behaviour.
+- A Unix socket path reaches the native layer as `unix:<path>`; a TCP host
+  that does not resolve is an error and is never used as a socket path. A
+  server refuses to bind over a file that is not a socket, or over a socket
+  another server is still accepting on, instead of deleting it.
+- wasm exports: `initClient(name, name_len, token, token_len)`; payloads
+  cross as pointer and length, and `freeSendResult` releases a send result.
+  Use the `daffi.js` and `app.wasm` of the same release.
+- `daffi.exceptions` exports `DaffiError`, the base of every daffi
+  exception. `BaseException` is still importable from `daffi.exceptions`
+  as an alias, but `from daffi.exceptions import *` no longer shadows the
+  built-in `BaseException`.
+- Logging goes through one `daffi` logger (the app name is in the record as
+  `daffi_app`) instead of one logger per app name, and propagates to the
+  application's handlers. daffi prints to the console itself only while
+  the root logger has no handlers.
 
 ### Added
 
@@ -32,6 +66,26 @@ All notable changes to this project are documented in this file.
   64). The choice is once per process and applies to clients as well as
   servers; a later constructor that disagrees raises `InitializationError`.
   `dfcore.getRuntime()` reports the active model.
+- `serdes=` on `Service`, `Client` and their async counterparts: the
+  `SerdeFormat` values accepted in incoming requests. A request in another
+  format is answered with a `SerdeNotAllowed` error before its payload is
+  decoded. The default accepts every format; leave out `PICKLE` unless every
+  peer is trusted.
+- `auth_token=` on `Router`, `Service`, `Client` and their async
+  counterparts (`authToken` in the JS client): a shared secret every peer
+  must send in its handshake. A peer without it is disconnected before it
+  can call anything or take a name.
+- `allowed_origins=` on a listening `TCPTransport`: the web pages that may
+  open a WebSocket to it. Other upgrades are refused with 403.
+- `callbacks=` on `Service`, `Client` and their async counterparts: the
+  callbacks this node offers. Default: every registered callback.
+- `verify=` on `TCPTransport` and `UnixTransport` (see Breaking).
+- `rpc()` and `rpc_nowait()` accept a list of receivers and send to
+  whichever of them is connected, taking turns.
+- `dfcore.missingMembers(conn_num, names)`: the names that are not
+  connected, read from the native membership.
+- `DAFFI_FRAME_STALL_MS` (default 30000): a connection whose half-received
+  message gets no further bytes for that long is closed.
 
 ### Changed
 
@@ -72,7 +126,25 @@ All notable changes to this project are documented in this file.
   connection. TLS handshakes and protocol detection of an accepted
   connection must finish within 5 s overall.
 - The evented runtime runs at most 1024 blocking jobs (TLS handshakes,
-  WebSocket sessions) at once; further connections are refused.
+  WebSocket sessions) at once; further connections are refused. WebSocket
+  sessions may take at most 768 of them, so idle browser tabs cannot use up
+  the pool.
+- A service's task queue also has a byte limit (256 MiB), and messages
+  still being received share a 1 GiB budget across the process. Past
+  either, requests get `ServiceOverloaded` or the connection is closed. A
+  Router answers `RouterOverloaded` past 2^20 requests in flight.
+- Large messages are sent as header and payload in one `writev`, without
+  copying the payload.
+- In the evented runtime a connection reads at most 16 messages per turn,
+  so a busy peer cannot starve the others on its loop. A write to a slow
+  peer no longer blocks the event loop: what the socket does not take is
+  queued (up to 64 MiB per connection, after which the connection is
+  closed) and sent by a pool thread.
+- Response timeouts, the accept loop and Unix socket restores use the
+  monotonic clock, so a wall-clock change no longer cuts them short or
+  stretches them.
+- `Client.connect()` fails at once when the kernel refuses the connection,
+  instead of waiting out the connect timeout.
 
 ### Fixed
 
@@ -100,6 +172,30 @@ All notable changes to this project are documented in this file.
   socket restores and failed writes no longer leak memory or descriptors.
 - A connection whose write failed partway is closed instead of left with a
   corrupt stream.
+- A message whose text payload or names are not valid UTF-8 no longer stops
+  the dispatcher, after which the node answered nothing. Such a payload
+  reaches the callback as `bytes`.
+- `start()` after `stop()` (or `connect()` after `stop()` on a client)
+  resets the stopped state: the second `stop()` used to do nothing and leave
+  the port open, and `join()` returned at once.
+- A callback that runs on the shared poller thread (`workers=1`) and makes a
+  blocking call no longer deadlocks when the answer has to come through
+  another node of the same process: polling moves to a new thread first.
+- A request with uuid 0 no longer aborts the receiving process.
+- Request ids still waiting for a response are not reused, and a response
+  goes to the connection that sent the request, not to a reconnected
+  client that took the same name.
+- A WebSocket message split over several frames no longer reads freed
+  memory.
+- The JS client passes payloads containing NUL bytes intact and no longer
+  leaks the memory of send results.
+- Publishing a service's callbacks no longer races a peer's handshake.
+- A peer that handshakes again while a write to it is stalled no longer
+  freezes routing through the Router.
+- `@alias` works above and below `@callback`.
+- `stream_nowait()` in `daffi.aio` uses the requested `serde`.
+- The poller no longer spins at full CPU when `kevent`/`epoll_wait` fails.
+- A client handler's method list and token are no longer leaked.
 
 
 ## 3.0.1

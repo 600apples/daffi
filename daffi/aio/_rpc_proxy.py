@@ -26,7 +26,6 @@ import json
 import time
 import logging
 import threading
-from itertools import repeat
 from typing import TYPE_CHECKING, Union, List, Optional, Tuple
 from contextlib import contextmanager
 
@@ -42,6 +41,7 @@ from daffi.exceptions import (
 )
 from daffi.utils.misc import iterable
 from daffi._wakeup import WakeupFd
+from daffi import dfcore
 from daffi.registry._executor_registry import EXECUTOR_REGISTRY
 from daffi._bindings import (
     send_message_from_client,
@@ -55,6 +55,7 @@ from daffi._bindings import (
 )
 from daffi._rpc_proxy import (
     METADATA_SEPARATOR,
+    _Receivers,
     system_exception_handler,
     RpcResult,
     connection_lost_error,
@@ -228,9 +229,7 @@ class AsyncRpcResult:
         return unpack_response(res, self.serde)
 
     def _check_receivers(self) -> None:
-        if missing := self.receivers - {
-            m["name"] for m in get_available_members(self.conn_num)
-        }:
+        if missing := set(dfcore.missingMembers(self.conn_num, self.receivers)):
             raise TransmissionFailure(
                 f"The anticipated receivers(s) {missing} unexpectedly"
                 f" disconnected, causing an interruption in the awaiting"
@@ -276,7 +275,7 @@ class _AsyncBoundRpc:
         if self._proxy.return_result:
             return await self._proxy._process_rpc(self._func_name, *args, **kwargs)
         else:
-            await self._proxy._process_stream(self._func_name, *args, **kwargs)
+            await self._proxy._process_nowait(self._func_name, *args, **kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -313,13 +312,11 @@ class AsyncRpcProxy:
     ):
         self.conn = conn
         self.timeout = int(timeout or 0)
-        self.receiver = (
-            METADATA_SEPARATOR.join(receiver) if iterable(receiver) else receiver or ""
-        )
+        self._to = _Receivers(receiver)
+        self.receiver = str(self._to)
         self.serde = serde
         self.return_result = return_result
         self.logger = logger
-        self._receiver = {receiver} if receiver else set()
 
     def __str__(self) -> str:
         req_name = "rpc call" if self.return_result else "rpc_nowait"
@@ -341,21 +338,19 @@ class AsyncRpcProxy:
         with system_exception_handler(
             f"Unable to proceed with {label}: {{}}", TransmissionFailure, conn_num
         ):
-            uuid, ts, found_receiver = send_message_from_client(
-                data=data,
-                flag=MessageFlag.REQUEST,
-                serde=self.serde,
-                receiver=self.receiver,
-                func_name=func_name,
-                return_result=self.return_result,
-                conn_num=conn_num,
-                is_bytes=is_bytes,
+            uuid, ts, found_receiver = self._to.send(
+                lambda receiver: send_message_from_client(
+                    data=data,
+                    flag=MessageFlag.REQUEST,
+                    serde=self.serde,
+                    receiver=receiver,
+                    func_name=func_name,
+                    return_result=self.return_result,
+                    conn_num=conn_num,
+                    is_bytes=is_bytes,
+                )
             )
-        found_receivers = (
-            None
-            if not found_receiver
-            else set(found_receiver.split(METADATA_SEPARATOR))
-        )
+        found_receivers = {found_receiver} if found_receiver else None
         if not found_receivers:
             members = (
                 ""
@@ -363,8 +358,6 @@ class AsyncRpcProxy:
                 else f"\nAvailable receivers: {_m}"
             )
             raise TransmissionFailure(f"No receivers found for {label}." + members)
-        elif missing := self._receiver - found_receivers:
-            self.logger.warning(f"Receiver(s): {missing} seems to be offline.")
         result = AsyncRpcResult(
             conn_num=conn_num,
             uuid=uuid,
@@ -377,45 +370,36 @@ class AsyncRpcProxy:
         data, flag, serde = await result.result()
         return Serializer.deserialize(serde, data)[0][0]
 
-    async def _process_stream(self, func_name: str, *args, **kwargs):
+    async def _process_nowait(self, func_name: str, *args, **kwargs):
+        """Send one fire-and-forget call with exactly these arguments."""
         conn_num = self.conn.client._conn_num
-        if args:
-            data = args[0]
-        elif kwargs:
-            data = kwargs[next(iter(kwargs))]
-        else:
-            data = None
-        items = [(args, kwargs)] if not iterable(data) else iter(zip(data, repeat({})))
         label = f"rpc_nowait(fn: {func_name!r})"
-        for a, k in items:
-            payload, is_bytes = Serializer.serialize(self.serde, *a, **k)
-            with system_exception_handler(
-                f"Unable to proceed with {label}: {{}}", TransmissionFailure, conn_num
-            ):
-                uuid, ts, found_receiver = send_message_from_client(
+        payload, is_bytes = Serializer.serialize(self.serde, *args, **kwargs)
+        with system_exception_handler(
+            f"Unable to proceed with {label}: {{}}", TransmissionFailure, conn_num
+        ):
+            uuid, ts, found_receiver = self._to.send(
+                lambda receiver: send_message_from_client(
                     data=payload,
                     flag=MessageFlag.REQUEST,
                     serde=self.serde,
-                    receiver=self.receiver,
+                    receiver=receiver,
                     func_name=func_name,
                     return_result=self.return_result,
                     conn_num=conn_num,
                     is_bytes=is_bytes,
                 )
-            if not found_receiver:
-                members = (
-                    ""
-                    if not (_m := get_available_members(conn_num))
-                    else f"\nAvailable receivers: {_m}"
-                )
-                raise TransmissionFailure(f"No receivers found for {label}." + members)
-            elif missing := self._receiver - set(
-                found_receiver.split(METADATA_SEPARATOR)
-            ):
-                self.logger.warning(f"Receiver(s) {missing} seems to be offline.")
+            )
+        if not found_receiver:
+            members = (
+                ""
+                if not (_m := get_available_members(conn_num))
+                else f"\nAvailable receivers: {_m}"
+            )
+            raise TransmissionFailure(f"No receivers found for {label}." + members)
 
     @classmethod
-    def _process_client_handshake(cls, conn_num: int) -> dict:
+    def _process_client_handshake(cls, conn_num: int, names: "list[str] | None" = None) -> dict:
         """Sync handshake — delegates to the sync ``RpcProxy`` implementation.
 
         Called via ``loop.run_in_executor`` so it does not block the event
@@ -424,7 +408,7 @@ class AsyncRpcProxy:
         """
         from daffi._rpc_proxy import RpcProxy as _SyncRpcProxy
 
-        return _SyncRpcProxy._process_client_handshake(conn_num)
+        return _SyncRpcProxy._process_client_handshake(conn_num, names)
 
 
 # ---------------------------------------------------------------------------
@@ -519,43 +503,50 @@ class AsyncBroadcastProxy:
                 + (f"\nAvailable peers: {available}" if available else "")
             )
         pending: dict[str, AsyncRpcResult] = {}
-        for receiver_name in receivers:
-            with system_exception_handler(
-                f"Unable to dispatch call_all to {receiver_name!r}: {{}}",
-                TransmissionFailure,
-                conn_num,
-            ):
-                uuid, ts, found = send_message_from_client(
-                    data=data,
-                    flag=MessageFlag.REQUEST,
-                    serde=self.serde,
-                    receiver=receiver_name,
-                    func_name=func_name,
-                    return_result=True,
-                    conn_num=conn_num,
-                    is_bytes=is_bytes,
-                )
-            if found:
-                pending[receiver_name] = AsyncRpcResult(
-                    conn_num=conn_num,
-                    uuid=uuid,
-                    ts=ts,
-                    timeout=self.timeout,
-                    receivers={receiver_name},
-                    serde=self.serde,
-                )
-            else:
-                self.logger.warning(
-                    f"call_all: receiver {receiver_name!r} not reachable, skipping."
-                )
-        results: dict = {}
-        for name, rpc_result in pending.items():
-            try:
-                result_data, _, serde_r = await rpc_result.result()
-                results[name] = Serializer.deserialize(serde_r, result_data)[0][0]
-            except Exception as exc:
-                results[name] = exc
-        return results
+        try:
+            for receiver_name in receivers:
+                with system_exception_handler(
+                    f"Unable to dispatch call_all to {receiver_name!r}: {{}}",
+                    TransmissionFailure,
+                    conn_num,
+                ):
+                    uuid, ts, found = send_message_from_client(
+                        data=data,
+                        flag=MessageFlag.REQUEST,
+                        serde=self.serde,
+                        receiver=receiver_name,
+                        func_name=func_name,
+                        return_result=True,
+                        conn_num=conn_num,
+                        is_bytes=is_bytes,
+                    )
+                if found:
+                    pending[receiver_name] = AsyncRpcResult(
+                        conn_num=conn_num,
+                        uuid=uuid,
+                        ts=ts,
+                        timeout=self.timeout,
+                        receivers={receiver_name},
+                        serde=self.serde,
+                    )
+                else:
+                    self.logger.warning(
+                        f"call_all: receiver {receiver_name!r} not reachable, skipping."
+                    )
+            results: dict = {}
+            for name in list(pending):
+                rpc_result = pending.pop(name)
+                try:
+                    result_data, _, serde_r = await rpc_result.result()
+                    results[name] = Serializer.deserialize(serde_r, result_data)[0][0]
+                except Exception as exc:
+                    results[name] = exc
+            return results
+        finally:
+            # Requests nobody will wait for any more keep their uuid taken
+            # until expired.
+            for rpc_result in pending.values():
+                expire_message(rpc_result.uuid, conn_num)
 
     async def _process_cast_all(self, func_name: str, *args, **kwargs) -> None:
         conn_num = self.conn.client._conn_num
@@ -800,7 +791,7 @@ class AsyncClientConnection:
     def rpc(
         self,
         timeout: Union[int, None] = None,
-        receiver: Union[str, None] = None,
+        receiver: Union[str, List[str], None] = None,
         serde: SerdeFormat = SerdeFormat.PICKLE,
     ) -> AsyncRpcProxy:
         """Configure a blocking call and return an async proxy.
@@ -820,7 +811,7 @@ class AsyncClientConnection:
 
     def rpc_nowait(
         self,
-        receiver: Union[str, None] = None,
+        receiver: Union[str, List[str], None] = None,
         serde: SerdeFormat = SerdeFormat.PICKLE,
     ) -> AsyncRpcProxy:
         """Configure a fire-and-forget call and return an async proxy.
@@ -903,7 +894,7 @@ class AsyncClientConnection:
         return AsyncStreamNowaitProxy(
             conn=self,
             receiver=receiver,
-            serde=SerdeFormat.OPAQUE,
+            serde=serde,
             timeout=None,
             logger=self.client.logger,
         )

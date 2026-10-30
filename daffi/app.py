@@ -8,9 +8,11 @@ import threading
 from abc import ABC
 from enum import Enum, IntEnum
 from threading import Event
+from collections.abc import Iterable
 from typing import Optional, List, Callable, Any
 
 from . import dfcore
+from daffi._serialization import SerdeFormat
 
 from daffi.utils import colors
 from daffi.utils.logger import get_daffi_logger, sync_native_log_level
@@ -56,6 +58,58 @@ def _coerce_runtime(value: "Runtime | str") -> Runtime:
             "runtime must be 'threads' or 'evented', "
             f"got {value!r}"
         ) from None
+
+
+def _coerce_serdes(value: "Iterable[int] | None") -> frozenset:
+    if value is None:
+        return SerdeFormat.ALL
+    if isinstance(value, (str, bytes)) or not isinstance(value, Iterable):
+        raise InitializationError(
+            f"serdes must be a collection of SerdeFormat values, got {value!r}"
+        )
+    serdes = frozenset(value)
+    unknown = sorted(serdes - SerdeFormat.ALL, key=repr)
+    if unknown:
+        raise InitializationError(
+            f"serdes has unknown formats {unknown!r}; use SerdeFormat values"
+        )
+    if not serdes:
+        raise InitializationError("serdes must name at least one format")
+    return serdes
+
+
+def _callback_names(value) -> "frozenset[str] | None":
+    """The names ``callbacks=`` allows: strings as given, ``@callback``
+    objects by the names they registered, functions by alias or name."""
+    from daffi.registry._callback import callback as _callback
+
+    if value is None:
+        return None
+    if isinstance(value, (str, bytes)) or not isinstance(value, Iterable):
+        raise InitializationError(
+            f"callbacks must be a collection of names or callbacks, got {value!r}"
+        )
+    names: set[str] = set()
+    for item in value:
+        if isinstance(item, str) and item:
+            names.add(item)
+        elif isinstance(item, _callback):
+            names.update(item.names)
+        elif callable(item) and hasattr(item, "__name__"):
+            names.add(getattr(item, "alias", item.__name__))
+        else:
+            raise InitializationError(f"invalid entry in callbacks: {item!r}")
+    return frozenset(names)
+
+
+def _coerce_auth_token(value: "str | None") -> "str | None":
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise InitializationError(f"auth_token must be a str, got {type(value).__name__}")
+    if not value or "\0" in value:
+        raise InitializationError("auth_token must be a non-empty string without NUL characters")
+    return value
 
 
 class ServerMode(IntEnum):
@@ -209,6 +263,9 @@ class Application(EventsMixin, ABC):
         workers: int = TaskDispatcher.DEFAULT_WORKERS,
         runtime: Optional[Runtime | str] = None,
         transport: TransportArg | None = None,
+        serdes: Optional[Iterable[int]] = None,
+        auth_token: Optional[str] = None,
+        callbacks: Optional[Iterable[Any]] = None,
     ):
         """
         Args:
@@ -235,6 +292,27 @@ class Application(EventsMixin, ABC):
                            ``__init__`` runs and stores the result on
                            ``_transports``.  TLS is configured on each
                            :class:`~daffi.transports.TCPTransport`, not here.
+            serdes:        The :class:`SerdeFormat` values this node accepts
+                           in incoming ``@callback`` requests; a request in
+                           any other format is answered with a
+                           ``SerdeNotAllowed`` error and never decoded.
+                           ``None`` (default) accepts every format.  Leave
+                           out ``SerdeFormat.PICKLE`` unless every peer is
+                           trusted: unpickling runs code the sender chooses.
+                           PICKLE from a WebSocket peer is always refused.
+                           Ignored by :class:`Router`.
+            auth_token:    Shared secret.  A :class:`Router` or
+                           :class:`Service` given one refuses every peer
+                           whose handshake does not carry the same token; a
+                           :class:`Client` sends it.  It travels in the clear
+                           unless the transport uses TLS.  ``None``
+                           (default) accepts any peer.
+            callbacks:     The ``@callback`` functions (or their names) this
+                           node offers to peers.  The others are neither
+                           announced nor run: a request for one fails as an
+                           unknown callback.  ``None`` (default) offers
+                           every registered callback.  Ignored by
+                           :class:`Router`.
         """
         # Mixins set ``_transports`` before calling us; ``transport`` itself
         # never arrives here when constructed via Router/Service/Client.
@@ -249,6 +327,9 @@ class Application(EventsMixin, ABC):
             raise InitializationError(str(exc)) from exc
         self.app_name = app_name
         self.workers = workers
+        self.serdes = _coerce_serdes(serdes)
+        self.auth_token = _coerce_auth_token(auth_token)
+        self.callbacks = _callback_names(callbacks)
         self._conn_num = None
         self._conn_type = None
         self._stop_event = Event()
@@ -314,6 +395,7 @@ class Application(EventsMixin, ABC):
                 listeners,
                 self.server_mode,
                 self.app_name,
+                self.auth_token,
             )
         except ValueError as exc:
             reason, *where = exc.args
@@ -324,6 +406,10 @@ class Application(EventsMixin, ABC):
                 conn_info=failed.conn_info() if failed else (),
             ):
                 raise ValueError(reason) from None
+
+    def _exposed_names(self) -> "list[str]":
+        """The registered callbacks this node offers (see ``callbacks=``)."""
+        return [name for name, _ in EXECUTOR_REGISTRY if self.callbacks is None or name in self.callbacks]
 
     def _register_executors(self):
         """Log all currently registered callbacks and subscribe for future ones.
@@ -343,11 +429,13 @@ class Application(EventsMixin, ABC):
                 # subscriber list, or when @callback is applied after stop().
                 if self._conn_num is None:
                     return
+                if self.callbacks is not None and executor.name not in self.callbacks:
+                    return
                 try:
                     if self.server_mode is None:
-                        RpcProxy._process_client_handshake(self._conn_num)
+                        RpcProxy._process_client_handshake(self._conn_num, self._exposed_names())
                     elif self.server_mode == ServerMode.SERVICE:
-                        RpcProxy._process_service_handshake(self._conn_num)
+                        RpcProxy._process_service_handshake(self._conn_num, self._exposed_names())
                     else:
                         return
                 except Exception as exc:
@@ -458,6 +546,8 @@ class ServerMixin:
         """
         if self._conn_num is not None:
             raise RuntimeError(f"{self.__class__.__name__} is already started")
+        # A server can start again after stop(); stop() must then work again.
+        self._stop_event.clear()
         try:
             if self.server_mode == ServerMode.SERVICE:
                 # Start the worker-thread pool before native I/O threads are
@@ -472,11 +562,11 @@ class ServerMixin:
                 self._task_dispatcher.start_for_connection(self)
                 # Before any socket accepts, so the first handshake already
                 # carries the callback list.
-                RpcProxy._advertise_service_methods(self._conn_num)
+                RpcProxy._advertise_service_methods(self._conn_num, self._exposed_names())
             dfcore.startServer(self._conn_num)
             self._register_executors()
             if self.server_mode == ServerMode.SERVICE:
-                RpcProxy._process_service_handshake(self._conn_num)
+                RpcProxy._process_service_handshake(self._conn_num, self._exposed_names())
         except BaseException:
             self._abort_start()
             raise
@@ -605,6 +695,10 @@ class Client(Application[SingleTransportMixin]):
         """
         if self._conn_num is not None:
             raise RuntimeError("Client is already connected")
+        # A client can connect again after stop().
+        self._stop_event.clear()
+        self._connection_error = None
+        self._disconnected = False
         self._do_connect()
         return ClientConnection(self)
 
@@ -631,6 +725,8 @@ class Client(Application[SingleTransportMixin]):
                 t.ca,
                 t.cert,
                 t.key,
+                t.verify,
+                self.auth_token,
             )
         except Exception as exc:
             raise InitializationError(
@@ -641,7 +737,7 @@ class Client(Application[SingleTransportMixin]):
                 f"Failed to connect to the server. connection info: {self.info}"
             )
         try:
-            handshake = RpcProxy._process_client_handshake(self._conn_num)
+            handshake = RpcProxy._process_client_handshake(self._conn_num, self._exposed_names())
         except Exception as exc:
             # Tear the native slot down so the caller can retry connect()
             # without hitting the "already connected" guard.  Remap to
