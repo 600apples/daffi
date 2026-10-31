@@ -409,7 +409,7 @@ class AsyncRpcProxy:
             serde=self.serde,
         )
         data, flag, serde = await result.result()
-        return Serializer.deserialize(serde, data)[0][0]
+        return Serializer.unpack_result(serde, data)
 
     async def _process_nowait(self, func_name: str, *args, **kwargs):
         """Send one fire-and-forget call with exactly these arguments."""
@@ -580,7 +580,7 @@ class AsyncBroadcastProxy:
             async def _take(name: str, rpc_result: AsyncRpcResult):
                 try:
                     result_data, _, serde_r = await rpc_result.result()
-                    return name, Serializer.deserialize(serde_r, result_data)[0][0]
+                    return name, Serializer.unpack_result(serde_r, result_data)
                 except Exception as exc:
                     return name, exc
 

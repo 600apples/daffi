@@ -53,10 +53,9 @@ pub const MessagePool = struct {
         self.allocator.destroy(self);
     }
 
-    /// Messages that fit here are framed on the stack. A typical RPC (header,
-    /// three short names, a small pickle) is a few hundred bytes, and allocating
-    /// that buffer on every send showed up in the call latency. A larger
-    /// payload is not copied: its header and metadata go out in front of it.
+    /// Header + metadata fit here on the stack for a typical RPC. The payload
+    /// is never copied into this buffer: it goes out via ``writeParts``
+    /// (writev) immediately after the prefix.
     const send_scratch_len: usize = 8 * 1024;
 
     pub fn sendMessage(
@@ -73,13 +72,6 @@ pub const MessagePool = struct {
         func_name: ?[]const u8,
     ) !void {
         const n = try RawMessage.encodedLen(data, transmitter, receiver, func_name);
-        if (n <= send_scratch_len) {
-            var scratch: [send_scratch_len]u8 = undefined;
-            try RawMessage.encodeInto(scratch[0..n], data, uuid, flag, decoder, is_bytes, return_result, transmitter, receiver, func_name);
-            const raw_message = RawMessage{ .data = scratch[0..n] };
-            try raw_message.sendTo(writer);
-            return;
-        }
         const prefix_len = n - data.len;
         var scratch: [send_scratch_len]u8 = undefined;
         const prefix = if (prefix_len <= scratch.len) scratch[0..prefix_len] else try self.allocator.alloc(u8, prefix_len);

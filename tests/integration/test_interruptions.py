@@ -195,7 +195,28 @@ def _sigkill(proc: mp.Process, *, wait: float = 0.3) -> None:
 
 
 def _sigstop(proc: mp.Process) -> None:
+    """SIGSTOP *proc* and wait until the kernel reports it stopped.
+
+    Without the wait, a follow-up RPC can still complete under load: the
+    request was already in the service's run queue (or the TCP ACK race)
+    before the stop took effect, so the client never sees TimeoutError.
+    """
     os.kill(proc.pid, signal.SIGSTOP)
+    deadline = time.monotonic() + 2.0
+    status_path = f"/proc/{proc.pid}/status"
+    while time.monotonic() < deadline:
+        try:
+            with open(status_path, encoding="utf-8") as f:
+                for line in f:
+                    if line.startswith("State:"):
+                        # T = stopped (job control); t = tracing stop.
+                        if line.split()[1] in ("T", "t"):
+                            return
+                        break
+        except FileNotFoundError:
+            return
+        time.sleep(0.01)
+    raise AssertionError(f"process {proc.pid} did not enter stopped state after SIGSTOP")
 
 
 def _sigcont(proc: mp.Process) -> None:

@@ -360,7 +360,7 @@ class RpcProxy:
             proxy=self,
             serde=self.serde,
         ).result()
-        return Serializer.deserialize(serde, data)[0][0]
+        return Serializer.unpack_result(serde, data)
 
     def _process_nowait(self, func_name: str, *args, **kwargs):
         """Send one fire-and-forget call with exactly these arguments."""
@@ -695,7 +695,7 @@ class BroadcastProxy:
                 rpc_result = pending.pop(name)
                 try:
                     result_data, _, serde_r = rpc_result.result()
-                    return name, Serializer.deserialize(serde_r, result_data)[0][0]
+                    return name, Serializer.unpack_result(serde_r, result_data)
                 except Exception as exc:
                     return name, exc
 

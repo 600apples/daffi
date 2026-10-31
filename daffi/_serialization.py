@@ -191,6 +191,27 @@ class Serializer:
         except KeyError:
             raise ValueError(f"Unknown serde format: {serde!r}")
 
+    @classmethod
+    def unpack_result(cls, serde: SerdeFormat, data: Union[bytes, str]):
+        """Return the single RPC result value from a RESPONSE payload.
+
+        OPAQUE skips the ``(args,), {}`` envelope and returns *data* as-is.
+        """
+        if serde == SerdeFormat.OPAQUE:
+            return data
+        return cls.deserialize(serde, data)[0][0]
+
+    @classmethod
+    def invoke(cls, serde: SerdeFormat, callback, data: Union[bytes, str]):
+        """Call *callback* with arguments decoded from *data*.
+
+        OPAQUE passes *data* as the sole positional argument (no tuple/dict).
+        """
+        if serde == SerdeFormat.OPAQUE:
+            return callback(data)
+        args, kwargs = cls.deserialize(serde, data)
+        return callback(*args, **kwargs)
+
     # Dispatch tables — populated after the class body so the static methods
     # are already defined when referenced here.
     _SERIALIZE: Dict[int, Callable] = {}

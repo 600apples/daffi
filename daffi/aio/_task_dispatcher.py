@@ -120,12 +120,16 @@ async def _invoke_callback_async(
     try:
         _check_serde(serde, accepted)
         cb = _lookup(func_name, exposed)
-        args, kwargs = Serializer.deserialize(serde, data)
+        if serde == SerdeFormat.OPAQUE:
+            call = functools.partial(cb, data)
+        else:
+            args, kwargs = Serializer.deserialize(serde, data)
+            call = functools.partial(cb, *args, **kwargs)
         if cb.is_coroutine:
-            result = await cb(*args, **kwargs)
+            result = await call()
         else:
             result = await asyncio.get_running_loop().run_in_executor(
-                _callback_executor, functools.partial(cb, *args, **kwargs)
+                _callback_executor, call
             )
         return result, MessageFlag.RESPONSE, serde
     except asyncio.CancelledError:

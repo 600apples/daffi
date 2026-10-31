@@ -315,8 +315,7 @@ def _invoke_callback(
                 "used with the synchronous dispatcher. "
                 "Use daffi.aio (AsyncClient / AsyncService) instead."
             )
-        args, kwargs = Serializer.deserialize(serde, data)
-        return cb(*args, **kwargs), MessageFlag.RESPONSE, serde
+        return Serializer.invoke(serde, cb, data), MessageFlag.RESPONSE, serde
     except Exception:
         return _error_result(_reply_serde(serde, accepted))
 
