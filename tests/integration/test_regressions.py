@@ -943,26 +943,31 @@ except BaseException as exc:
         assert code == 0 and "raised" in output, output
 
     @pytest.mark.skipif(not hasattr(os, "fork"), reason="fork is POSIX-only")
-    def test_forked_child_terminates_on_sigterm(self, free_port):
-        child_port = free_port + 1 if free_port < 65000 else free_port - 1
+    def test_forked_child_terminates_on_sigterm(self):
         script = f"""
 import multiprocessing as mp, socket, time
 from daffi import Service, TCPTransport, dfcore
 dfcore.setRuntime({active_runtime()!r})
+
+def free_port():
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
 
 def child(port):
     svc = Service(app_name="forked", transport=TCPTransport("127.0.0.1", port), runtime={active_runtime()!r})
     svc.start()
     svc.join()
 
-parent = Service(app_name="parent", transport=TCPTransport("127.0.0.1", {free_port}), runtime={active_runtime()!r})
+parent_port, child_port = free_port(), free_port()
+parent = Service(app_name="parent", transport=TCPTransport("127.0.0.1", parent_port), runtime={active_runtime()!r})
 parent.start()
-proc = mp.get_context("fork").Process(target=child, args=({child_port},), daemon=True)
+proc = mp.get_context("fork").Process(target=child, args=(child_port,), daemon=True)
 proc.start()
 deadline = time.monotonic() + 15
 while True:
     try:
-        socket.create_connection(("127.0.0.1", {child_port}), timeout=0.2).close()
+        socket.create_connection(("127.0.0.1", child_port), timeout=0.2).close()
         break
     except OSError:
         if time.monotonic() > deadline:
