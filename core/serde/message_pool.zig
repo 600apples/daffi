@@ -12,6 +12,8 @@ const MessageFlag = serde.MessageFlag;
 const MessageDecoder = serde.MessageDecoder;
 const print = std.debug.print;
 
+pub const RecvFreelist = @import("recv_freelist.zig").RecvFreelist;
+
 /// First allocation made for an incoming message body.  Only once the peer
 /// has actually sent that much is the buffer grown to the declared size, so a
 /// bare header cannot make us reserve up to 32 MiB.  A single jump (instead of
@@ -35,6 +37,8 @@ pub fn partialBytes() usize {
 
 pub const MessagePool = struct {
     allocator: Allocator,
+    /// Recycles receive buffers and Message shells for this client/server.
+    freelist: RecvFreelist = .{},
     // web_connection: ?*WebConnection,
 
     const Self = @This();
@@ -50,6 +54,7 @@ pub const MessagePool = struct {
 
     pub fn deinit(self: *Self) void {
         // if (self.web_connection) |web_connection| web_connection.deinit();
+        self.freelist.deinit(self.allocator, Message);
         self.allocator.destroy(self);
     }
 
@@ -110,9 +115,10 @@ pub const MessagePool = struct {
     pub fn buildWsMessage(self: *Self, data: []const u8) !*Message {
         const header = try Header.parse(data);
         if (data.len != @as(usize, serde.HEADER_SIZE) + header.msg_len) return error.LengthMismatch;
-        const data_buf = try self.allocator.dupe(u8, data);
-        errdefer self.allocator.free(data_buf);
-        return try Message.create(self.allocator, header, data_buf);
+        const buf = try self.freelist.allocBuf(self.allocator, data.len);
+        errdefer self.freelist.freeBuf(self.allocator, buf);
+        @memcpy(buf[0..data.len], data);
+        return try Message.createWithCapacity(self.allocator, header, buf[0..data.len], buf.len, &self.freelist);
     }
 };
 
@@ -123,10 +129,12 @@ pub const MessagePool = struct {
 /// make us reserve up to 32 MiB per connection.
 pub const FrameDecoder = struct {
     allocator: Allocator,
+    /// When set, frame buffers and finished Messages come from this pool.
+    freelist: ?*RecvFreelist = null,
     header_buf: [serde.HEADER_SIZE]u8 = undefined,
     header_filled: usize = 0,
     header: Header = undefined,
-    /// Whole frame (header included) once the header is parsed.
+    /// Whole-frame allocation (capacity).  Logical length is `filled`.
     frame: []u8 = &.{},
     filled: usize = 0,
     /// This frame's share of `partial_bytes`.
@@ -136,10 +144,36 @@ pub const FrameDecoder = struct {
         return .{ .allocator = allocator };
     }
 
+    pub fn initPooled(allocator: Allocator, freelist: *RecvFreelist) FrameDecoder {
+        return .{ .allocator = allocator, .freelist = freelist };
+    }
+
     pub fn deinit(self: *FrameDecoder) void {
-        if (self.frame.len != 0) self.allocator.free(self.frame);
+        if (self.frame.len != 0) self.freeFrame(self.frame);
         self.releaseBudget();
         self.* = undefined;
+    }
+
+    fn allocFrame(self: *FrameDecoder, min_len: usize) ![]u8 {
+        if (self.freelist) |fl| return try fl.allocBuf(self.allocator, min_len);
+        return try self.allocator.alloc(u8, min_len);
+    }
+
+    fn reallocFrame(self: *FrameDecoder, new_len: usize) !void {
+        if (self.frame.len >= new_len) return;
+        if (self.freelist) |fl| {
+            self.frame = try fl.reallocBuf(self.allocator, self.frame, self.filled, new_len);
+            return;
+        }
+        self.frame = try self.allocator.realloc(self.frame, new_len);
+    }
+
+    fn freeFrame(self: *FrameDecoder, buf: []u8) void {
+        if (self.freelist) |fl| {
+            fl.freeBuf(self.allocator, buf);
+            return;
+        }
+        self.allocator.free(buf);
     }
 
     /// Whether a frame has started and not yet finished.
@@ -186,7 +220,13 @@ pub const FrameDecoder = struct {
             self.header = try Header.parse(&self.header_buf);
             const total: usize = @as(usize, serde.HEADER_SIZE) + self.header.msg_len;
             try self.chargeBudgetFor(total);
-            self.frame = try self.allocator.alloc(u8, @min(total, INITIAL_RECV_CHUNK));
+            // Prefer a freelist class that already fits `total` so small RPCs
+            // skip the INITIAL_RECV_CHUNK → realloc step.
+            const want = if (self.freelist != null and RecvFreelist.classFor(total) != null)
+                total
+            else
+                @min(total, INITIAL_RECV_CHUNK);
+            self.frame = try self.allocFrame(want);
             @memcpy(self.frame[0..self.header_buf.len], &self.header_buf);
             self.filled = self.header_buf.len;
         }
@@ -194,11 +234,14 @@ pub const FrameDecoder = struct {
         const total: usize = @as(usize, serde.HEADER_SIZE) + self.header.msg_len;
         while (self.filled < total) {
             if (input.len == 0) return null;
-            if (self.filled == self.frame.len) {
+            // Grow when the allocation is exhausted but the frame is not done.
+            // Freelist class capacity may exceed `total`; never copy past it.
+            if (self.frame.len < total and self.filled >= self.frame.len) {
                 try self.chargeBudgetFor(total);
-                self.frame = try self.allocator.realloc(self.frame, total);
+                try self.reallocFrame(total);
             }
-            const n = @min(input.len, self.frame.len - self.filled);
+            const room = @min(self.frame.len, total) - self.filled;
+            const n = @min(input.len, room);
             @memcpy(self.frame[self.filled..][0..n], input.*[0..n]);
             self.filled += n;
             input.* = input.*[n..];
@@ -215,11 +258,12 @@ pub const FrameDecoder = struct {
         if (self.frame.len == 0) return null;
         const total: usize = @as(usize, serde.HEADER_SIZE) + self.header.msg_len;
         if (total - self.filled < min) return null;
-        if (self.filled == self.frame.len) {
+        if (self.frame.len < total and self.filled >= self.frame.len) {
             try self.chargeBudgetFor(total);
-            self.frame = try self.allocator.realloc(self.frame, total);
+            try self.reallocFrame(total);
         }
-        return self.frame[self.filled..];
+        // Cap at both allocation and logical frame end (class capacity may exceed `total`).
+        return self.frame[self.filled..@min(self.frame.len, total)];
     }
 
     /// Account for `n` bytes read into `directBuffer`; returns the message
@@ -234,12 +278,18 @@ pub const FrameDecoder = struct {
     }
 
     fn finish(self: *FrameDecoder) !*Message {
-        const frame = self.frame;
+        const total: usize = @as(usize, serde.HEADER_SIZE) + self.header.msg_len;
+        const capacity = self.frame.len;
+        const frame = self.frame[0..total];
         self.frame = &.{};
         self.header_filled = 0;
         self.filled = 0;
         self.releaseBudget();
-        errdefer self.allocator.free(frame);
+        errdefer self.freeFrame(if (capacity == 0) frame else frame.ptr[0..capacity]);
+        if (self.freelist) |fl| {
+            return try Message.createWithCapacity(self.allocator, self.header, frame, capacity, fl);
+        }
+        // Without a freelist the allocation is exact-sized (`capacity == total`).
         return try Message.create(self.allocator, self.header, frame);
     }
 };
@@ -248,8 +298,8 @@ pub const FrameDecoder = struct {
 /// closes it, calling `dispatch(ctx, message)` for each one (it returns
 /// false to stop).  Reads in chunks, so a burst of small messages costs one
 /// read; a large body is read straight into its own buffer.
-pub fn receiveLoop(allocator: Allocator, conn: anytype, ctx: anytype, comptime dispatch: anytype) anyerror!void {
-    var decoder = FrameDecoder.init(allocator);
+pub fn receiveLoop(allocator: Allocator, freelist: ?*RecvFreelist, conn: anytype, ctx: anytype, comptime dispatch: anytype) anyerror!void {
+    var decoder = if (freelist) |fl| FrameDecoder.initPooled(allocator, fl) else FrameDecoder.init(allocator);
     defer decoder.deinit();
     var scratch: [16 * 1024]u8 = undefined;
     while (true) {
@@ -487,4 +537,61 @@ test "drainReadable reads a large body in place" {
     try std.testing.expectEqual(@as(usize, 3 * INITIAL_RECV_CHUNK), got.body_len);
     // One small read for the header, then the body straight into place.
     try expect(conn.reads <= 4);
+}
+
+test "FrameDecoder freelist recycles buffer and Message shell" {
+    const allocator = std.testing.allocator;
+    var freelist: RecvFreelist = .{};
+    defer freelist.deinit(allocator, Message);
+
+    const payload = "freelist-rpc";
+    const raw = try RawMessage.create(allocator, payload, 42, .REQUEST, .OPAQUE, true, false, "tx", "rx", "fn");
+    defer allocator.free(raw.data);
+
+    var decoder = FrameDecoder.initPooled(allocator, &freelist);
+    defer decoder.deinit();
+
+    var input: []const u8 = raw.data;
+    const msg1 = (try decoder.next(&input)).?;
+    try expect(msg1.freelist == &freelist);
+    try expect(msg1.data_capacity >= msg1.data.len);
+    const buf_ptr = msg1.data.ptr;
+    const shell_ptr: *anyopaque = msg1;
+    msg1.deinit();
+
+    try expect(freelist.msg_len == 1);
+    try expect(freelist.buf_len[0] + freelist.buf_len[1] + freelist.buf_len[2] == 1);
+
+    input = raw.data;
+    const msg2 = (try decoder.next(&input)).?;
+    defer msg2.deinit();
+    try expect(msg2 == @as(*Message, @ptrCast(@alignCast(shell_ptr))));
+    try expect(msg2.data.ptr == buf_ptr);
+    try expect(std.mem.eql(u8, msg2.getData(), payload));
+}
+
+test "FrameDecoder freelist does not swallow the next frame into spare capacity" {
+    const allocator = std.testing.allocator;
+    var freelist: RecvFreelist = .{};
+    defer freelist.deinit(allocator, Message);
+
+    const raw1 = try RawMessage.create(allocator, "one", 1, .REQUEST, .OPAQUE, true, false, "tx", "rx", "fn");
+    defer allocator.free(raw1.data);
+    const raw2 = try RawMessage.create(allocator, "two-two", 2, .REQUEST, .OPAQUE, true, false, "tx", "rx", "fn");
+    defer allocator.free(raw2.data);
+    const stream = try std.mem.concat(allocator, u8, &.{ raw1.data, raw2.data });
+    defer allocator.free(stream);
+
+    var decoder = FrameDecoder.initPooled(allocator, &freelist);
+    defer decoder.deinit();
+    var input: []const u8 = stream;
+    const a = (try decoder.next(&input)).?;
+    defer a.deinit();
+    const b = (try decoder.next(&input)).?;
+    defer b.deinit();
+    try expect(a.header.uuid == 1);
+    try expect(b.header.uuid == 2);
+    try expect(std.mem.eql(u8, a.getData(), "one"));
+    try expect(std.mem.eql(u8, b.getData(), "two-two"));
+    try expect(input.len == 0);
 }

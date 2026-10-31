@@ -1032,7 +1032,7 @@ fn connectionMain(comptime mode: HandlerMode, rt: *Runtime, listener: *ServerCon
     if (client.is_websocket) {
         serverWsLoop(client, rt.msgpool, handler);
     } else {
-        serverLoop(client, rt.allocator, handler);
+        serverLoop(client, rt.allocator, &rt.msgpool.freelist, handler);
     }
     releaseConnection(rt, client);
 }
@@ -1099,7 +1099,7 @@ fn ConnectionSource(comptime mode: HandlerMode) type {
                 .source = .{ .fd = conn.handle(), .onReadable = onReadable, .onRemoved = onRemoved },
                 .rt = rt,
                 .conn = conn,
-                .decoder = .init(rt.allocator),
+                .decoder = .initPooled(rt.allocator, &rt.msgpool.freelist),
             };
             try loop.register(&self.source);
         }
@@ -1172,7 +1172,7 @@ fn dispatchMessage(conn: *ServerHandler.ConnectionT, message: *Message, msg_hand
     return true;
 }
 
-fn serverLoop(conn: *ServerHandler.ConnectionT, allocator: Allocator, msg_handler: anytype) void {
+fn serverLoop(conn: *ServerHandler.ConnectionT, allocator: Allocator, freelist: *serde.RecvFreelist, msg_handler: anytype) void {
     if (conn.peer_addr) |addr|
         log.debug("serverLoop started for {f}", .{fmtNetAddr(addr)});
     defer if (conn.peer_addr) |addr| log.debug("serverLoop exiting for {f}", .{fmtNetAddr(addr)});
@@ -1186,7 +1186,7 @@ fn serverLoop(conn: *ServerHandler.ConnectionT, allocator: Allocator, msg_handle
         }
     };
     const ctx = Ctx{ .conn = conn, .handler = msg_handler };
-    serde.receiveLoop(allocator, conn, &ctx, Ctx.dispatch) catch |err| if (err != error.Stopped) {
+    serde.receiveLoop(allocator, freelist, conn, &ctx, Ctx.dispatch) catch |err| if (err != error.Stopped) {
         if (conn.peer_addr) |addr| {
             // Clean peer hang-up (short-lived clients) is expected — debug only.
             switch (err) {

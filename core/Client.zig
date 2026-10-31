@@ -144,8 +144,9 @@ const ClientEntry = struct {
     pub fn destroy(self: *ClientEntry) void {
         if (is_wasm) {
             self.connection.destroy();
-            self.msgpool.deinit();
+            // Drain queued Messages before the recv freelist they point at.
             self.client_handler.deinit();
+            self.msgpool.deinit();
             self.alloc.destroy(self);
             return;
         }
@@ -164,8 +165,10 @@ const ClientEntry = struct {
         self.users_mutex.unlock();
         log.debug("[{s}] destroy: freeing connection", .{self.client_handler.app_name});
         self.connection.destroy();
-        self.msgpool.deinit();
+        // Messages in the tasks queue (and any still held by Python) recycle
+        // into `msgpool.freelist`.  Free them before tearing the freelist down.
         self.client_handler.deinit();
+        self.msgpool.deinit();
         self.alloc.destroy(self);
     }
 
@@ -181,7 +184,7 @@ const ClientEntry = struct {
             }
         };
         const ctx = Ctx{ .entry = self, .handler = msg_handler };
-        const err = serde.receiveLoop(self.alloc, self.connection, &ctx, Ctx.dispatch);
+        const err = serde.receiveLoop(self.alloc, &self.msgpool.freelist, self.connection, &ctx, Ctx.dispatch);
         err catch |e| if (e != error.Stopped) self.connectionEnded(msg_handler, e);
         self.finishReceiving(msg_handler);
     }
@@ -328,7 +331,7 @@ const ClientSource = struct {
         self.* = .{
             .source = .{ .fd = entry.connection.handle(), .onReadable = onReadable, .onRemoved = onRemoved },
             .entry = entry,
-            .decoder = .init(entry.alloc),
+            .decoder = .initPooled(entry.alloc, &entry.msgpool.freelist),
         };
         try loop.register(&self.source);
         return self;

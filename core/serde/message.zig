@@ -8,6 +8,7 @@ const Allocator = std.mem.Allocator;
 const Endian = std.builtin.Endian;
 const native_endian = builtin.target.cpu.arch.endian();
 const ArenaAllocator = std.heap.ArenaAllocator;
+const RecvFreelist = @import("recv_freelist.zig").RecvFreelist;
 
 const expect = std.testing.expect;
 
@@ -254,6 +255,11 @@ pub const Message = struct {
     metadata: Metadata = .{},
     /// Link in a `TasksQueue`.  A message is in at most one queue.
     queue_node: std.DoublyLinkedList.Node = .{},
+    /// Allocated capacity of `data` when the buffer came from a freelist
+    /// (`>= data.len`).  Zero means capacity equals `data.len`.
+    data_capacity: usize = 0,
+    /// Receive freelist that owns this shell and its buffer, if any.
+    freelist: ?*RecvFreelist = null,
 
     pub fn format(self: Message, _: []const u8, _: fmt.FormatOptions, writer: anytype) !void {
         const h = self.header;
@@ -269,14 +275,32 @@ pub const Message = struct {
     /// Wrap `data` (header + metadata + payload) in a Message.
     /// On error ownership of `data` stays with the caller.
     pub fn create(allocator: Allocator, header: Header, data: []u8) !*Message {
+        return createWithCapacity(allocator, header, data, data.len, null);
+    }
+
+    /// Like `create`, but `capacity` is the allocated size of the buffer
+    /// (`>= data.len`) and an optional freelist recycles both on `deinit`.
+    pub fn createWithCapacity(
+        allocator: Allocator,
+        header: Header,
+        data: []u8,
+        capacity: usize,
+        freelist: ?*RecvFreelist,
+    ) !*Message {
         if (header.metadata_len > header.msg_len) return error.InvalidMetadataLen;
         if (data.len != @as(usize, serde.HEADER_SIZE) + header.msg_len) return error.LengthMismatch;
-        const self = try allocator.create(Message);
-        errdefer allocator.destroy(self);
+        if (capacity < data.len) return error.LengthMismatch;
+        const self = if (freelist) |fl|
+            try fl.acquireMessage(allocator, Message)
+        else
+            try allocator.create(Message);
+        errdefer if (freelist) |fl| fl.releaseMessage(allocator, Message, self) else allocator.destroy(self);
         self.* = .{
             .header = header,
             .data = data,
             .allocator = allocator,
+            .data_capacity = if (freelist != null) capacity else 0,
+            .freelist = freelist,
         };
         try self.metadata.initFromMetadataFromStr(self.getMetadata());
         return self;
@@ -287,8 +311,27 @@ pub const Message = struct {
         return try Message.create(allocator, header, raw_message.data);
     }
 
+    fn bufferCapacity(self: *const Message) usize {
+        return if (self.data_capacity != 0) self.data_capacity else self.data.len;
+    }
+
     pub fn deinit(self: *Message) void {
-        self.allocator.free(self.data);
+        const cap = self.bufferCapacity();
+        const buf = if (cap == 0) self.data else self.data.ptr[0..cap];
+        if (self.freelist) |fl| {
+            fl.freeBuf(self.allocator, buf);
+            self.metadata = .{};
+            self.queue_node = .{};
+            self.header = undefined;
+            self.data = &.{};
+            self.data_capacity = 0;
+            const allocator = self.allocator;
+            const freelist = fl;
+            self.freelist = null;
+            freelist.releaseMessage(allocator, Message, self);
+            return;
+        }
+        if (buf.len != 0) self.allocator.free(buf);
         self.allocator.destroy(self);
     }
 
@@ -373,15 +416,28 @@ pub const Message = struct {
     pub fn setData(self: *Message, data: []const u8) !void {
         const new_msg_len: usize = data.len + self.header.metadata_len;
         if (new_msg_len > std.math.maxInt(@FieldType(Header, "msg_len"))) return error.ExceedsMaxMessageSize;
-        if (self.allocator.resize(self.data, new_msg_len + serde.HEADER_SIZE)) {
-            // Optimal case when we can resize existing memory. We don't need to copy data to new location.
-            // header and metadata are not changed, so we don't need to copy them.
-            self.data = self.data.ptr[0 .. new_msg_len + serde.HEADER_SIZE];
+        const new_total = new_msg_len + serde.HEADER_SIZE;
+        const cap = self.bufferCapacity();
+        if (new_total <= cap and (self.freelist != null or self.data_capacity != 0)) {
+            // Reuse spare freelist/class capacity without telling the allocator.
+            self.data = self.data.ptr[0..new_total];
+            std.mem.copyForwards(u8, self.data[self.dataStartPosition()..], data);
+        } else if (self.freelist == null and self.allocator.resize(self.data.ptr[0..cap], new_total)) {
+            // Exact-sized heap buffer: resize grows or shrinks in place.
+            self.data = self.data.ptr[0..new_total];
+            self.data_capacity = 0;
             std.mem.copyForwards(u8, self.data[self.dataStartPosition()..], data);
         } else {
-            // Fall back to allocating new memory and copying data to it.
             const new_data = try serde.concatenateSlicesAlloc(self.allocator, &[_][]const u8{ self.data[0..serde.HEADER_OFFSET_END], self.getMetadata(), data });
-            self.allocator.free(self.data);
+            if (self.freelist) |fl| {
+                fl.freeBuf(self.allocator, self.data.ptr[0..cap]);
+                // Replacement buffer is exact-sized and no longer pooled.
+                self.freelist = null;
+                self.data_capacity = 0;
+            } else {
+                self.allocator.free(self.data.ptr[0..cap]);
+                self.data_capacity = 0;
+            }
             self.data = new_data;
             // re-calculate metadata as it is pointed to wrong location
             self.metadata.initFromMetadataFromStr(self.getMetadata()) catch unreachable; // we just built it
@@ -420,7 +476,15 @@ pub const Message = struct {
         if (new_msg_len > std.math.maxInt(@FieldType(Header, "msg_len"))) return error.ExceedsMaxMessageSize;
         if (new_metadata_len > std.math.maxInt(@FieldType(Header, "metadata_len"))) return error.MetadataTooLong;
         const new_data = try serde.concatenateSlicesAlloc(self.allocator, &[_][]const u8{ self.data[0..serde.HEADER_OFFSET_END], ptransmitter, SECTION_SEPARATOR_SEQ, preceiver, SECTION_SEPARATOR_SEQ, pfun_name, data });
-        self.allocator.free(self.data);
+        const cap = self.bufferCapacity();
+        if (self.freelist) |fl| {
+            fl.freeBuf(self.allocator, self.data.ptr[0..cap]);
+            self.freelist = null;
+            self.data_capacity = 0;
+        } else {
+            self.allocator.free(self.data.ptr[0..cap]);
+            self.data_capacity = 0;
+        }
         self.data = new_data;
         self.setMessageLen(@as(@FieldType(Header, "msg_len"), @truncate(new_msg_len)));
         self.setMetadataLen(@as(@FieldType(Header, "metadata_len"), @truncate(new_metadata_len)));
