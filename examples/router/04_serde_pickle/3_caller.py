@@ -7,13 +7,13 @@ broadcast to all workers.
 
 Run 1_router.py and 2_worker.py first.
 """
-from daffi import Client
-from daffi import SerdeFormat
+
+from daffi import Client, TCPTransport
+from daffi import SerdeFormat, TCPTransport
 from models import Task, TaskResult, Priority
 
-
 if __name__ == "__main__":
-    caller = Client(app_name="task-caller", host="0.0.0.0", port=6004)
+    caller = Client(app_name="task-caller", transport=TCPTransport("0.0.0.0", 6004))
     conn = caller.connect()
 
     rpc = conn.rpc(timeout=5, serde=SerdeFormat.PICKLE)
@@ -24,8 +24,10 @@ if __name__ == "__main__":
     ]
     for task in tasks:
         result: TaskResult = rpc.execute_task(task)
-        print(f"task {result.task_id}: worker={result.worker!r}  "
-              f"output={result.output!r}  ok={result.success}")
+        print(
+            f"task {result.task_id}: worker={result.worker!r}  "
+            f"output={result.output!r}  ok={result.success}"
+        )
 
     # cast() — broadcast to ALL workers.
     cast = conn.cast(timeout=5, serde=SerdeFormat.PICKLE)

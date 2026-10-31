@@ -10,8 +10,9 @@ Event dict keys:
 
 Run first, then run 2_client.py.
 """
+
 import asyncio
-from daffi import callback
+from daffi import callback, TCPTransport
 from daffi.aio import AsyncService
 
 
@@ -31,9 +32,13 @@ async def main():
             print(f"[service] ✦ {name!r} connected   (total: {len(connected_clients)})")
         elif event["type"] == "disconnected":
             connected_clients.discard(name)
-            print(f"[service] ✦ {name!r} disconnected (total: {len(connected_clients)})")
+            print(
+                f"[service] ✦ {name!r} disconnected (total: {len(connected_clients)})"
+            )
 
-    svc = AsyncService(app_name="event-service", host="0.0.0.0", port=5009)
+    svc = AsyncService(
+        app_name="event-service", transport=TCPTransport("0.0.0.0", 5009)
+    )
     svc.add_event_handler(on_event)
     await svc.start()
     print("Service running on 0.0.0.0:5009 — press Ctrl+C to stop.")

@@ -10,11 +10,15 @@ pub const Handshake = @import("serde/handshake.zig").Handshake;
 pub const Event = @import("serde/handshake.zig").Event;
 pub const RawMessage = @import("serde/message.zig").RawMessage;
 pub const MessagePool = @import("serde/message_pool.zig").MessagePool;
+pub const FrameDecoder = @import("serde/message_pool.zig").FrameDecoder;
+pub const receiveLoop = @import("serde/message_pool.zig").receiveLoop;
+pub const drainReadable = @import("serde/message_pool.zig").drainReadable;
 pub const concatenateSlicesAlloc = @import("serde/slices.zig").concatenateSlicesAlloc;
 pub const concatenateSlicesAllocZ = @import("serde/slices.zig").concatenateSlicesAllocZ;
 pub const concatenateSlicesBuf = @import("serde/slices.zig").concatenateSlicesBuf;
 pub const createHandshakeMessage = @import("serde/message.zig").createHandshakeMessage;
 pub const createEventMessage = @import("serde/message.zig").createEventMessage;
+pub const createErrorReply = @import("serde/message.zig").createErrorReply;
 
 pub const MAX_BYTES_MESSAGE: @FieldType(Header, "msg_len") = std.math.maxInt(@FieldType(Header, "msg_len"));
 pub const HEADER_OFFSET_START: u32 = 0;
@@ -30,5 +34,5 @@ pub const UNIT_SEPARATOR_SEQ = @import("serde/message.zig").UNIT_SEPARATOR_SEQ;
 test {
     _ = @import("serde/message.zig");
     // _ = @import("serde/slices.zig");
-    // _ = @import("serde/message_pool.zig");
+    _ = @import("serde/message_pool.zig");
 }

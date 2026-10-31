@@ -16,6 +16,8 @@ either side knowing the other's address.  Run the numbered files in order.
 | 06 | `06_serde_opaque/` | OPAQUE — raw bytes forwarded by the Router |
 | 07 | `07_serde_msgpack/` | MSGPACK — compact binary, all four call styles |
 | 08 | `08_events/` | `add_event_handler()` — membership events via Router |
+| 09 | `09_wait_for_members/` | `wait_for_members()` before the first call |
+| 10 | `10_multitransport/` | One Router on TCP and a Unix socket |
 
 ## Quick Start
 
@@ -42,23 +44,23 @@ Worker ──┘   (bidirectional: workers can also call each other)
 ## API Reference
 
 ```python
-from daffi import Router, Client, callback
+from daffi import Router, Client, callback, TCPTransport
 from daffi import SerdeFormat
 
 # --- Router ---
-router = Router(host="127.0.0.1", port=6000)
+router = Router(transport=TCPTransport("127.0.0.1", 6000))
 router.start()
 
 # --- Worker (Client with @callback) ---
 @callback
 def my_func(x: int) -> int: ...
 
-worker = Client(app_name="worker-1", host="127.0.0.1", port=6000)
+worker = Client(app_name="worker-1", transport=TCPTransport("127.0.0.1", 6000))
 worker.add_event_handler(lambda e: print(e))
 conn = worker.connect()
 
 # --- Caller ---
-caller = Client(app_name="caller", host="127.0.0.1", port=6000)
+caller = Client(app_name="caller", transport=TCPTransport("127.0.0.1", 6000))
 conn = caller.connect()
 
 rpc          = conn.rpc(timeout=5)                       # blocking, one worker

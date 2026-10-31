@@ -5,15 +5,13 @@ Async RPC proxies and the :class:`AsyncClientConnection` handle returned by
 Design notes
 ------------
 ``AsyncResponseNotifier``
-    Replaces the sync :class:`~daffi._rpc_proxy.ResponseNotifier`.  A
-    permanent ``loop.add_reader`` callback signals an ``asyncio.Condition``
-    whenever Zig writes to the response fd.  Multiple concurrent
-    ``AsyncRpcResult`` waiters all subscribe to that condition — the same
-    fd, zero conflicts.
+    One per connection.  The native layer signals its fd whenever a
+    response is parked; a ``loop.add_reader`` callback then takes the uuids
+    that arrived and resolves only those futures.  One wakeup covers a
+    burst of replies.
 
 ``AsyncRpcResult``
-    Awaits the condition (with a liveness-check timeout cap) instead of
-    blocking in ``select.select``.
+    Awaits its future (with a liveness-check timeout cap).
 
 Proxy classes (``AsyncRpcProxy``, ``AsyncBroadcastProxy``, ``AsyncStreamProxy``,
 ``AsyncStreamNowaitProxy``)
@@ -24,11 +22,11 @@ Proxy classes (``AsyncRpcProxy``, ``AsyncBroadcastProxy``, ``AsyncStreamProxy``,
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import time
 import logging
 import threading
-from itertools import repeat
 from typing import TYPE_CHECKING, Union, List, Optional, Tuple
 from contextlib import contextmanager
 
@@ -38,17 +36,20 @@ if TYPE_CHECKING:
 from daffi._serialization import SerdeFormat, Serializer
 from daffi.exceptions import (
     CallTimeout,
+    Disconnected,
+    Evicted,
     TransmissionFailure,
-    RemoteCallError,
     InitializationError,
 )
 from daffi.utils.misc import iterable
 from daffi._wakeup import WakeupFd
+from daffi import dfcore
 from daffi.registry._executor_registry import EXECUTOR_REGISTRY
 from daffi._bindings import (
     send_message_from_client,
     get_message_from_client_store,
-    mark_message_as_expired,
+    drain_parked_responses,
+    expire_message,
     set_service_methods,
     send_handshake_from_client,
     set_response_fd,
@@ -57,25 +58,53 @@ from daffi._bindings import (
 )
 from daffi._rpc_proxy import (
     METADATA_SEPARATOR,
+    _Receivers,
+    coerce_timeout,
     system_exception_handler,
-    RpcResult,          # _unpack_response is reused as a classmethod
+    RpcResult,
+    connection_lost_error,
+    unpack_response,
 )
 
+
+async def _offload(fn, *args):
+    """Run a blocking native call off the event loop."""
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, fn, *args)
+
+
+async def _aiter_chunks(gen):
+    """Yield chunks without blocking the loop on a synchronous generator."""
+    if inspect.isasyncgen(gen) or hasattr(gen, "__aiter__"):
+        async for chunk in gen:
+            yield chunk
+        return
+    chunks = gen if iterable(gen) else [gen]
+    it = iter(chunks)
+
+    def _next():
+        try:
+            return True, next(it)
+        except StopIteration:
+            return False, None
+
+    loop = asyncio.get_running_loop()
+    while True:
+        ok, chunk = await loop.run_in_executor(None, _next)
+        if not ok:
+            return
+        yield chunk
 
 # ---------------------------------------------------------------------------
 # AsyncResponseNotifier
 # ---------------------------------------------------------------------------
 
+
 class AsyncResponseNotifier:
-    """Per-connection async response notifier.
+    """Per-connection response router for asyncio waiters.
 
-    A single permanent ``loop.add_reader`` watches the native wakeup fd.
-    When Zig signals a new response, every waiting :class:`AsyncRpcResult`
-    is notified via its own ``asyncio.Event`` — one event per waiter, no
-    shared lock, no interaction issues with ``asyncio.wait_for``.
-
-    Class-level registry mirrors :class:`~daffi._rpc_proxy.ResponseNotifier`
-    so the rest of the code can switch between the two transparently.
+    Lives on the event loop: futures are created, resolved and dropped only
+    from the loop thread, so no lock is needed around them.
     """
 
     _instances: dict[int, "AsyncResponseNotifier"] = {}
@@ -84,85 +113,62 @@ class AsyncResponseNotifier:
     def __init__(self, conn_num: int, loop: asyncio.AbstractEventLoop) -> None:
         self._conn_num = conn_num
         self._wakeup = WakeupFd()
-        self._lifecycle_error: Optional[Exception] = None
         self._loop = loop
-        # Each active waiter registers its own Event here.
-        self._waiters: list[asyncio.Event] = []
-        self._waiters_lock = threading.Lock()
+        self._futures: dict[int, asyncio.Future] = {}
         set_response_fd(conn_num, self._wakeup.write_fd)
         loop.add_reader(self._wakeup.read_fd, self._on_readable)
 
-    # ------------------------------------------------------------------
-    # Internal notification pipeline
-    # ------------------------------------------------------------------
-
     def _on_readable(self) -> None:
-        """Called on the event-loop thread when the response fd fires."""
         self._wakeup.drain()
-        # Set every registered waiter event from the event-loop thread.
-        # asyncio.Event.set() is thread-safe when called from the same
-        # thread as the running loop (which is the case here, since
-        # add_reader callbacks run on the loop thread).
-        with self._waiters_lock:
-            for ev in self._waiters:
-                ev.set()
+        batch = drain_parked_responses(self._conn_num)
+        if batch == "disconnected":
+            for fut in self._futures.values():
+                if not fut.done():
+                    fut.set_result(batch)
+            return
+        for uuid in batch:
+            fut = self._futures.get(uuid)
+            if fut is None or fut.done():
+                continue
+            res = get_message_from_client_store(uuid, self._conn_num)
+            if res is not None:
+                fut.set_result(res)
 
-    # ------------------------------------------------------------------
-    # Waiter API (used by AsyncRpcResult)
-    # ------------------------------------------------------------------
+    def expect(self, uuid: int) -> asyncio.Future:
+        """A future resolved with the native result tuple (or reason string,
+        or lifecycle error) for *uuid*."""
+        fut = self._loop.create_future()
+        self._futures[uuid] = fut
+        # The response may have been parked before this future existed.
+        res = get_message_from_client_store(uuid, self._conn_num)
+        if res is not None:
+            fut.set_result(res)
+        return fut
 
-    async def wait(self, timeout: Optional[float] = None) -> bool:
-        """Suspend until Zig signals a new response (or *timeout* elapses).
-
-        Each caller gets its own ``asyncio.Event`` that is set by
-        ``_on_readable`` — no shared lock, no ``asyncio.Condition``
-        interaction issues with ``asyncio.wait_for``.
-
-        Returns:
-            ``True`` if woken by a signal, ``False`` if *timeout* elapsed.
-        """
-        ev = asyncio.Event()
-        with self._waiters_lock:
-            self._waiters.append(ev)
-        signaled = False
-        try:
-            try:
-                await asyncio.wait_for(ev.wait(), timeout=timeout)
-                signaled = True
-            except (asyncio.TimeoutError, TimeoutError):
-                pass
-        finally:
-            with self._waiters_lock:
-                try:
-                    self._waiters.remove(ev)
-                except ValueError:
-                    pass
-        return signaled
-
-    # ------------------------------------------------------------------
-    # Class-level registry
-    # ------------------------------------------------------------------
+    def forget(self, uuid: int) -> None:
+        self._futures.pop(uuid, None)
 
     @classmethod
     def register(cls, conn_num: int) -> "AsyncResponseNotifier":
-        """Create and register a notifier, closing any stale one first."""
-        loop = asyncio.get_running_loop()
+        """Create and register a notifier.  A stale one for the same handle
+        is closed after the new fd is installed, so the native layer never
+        holds a closed descriptor."""
+        notifier = cls(conn_num, asyncio.get_running_loop())
         with cls._instances_lock:
             old = cls._instances.pop(conn_num, None)
-        if old is not None:
-            old.close()
-        notifier = cls(conn_num, loop)
-        with cls._instances_lock:
             cls._instances[conn_num] = notifier
+        if old is not None:
+            old._close()
         return notifier
 
     @classmethod
     def unregister(cls, conn_num: int) -> None:
-        """Close and forget the notifier for *conn_num*."""
+        """Withdraw the fd from the native layer, then close the notifier."""
         with cls._instances_lock:
             n = cls._instances.pop(conn_num, None)
         if n is not None:
-            n.close()
+            set_response_fd(conn_num, -1)
+            n._close()
 
     @classmethod
     def for_conn(cls, conn_num: int) -> Optional["AsyncResponseNotifier"]:
@@ -171,42 +177,32 @@ class AsyncResponseNotifier:
 
     @classmethod
     def signal_lifecycle_error(cls, conn_num: int, err: Exception) -> None:
-        """Wake all waiters with a lifecycle error (disconnect / eviction)."""
+        """Fail every pending waiter of *conn_num* with *err*."""
         with cls._instances_lock:
             n = cls._instances.get(conn_num)
         if n is None:
             return
-        n._lifecycle_error = err
-        # Wake every waiting AsyncRpcResult so it re-checks _lifecycle_error.
-        with n._waiters_lock:
-            for ev in n._waiters:
-                ev.set()
+        for fut in n._futures.values():
+            if not fut.done():
+                fut.set_result(err)
 
-    def close(self) -> None:
-        """Release the wakeup fd and remove the reader."""
+    def _close(self) -> None:
         try:
             self._loop.remove_reader(self._wakeup.read_fd)
         except Exception:
             pass
-        try:
-            self._wakeup.close()
-        except Exception:
-            pass
+        self._wakeup.close()
 
 
 # ---------------------------------------------------------------------------
 # AsyncRpcResult
 # ---------------------------------------------------------------------------
 
-class AsyncRpcResult:
-    """Async counterpart of :class:`~daffi._rpc_proxy.RpcResult`.
 
-    ``await result.result()`` waits on :class:`AsyncResponseNotifier`'s
-    ``asyncio.Condition`` instead of blocking in ``select.select``.
-    """
+class AsyncRpcResult:
+    """Async counterpart of :class:`~daffi._rpc_proxy.RpcResult`."""
 
     _LIVENESS_INTERVAL = RpcResult._LIVENESS_INTERVAL
-    _FALLBACK_POLL_INTERVAL = RpcResult._FALLBACK_POLL_INTERVAL
 
     def __init__(
         self,
@@ -216,6 +212,7 @@ class AsyncRpcResult:
         timeout: int,
         receivers: Optional[set] = None,
         proxy=None,
+        serde: Optional[int] = None,
     ) -> None:
         self.conn_num = conn_num
         self.uuid = uuid
@@ -223,96 +220,68 @@ class AsyncRpcResult:
         self.timeout = timeout
         self.receivers = receivers
         self.proxy = proxy
+        self.serde = serde
+        self._started = time.monotonic()
 
     async def result(self) -> Tuple[bytes, int, int]:
-        """Await the response and return ``(data, flag, serde)``."""
+        """Await the response and return ``(data, flag, serde)``.
+
+        Every exit other than a delivered response, cancellation included,
+        expires the uuid so a late response is dropped instead of parked.
+        """
         notifier = AsyncResponseNotifier.for_conn(self.conn_num)
-        deadline = (self.send_ts + self.timeout) if self.timeout > 0 else None
+        if notifier is None:
+            raise connection_lost_error(False)
+        fut = notifier.expect(self.uuid)
+        deadline = self._started + self.timeout if self.timeout > 0 else None
+        try:
+            while not fut.done():
+                wait = self._LIVENESS_INTERVAL if self.receivers else None
+                if deadline is not None:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise CallTimeout(
+                            call=str(self.proxy) if self.proxy else f"(uuid: {self.uuid})",
+                            timeout=self.timeout,
+                            elapsed=time.monotonic() - self._started,
+                            receivers=self.receivers or None,
+                        )
+                    wait = remaining if wait is None else min(wait, remaining)
+                if wait is None:
+                    await fut
+                else:
+                    await asyncio.wait((fut,), timeout=wait)
+                if not fut.done() and self.receivers:
+                    self._check_receivers()
+        except BaseException:
+            expire_message(self.uuid, self.conn_num)
+            raise
+        finally:
+            notifier.forget(self.uuid)
+        return self._outcome(fut.result())
 
-        while True:
-            # 1. Check message store first (response may already be there).
-            if res := get_message_from_client_store(self.uuid, self.conn_num):
-                return self._unpack_response(res)
+    def _outcome(self, res) -> Tuple[bytes, int, int]:
+        if isinstance(res, BaseException):
+            raise res
+        if isinstance(res, str):
+            app_name = self.proxy.conn.client.app_name if self.proxy else None
+            raise connection_lost_error(res == "evicted", app_name)
+        return unpack_response(res, self.serde)
 
-            # 2. Raise lifecycle error when there is nothing waiting in store.
-            if notifier is not None and (
-                _err := notifier._lifecycle_error
-            ) is not None:
-                notifier._lifecycle_error = None
-                raise _err
-
-            # 3. Deadline check.
-            remaining = (deadline - time.time()) if deadline else None
-            if remaining is not None and remaining <= 0:
-                mark_message_as_expired(self.uuid, self.conn_num)
-                raise CallTimeout(
-                    call=str(self.proxy) if self.proxy else f"(uuid: {self.uuid})",
-                    timeout=self.timeout,
-                    elapsed=time.time() - self.send_ts,
-                    receivers=self.receivers or None,
-                )
-
-            # 4. Compute how long to wait this iteration.
-            if remaining is None:
-                wait_chunk = self._LIVENESS_INTERVAL if self.receivers else None
-            elif self.receivers:
-                wait_chunk = min(remaining, self._LIVENESS_INTERVAL)
-            else:
-                wait_chunk = remaining
-
-            # 5. Wait for a Zig signal or a timeout.
-            signaled = True
-            if notifier is not None:
-                signaled = await notifier.wait(timeout=wait_chunk)
-            else:
-                interval = (
-                    self._FALLBACK_POLL_INTERVAL
-                    if wait_chunk is None
-                    else min(wait_chunk, self._FALLBACK_POLL_INTERVAL)
-                )
-                await asyncio.sleep(interval)
-                signaled = False
-
-            # 6. After waking, loop back to step 1 to check the store.
-            # NOTE: Do NOT call get_message_from_client_store here — the
-            # native store is a destructive pop-on-read; a second call would
-            # consume the response before step 1 in the next iteration sees it.
-            #
-            # Liveness check: only when we timed out (not signaled) and we
-            # have a fixed receiver — detect a disconnected peer early.
-            if not signaled and self.receivers:
-                if missing := self.receivers - {
-                    m["name"] for m in get_available_members(self.conn_num)
-                }:
-                    raise TransmissionFailure(
-                        f"The anticipated receivers(s) {missing} unexpectedly"
-                        f" disconnected, causing an interruption in the awaiting"
-                        f" result of {self.proxy}."
-                        f" All receivers: {self.receivers}"
-                    )
-
-    @staticmethod
-    def _unpack_response(res: Tuple) -> Tuple[bytes, int, int]:
-        """Decode a native store tuple — mirrors :meth:`RpcResult._unpack_response`."""
-        if len(res) == 1:
-            raise RemoteCallError(f"Unexpected response: {res[0]}")
-        data, flag, serde = res
-        if flag == MessageFlag.ERROR:
-            (error_tuple,), _ = Serializer.deserialize(serde, data)
-            err_name, err_module, err_msg, tb = error_tuple
-            restored_exc = type(
-                err_name, (RemoteCallError,), {"__module__": err_module}
+    def _check_receivers(self) -> None:
+        if missing := set(dfcore.missingMembers(self.conn_num, self.receivers)):
+            raise TransmissionFailure(
+                f"The anticipated receivers(s) {missing} unexpectedly"
+                f" disconnected, causing an interruption in the awaiting"
+                f" result of {self.proxy}."
+                f" All receivers: {self.receivers}"
             )
-            if tb:
-                raise restored_exc(err_msg).with_traceback(tb)
-            else:
-                raise restored_exc(err_msg)
-        return data, flag, serde
 
 
 # ---------------------------------------------------------------------------
 # _AsyncBoundRpc — immutable single-call object returned by AsyncRpcProxy.__getattr__
 # ---------------------------------------------------------------------------
+
 
 class _AsyncBoundRpc:
     """Immutable callable that wraps one (proxy, func_name) pair.
@@ -346,12 +315,13 @@ class _AsyncBoundRpc:
         if self._proxy.return_result:
             return await self._proxy._process_rpc(self._func_name, *args, **kwargs)
         else:
-            await self._proxy._process_stream(self._func_name, *args, **kwargs)
+            await self._proxy._process_nowait(self._func_name, *args, **kwargs)
 
 
 # ---------------------------------------------------------------------------
 # AsyncRpcProxy
 # ---------------------------------------------------------------------------
+
 
 class AsyncRpcProxy:
     """Async lazy call builder returned by :meth:`~AsyncClientConnection.rpc`
@@ -381,14 +351,12 @@ class AsyncRpcProxy:
         logger: logging.Logger,
     ):
         self.conn = conn
-        self.timeout = int(timeout or 0)
-        self.receiver = (
-            METADATA_SEPARATOR.join(receiver) if iterable(receiver) else receiver or ""
-        )
+        self.timeout = coerce_timeout(timeout)
+        self._to = _Receivers(receiver)
+        self.receiver = str(self._to)
         self.serde = serde
         self.return_result = return_result
         self.logger = logger
-        self._receiver = {receiver} if receiver else set()
 
     def __str__(self) -> str:
         req_name = "rpc call" if self.return_result else "rpc_nowait"
@@ -410,21 +378,20 @@ class AsyncRpcProxy:
         with system_exception_handler(
             f"Unable to proceed with {label}: {{}}", TransmissionFailure, conn_num
         ):
-            uuid, ts, found_receiver = send_message_from_client(
-                data=data,
-                flag=MessageFlag.REQUEST,
-                serde=self.serde,
-                receiver=self.receiver,
-                func_name=func_name,
-                return_result=self.return_result,
-                conn_num=conn_num,
-                is_bytes=is_bytes,
+            uuid, ts, found_receiver = await _offload(
+                self._to.send,
+                lambda receiver: send_message_from_client(
+                    data=data,
+                    flag=MessageFlag.REQUEST,
+                    serde=self.serde,
+                    receiver=receiver,
+                    func_name=func_name,
+                    return_result=self.return_result,
+                    conn_num=conn_num,
+                    is_bytes=is_bytes,
+                ),
             )
-        found_receivers = (
-            None
-            if not found_receiver
-            else set(found_receiver.split(METADATA_SEPARATOR))
-        )
+        found_receivers = {found_receiver} if found_receiver else None
         if not found_receivers:
             members = (
                 ""
@@ -432,8 +399,6 @@ class AsyncRpcProxy:
                 else f"\nAvailable receivers: {_m}"
             )
             raise TransmissionFailure(f"No receivers found for {label}." + members)
-        elif missing := self._receiver - found_receivers:
-            self.logger.warning(f"Receiver(s): {missing} seems to be offline.")
         result = AsyncRpcResult(
             conn_num=conn_num,
             uuid=uuid,
@@ -441,65 +406,57 @@ class AsyncRpcProxy:
             timeout=self.timeout,
             receivers=found_receivers,
             proxy=self,
+            serde=self.serde,
         )
         data, flag, serde = await result.result()
         return Serializer.deserialize(serde, data)[0][0]
 
-    async def _process_stream(self, func_name: str, *args, **kwargs):
+    async def _process_nowait(self, func_name: str, *args, **kwargs):
+        """Send one fire-and-forget call with exactly these arguments."""
         conn_num = self.conn.client._conn_num
-        if args:
-            data = args[0]
-        elif kwargs:
-            data = kwargs[next(iter(kwargs))]
-        else:
-            data = None
-        items = [(args, kwargs)] if not iterable(data) else iter(zip(data, repeat({})))
         label = f"rpc_nowait(fn: {func_name!r})"
-        for a, k in items:
-            payload, is_bytes = Serializer.serialize(self.serde, *a, **k)
-            with system_exception_handler(
-                f"Unable to proceed with {label}: {{}}", TransmissionFailure, conn_num
-            ):
-                uuid, ts, found_receiver = send_message_from_client(
+        payload, is_bytes = Serializer.serialize(self.serde, *args, **kwargs)
+        with system_exception_handler(
+            f"Unable to proceed with {label}: {{}}", TransmissionFailure, conn_num
+        ):
+            uuid, ts, found_receiver = await _offload(
+                self._to.send,
+                lambda receiver: send_message_from_client(
                     data=payload,
                     flag=MessageFlag.REQUEST,
                     serde=self.serde,
-                    receiver=self.receiver,
+                    receiver=receiver,
                     func_name=func_name,
                     return_result=self.return_result,
                     conn_num=conn_num,
                     is_bytes=is_bytes,
-                )
-            if not found_receiver:
-                members = (
-                    ""
-                    if not (_m := get_available_members(conn_num))
-                    else f"\nAvailable receivers: {_m}"
-                )
-                raise TransmissionFailure(f"No receivers found for {label}." + members)
-            elif missing := self._receiver - set(
-                found_receiver.split(METADATA_SEPARATOR)
-            ):
-                self.logger.warning(f"Receiver(s) {missing} seems to be offline.")
+                ),
+            )
+        if not found_receiver:
+            members = (
+                ""
+                if not (_m := get_available_members(conn_num))
+                else f"\nAvailable receivers: {_m}"
+            )
+            raise TransmissionFailure(f"No receivers found for {label}." + members)
 
     @classmethod
-    def _process_client_handshake(cls, conn_num: int) -> dict:
+    def _process_client_handshake(cls, conn_num: int, names: "list[str] | None" = None) -> dict:
         """Sync handshake — delegates to the sync ``RpcProxy`` implementation.
 
         Called via ``loop.run_in_executor`` so it does not block the event
-        loop.  The :class:`AsyncResponseNotifier` is already registered before
-        this runs, so the notifier's ``add_reader`` fires when Zig responds.
-        However, inside the executor thread the sync :class:`RpcResult` is
-        used (which polls via ``select.select``) — this is correct because
-        ``run_in_executor`` runs in a thread separate from the event loop.
+        loop.  The executor thread waits in the native layer, which hands it
+        the response directly.
         """
         from daffi._rpc_proxy import RpcProxy as _SyncRpcProxy
-        return _SyncRpcProxy._process_client_handshake(conn_num)
+
+        return _SyncRpcProxy._process_client_handshake(conn_num, names)
 
 
 # ---------------------------------------------------------------------------
 # _AsyncBoundBroadcast — immutable callable returned by AsyncBroadcastProxy.__getattr__
 # ---------------------------------------------------------------------------
+
 
 class _AsyncBoundBroadcast:
     """Immutable callable that wraps one (broadcast_proxy, func_name) pair.
@@ -531,6 +488,7 @@ class _AsyncBoundBroadcast:
 # AsyncBroadcastProxy
 # ---------------------------------------------------------------------------
 
+
 class AsyncBroadcastProxy:
     """Async counterpart of :class:`~daffi._rpc_proxy.BroadcastProxy`.
 
@@ -549,7 +507,7 @@ class AsyncBroadcastProxy:
         logger: logging.Logger,
     ):
         self.conn = conn
-        self.timeout = int(timeout or 0)
+        self.timeout = coerce_timeout(timeout)
         self.serde = serde
         self.return_result = return_result
         self.logger = logger
@@ -587,42 +545,56 @@ class AsyncBroadcastProxy:
                 + (f"\nAvailable peers: {available}" if available else "")
             )
         pending: dict[str, AsyncRpcResult] = {}
-        for receiver_name in receivers:
-            with system_exception_handler(
-                f"Unable to dispatch call_all to {receiver_name!r}: {{}}",
-                TransmissionFailure,
-                conn_num,
-            ):
-                uuid, ts, found = send_message_from_client(
-                    data=data,
-                    flag=MessageFlag.REQUEST,
-                    serde=self.serde,
-                    receiver=receiver_name,
-                    func_name=func_name,
-                    return_result=True,
-                    conn_num=conn_num,
-                    is_bytes=is_bytes,
-                )
-            if found:
-                pending[receiver_name] = AsyncRpcResult(
-                    conn_num=conn_num,
-                    uuid=uuid,
-                    ts=ts,
-                    timeout=self.timeout,
-                    receivers={receiver_name},
-                )
-            else:
-                self.logger.warning(
-                    f"call_all: receiver {receiver_name!r} not reachable, skipping."
-                )
-        results: dict = {}
-        for name, rpc_result in pending.items():
-            try:
-                result_data, _, serde_r = await rpc_result.result()
-                results[name] = Serializer.deserialize(serde_r, result_data)[0][0]
-            except Exception as exc:
-                results[name] = exc
-        return results
+        try:
+            for receiver_name in receivers:
+                with system_exception_handler(
+                    f"Unable to dispatch call_all to {receiver_name!r}: {{}}",
+                    TransmissionFailure,
+                    conn_num,
+                ):
+                    uuid, ts, found = await _offload(
+                        lambda: send_message_from_client(
+                            data=data,
+                            flag=MessageFlag.REQUEST,
+                            serde=self.serde,
+                            receiver=receiver_name,
+                            func_name=func_name,
+                            return_result=True,
+                            conn_num=conn_num,
+                            is_bytes=is_bytes,
+                        )
+                    )
+                if found:
+                    pending[receiver_name] = AsyncRpcResult(
+                        conn_num=conn_num,
+                        uuid=uuid,
+                        ts=ts,
+                        timeout=self.timeout,
+                        receivers={receiver_name},
+                        serde=self.serde,
+                    )
+                else:
+                    self.logger.warning(
+                        f"call_all: receiver {receiver_name!r} not reachable, skipping."
+                    )
+            async def _take(name: str, rpc_result: AsyncRpcResult):
+                try:
+                    result_data, _, serde_r = await rpc_result.result()
+                    return name, Serializer.deserialize(serde_r, result_data)[0][0]
+                except Exception as exc:
+                    return name, exc
+
+            items = list(pending.items())
+            pending.clear()
+            gathered = await asyncio.gather(
+                *[_take(name, rpc_result) for name, rpc_result in items]
+            )
+            return dict(gathered)
+        finally:
+            # Requests nobody will wait for any more keep their uuid taken
+            # until expired.
+            for rpc_result in pending.values():
+                expire_message(rpc_result.uuid, conn_num)
 
     async def _process_cast_all(self, func_name: str, *args, **kwargs) -> None:
         conn_num = self.conn.client._conn_num
@@ -640,21 +612,24 @@ class AsyncBroadcastProxy:
                 TransmissionFailure,
                 conn_num,
             ):
-                send_message_from_client(
-                    data=data,
-                    flag=MessageFlag.REQUEST,
-                    serde=self.serde,
-                    receiver=receiver_name,
-                    func_name=func_name,
-                    return_result=False,
-                    conn_num=conn_num,
-                    is_bytes=is_bytes,
+                await _offload(
+                    lambda: send_message_from_client(
+                        data=data,
+                        flag=MessageFlag.REQUEST,
+                        serde=self.serde,
+                        receiver=receiver_name,
+                        func_name=func_name,
+                        return_result=False,
+                        conn_num=conn_num,
+                        is_bytes=is_bytes,
+                    )
                 )
 
 
 # ---------------------------------------------------------------------------
 # Async stream proxies
 # ---------------------------------------------------------------------------
+
 
 class _AsyncStreamBase:
     """Shared init for the two async stream variants.
@@ -675,7 +650,7 @@ class _AsyncStreamBase:
         self.conn = conn
         self.receiver = receiver or ""
         self.serde = serde
-        self.timeout = int(timeout or 0)
+        self.timeout = coerce_timeout(timeout)
         self.logger = logger
         self._receiver = {receiver} if receiver else set()
 
@@ -695,15 +670,17 @@ class _AsyncStreamBase:
         with system_exception_handler(
             f"Unable to stream to {label}: {{}}", TransmissionFailure, conn_num
         ):
-            uuid, ts, found_receiver = send_message_from_client(
-                data=data,
-                flag=MessageFlag.REQUEST,
-                serde=self.serde,
-                receiver=self.receiver,
-                func_name=func_name,
-                return_result=return_result,
-                conn_num=conn_num,
-                is_bytes=is_bytes,
+            uuid, ts, found_receiver = await _offload(
+                lambda: send_message_from_client(
+                    data=data,
+                    flag=MessageFlag.REQUEST,
+                    serde=self.serde,
+                    receiver=self.receiver,
+                    func_name=func_name,
+                    return_result=return_result,
+                    conn_num=conn_num,
+                    is_bytes=is_bytes,
+                )
             )
         if not found_receiver:
             members = (
@@ -745,7 +722,7 @@ class _AsyncBoundStream:
 class AsyncStreamProxy(_AsyncStreamBase):
     """Async backpressure stream — waits for ack before sending next chunk::
 
-        await conn.stream().receive_chunk(data_source())
+    await conn.stream().receive_chunk(data_source())
     """
 
     def __getattr__(self, item: str) -> "_AsyncBoundStreamBlocking":
@@ -758,8 +735,7 @@ class _AsyncBoundStreamBlocking(_AsyncBoundStream):
     async def __call__(self, gen) -> None:  # type: ignore[override]
         await self._proxy.conn._ensure_connected()
         conn_num = self._proxy.conn.client._conn_num
-        chunks = gen if iterable(gen) else [gen]
-        for chunk in chunks:
+        async for chunk in _aiter_chunks(gen):
             uuid, ts, _ = await self._proxy._send_chunk(
                 self._func_name, conn_num, chunk, return_result=True
             )
@@ -770,13 +746,14 @@ class _AsyncBoundStreamBlocking(_AsyncBoundStream):
                 timeout=self._proxy.timeout,
                 receivers=self._proxy._receiver or None,
                 proxy=self._proxy,
+                serde=self._proxy.serde,
             ).result()
 
 
 class AsyncStreamNowaitProxy(_AsyncStreamBase):
     """Async fire-and-forget stream — sends each chunk without waiting::
 
-        await conn.stream_nowait().receive_chunk(data_source())
+    await conn.stream_nowait().receive_chunk(data_source())
     """
 
     def __getattr__(self, item: str) -> "_AsyncBoundStreamNowait":
@@ -789,8 +766,7 @@ class _AsyncBoundStreamNowait(_AsyncBoundStream):
     async def __call__(self, gen) -> None:  # type: ignore[override]
         await self._proxy.conn._ensure_connected()
         conn_num = self._proxy.conn.client._conn_num
-        chunks = gen if iterable(gen) else [gen]
-        for chunk in chunks:
+        async for chunk in _aiter_chunks(gen):
             await self._proxy._send_chunk(
                 self._func_name, conn_num, chunk, return_result=False
             )
@@ -799,6 +775,7 @@ class _AsyncBoundStreamNowait(_AsyncBoundStream):
 # ---------------------------------------------------------------------------
 # AsyncClientConnection
 # ---------------------------------------------------------------------------
+
 
 class AsyncClientConnection:
     """Async proxy returned by :meth:`~daffi.aio.app.AsyncClient.connect`.
@@ -824,8 +801,13 @@ class AsyncClientConnection:
     async def _ensure_connected(self) -> None:
         """Detect a background disconnect and attempt one reconnect."""
         client = self.client
-        if not client._disconnected:
+        if client._intentionally_stopped:
+            raise TransmissionFailure("Client was stopped.")
+        if not client._disconnected and client._conn_num is not None:
             return
+        if isinstance(client._connection_error, Evicted):
+            # Reconnecting would evict the connection that took the name.
+            raise client._connection_error
         client.logger.info(
             "Connection was lost in the background; attempting one reconnect..."
         )
@@ -861,8 +843,8 @@ class AsyncClientConnection:
     def rpc(
         self,
         timeout: Union[int, None] = None,
-        receiver: Union[str, None] = None,
-        serde: SerdeFormat = SerdeFormat.PICKLE,
+        receiver: Union[str, List[str], None] = None,
+        serde: SerdeFormat = SerdeFormat.DEFAULT,
     ) -> AsyncRpcProxy:
         """Configure a blocking call and return an async proxy.
 
@@ -881,8 +863,8 @@ class AsyncClientConnection:
 
     def rpc_nowait(
         self,
-        receiver: Union[str, None] = None,
-        serde: SerdeFormat = SerdeFormat.PICKLE,
+        receiver: Union[str, List[str], None] = None,
+        serde: SerdeFormat = SerdeFormat.DEFAULT,
     ) -> AsyncRpcProxy:
         """Configure a fire-and-forget call and return an async proxy.
 
@@ -903,7 +885,7 @@ class AsyncClientConnection:
         self,
         timeout: Union[int, None] = None,
         receiver: Union[str, List[str], None] = None,
-        serde: SerdeFormat = SerdeFormat.PICKLE,
+        serde: SerdeFormat = SerdeFormat.DEFAULT,
     ) -> AsyncBroadcastProxy:
         """Broadcast to all matching workers; collect ``{name: result}`` dict.
 
@@ -923,7 +905,7 @@ class AsyncClientConnection:
     def cast_nowait(
         self,
         receiver: Union[str, List[str], None] = None,
-        serde: SerdeFormat = SerdeFormat.PICKLE,
+        serde: SerdeFormat = SerdeFormat.DEFAULT,
     ) -> AsyncBroadcastProxy:
         """Fire-and-forget broadcast to all matching workers."""
         return AsyncBroadcastProxy(
@@ -964,7 +946,7 @@ class AsyncClientConnection:
         return AsyncStreamNowaitProxy(
             conn=self,
             receiver=receiver,
-            serde=SerdeFormat.OPAQUE,
+            serde=serde,
             timeout=None,
             logger=self.client.logger,
         )
@@ -983,11 +965,23 @@ class AsyncClientConnection:
         """
         if not members:
             return
+        client = self.client
+        if client._disconnected or client._conn_num is None:
+            err = client._connection_error
+            if err is not None:
+                raise err
+            raise Disconnected("Client is not connected.")
         needed = set(members)
         import time as _time
+
         start = _time.monotonic()
         while True:
-            current = {m["name"] for m in get_available_members(self.client._conn_num)}
+            if client._disconnected or client._conn_num is None:
+                err = client._connection_error
+                if err is not None:
+                    raise err
+                raise Disconnected("Client disconnected while waiting for members.")
+            current = {m["name"] for m in get_available_members(client._conn_num)}
             if needed.issubset(current):
                 return
             if timeout is not None and (_time.monotonic() - start) >= timeout:

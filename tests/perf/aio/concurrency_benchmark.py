@@ -38,6 +38,13 @@ Run::
 """
 
 from __future__ import annotations
+import sys
+from pathlib import Path
+
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+from tests.conftest import active_runtime
 
 import asyncio
 import logging
@@ -56,46 +63,58 @@ if _PROJECT_ROOT not in sys.path:
 
 # ── constants ─────────────────────────────────────────────────────────────────
 
-N_CLIENTS        = 200
+N_CLIENTS = 200
 CALLS_PER_CLIENT = 1_000  # rpc() calls per client
 
-N_WORKERS        = 50
-N_CALLERS        = 3
+N_WORKERS = 50
+N_CALLERS = 3
 CASTS_PER_CALLER = 100
 
-HEAVY_WORKERS    = 200    # asyncio worker tasks in scenarios 4 & 5
+HEAVY_WORKERS = 200  # asyncio worker tasks in scenarios 4 & 5
 
-WARMUP_CALLS  = 3
-TIMEOUT       = 60
-CAST_TIMEOUT  = 120
-HOST          = "127.0.0.1"
+WARMUP_CALLS = 3
+TIMEOUT = 60
+CAST_TIMEOUT = 120
+HOST = "127.0.0.1"
 
 PAYLOAD = {"x": 42, "msg": "hello"}
 
-SERVICE_WORKERS = 10   # asyncio tasks for the Service in scenario 1
+SERVICE_WORKERS = 10  # asyncio tasks for the Service in scenario 1
 
 # ── silence helpers ───────────────────────────────────────────────────────────
 
-def _silence_subprocess() -> None:
+
+def _silence_subprocess(runtime: str) -> None:
     devnull_fd = os.open(os.devnull, os.O_WRONLY)
     os.dup2(devnull_fd, 1)
     os.dup2(devnull_fd, 2)
     os.close(devnull_fd)
     logging.disable(logging.CRITICAL)
 
+    import tests.conftest as _runtime_state
+    _runtime_state.SELECTED_RUNTIME = runtime
+    from daffi import dfcore
+    dfcore.setRuntime(runtime)
+
 
 def _quiet_kill(proc: mp.Process) -> None:
     try:
         devnull = os.open(os.devnull, os.O_WRONLY)
         saved = (os.dup(1), os.dup(2))
-        os.dup2(devnull, 1); os.dup2(devnull, 2); os.close(devnull)
+        os.dup2(devnull, 1)
+        os.dup2(devnull, 2)
+        os.close(devnull)
         proc.terminate()
     finally:
-        os.dup2(saved[0], 1); os.dup2(saved[1], 2)
-        os.close(saved[0]); os.close(saved[1])
+        os.dup2(saved[0], 1)
+        os.dup2(saved[1], 2)
+        os.close(saved[0])
+        os.close(saved[1])
     proc.join(timeout=5)
 
+
 # ── port helpers ──────────────────────────────────────────────────────────────
+
 
 def _free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -117,11 +136,12 @@ def _wait_for_port(port: int, timeout: float = 20.0) -> None:
 
 # ── subprocess entry points ───────────────────────────────────────────────────
 
-def _proc_service(port: int, n_workers: int = SERVICE_WORKERS) -> None:
-    _silence_subprocess()
+
+def _proc_service(runtime: str, port: int, n_workers: int = SERVICE_WORKERS) -> None:
+    _silence_subprocess(runtime)
 
     async def _main():
-        from daffi import callback
+        from daffi import callback, TCPTransport
         from daffi.aio import AsyncService
 
         @callback
@@ -129,7 +149,10 @@ def _proc_service(port: int, n_workers: int = SERVICE_WORKERS) -> None:
             return payload
 
         svc = AsyncService(
-            app_name="conc-service-aio", host=HOST, port=port, workers=n_workers
+            app_name="conc-service-aio",
+            workers=n_workers,
+            transport=TCPTransport(HOST, port),
+            runtime=runtime,
         )
         await svc.start()
         await svc.join()
@@ -137,24 +160,28 @@ def _proc_service(port: int, n_workers: int = SERVICE_WORKERS) -> None:
     asyncio.run(_main())
 
 
-def _proc_router(port: int) -> None:
-    _silence_subprocess()
+def _proc_router(runtime: str, port: int) -> None:
+    _silence_subprocess(runtime)
 
     async def _main():
         from daffi.aio import AsyncRouter
+        from daffi import TCPTransport
 
-        router = AsyncRouter(app_name="conc-router-aio", host=HOST, port=port)
+        router = AsyncRouter(
+            app_name="conc-router-aio", transport=TCPTransport(HOST, port),
+            runtime=runtime,
+        )
         await router.start()
         await router.join()
 
     asyncio.run(_main())
 
 
-def _proc_worker(port: int, worker_id: int) -> None:
-    _silence_subprocess()
+def _proc_worker(runtime: str, port: int, worker_id: int) -> None:
+    _silence_subprocess(runtime)
 
     async def _main():
-        from daffi import callback
+        from daffi import callback, TCPTransport
         from daffi.aio import AsyncClient
 
         @callback
@@ -162,7 +189,8 @@ def _proc_worker(port: int, worker_id: int) -> None:
             return payload
 
         client = AsyncClient(
-            app_name=f"worker-{worker_id:03d}", host=HOST, port=port
+            app_name=f"worker-{worker_id:03d}", transport=TCPTransport(HOST, port),
+            runtime=runtime,
         )
         await client.connect()
         await client.join()
@@ -170,11 +198,11 @@ def _proc_worker(port: int, worker_id: int) -> None:
     asyncio.run(_main())
 
 
-def _proc_heavy_worker(port: int, n_workers: int) -> None:
-    _silence_subprocess()
+def _proc_heavy_worker(runtime: str, port: int, n_workers: int) -> None:
+    _silence_subprocess(runtime)
 
     async def _main():
-        from daffi import callback
+        from daffi import callback, TCPTransport
         from daffi.aio import AsyncClient
 
         @callback
@@ -182,7 +210,10 @@ def _proc_heavy_worker(port: int, n_workers: int) -> None:
             return payload
 
         client = AsyncClient(
-            app_name="heavy-worker-aio", host=HOST, port=port, workers=n_workers
+            app_name="heavy-worker-aio",
+            workers=n_workers,
+            transport=TCPTransport(HOST, port),
+            runtime=runtime,
         )
         await client.connect()
         await client.join()
@@ -190,11 +221,11 @@ def _proc_heavy_worker(port: int, n_workers: int) -> None:
     asyncio.run(_main())
 
 
-def _proc_heavy_service(port: int, n_workers: int) -> None:
-    _silence_subprocess()
+def _proc_heavy_service(runtime: str, port: int, n_workers: int) -> None:
+    _silence_subprocess(runtime)
 
     async def _main():
-        from daffi import callback
+        from daffi import callback, TCPTransport
         from daffi.aio import AsyncService
 
         @callback
@@ -202,7 +233,10 @@ def _proc_heavy_service(port: int, n_workers: int) -> None:
             return payload
 
         svc = AsyncService(
-            app_name="heavy-service-aio", host=HOST, port=port, workers=n_workers
+            app_name="heavy-service-aio",
+            workers=n_workers,
+            transport=TCPTransport(HOST, port),
+            runtime=runtime,
         )
         await svc.start()
         await svc.join()
@@ -212,38 +246,49 @@ def _proc_heavy_service(port: int, n_workers: int) -> None:
 
 # ── stats helper ──────────────────────────────────────────────────────────────
 
-def _stats(label: str, wall_s: float, total_calls: int,
-           per_task_times: list[float], n_tasks: int) -> None:
+
+def _stats(
+    label: str,
+    wall_s: float,
+    total_calls: int,
+    per_task_times: list[float],
+    n_tasks: int,
+) -> None:
     if not per_task_times:
         print(f"\n  ── {label}  [no results — all tasks failed]")
         return
     avg_ms = sum(per_task_times) / len(per_task_times) * 1_000
     min_ms = min(per_task_times) * 1_000
     max_ms = max(per_task_times) * 1_000
-    cps    = total_calls / wall_s if wall_s > 0 else 0
+    cps = total_calls / wall_s if wall_s > 0 else 0
 
     print(f"\n  ── {label}")
     print(f"     tasks    : {n_tasks}")
     print(f"     calls    : {total_calls:,}")
     print(f"     wall time: {wall_s:.3f} s")
     print(f"     calls/s  : {cps:,.0f}")
-    print(f"     per-task  avg={avg_ms:.1f} ms  min={min_ms:.1f} ms  max={max_ms:.1f} ms")
+    print(
+        f"     per-task  avg={avg_ms:.1f} ms  min={min_ms:.1f} ms  max={max_ms:.1f} ms"
+    )
 
 
 # ── async load subprocess ─────────────────────────────────────────────────────
 # Uses asyncio.gather so all N_CLIENTS callers run in a single event loop.
 
-def _rpc_load_proc(port: int, n_clients: int, n_calls: int, q: "mp.Queue") -> None:
+
+def _rpc_load_proc(runtime: str, port: int, n_clients: int, n_calls: int, q: "mp.Queue") -> None:
     """RPC measurement subprocess: all callers as asyncio Tasks."""
 
-    async def _run() -> dict:
+    async def _run(runtime: str, ) -> dict:
         import os as _os, logging as _log
+
         devnull = _os.open(_os.devnull, _os.O_WRONLY)
         _os.dup2(devnull, 2)
         _os.close(devnull)
         _log.disable(_log.CRITICAL)
 
         from daffi.aio import AsyncClient
+        from daffi import TCPTransport
 
         # Connect all clients sequentially to avoid a stampede.
         connected: list[tuple] = []
@@ -252,7 +297,8 @@ def _rpc_load_proc(port: int, n_clients: int, n_calls: int, q: "mp.Queue") -> No
             print(f"\r  Connecting clients… {i + 1}/{n_clients}", end="", flush=True)
             try:
                 client = AsyncClient(
-                    app_name=f"caller-{i:03d}", host=HOST, port=port
+                    app_name=f"caller-{i:03d}", transport=TCPTransport(HOST, port),
+                    runtime=runtime,
                 )
                 conn = await client.connect()
                 connected.append((client, conn))
@@ -261,12 +307,14 @@ def _rpc_load_proc(port: int, n_clients: int, n_calls: int, q: "mp.Queue") -> No
                 if connect_errors <= 3:
                     print(f"\n  [!] client {i} connect failed: {exc}", end="")
 
-        print(f"\r  Connected {len(connected)}/{n_clients} ({connect_errors} failed)   ")
+        print(
+            f"\r  Connected {len(connected)}/{n_clients} ({connect_errors} failed)   "
+        )
 
         if not connected:
             return {"wall": 0, "per_task": [], "n_connected": 0, "n_errors": 0}
 
-        actual  = len(connected)
+        actual = len(connected)
         results = [None] * actual
         errors: list = []
 
@@ -295,10 +343,12 @@ def _rpc_load_proc(port: int, n_clients: int, n_calls: int, q: "mp.Queue") -> No
         # The barrier ensures all callers begin measuring at the same instant.
         print(f"  Warming up {actual} async callers…", flush=True)
         t0_wall = time.perf_counter()
-        await asyncio.gather(*[
-            _warmup_and_measure(cl, conn, i)
-            for i, (cl, conn) in enumerate(connected)
-        ])
+        await asyncio.gather(
+            *[
+                _warmup_and_measure(cl, conn, i)
+                for i, (cl, conn) in enumerate(connected)
+            ]
+        )
         wall = time.perf_counter() - t0_wall
 
         if errors:
@@ -314,13 +364,15 @@ def _rpc_load_proc(port: int, n_clients: int, n_calls: int, q: "mp.Queue") -> No
             "n_errors": len(errors),
         }
 
-    result = asyncio.run(_run())
+    result = asyncio.run(_run(runtime, ))
     q.put(result)
 
 
 def _run_rpc_scenario(label: str, port: int, n_clients: int, n_calls: int) -> None:
     q: mp.Queue = mp.Queue()
-    p = mp.Process(target=_rpc_load_proc, args=(port, n_clients, n_calls, q), daemon=True)
+    p = mp.Process(
+        target=_rpc_load_proc, args=(active_runtime(), port, n_clients, n_calls, q), daemon=True
+    )
     p.start()
     p.join()
     try:
@@ -334,24 +386,35 @@ def _run_rpc_scenario(label: str, port: int, n_clients: int, n_calls: int) -> No
 
 # ── cast load subprocess ───────────────────────────────────────────────────────
 
-def _cast_load_proc(port: int, n_callers: int, n_casts: int,
-                    n_workers: int, result_file: str) -> None:
+
+def _cast_load_proc(runtime: str, 
+    port: int, n_callers: int, n_casts: int, n_workers: int, result_file: str
+) -> None:
     """Cast broadcast subprocess: all callers as asyncio Tasks."""
 
-    async def _run() -> dict:
+    async def _run(runtime: str, ) -> dict:
         import os as _os, logging as _log, json as _json
+
         devnull = _os.open(_os.devnull, _os.O_WRONLY)
         _os.dup2(devnull, 2)
         _os.close(devnull)
         _log.disable(_log.CRITICAL)
 
         from daffi.aio import AsyncClient
+        from daffi import TCPTransport
 
         callers: list[tuple] = []
         for i in range(n_callers):
-            print(f"\r  Connecting {n_callers} callers… {i + 1}/{n_callers}", end="", flush=True)
+            print(
+                f"\r  Connecting {n_callers} callers… {i + 1}/{n_callers}",
+                end="",
+                flush=True,
+            )
             try:
-                c = AsyncClient(app_name=f"caller-{i:03d}", host=HOST, port=port)
+                c = AsyncClient(
+                    app_name=f"caller-{i:03d}", transport=TCPTransport(HOST, port),
+                    runtime=runtime,
+                )
                 callers.append((c, await c.connect()))
             except Exception as exc:
                 print(f"\n  [!] caller {i} failed: {exc}")
@@ -381,32 +444,37 @@ def _cast_load_proc(port: int, n_callers: int, n_casts: int,
                 print(f"  [!] cast task {idx}: {exc}", flush=True)
 
         t0_wall = time.perf_counter()
-        await asyncio.gather(*[
-            _cast_task(c, conn, i) for i, (c, conn) in enumerate(callers)
-        ])
+        await asyncio.gather(
+            *[_cast_task(c, conn, i) for i, (c, conn) in enumerate(callers)]
+        )
         wall = time.perf_counter() - t0_wall
 
         per_caller = [r[0] for r in results if r is not None]
-        responses  = sum(r[1] for r in results if r is not None)
+        responses = sum(r[1] for r in results if r is not None)
         casts_done = len(per_caller) * n_casts
         return {
-            "wall": wall, "per_caller": per_caller,
-            "responses": responses, "casts_done": casts_done,
+            "wall": wall,
+            "per_caller": per_caller,
+            "responses": responses,
+            "casts_done": casts_done,
         }
 
     import json
-    r = asyncio.run(_run())
+
+    r = asyncio.run(_run(runtime, ))
     with open(result_file, "w") as f:
         json.dump(r, f)
 
 
 # ── worker readiness probe ─────────────────────────────────────────────────────
 
+
 async def _wait_for_workers_async(port: int, n: int, timeout: float = 60) -> None:
     from daffi.aio import AsyncClient
+    from daffi import TCPTransport
     from daffi._bindings import get_available_members
 
-    probe = AsyncClient(app_name="probe-aio", host=HOST, port=port)
+    probe = AsyncClient(app_name="probe-aio", transport=TCPTransport(HOST, port), runtime=active_runtime())
     await probe.connect()
     conn_num = probe._conn_num
 
@@ -414,7 +482,8 @@ async def _wait_for_workers_async(port: int, n: int, timeout: float = 60) -> Non
     while time.monotonic() < deadline:
         members = get_available_members(conn_num)
         ready = sum(
-            1 for m in members
+            1
+            for m in members
             if "echo" in (m.get("methods") or [])
             and m.get("name", "") != probe.app_name
         )
@@ -430,10 +499,10 @@ async def _wait_for_workers_async(port: int, n: int, timeout: float = 60) -> Non
 
 def _wait_for_workers(port: int, n: int, timeout: float = 60) -> None:
     """Sync wrapper — used from the main process before asyncio.run."""
-    from daffi import Client
+    from daffi import Client, TCPTransport
     from daffi._bindings import get_available_members
 
-    probe = Client(app_name="probe-sync", host=HOST, port=port)
+    probe = Client(app_name="probe-sync", transport=TCPTransport(HOST, port), runtime=active_runtime())
     probe.connect()
     conn_num = probe._conn_num
     ready = 0
@@ -442,7 +511,8 @@ def _wait_for_workers(port: int, n: int, timeout: float = 60) -> None:
     while time.monotonic() < deadline:
         members = get_available_members(conn_num)
         ready = sum(
-            1 for m in members
+            1
+            for m in members
             if "echo" in (m.get("methods") or [])
             and m.get("name", "") != probe.app_name
         )
@@ -458,6 +528,7 @@ def _wait_for_workers(port: int, n: int, timeout: float = 60) -> None:
 
 # ── scenario runners ──────────────────────────────────────────────────────────
 
+
 def run_scenario_1() -> None:
     """200 async callers → AsyncService (direct)."""
     label = (
@@ -466,11 +537,13 @@ def run_scenario_1() -> None:
     )
     print(f"\n{'='*70}")
     print(f"  {label}")
-    print(f"  {CALLS_PER_CLIENT} await rpc() per caller  (total: {N_CLIENTS * CALLS_PER_CLIENT:,})")
+    print(
+        f"  {CALLS_PER_CLIENT} await rpc() per caller  (total: {N_CLIENTS * CALLS_PER_CLIENT:,})"
+    )
     print(f"{'='*70}")
 
     port = _free_port()
-    svc_proc = mp.Process(target=_proc_service, args=(port,), daemon=True)
+    svc_proc = mp.Process(target=_proc_service, args=(active_runtime(), port,), daemon=True)
     svc_proc.start()
     try:
         _wait_for_port(port)
@@ -485,12 +558,14 @@ def run_scenario_2() -> None:
     label = f"Scenario 2 — {N_CLIENTS} async callers → AsyncRouter → 1 AsyncWorker"
     print(f"\n{'='*70}")
     print(f"  {label}")
-    print(f"  {CALLS_PER_CLIENT} await rpc() per caller  (total: {N_CLIENTS * CALLS_PER_CLIENT:,})")
+    print(
+        f"  {CALLS_PER_CLIENT} await rpc() per caller  (total: {N_CLIENTS * CALLS_PER_CLIENT:,})"
+    )
     print(f"{'='*70}")
 
     port = _free_port()
-    router_proc = mp.Process(target=_proc_router, args=(port,), daemon=True)
-    worker_proc = mp.Process(target=_proc_worker, args=(port, 0), daemon=True)
+    router_proc = mp.Process(target=_proc_router, args=(active_runtime(), port,), daemon=True)
+    worker_proc = mp.Process(target=_proc_worker, args=(active_runtime(), port, 0), daemon=True)
     router_proc.start()
     try:
         _wait_for_port(port)
@@ -504,7 +579,7 @@ def run_scenario_2() -> None:
 
 def run_scenario_3() -> None:
     """3 async callers → AsyncRouter → N_WORKERS Async-Workers (cast broadcast)."""
-    total_casts    = N_CALLERS * CASTS_PER_CALLER
+    total_casts = N_CALLERS * CASTS_PER_CALLER
     total_messages = total_casts * N_WORKERS
     label = (
         f"Scenario 3 — {N_CALLERS} async callers → AsyncRouter → "
@@ -513,11 +588,13 @@ def run_scenario_3() -> None:
     print(f"\n{'='*70}")
     print(f"  {label}")
     print(f"  {CASTS_PER_CALLER} cast() calls per caller")
-    print(f"  Total fan-out messages: {total_messages:,}  ({total_casts} casts × {N_WORKERS} workers)")
+    print(
+        f"  Total fan-out messages: {total_messages:,}  ({total_casts} casts × {N_WORKERS} workers)"
+    )
     print(f"{'='*70}")
 
     port = _free_port()
-    router_proc = mp.Process(target=_proc_router, args=(port,), daemon=True)
+    router_proc = mp.Process(target=_proc_router, args=(active_runtime(), port,), daemon=True)
     router_proc.start()
     worker_procs: list[mp.Process] = []
     try:
@@ -525,7 +602,7 @@ def run_scenario_3() -> None:
 
         print(f"  Starting {N_WORKERS} async workers…", end="", flush=True)
         for i in range(N_WORKERS):
-            p = mp.Process(target=_proc_worker, args=(port, i), daemon=True)
+            p = mp.Process(target=_proc_worker, args=(active_runtime(), port, i), daemon=True)
             p.start()
             worker_procs.append(p)
         print(" done")
@@ -535,11 +612,12 @@ def run_scenario_3() -> None:
         print(" done")
 
         import tempfile, json, os as _os
+
         result_fd, result_path = tempfile.mkstemp(suffix=".json")
         _os.close(result_fd)
         cast_proc = mp.Process(
             target=_cast_load_proc,
-            args=(port, N_CALLERS, CASTS_PER_CALLER, N_WORKERS, result_path),
+            args=(active_runtime(), port, N_CALLERS, CASTS_PER_CALLER, N_WORKERS, result_path),
             daemon=True,
         )
         cast_proc.start()
@@ -562,16 +640,18 @@ def run_scenario_3() -> None:
             except Exception:
                 pass
 
-        per_caller       = r.get("per_caller", [])
+        per_caller = r.get("per_caller", [])
         actual_responses = r.get("responses", 0)
-        casts_done       = r.get("casts_done", 0)
-        wall             = r.get("wall", 0)
+        casts_done = r.get("casts_done", 0)
+        wall = r.get("wall", 0)
 
         print(f"\n  ── {label}")
         print(f"     callers      : {N_CALLERS}")
         print(f"     workers      : {N_WORKERS}")
         print(f"     casts done   : {casts_done:,}")
-        print(f"     responses    : {actual_responses:,}  (expected {total_messages:,})")
+        print(
+            f"     responses    : {actual_responses:,}  (expected {total_messages:,})"
+        )
         print(f"     wall time    : {wall:.3f} s")
         if wall > 0 and casts_done:
             print(f"     casts/s      : {casts_done / wall:,.1f}")
@@ -592,14 +672,16 @@ def run_scenario_4() -> None:
     )
     print(f"\n{'='*70}")
     print(f"  {label}")
-    print(f"  {CALLS_PER_CLIENT} await rpc() per caller  (total: {N_CLIENTS * CALLS_PER_CLIENT:,})")
+    print(
+        f"  {CALLS_PER_CLIENT} await rpc() per caller  (total: {N_CLIENTS * CALLS_PER_CLIENT:,})"
+    )
     print(f"  (compare: scenario 2 uses 1 worker task — shows task-pool scaling)")
     print(f"{'='*70}")
 
-    port        = _free_port()
-    router_proc = mp.Process(target=_proc_router, args=(port,), daemon=True)
+    port = _free_port()
+    router_proc = mp.Process(target=_proc_router, args=(active_runtime(), port,), daemon=True)
     worker_proc = mp.Process(
-        target=_proc_heavy_worker, args=(port, HEAVY_WORKERS), daemon=True
+        target=_proc_heavy_worker, args=(active_runtime(), port, HEAVY_WORKERS), daemon=True
     )
     router_proc.start()
     try:
@@ -616,18 +698,20 @@ def run_scenario_4() -> None:
 
 def run_scenario_5() -> None:
     """N_CLIENTS callers → AsyncService (HEAVY_WORKERS tasks)."""
-    label = (
-        f"Scenario 5 — {N_CLIENTS} callers → AsyncService ({HEAVY_WORKERS} tasks)"
-    )
+    label = f"Scenario 5 — {N_CLIENTS} callers → AsyncService ({HEAVY_WORKERS} tasks)"
     print(f"\n{'='*70}")
     print(f"  {label}")
-    print(f"  {CALLS_PER_CLIENT} await rpc() per caller  (total: {N_CLIENTS * CALLS_PER_CLIENT:,})")
-    print(f"  (compare: scenario 1 uses {SERVICE_WORKERS} tasks — shows task-pool scaling)")
+    print(
+        f"  {CALLS_PER_CLIENT} await rpc() per caller  (total: {N_CLIENTS * CALLS_PER_CLIENT:,})"
+    )
+    print(
+        f"  (compare: scenario 1 uses {SERVICE_WORKERS} tasks — shows task-pool scaling)"
+    )
     print(f"{'='*70}")
 
-    port     = _free_port()
+    port = _free_port()
     svc_proc = mp.Process(
-        target=_proc_heavy_service, args=(port, HEAVY_WORKERS), daemon=True
+        target=_proc_heavy_service, args=(active_runtime(), port, HEAVY_WORKERS), daemon=True
     )
     svc_proc.start()
     try:
@@ -640,6 +724,7 @@ def run_scenario_5() -> None:
 
 # ── main ──────────────────────────────────────────────────────────────────────
 
+
 def main(argv: Optional[list] = None) -> None:
     logging.disable(logging.CRITICAL)
 
@@ -649,15 +734,27 @@ def main(argv: Optional[list] = None) -> None:
     os.close(devnull)
 
     try:
-        print("\ndaffi.aio concurrency benchmark  (asyncio.gather — no OS threads for callers)")
+        print(
+            "\ndaffi.aio concurrency benchmark  (asyncio.gather — no OS threads for callers)"
+        )
         print(f"host: {HOST}")
         print(f"payload: {PAYLOAD}")
         print(f"scenarios:")
-        print(f"  1. {N_CLIENTS} async callers → AsyncService (tasks={SERVICE_WORKERS}),  {CALLS_PER_CLIENT} calls each")
-        print(f"  2. {N_CLIENTS} async callers → AsyncRouter → 1 AsyncWorker,  {CALLS_PER_CLIENT} calls each")
-        print(f"  3. {N_CALLERS} async callers → AsyncRouter → {N_WORKERS} AsyncWorkers,  {CASTS_PER_CALLER} casts each")
-        print(f"  4. {N_CLIENTS} async callers → AsyncRouter → 1 AsyncWorker ({HEAVY_WORKERS} tasks),  {CALLS_PER_CLIENT} calls each")
-        print(f"  5. {N_CLIENTS} async callers → AsyncService ({HEAVY_WORKERS} tasks),  {CALLS_PER_CLIENT} calls each")
+        print(
+            f"  1. {N_CLIENTS} async callers → AsyncService (tasks={SERVICE_WORKERS}),  {CALLS_PER_CLIENT} calls each"
+        )
+        print(
+            f"  2. {N_CLIENTS} async callers → AsyncRouter → 1 AsyncWorker,  {CALLS_PER_CLIENT} calls each"
+        )
+        print(
+            f"  3. {N_CALLERS} async callers → AsyncRouter → {N_WORKERS} AsyncWorkers,  {CASTS_PER_CALLER} casts each"
+        )
+        print(
+            f"  4. {N_CLIENTS} async callers → AsyncRouter → 1 AsyncWorker ({HEAVY_WORKERS} tasks),  {CALLS_PER_CLIENT} calls each"
+        )
+        print(
+            f"  5. {N_CLIENTS} async callers → AsyncService ({HEAVY_WORKERS} tasks),  {CALLS_PER_CLIENT} calls each"
+        )
 
         run_scenario_1()
         run_scenario_2()

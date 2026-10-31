@@ -3,7 +3,9 @@ Async integration tests for the asyncio-worker execution mode.
 
 Mirrors tests/integration/test_workers.py using daffi.aio.
 """
+
 from __future__ import annotations
+from tests.conftest import active_runtime
 
 import asyncio
 import multiprocessing as mp
@@ -11,22 +13,27 @@ import multiprocessing as mp
 import pytest
 
 from .conftest import (
-    HOST, TIMEOUT,
-    wait_for_port, wait_for_members,
-    silence_subprocess, quiet_kill, proc_router,
+    HOST,
+    TIMEOUT,
+    wait_for_port,
+    wait_for_members,
+    silence_subprocess,
+    quiet_kill,
+    proc_router,
 )
 
-N_CONCURRENT     = 30
-CALLS_PER_TASK   = 10
+N_CONCURRENT = 30
+CALLS_PER_TASK = 10
 
 
 # ── subprocess entry points ───────────────────────────────────────────────────
 
-def _svc_task_workers(port: int, n_workers: int) -> None:
-    silence_subprocess()
+
+def _svc_task_workers(runtime: str, port: int, n_workers: int) -> None:
+    silence_subprocess(runtime)
 
     async def _main():
-        from daffi import callback
+        from daffi import callback, TCPTransport
         from daffi.aio import AsyncService
 
         @callback
@@ -47,7 +54,10 @@ def _svc_task_workers(port: int, n_workers: int) -> None:
             raise ValueError(msg)
 
         svc = AsyncService(
-            app_name="workers-aio-svc", host=HOST, port=port, workers=n_workers
+            app_name="workers-aio-svc",
+            workers=n_workers,
+            transport=TCPTransport(HOST, port),
+            runtime=runtime,
         )
         await svc.start()
         await svc.join()
@@ -55,11 +65,11 @@ def _svc_task_workers(port: int, n_workers: int) -> None:
     asyncio.run(_main())
 
 
-def _client_task_workers(port: int, n_workers: int) -> None:
-    silence_subprocess()
+def _client_task_workers(runtime: str, port: int, n_workers: int) -> None:
+    silence_subprocess(runtime)
 
     async def _main():
-        from daffi import callback
+        from daffi import callback, TCPTransport
         from daffi.aio import AsyncClient
 
         @callback
@@ -79,7 +89,10 @@ def _client_task_workers(port: int, n_workers: int) -> None:
             raise ValueError(msg)
 
         client = AsyncClient(
-            app_name="workers-aio-worker", host=HOST, port=port, workers=n_workers
+            app_name="workers-aio-worker",
+            workers=n_workers,
+            transport=TCPTransport(HOST, port),
+            runtime=runtime,
         )
         await client.connect()
         await client.join()
@@ -89,10 +102,11 @@ def _client_task_workers(port: int, n_workers: int) -> None:
 
 # ── fixtures ──────────────────────────────────────────────────────────────────
 
+
 @pytest.fixture(params=[1, 4, 16])
 def direct_svc_workers(request, free_port):
     n = request.param
-    proc = mp.Process(target=_svc_task_workers, args=(free_port, n), daemon=True)
+    proc = mp.Process(target=_svc_task_workers, args=(active_runtime(), free_port, n), daemon=True)
     proc.start()
     wait_for_port(free_port)
     wait_for_members(free_port, {"workers-aio-svc"})
@@ -103,11 +117,11 @@ def direct_svc_workers(request, free_port):
 @pytest.fixture(params=[1, 4, 16])
 def router_client_workers(request, free_port):
     n = request.param
-    rproc = mp.Process(target=proc_router, args=(free_port,), daemon=True)
+    rproc = mp.Process(target=proc_router, args=(active_runtime(), free_port,), daemon=True)
     rproc.start()
     wait_for_port(free_port)
 
-    wproc = mp.Process(target=_client_task_workers, args=(free_port, n), daemon=True)
+    wproc = mp.Process(target=_client_task_workers, args=(active_runtime(), free_port, n), daemon=True)
     wproc.start()
     wait_for_members(free_port, {"workers-aio-worker"})
     yield free_port, n
@@ -117,23 +131,30 @@ def router_client_workers(request, free_port):
 
 # ── Direct layout tests ────────────────────────────────────────────────────────
 
+
 @pytest.mark.asyncio
 class TestDirectWorkersAsync:
 
     async def test_echo_correct(self, direct_svc_workers):
         from daffi.aio import AsyncClient
+        from daffi import TCPTransport
+
         port, _ = direct_svc_workers
-        client = AsyncClient(app_name="w-echo", host=HOST, port=port)
+        client = AsyncClient(app_name="w-echo", transport=TCPTransport(HOST, port), runtime=active_runtime())
         conn = await client.connect()
         try:
-            assert await conn.rpc(timeout=TIMEOUT).echo("hello workers") == "hello workers"
+            assert (
+                await conn.rpc(timeout=TIMEOUT).echo("hello workers") == "hello workers"
+            )
         finally:
             await client.stop()
 
     async def test_add_correct(self, direct_svc_workers):
         from daffi.aio import AsyncClient
+        from daffi import TCPTransport
+
         port, _ = direct_svc_workers
-        client = AsyncClient(app_name="w-add", host=HOST, port=port)
+        client = AsyncClient(app_name="w-add", transport=TCPTransport(HOST, port), runtime=active_runtime())
         conn = await client.connect()
         try:
             assert await conn.rpc(timeout=TIMEOUT).add(21, 21) == 42
@@ -142,8 +163,10 @@ class TestDirectWorkersAsync:
 
     async def test_cpu_work_correct(self, direct_svc_workers):
         from daffi.aio import AsyncClient
+        from daffi import TCPTransport
+
         port, _ = direct_svc_workers
-        client = AsyncClient(app_name="w-cpu", host=HOST, port=port)
+        client = AsyncClient(app_name="w-cpu", transport=TCPTransport(HOST, port), runtime=active_runtime())
         conn = await client.connect()
         expected = sum(i * i for i in range(100))
         try:
@@ -153,10 +176,12 @@ class TestDirectWorkersAsync:
 
     async def test_concurrent_echo(self, direct_svc_workers):
         from daffi.aio import AsyncClient
+        from daffi import TCPTransport
+
         port, n_workers = direct_svc_workers
 
         clients = [
-            AsyncClient(app_name=f"w-conc-{i}", host=HOST, port=port)
+            AsyncClient(app_name=f"w-conc-{i}", transport=TCPTransport(HOST, port), runtime=active_runtime())
             for i in range(N_CONCURRENT)
         ]
         conns = await asyncio.gather(*[c.connect() for c in clients])
@@ -174,9 +199,11 @@ class TestDirectWorkersAsync:
 
     async def test_exception_propagates(self, direct_svc_workers):
         from daffi.aio import AsyncClient
+        from daffi import TCPTransport
         from daffi.exceptions import RemoteCallError
+
         port, _ = direct_svc_workers
-        client = AsyncClient(app_name="w-exc", host=HOST, port=port)
+        client = AsyncClient(app_name="w-exc", transport=TCPTransport(HOST, port), runtime=active_runtime())
         conn = await client.connect()
         try:
             with pytest.raises((RemoteCallError, ValueError)):
@@ -187,23 +214,30 @@ class TestDirectWorkersAsync:
 
 # ── Router layout tests ────────────────────────────────────────────────────────
 
+
 @pytest.mark.asyncio
 class TestRouterWorkersAsync:
 
     async def test_echo_correct(self, router_client_workers):
         from daffi.aio import AsyncClient
+        from daffi import TCPTransport
+
         port, _ = router_client_workers
-        client = AsyncClient(app_name="rw-echo", host=HOST, port=port)
+        client = AsyncClient(app_name="rw-echo", transport=TCPTransport(HOST, port), runtime=active_runtime())
         conn = await client.connect()
         try:
-            assert await conn.rpc(timeout=TIMEOUT).echo("routed hello") == "routed hello"
+            assert (
+                await conn.rpc(timeout=TIMEOUT).echo("routed hello") == "routed hello"
+            )
         finally:
             await client.stop()
 
     async def test_add_correct(self, router_client_workers):
         from daffi.aio import AsyncClient
+        from daffi import TCPTransport
+
         port, _ = router_client_workers
-        client = AsyncClient(app_name="rw-add", host=HOST, port=port)
+        client = AsyncClient(app_name="rw-add", transport=TCPTransport(HOST, port), runtime=active_runtime())
         conn = await client.connect()
         try:
             assert await conn.rpc(timeout=TIMEOUT).add(6, 7) == 13
@@ -212,10 +246,12 @@ class TestRouterWorkersAsync:
 
     async def test_concurrent_echo(self, router_client_workers):
         from daffi.aio import AsyncClient
+        from daffi import TCPTransport
+
         port, _ = router_client_workers
 
         clients = [
-            AsyncClient(app_name=f"rw-conc-{i}", host=HOST, port=port)
+            AsyncClient(app_name=f"rw-conc-{i}", transport=TCPTransport(HOST, port), runtime=active_runtime())
             for i in range(N_CONCURRENT)
         ]
         conns = await asyncio.gather(*[c.connect() for c in clients])
@@ -233,9 +269,11 @@ class TestRouterWorkersAsync:
 
     async def test_exception_propagates(self, router_client_workers):
         from daffi.aio import AsyncClient
+        from daffi import TCPTransport
         from daffi.exceptions import RemoteCallError
+
         port, _ = router_client_workers
-        client = AsyncClient(app_name="rw-exc", host=HOST, port=port)
+        client = AsyncClient(app_name="rw-exc", transport=TCPTransport(HOST, port), runtime=active_runtime())
         conn = await client.connect()
         try:
             with pytest.raises((RemoteCallError, ValueError)):

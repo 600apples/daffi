@@ -6,12 +6,16 @@ Multiple calls can be gathered with asyncio.gather() for true concurrency.
 
 Run 1_service.py first.
 """
+
 import asyncio
 from daffi.aio import AsyncClient
+from daffi import TCPTransport
 
 
 async def main():
-    client = AsyncClient(app_name="calc-client", host="0.0.0.0", port=5001)
+    client = AsyncClient(
+        app_name="calc-client", transport=TCPTransport("0.0.0.0", 5001)
+    )
     conn = await client.connect()
 
     rpc = conn.rpc(timeout=5)

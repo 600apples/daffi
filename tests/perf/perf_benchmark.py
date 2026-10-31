@@ -26,6 +26,13 @@ Run::
 """
 
 from __future__ import annotations
+import sys
+from pathlib import Path
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+from tests.conftest import active_runtime
 
 import json
 import logging
@@ -42,13 +49,14 @@ _DATA_FILE = Path(__file__).parent / "data.json"
 
 # ── constants ─────────────────────────────────────────────────────────────────
 
-N      = 100_000   # measured calls per (layout × serde) combination
-WARMUP = 20       # throwaway calls before measurement
-TIMEOUT = 30      # per-call RPC timeout (seconds)
-HOST   = "127.0.0.1"
+N = 100_000  # measured calls per (layout × serde) combination
+WARMUP = 20  # throwaway calls before measurement
+TIMEOUT = 30  # per-call RPC timeout (seconds)
+HOST = "127.0.0.1"
 
 # ── serde format list ─────────────────────────────────────────────────────────
 # Imported lazily in main() so subprocesses that don't need them stay clean.
+
 
 def _serde_modes():
     """Return list of (serde_int, label) pairs to benchmark.
@@ -56,13 +64,15 @@ def _serde_modes():
     MSGPACK is skipped with a notice if the optional package is absent.
     """
     from daffi._serialization import SerdeFormat
+
     modes = [
-        (SerdeFormat.PICKLE,  "PICKLE"),
-        (SerdeFormat.JSON,    "JSON"),
-        (SerdeFormat.OPAQUE,  "OPAQUE"),
+        (SerdeFormat.PICKLE, "PICKLE"),
+        (SerdeFormat.JSON, "JSON"),
+        (SerdeFormat.OPAQUE, "OPAQUE"),
     ]
     try:
         import msgpack as _  # noqa: F401
+
         modes.insert(2, (SerdeFormat.MSGPACK, "MSGPACK"))
     except ImportError:
         print("  [note] msgpack not installed — MSGPACK format skipped")
@@ -70,6 +80,7 @@ def _serde_modes():
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
+
 
 def _free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -86,16 +97,23 @@ def _wait_for_port(port: int, timeout: float = 15.0) -> None:
                 return
         except OSError:
             time.sleep(0.05)
-    raise TimeoutError(f"Server on {HOST}:{port} did not become ready within {timeout}s")
+    raise TimeoutError(
+        f"Server on {HOST}:{port} did not become ready within {timeout}s"
+    )
 
 
-def _silence_subprocess() -> None:
+def _silence_subprocess(runtime: str) -> None:
     """Redirect all fd-level output to /dev/null (catches Zig native prints too)."""
     devnull_fd = os.open(os.devnull, os.O_WRONLY)
     os.dup2(devnull_fd, 1)
     os.dup2(devnull_fd, 2)
     os.close(devnull_fd)
     logging.disable(logging.CRITICAL)
+
+    import tests.conftest as _runtime_state
+    _runtime_state.SELECTED_RUNTIME = runtime
+    from daffi import dfcore
+    dfcore.setRuntime(runtime)
 
 
 def _quiet_teardown(fn, *args, **kwargs) -> None:
@@ -122,37 +140,38 @@ def _report(label: str, latencies_ms: list[float]) -> None:
 
 # ── subprocess entry points ───────────────────────────────────────────────────
 
-def _proc_service(host: str, port: int) -> None:
-    _silence_subprocess()
-    from daffi import Service, callback
+
+def _proc_service(runtime: str, host: str, port: int) -> None:
+    _silence_subprocess(runtime)
+    from daffi import Service, callback, TCPTransport
 
     @callback
     def echo(payload):  # noqa: F811
         return payload
 
-    svc = Service(app_name="perf-service", host=host, port=port)
+    svc = Service(app_name="perf-service", transport=TCPTransport(host, port), runtime=runtime)
     svc.start()
     svc.join()
 
 
-def _proc_router(host: str, port: int) -> None:
-    _silence_subprocess()
-    from daffi import Router
+def _proc_router(runtime: str, host: str, port: int) -> None:
+    _silence_subprocess(runtime)
+    from daffi import Router, TCPTransport
 
-    router = Router(app_name="perf-router", host=host, port=port)
+    router = Router(app_name="perf-router", transport=TCPTransport(host, port), runtime=runtime)
     router.start()
     router.join()
 
 
-def _proc_worker(host: str, port: int) -> None:
-    _silence_subprocess()
-    from daffi import Client, callback
+def _proc_worker(runtime: str, host: str, port: int) -> None:
+    _silence_subprocess(runtime)
+    from daffi import Client, callback, TCPTransport
 
     @callback
     def echo(payload):  # noqa: F811
         return payload
 
-    client = Client(app_name="perf-worker", host=host, port=port)
+    client = Client(app_name="perf-worker", transport=TCPTransport(host, port), runtime=runtime)
     client.connect()
     try:
         while True:
@@ -165,22 +184,24 @@ def _proc_worker(host: str, port: int) -> None:
 
 # ── benchmark functions ───────────────────────────────────────────────────────
 
+
 def bench_direct(serde: int, data: dict, label: str) -> list[float]:
     """Direct: Client → Service, single hop."""
-    from daffi import Client
+    from daffi import Client, TCPTransport
 
     # OPAQUE requires a single pre-serialised string argument.
     from daffi._serialization import SerdeFormat
+
     wire = json.dumps(data) if serde == SerdeFormat.OPAQUE else data
 
     port = _free_port()
-    proc = mp.Process(target=_proc_service, args=(HOST, port), daemon=True)
+    proc = mp.Process(target=_proc_service, args=(active_runtime(), HOST, port), daemon=True)
     proc.start()
     try:
         _wait_for_port(port)
         time.sleep(0.15)
 
-        client = Client(app_name="perf-direct", host=HOST, port=port)
+        client = Client(app_name="perf-direct", transport=TCPTransport(HOST, port), runtime=active_runtime())
         conn = client.connect()
         c = conn.rpc(timeout=TIMEOUT, serde=serde)
 
@@ -206,14 +227,14 @@ def bench_direct(serde: int, data: dict, label: str) -> list[float]:
 
 def bench_via_router(serde: int, data: dict, label: str) -> list[float]:
     """Via Router: Client → Router → Worker, two hops."""
-    from daffi import Client
+    from daffi import Client, TCPTransport
     from daffi._serialization import SerdeFormat
 
     wire = json.dumps(data) if serde == SerdeFormat.OPAQUE else data
 
     router_port = _free_port()
-    router_proc = mp.Process(target=_proc_router, args=(HOST, router_port), daemon=True)
-    worker_proc = mp.Process(target=_proc_worker, args=(HOST, router_port), daemon=True)
+    router_proc = mp.Process(target=_proc_router, args=(active_runtime(), HOST, router_port), daemon=True)
+    worker_proc = mp.Process(target=_proc_worker, args=(active_runtime(), HOST, router_port), daemon=True)
 
     router_proc.start()
     try:
@@ -221,7 +242,10 @@ def bench_via_router(serde: int, data: dict, label: str) -> list[float]:
         worker_proc.start()
         time.sleep(0.4)
 
-        client = Client(app_name="perf-router-caller", host=HOST, port=router_port)
+        client = Client(
+            app_name="perf-router-caller", transport=TCPTransport(HOST, router_port),
+            runtime=active_runtime(),
+        )
         conn = client.connect()
         c = conn.rpc(timeout=TIMEOUT, serde=serde)
 
@@ -249,6 +273,7 @@ def bench_via_router(serde: int, data: dict, label: str) -> list[float]:
 
 # ── main ──────────────────────────────────────────────────────────────────────
 
+
 def main() -> None:
     logging.disable(logging.INFO)
 
@@ -264,7 +289,9 @@ def main() -> None:
 
         modes = _serde_modes()
 
-        print(f"\ndaffi performance benchmark  —  {N} sequential rpc() calls per layout × serde")
+        print(
+            f"\ndaffi performance benchmark  —  {N} sequential rpc() calls per layout × serde"
+        )
         print(f"host: {HOST}   warmup: {WARMUP} calls   timeout: {TIMEOUT}s")
         print(f"payload: {_DATA_FILE.name}  ({payload_bytes} bytes JSON)\n")
 

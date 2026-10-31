@@ -1,0 +1,247 @@
+"""
+Unix-domain-socket transport tests.
+
+Regressions covered:
+* ``unix_sock_path`` was never forwarded to the native layer (``host``/``port``
+  were passed as ``None``), so every Unix-socket Service/Client failed to start.
+* The native ``Address`` buffer was 28 bytes (a ``sockaddr_in6``), truncating
+  any socket path longer than ~26 characters and reading past the buffer.
+* A host that is really a path must not be sent through the DNS resolver.
+"""
+
+from __future__ import annotations
+from tests.conftest import active_runtime
+
+import asyncio
+import multiprocessing as mp
+import os
+import socket
+import sys
+import time
+
+import pytest
+
+from .conftest import quiet_kill, silence_subprocess
+
+pytestmark = pytest.mark.skipif(
+    sys.platform == "win32", reason="no Unix sockets on Windows"
+)
+
+
+def _service(runtime: str, path: str) -> None:
+    silence_subprocess(runtime)
+    from daffi import Service, callback, UnixTransport, TCPTransport
+
+    @callback
+    def echo(payload):
+        return payload
+
+    @callback
+    def add(a: int, b: int) -> int:
+        return a + b
+
+    svc = Service(app_name="ux-service", workers=2, transport=UnixTransport(path), runtime=runtime)
+    svc.start()
+    svc.join()
+
+
+def _router(runtime: str, path: str) -> None:
+    silence_subprocess(runtime)
+    from daffi import Router, UnixTransport, TCPTransport
+
+    r = Router(app_name="ux-router", transport=UnixTransport(path), runtime=runtime)
+    r.start()
+    r.join()
+
+
+def _worker(runtime: str, path: str) -> None:
+    silence_subprocess(runtime)
+    from daffi import Client, callback, UnixTransport, TCPTransport
+
+    @callback
+    def echo(payload):
+        return payload
+
+    @callback
+    def add(a: int, b: int) -> int:
+        return a + b
+
+    c = Client(app_name="ux-service", workers=2, transport=UnixTransport(path), runtime=runtime)
+    c.connect()
+    while True:
+        time.sleep(1)
+
+
+def _wait_for_socket(path: str, timeout: float = 15.0) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if os.path.exists(path):
+            return
+        time.sleep(0.05)
+    raise TimeoutError(f"{path} was not created")
+
+
+def _wait_for_listener(path: str, timeout: float = 15.0) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            probe.connect(path)
+            return
+        except OSError:
+            time.sleep(0.05)
+        finally:
+            probe.close()
+    raise TimeoutError(f"nothing is listening on {path}")
+
+
+def _sock_path(tmp_path, *, long: bool = False) -> str:
+    # macOS limits sun_path to 104 bytes, Linux to 108; pytest's tmp_path can
+    # already be long, so build the deep path under a short temp dir.
+    base = os.path.join("/tmp", f"dfx{os.getpid()}-{time.monotonic_ns() % 10**8}")
+    os.makedirs(base, exist_ok=True)
+    name = ("a-rather-long-socket-file-name-" * 2 + ".sock") if long else "s.sock"
+    path = os.path.join(base, name)
+    assert len(path) < 100
+    return path
+
+
+@pytest.fixture
+def unix_service(tmp_path, request):
+    path = _sock_path(tmp_path, long=getattr(request, "param", False))
+    proc = mp.Process(target=_service, args=(active_runtime(), path,), daemon=True)
+    proc.start()
+    _wait_for_socket(path)
+    yield path
+    quiet_kill(proc)
+
+
+@pytest.mark.parametrize(
+    "unix_service", [False, True], indirect=True, ids=["short-path", "long-path"]
+)
+def test_rpc_over_unix_socket(unix_service):
+    from daffi import Client, UnixTransport, TCPTransport
+
+    assert unix_service.count("/") >= 2
+    client = Client(app_name="ux-client", transport=UnixTransport(unix_service), runtime=active_runtime())
+    conn = client.connect()
+    try:
+        conn.wait_for_members("ux-service", timeout=15)
+        rpc = conn.rpc(timeout=15)
+        assert rpc.add(20, 22) == 42
+        blob = b"u" * (2 * 1024 * 1024)
+        assert rpc.echo(blob) == blob
+    finally:
+        client.stop()
+
+
+def test_router_over_unix_socket(tmp_path):
+    from daffi import Client, UnixTransport, TCPTransport
+
+    path = _sock_path(tmp_path, long=True)
+    rproc = mp.Process(target=_router, args=(active_runtime(), path,), daemon=True)
+    rproc.start()
+    _wait_for_socket(path)
+    wproc = mp.Process(target=_worker, args=(active_runtime(), path,), daemon=True)
+    wproc.start()
+    try:
+        client = Client(app_name="ux-client", transport=UnixTransport(path), runtime=active_runtime())
+        conn = client.connect()
+        try:
+            conn.wait_for_members("ux-service", timeout=20)
+            assert conn.rpc(timeout=15).add(1, 2) == 3
+        finally:
+            client.stop()
+    finally:
+        quiet_kill(wproc)
+        quiet_kill(rproc)
+
+
+def test_async_client_over_unix_socket(unix_service):
+    from daffi.aio import AsyncClient
+    from daffi import UnixTransport
+
+    async def main():
+        client = AsyncClient(
+            app_name="ux-aclient", transport=UnixTransport(unix_service),
+            runtime=active_runtime(),
+        )
+        conn = await client.connect()
+        try:
+            await conn.wait_for_members("ux-service", timeout=15)
+            assert await conn.rpc(timeout=15).add(3, 4) == 7
+        finally:
+            await client.stop()
+
+    asyncio.run(main())
+
+
+def test_stale_socket_file_is_replaced(tmp_path):
+    from daffi import Client, UnixTransport, TCPTransport
+
+    path = _sock_path(tmp_path)
+    # A crashed run leaves its socket file behind with nobody listening.
+    leftover = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    leftover.bind(path)
+    leftover.close()
+    proc = mp.Process(target=_service, args=(active_runtime(), path,), daemon=True)
+    proc.start()
+    try:
+        _wait_for_listener(path)
+        client = Client(app_name="ux-client", transport=UnixTransport(path), runtime=active_runtime())
+        conn = client.connect()
+        try:
+            conn.wait_for_members("ux-service", timeout=15)
+        finally:
+            client.stop()
+    finally:
+        quiet_kill(proc)
+
+
+def test_regular_file_at_the_socket_path_is_not_deleted(tmp_path):
+    path = _sock_path(tmp_path)
+    with open(path, "w") as f:
+        f.write("not a socket")
+    proc = mp.Process(target=_service, args=(active_runtime(), path,), daemon=True)
+    proc.start()
+    try:
+        proc.join(timeout=20)
+        assert proc.exitcode not in (None, 0), "the service started over a regular file"
+        with open(path) as f:
+            assert f.read() == "not a socket"
+    finally:
+        quiet_kill(proc)
+
+
+def test_second_server_does_not_take_over_a_live_socket(tmp_path):
+    from daffi import Client, UnixTransport
+
+    path = _sock_path(tmp_path)
+    first = mp.Process(target=_service, args=(active_runtime(), path,), daemon=True)
+    first.start()
+    second = None
+    try:
+        _wait_for_listener(path)
+        second = mp.Process(target=_router, args=(active_runtime(), path,), daemon=True)
+        second.start()
+        second.join(timeout=20)
+        assert second.exitcode not in (None, 0), "the second server started on a live socket"
+
+        client = Client(app_name="ux-client", transport=UnixTransport(path), runtime=active_runtime())
+        conn = client.connect()
+        try:
+            conn.wait_for_members("ux-service", timeout=15)
+            assert conn.rpc(timeout=15).add(1, 2) == 3
+        finally:
+            client.stop()
+    finally:
+        if second is not None:
+            quiet_kill(second)
+        quiet_kill(first)
+
+
+def test_missing_transport_is_rejected():
+    from daffi import Client
+
+    with pytest.raises(TypeError):
+        Client(app_name="bad", runtime=active_runtime())

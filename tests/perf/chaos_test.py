@@ -23,6 +23,13 @@ Usage
 """
 
 from __future__ import annotations
+import sys
+from pathlib import Path
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+from tests.conftest import active_runtime
 
 import argparse
 import logging
@@ -37,35 +44,36 @@ from queue import Empty, Queue
 
 # ─── tunables (overridden by CLI args before threads start) ──────────────────
 
-DURATION           = 30 * 60    # seconds (default 30 min)
-N_WORKERS          = 3          # worker subprocesses (router topology)
-N_SERVICES         = 2          # service subprocesses (direct topology)
-N_ROUTER_CALLERS   = 8          # in-process threads calling workers via router
-N_SERVICE_CALLERS  = 4          # in-process threads calling services directly
-CALL_TIMEOUT       = 10.0       # RPC timeout for blocking calls
-RECONNECT_EVERY    = 500        # reconnect after this many calls per thread
-REPORT_INTERVAL    = 10.0       # stats print interval (seconds)
-HOST               = "127.0.0.1"
+DURATION = 30 * 60  # seconds (default 30 min)
+N_WORKERS = 3  # worker subprocesses (router topology)
+N_SERVICES = 2  # service subprocesses (direct topology)
+N_ROUTER_CALLERS = 8  # in-process threads calling workers via router
+N_SERVICE_CALLERS = 4  # in-process threads calling services directly
+CALL_TIMEOUT = 10.0  # RPC timeout for blocking calls
+RECONNECT_EVERY = 500  # reconnect after this many calls per thread
+REPORT_INTERVAL = 10.0  # stats print interval (seconds)
+HOST = "127.0.0.1"
 
 # rpc mode weights — (mode, weight); must sum to 100
 _MODE_TABLE = [
-    ("rpc",         40),
-    ("rpc_nowait",  20),
-    ("cast",        20),
+    ("rpc", 40),
+    ("rpc_nowait", 20),
+    ("cast", 20),
     ("cast_nowait", 20),
 ]
-_MODES      = [m for m, _ in _MODE_TABLE]
-_WEIGHTS    = [w for _, w in _MODE_TABLE]
+_MODES = [m for m, _ in _MODE_TABLE]
+_WEIGHTS = [w for _, w in _MODE_TABLE]
 
 # ─── shared state ─────────────────────────────────────────────────────────────
 
-_stop   = threading.Event()          # set on error or timeout
-_errors: "Queue[tuple]" = Queue()    # (thread_name, exc, context, traceback_str)
+_stop = threading.Event()  # set on error or timeout
+_errors: "Queue[tuple]" = Queue()  # (thread_name, exc, context, traceback_str)
 
-_counts      = {m: 0 for m in _MODES}
+_counts = {m: 0 for m in _MODES}
 _counts_lock = threading.Lock()
 
 # ─── infrastructure helpers ───────────────────────────────────────────────────
+
 
 def _free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -85,7 +93,7 @@ def _wait_for_port(port: int, timeout: float = 20.0) -> None:
     raise TimeoutError(f"{HOST}:{port} did not open within {timeout}s")
 
 
-def _silence() -> None:
+def _silence(runtime: str) -> None:
     """Redirect stdout/stderr to /dev/null and kill logging.  Called in every
     subprocess at startup so Zig native prints don't pollute the terminal."""
     devnull = os.open(os.devnull, os.O_WRONLY)
@@ -93,8 +101,14 @@ def _silence() -> None:
     os.dup2(devnull, 2)
     os.close(devnull)
     logging.disable(logging.CRITICAL)
+
+    import tests.conftest as _runtime_state
+    _runtime_state.SELECTED_RUNTIME = runtime
+    from daffi import dfcore
+    dfcore.setRuntime(runtime)
     try:
         from daffi.registry._executor_registry import EXECUTOR_REGISTRY
+
         EXECUTOR_REGISTRY.subscribers.clear()
         EXECUTOR_REGISTRY.registry.clear()
     except Exception:
@@ -119,8 +133,13 @@ def _quiet_kill(proc: mp.Process, timeout: float = 5.0) -> None:
 
 def _probe_wait(port: int, members: set[str], timeout: float = 30.0) -> None:
     """Open a throw-away client, wait for *members*, disconnect."""
-    from daffi import Client
-    c = Client(app_name=f"chaos-probe-{os.getpid()}-{id(members)}", host=HOST, port=port)
+    from daffi import Client, TCPTransport
+
+    c = Client(
+        app_name=f"chaos-probe-{os.getpid()}-{id(members)}",
+        transport=TCPTransport(HOST, port),
+        runtime=active_runtime(),
+    )
     conn = c.connect()
     try:
         conn.wait_for_members(*members, timeout=timeout)
@@ -130,19 +149,21 @@ def _probe_wait(port: int, members: set[str], timeout: float = 30.0) -> None:
 
 # ─── subprocess entry points (must import daffi lazily after _silence) ────────
 
-def _proc_router(port: int) -> None:
-    _silence()
-    from daffi import Router
-    r = Router(app_name="chaos-router", host=HOST, port=port)
+
+def _proc_router(runtime: str, port: int) -> None:
+    _silence(runtime)
+    from daffi import Router, TCPTransport
+
+    r = Router(app_name="chaos-router", transport=TCPTransport(HOST, port), runtime=runtime)
     r.start()
     r.join()
 
 
-def _proc_worker(port: int, worker_id: int) -> None:
+def _proc_worker(runtime: str, port: int, worker_id: int) -> None:
     """Client-worker subprocess: registers callbacks and keeps running."""
-    _silence()
+    _silence(runtime)
     import time as _t
-    from daffi import Client, callback
+    from daffi import Client, callback, TCPTransport
 
     @callback
     def worker_echo(payload: bytes) -> bytes:
@@ -158,9 +179,9 @@ def _proc_worker(port: int, worker_id: int) -> None:
 
     client = Client(
         app_name=f"chaos-worker-{worker_id}",
-        host=HOST,
-        port=port,
         workers=4,
+        transport=TCPTransport(HOST, port),
+        runtime=runtime,
     )
     client.connect()
     try:
@@ -172,9 +193,9 @@ def _proc_worker(port: int, worker_id: int) -> None:
         client.stop()
 
 
-def _proc_service(port: int, service_id: int) -> None:
-    _silence()
-    from daffi import Service, callback
+def _proc_service(runtime: str, port: int, service_id: int) -> None:
+    _silence(runtime)
+    from daffi import Service, callback, TCPTransport
 
     @callback
     def svc_echo(payload: bytes) -> bytes:
@@ -186,9 +207,9 @@ def _proc_service(port: int, service_id: int) -> None:
 
     svc = Service(
         app_name=f"chaos-service-{service_id}",
-        host=HOST,
-        port=port,
         workers=4,
+        transport=TCPTransport(HOST, port),
+        runtime=runtime,
     )
     svc.start()
     svc.join()
@@ -196,10 +217,11 @@ def _proc_service(port: int, service_id: int) -> None:
 
 # ─── RPC action helpers (called from within caller threads) ───────────────────
 
+
 def _do_rpc(conn, rng: random.Random, worker_names: list[str]) -> None:
-    method   = rng.choice(("worker_echo", "worker_add", "worker_ping"))
+    method = rng.choice(("worker_echo", "worker_add", "worker_ping"))
     receiver = rng.choice(worker_names) if rng.random() < 0.5 else None
-    kwargs   = {"timeout": CALL_TIMEOUT}
+    kwargs = {"timeout": CALL_TIMEOUT}
     if receiver:
         kwargs["receiver"] = receiver
     proxy = conn.rpc(**kwargs)
@@ -224,10 +246,10 @@ def _do_rpc(conn, rng: random.Random, worker_names: list[str]) -> None:
 
 
 def _do_rpc_nowait(conn, rng: random.Random, worker_names: list[str]) -> None:
-    method   = rng.choice(("worker_echo", "worker_add", "worker_ping"))
+    method = rng.choice(("worker_echo", "worker_add", "worker_ping"))
     receiver = rng.choice(worker_names) if rng.random() < 0.5 else None
-    kwargs   = {"receiver": receiver} if receiver else {}
-    proxy    = conn.rpc_nowait(**kwargs)
+    kwargs = {"receiver": receiver} if receiver else {}
+    proxy = conn.rpc_nowait(**kwargs)
 
     if method == "worker_echo":
         proxy.worker_echo(bytes(rng.getrandbits(8) for _ in range(rng.randint(1, 50))))
@@ -239,7 +261,7 @@ def _do_rpc_nowait(conn, rng: random.Random, worker_names: list[str]) -> None:
 
 def _do_cast(conn, rng: random.Random, n_workers: int) -> None:
     method = rng.choice(("worker_echo", "worker_add", "worker_ping"))
-    proxy  = conn.cast(timeout=CALL_TIMEOUT)
+    proxy = conn.cast(timeout=CALL_TIMEOUT)
 
     if method == "worker_echo":
         payload = bytes(rng.getrandbits(8) for _ in range(rng.randint(10, 100)))
@@ -250,7 +272,9 @@ def _do_cast(conn, rng: random.Random, n_workers: int) -> None:
             )
         for name, val in results.items():
             if isinstance(val, Exception):
-                raise AssertionError(f"cast worker_echo from {name!r} raised: {val}") from val
+                raise AssertionError(
+                    f"cast worker_echo from {name!r} raised: {val}"
+                ) from val
             if val != payload:
                 raise AssertionError(
                     f"cast worker_echo from {name!r}: result mismatch "
@@ -265,7 +289,9 @@ def _do_cast(conn, rng: random.Random, n_workers: int) -> None:
             )
         for name, val in results.items():
             if isinstance(val, Exception):
-                raise AssertionError(f"cast worker_add from {name!r} raised: {val}") from val
+                raise AssertionError(
+                    f"cast worker_add from {name!r} raised: {val}"
+                ) from val
             if val != a + b:
                 raise AssertionError(
                     f"cast worker_add({a},{b}) from {name!r}: expected {a+b}, got {val!r}"
@@ -278,7 +304,9 @@ def _do_cast(conn, rng: random.Random, n_workers: int) -> None:
             )
         for name, val in results.items():
             if isinstance(val, Exception):
-                raise AssertionError(f"cast worker_ping from {name!r} raised: {val}") from val
+                raise AssertionError(
+                    f"cast worker_ping from {name!r} raised: {val}"
+                ) from val
             if val != "pong":
                 raise AssertionError(
                     f"cast worker_ping from {name!r}: expected 'pong', got {val!r}"
@@ -287,7 +315,7 @@ def _do_cast(conn, rng: random.Random, n_workers: int) -> None:
 
 def _do_cast_nowait(conn, rng: random.Random) -> None:
     method = rng.choice(("worker_echo", "worker_add", "worker_ping"))
-    proxy  = conn.cast_nowait()
+    proxy = conn.cast_nowait()
     if method == "worker_echo":
         proxy.worker_echo(bytes(rng.getrandbits(8) for _ in range(rng.randint(1, 50))))
     elif method == "worker_add":
@@ -298,29 +326,34 @@ def _do_cast_nowait(conn, rng: random.Random) -> None:
 
 # ─── caller thread loops ──────────────────────────────────────────────────────
 
-def _router_caller_loop(
-    caller_id:    int,
-    router_port:  int,
+
+def _router_caller_loop(runtime: str, 
+    caller_id: int,
+    router_port: int,
     worker_names: list[str],
 ) -> None:
     """Fire randomised RPCs to workers via the router until _stop is set."""
-    from daffi import Client
+    from daffi import Client, TCPTransport
     from daffi.exceptions import (
-        CallTimeout, Disconnected, Evicted, RemoteCallError, TransmissionFailure,
+        CallTimeout,
+        Disconnected,
+        Evicted,
+        RemoteCallError,
+        TransmissionFailure,
     )
 
     thread_name = f"RouterCaller-{caller_id}"
-    rng         = random.Random(caller_id)
-    call_count  = 0
-    attempt     = 0
+    rng = random.Random(caller_id)
+    call_count = 0
+    attempt = 0
 
     def _connect():
         nonlocal attempt
         attempt += 1
-        c    = Client(
+        c = Client(
             app_name=f"chaos-rcaller-{caller_id}-r{attempt}",
-            host=HOST,
-            port=router_port,
+            transport=TCPTransport(HOST, router_port),
+            runtime=runtime,
         )
         conn = c.connect()
         conn.wait_for_members(*worker_names, timeout=30)
@@ -328,6 +361,7 @@ def _router_caller_loop(
 
     def _bug(exc: Exception, ctx: str) -> None:
         import traceback
+
         _errors.put((thread_name, exc, ctx, traceback.format_exc()))
         _stop.set()
 
@@ -374,8 +408,13 @@ def _router_caller_loop(
             except AssertionError as e:
                 _bug(e, f"WRONG RESULT: {ctx}")
                 return
-            except (CallTimeout, TransmissionFailure, RemoteCallError,
-                    Disconnected, Evicted) as e:
+            except (
+                CallTimeout,
+                TransmissionFailure,
+                RemoteCallError,
+                Disconnected,
+                Evicted,
+            ) as e:
                 _bug(e, f"RPC ERROR: {ctx}")
                 return
             except Exception as e:
@@ -389,29 +428,33 @@ def _router_caller_loop(
             pass
 
 
-def _service_caller_loop(
-    caller_id:    int,
+def _service_caller_loop(runtime: str, 
+    caller_id: int,
     service_port: int,
     service_name: str,
 ) -> None:
     """Fire randomised rpc / rpc_nowait calls to a Service (direct, no router)."""
-    from daffi import Client
+    from daffi import Client, TCPTransport
     from daffi.exceptions import (
-        CallTimeout, Disconnected, Evicted, RemoteCallError, TransmissionFailure,
+        CallTimeout,
+        Disconnected,
+        Evicted,
+        RemoteCallError,
+        TransmissionFailure,
     )
 
     thread_name = f"ServiceCaller-{caller_id}"
-    rng         = random.Random(10_000 + caller_id)
-    call_count  = 0
-    attempt     = 0
+    rng = random.Random(10_000 + caller_id)
+    call_count = 0
+    attempt = 0
 
     def _connect():
         nonlocal attempt
         attempt += 1
-        c    = Client(
+        c = Client(
             app_name=f"chaos-scaller-{caller_id}-r{attempt}",
-            host=HOST,
-            port=service_port,
+            transport=TCPTransport(HOST, service_port),
+            runtime=runtime,
         )
         conn = c.connect()
         conn.wait_for_members(service_name, timeout=30)
@@ -419,6 +462,7 @@ def _service_caller_loop(
 
     def _bug(exc: Exception, ctx: str) -> None:
         import traceback
+
         _errors.put((thread_name, exc, ctx, traceback.format_exc()))
         _stop.set()
 
@@ -452,7 +496,9 @@ def _service_caller_loop(
                 if use_nowait:
                     proxy = conn.rpc_nowait(receiver=service_name)
                     if rng.random() < 0.5:
-                        proxy.svc_echo(bytes(rng.getrandbits(8) for _ in range(rng.randint(1, 50))))
+                        proxy.svc_echo(
+                            bytes(rng.getrandbits(8) for _ in range(rng.randint(1, 50)))
+                        )
                     else:
                         proxy.svc_double(rng.randint(0, 100))
                     with _counts_lock:
@@ -460,15 +506,17 @@ def _service_caller_loop(
                 else:
                     proxy = conn.rpc(timeout=CALL_TIMEOUT, receiver=service_name)
                     if rng.random() < 0.5:
-                        payload = bytes(rng.getrandbits(8) for _ in range(rng.randint(10, 200)))
-                        result  = proxy.svc_echo(payload)
+                        payload = bytes(
+                            rng.getrandbits(8) for _ in range(rng.randint(10, 200))
+                        )
+                        result = proxy.svc_echo(payload)
                         if result != payload:
                             raise AssertionError(
                                 f"svc_echo: result mismatch "
                                 f"(got {len(result)} bytes, expected {len(payload)} bytes)"
                             )
                     else:
-                        n      = rng.randint(0, 10_000)
+                        n = rng.randint(0, 10_000)
                         result = proxy.svc_double(n)
                         if result != n * 2:
                             raise AssertionError(
@@ -480,8 +528,13 @@ def _service_caller_loop(
             except AssertionError as e:
                 _bug(e, f"WRONG RESULT: {ctx}")
                 return
-            except (CallTimeout, TransmissionFailure, RemoteCallError,
-                    Disconnected, Evicted) as e:
+            except (
+                CallTimeout,
+                TransmissionFailure,
+                RemoteCallError,
+                Disconnected,
+                Evicted,
+            ) as e:
                 _bug(e, f"RPC ERROR: {ctx}")
                 return
             except Exception as e:
@@ -497,14 +550,15 @@ def _service_caller_loop(
 
 # ─── stats thread ─────────────────────────────────────────────────────────────
 
+
 def _stats_loop(start: float) -> None:
     while not _stop.wait(REPORT_INTERVAL):
-        elapsed   = time.monotonic() - start
+        elapsed = time.monotonic() - start
         remaining = max(0.0, DURATION - elapsed)
         with _counts_lock:
             c = dict(_counts)
         total = sum(c.values())
-        rate  = total / max(elapsed, 1)
+        rate = total / max(elapsed, 1)
         print(
             f"  [{elapsed:6.0f}s / {DURATION}s]  "
             f"calls={total:,}  {rate:.0f}/s  "
@@ -517,10 +571,11 @@ def _stats_loop(start: float) -> None:
 
 # ─── main run ─────────────────────────────────────────────────────────────────
 
+
 def _run() -> None:
-    router_port   = _free_port()
+    router_port = _free_port()
     service_ports = [_free_port() for _ in range(N_SERVICES)]
-    worker_names  = [f"chaos-worker-{i}" for i in range(N_WORKERS)]
+    worker_names = [f"chaos-worker-{i}" for i in range(N_WORKERS)]
     service_names = [f"chaos-service-{i}" for i in range(N_SERVICES)]
 
     print(f"\ndaffi — chaos test")
@@ -528,19 +583,23 @@ def _run() -> None:
     print(f"  router port  : {router_port}")
     print(f"  workers      : {N_WORKERS}  ({', '.join(worker_names)})")
     print(f"  services     : {N_SERVICES}  ({', '.join(service_names)})")
-    print(f"  router-callers: {N_ROUTER_CALLERS}  "
-          f"service-callers: {N_SERVICE_CALLERS}")
-    print(f"  call timeout : {CALL_TIMEOUT}s  "
-          f"reconnect every: {RECONNECT_EVERY} calls")
+    print(
+        f"  router-callers: {N_ROUTER_CALLERS}  "
+        f"service-callers: {N_SERVICE_CALLERS}"
+    )
+    print(
+        f"  call timeout : {CALL_TIMEOUT}s  "
+        f"reconnect every: {RECONNECT_EVERY} calls"
+    )
     print()
 
-    procs:   list[mp.Process]    = []
+    procs: list[mp.Process] = []
     threads: list[threading.Thread] = []
-    start    = time.monotonic()
+    start = time.monotonic()
 
     try:
         # ── router ────────────────────────────────────────────────────────────
-        rproc = mp.Process(target=_proc_router, args=(router_port,), daemon=True)
+        rproc = mp.Process(target=_proc_router, args=(active_runtime(), router_port,), daemon=True)
         rproc.start()
         procs.append(rproc)
         _wait_for_port(router_port)
@@ -548,7 +607,7 @@ def _run() -> None:
 
         # ── workers ───────────────────────────────────────────────────────────
         for i in range(N_WORKERS):
-            p = mp.Process(target=_proc_worker, args=(router_port, i), daemon=True)
+            p = mp.Process(target=_proc_worker, args=(active_runtime(), router_port, i), daemon=True)
             p.start()
             procs.append(p)
 
@@ -558,7 +617,9 @@ def _run() -> None:
 
         # ── services ──────────────────────────────────────────────────────────
         for i in range(N_SERVICES):
-            p = mp.Process(target=_proc_service, args=(service_ports[i], i), daemon=True)
+            p = mp.Process(
+                target=_proc_service, args=(active_runtime(), service_ports[i], i), daemon=True
+            )
             p.start()
             procs.append(p)
             _wait_for_port(service_ports[i])
@@ -568,7 +629,7 @@ def _run() -> None:
         for i in range(N_ROUTER_CALLERS):
             t = threading.Thread(
                 target=_router_caller_loop,
-                args=(i, router_port, worker_names),
+                args=(active_runtime(), i, router_port, worker_names),
                 name=f"RouterCaller-{i}",
                 daemon=True,
             )
@@ -579,7 +640,7 @@ def _run() -> None:
             svc_idx = i % N_SERVICES
             t = threading.Thread(
                 target=_service_caller_loop,
-                args=(i, service_ports[svc_idx], service_names[svc_idx]),
+                args=(active_runtime(), i, service_ports[svc_idx], service_names[svc_idx]),
                 name=f"ServiceCaller-{i}",
                 daemon=True,
             )
@@ -644,7 +705,7 @@ def _run() -> None:
 def main() -> None:
     logging.disable(logging.CRITICAL)
     # Suppress Zig native teardown noise on stderr for the duration of the run.
-    devnull      = os.open(os.devnull, os.O_WRONLY)
+    devnull = os.open(os.devnull, os.O_WRONLY)
     saved_stderr = os.dup(2)
     os.dup2(devnull, 2)
     os.close(devnull)
@@ -661,22 +722,31 @@ if __name__ == "__main__":
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(
-        "--duration", type=int, default=DURATION,
+        "--duration",
+        type=int,
+        default=DURATION,
         help="How long to run (seconds)",
     )
     parser.add_argument(
-        "--short", action="store_true",
+        "--short",
+        action="store_true",
         help="Quick 60-second smoke test (overrides --duration)",
     )
-    parser.add_argument("--workers",  type=int, default=N_WORKERS,  help="Worker subprocesses")
-    parser.add_argument("--services", type=int, default=N_SERVICES, help="Service subprocesses")
-    parser.add_argument("--callers",  type=int, default=N_ROUTER_CALLERS, help="Router caller threads")
+    parser.add_argument(
+        "--workers", type=int, default=N_WORKERS, help="Worker subprocesses"
+    )
+    parser.add_argument(
+        "--services", type=int, default=N_SERVICES, help="Service subprocesses"
+    )
+    parser.add_argument(
+        "--callers", type=int, default=N_ROUTER_CALLERS, help="Router caller threads"
+    )
     args = parser.parse_args()
 
-    DURATION          = 60 if args.short else args.duration
-    N_WORKERS         = args.workers
-    N_SERVICES        = args.services
-    N_ROUTER_CALLERS  = args.callers
+    DURATION = 60 if args.short else args.duration
+    N_WORKERS = args.workers
+    N_SERVICES = args.services
+    N_ROUTER_CALLERS = args.callers
 
     mp.set_start_method("spawn", force=True)
     try:

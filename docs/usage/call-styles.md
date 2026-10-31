@@ -154,10 +154,10 @@ conn.stream_nowait(serde=SerdeFormat.OPAQUE).receive_chunk(data_source())
 
 ```python
 # examples/router/02_cast/3_caller.py
-from daffi import Client
+from daffi import Client, TCPTransport
 
 if __name__ == "__main__":
-    caller = Client(app_name="cast-caller", host="127.0.0.1", port=6002)
+    caller = Client(app_name="cast-caller", transport=TCPTransport("127.0.0.1", 6002))
     conn = caller.connect()
 
     # Blocking broadcast — returns when all workers reply.

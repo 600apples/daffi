@@ -7,12 +7,16 @@ conn.rpc(receiver=…) pins the call to a specific worker.
 
 Run 1_router.py and 2_worker.py first.
 """
+
 import asyncio
 from daffi.aio import AsyncClient
+from daffi import TCPTransport
 
 
 async def main():
-    caller = AsyncClient(app_name="calc-caller", host="0.0.0.0", port=6001)
+    caller = AsyncClient(
+        app_name="calc-caller", transport=TCPTransport("0.0.0.0", 6001)
+    )
     conn = await caller.connect()
 
     result = await conn.rpc(timeout=5).multiply(6, 7)

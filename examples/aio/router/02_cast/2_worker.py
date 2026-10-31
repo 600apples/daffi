@@ -9,9 +9,10 @@ Run this script in 3 separate terminals:
 
 Start 1_router.py first, then the workers, then 3_caller.py.
 """
+
 import asyncio
 import random
-from daffi import callback
+from daffi import callback, TCPTransport
 from daffi.aio import AsyncClient
 
 TAG = random.choice(["🔵", "🟢", "🟡", "🔴", "🟣", "🟠"])
@@ -24,7 +25,7 @@ async def process(item: str) -> str:
 
 
 async def main():
-    worker = AsyncClient(host="0.0.0.0", port=6002)
+    worker = AsyncClient(transport=TCPTransport("0.0.0.0", 6002))
     await worker.connect()
     print(f"{TAG}  worker connected — press Ctrl+C to stop.")
     await worker.join()

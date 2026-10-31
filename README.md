@@ -36,11 +36,13 @@ throughput up to **~1.2 GiB/s** for large binary payloads.
 pip install daffi
 ```
 
+Requires Python 3.10 or newer.
+
 ## Quick start — direct layout (Client → Service)
 
 `service.py`:
 ```python
-from daffi import Service, callback
+from daffi import Service, callback, TCPTransport
 
 @callback
 def add(a: float, b: float) -> float:
@@ -50,16 +52,16 @@ def add(a: float, b: float) -> float:
 def greet(name: str) -> str:
     return f"Hello, {name}!"
 
-svc = Service(app_name="my-service", host="127.0.0.1", port=5000)
+svc = Service(app_name="my-service", transport=TCPTransport("127.0.0.1", 5000))
 svc.start()
 svc.join()          # block until svc.stop() is called
 ```
 
 `client.py`:
 ```python
-from daffi import Client
+from daffi import Client, TCPTransport
 
-client = Client(app_name="my-client", host="127.0.0.1", port=5000)
+client = Client(app_name="my-client", transport=TCPTransport("127.0.0.1", 5000))
 conn = client.connect()
 
 result = conn.rpc(timeout=5).add(1, 2)     # → 3.0
@@ -79,31 +81,31 @@ load-balanced / broadcast calls.
 
 `router.py`:
 ```python
-from daffi import Router
+from daffi import Router, TCPTransport
 
-router = Router(host="127.0.0.1", port=6000)
+router = Router(transport=TCPTransport("127.0.0.1", 6000))
 router.start()
 router.join()
 ```
 
 `worker.py`:
 ```python
-from daffi import Client, callback
+from daffi import Client, callback, TCPTransport
 
 @callback
 def process(task: str) -> str:
     return f"done: {task}"
 
-client = Client(app_name="worker-1", host="127.0.0.1", port=6000)
+client = Client(app_name="worker-1", transport=TCPTransport("127.0.0.1", 6000))
 client.connect()
 client.join()   # block until Ctrl+C / SIGTERM
 ```
 
 `caller.py`:
 ```python
-from daffi import Client
+from daffi import Client, TCPTransport
 
-client = Client(app_name="caller", host="127.0.0.1", port=6000)
+client = Client(app_name="caller", transport=TCPTransport("127.0.0.1", 6000))
 conn = client.connect()
 
 # RPC — routed to one worker (round-robin)
@@ -195,10 +197,10 @@ Pass `serde=SerdeFormat.X` to any call method.
 
 | Format | Import | Notes                                                                    |
 |---|---|--------------------------------------------------------------------------|
-| `PICKLE` | `from daffi import SerdeFormat` | Default. Any Python object.                                              |
+| `MSGPACK` | `from daffi import SerdeFormat` | Default. Compact binary; language-agnostic.                              |
 | `JSON` | same | Human-readable; requires JSON-serialisable values.                       |
 | `OPAQUE` | same | Raw `bytes` or `string` — zero-copy, fastest for binary and string data. |
-| `MSGPACK` | same | Compact binary; requires `pip install daffi[msgpack]`.                   |
+| `PICKLE` | same | Any Python object. Pass `serde=SerdeFormat.PICKLE` on the call.          |
 
 ```python
 from daffi import Client, SerdeFormat
@@ -238,7 +240,7 @@ run in parallel:
 
 ```python
 import time
-from daffi import Service, callback
+from daffi import Service, callback, TCPTransport
 
 @callback
 def slow_task(n: int) -> int:
@@ -246,10 +248,10 @@ def slow_task(n: int) -> int:
     return n * n
 
 # workers=1 (default) — three concurrent callers would each wait ~1 s
-svc = Service(host="127.0.0.1", port=5000, workers=1)
+svc = Service( workers=1,transport=TCPTransport("127.0.0.1", 5000))
 
 # workers=4 — three concurrent callers all finish in ~1 s
-svc = Service(host="127.0.0.1", port=5000, workers=4)
+svc = Service( workers=4,transport=TCPTransport("127.0.0.1", 5000))
 
 svc.start()
 svc.join()
@@ -258,7 +260,7 @@ svc.join()
 The same parameter works on a `Client` acting as a worker in the Router topology:
 
 ```python
-from daffi import Client, callback
+from daffi import Client, callback, TCPTransport
 
 @callback
 def process(task: str) -> str:
@@ -266,7 +268,7 @@ def process(task: str) -> str:
     return f"done: {task}"
 
 # This single Client instance can now handle up to 8 concurrent incoming calls
-client = Client(app_name="worker-1", host="127.0.0.1", port=6000, workers=8)
+client = Client(app_name="worker-1", workers=8, transport=TCPTransport("127.0.0.1", 6000))
 client.connect()
 client.join()
 ```
@@ -281,18 +283,86 @@ client.join()
 
 ---
 
+## Native runtime (`threads` vs `evented`)
+
+The native core can serve connections in two ways, chosen per process with
+the `runtime` argument:
+
+- `threads` (default): one OS thread per connection.
+- `evented`: all connections are multiplexed over a few event-loop threads
+  (kqueue on macOS, epoll on Linux).
+
+The same split — blocking **threaded** I/O vs multiplexed **evented** I/O —
+is described in Zig’s own documentation as `Io.Threaded` and `Io.Evented`;
+see [I/O as an Interface](https://ziglang.org/download/0.16.0/release-notes.html#IO-as-an-Interface)
+in the [Zig 0.16.0 release notes](https://ziglang.org/download/0.16.0/release-notes.html).
+(daffi’s native core follows that idea with its own epoll/kqueue loops; it does
+not use `std.Io.Evented` yet.)
+
+```python
+from daffi import Runtime, Router, TCPTransport
+
+# threads is the default; pass runtime= only to force evented
+router = Router(
+    transport=TCPTransport("127.0.0.1", 6000),
+    runtime=Runtime.EVENTED,
+)
+```
+
+Omit `runtime` and that node selects `threads`. One process cannot mix the
+two models: a later constructor that disagrees raises `InitializationError`.
+
+`DAFFI_EVENT_LOOPS` sets the number of loop threads (default: one per CPU,
+capped at 64). Nothing else in your code changes. This is independent of
+`daffi.aio`, which is the Python asyncio API and works with both models.
+
+Measured with daffi's benchmark suite (release build, localhost):
+
+| | threads | evented |
+|---|---|---|
+| Sequential calls/s, Client → Service | 12,097 | 12,148 |
+| 200 concurrent clients → Service, calls/s | 14,559 | 15,272 |
+| Native threads with 64 clients connected | 67 | 7 |
+
+`threads` is faster for one caller and for many clients calling one Service
+together. With `threads` the Service uses about one native thread per client
+(2003 threads for 2000 clients). With `evented` the Service stays at a handful
+(7 in that run).
+
+> **`threads` (default) fits when:**
+> - You want the faster path, for one caller or for many clients at once.
+> - Peers that may be **slow to read** large messages or streams. In the evented
+>   model a stalled peer can briefly hold up other connections on the same loop.
+> - Mostly **WebSocket (browser)** clients. They keep a thread each in both
+>   models.
+>
+> **Prefer `evented` when:**
+> - A Router or Service holds **many connections** and one thread per connection
+>   does not fit, for example a container with a low thread limit.
+> - Most connections are idle, such as workers waiting for tasks.
+
+Compare both on your machine with `python tests/perf/runtime_benchmark.py`.
+The `concurrent` rows are the many-clients → one Service case.
+
+See the [runtime guide](https://600apples.github.io/daffi/usage/runtime/)
+for details and full measurements, and the Zig docs linked above for the
+`Io.Threaded` / `Io.Evented` background.
+
+---
+
 ## Event handlers
 
 Receive `connected` / `disconnected` notifications for nodes joining or
 leaving the network.
 
 ```python
+from daffi import Service, TCPTransport
 def on_event(event: dict):
     # event["type"]   → "connected" or "disconnected"
     # event["member"] → app_name of the node that changed state
     print(f"[{event['type']}] {event['member']}")
 
-svc = Service(host="127.0.0.1", port=5000)
+svc = Service(transport=TCPTransport("127.0.0.1", 5000))
 svc.add_event_handler(on_event)
 svc.start()
 ```
@@ -303,14 +373,14 @@ Both `Service` and `Client` support `add_event_handler`.
 
 ## Unix sockets
 
-Use `unix_sock_path` instead of `host`/`port` for inter-process communication
-on the same machine.
+Use a `UnixTransport` for inter-process communication on the same machine.
 
 ```python
-svc = Service(unix_sock_path="/tmp/daffi.sock")
+from daffi import Service, Client, UnixTransport
+svc = Service(transport=UnixTransport("/tmp/daffi.sock"))
 svc.start()
 
-client = Client(unix_sock_path="/tmp/daffi.sock")
+client = Client(transport=UnixTransport("/tmp/daffi.sock"))
 conn = client.connect()
 ```
 
@@ -319,21 +389,29 @@ conn = client.connect()
 ## TLS
 
 ```python
-# Server (Router or Service)
+from daffi import Router, Client, TCPTransport
+# Server (Router or Service) — TLS is configured on the transport.
+# cert/key/ca accept a filesystem path or PEM material.
 router = Router(
-    host="127.0.0.1", port=6000,
-    tls=True,
-    cert_file="/path/to/server.crt",
-    key_file="/path/to/server.key",
+    transport=TCPTransport(
+        "127.0.0.1",
+        6000,
+        tls=True,
+        cert="/path/to/server.crt",
+        key="/path/to/server.key",
+    ),
 )
 router.start()
 
-# Client — supply ca_file to verify the server certificate,
+# Client — supply ca to verify the server certificate,
 # or leave it empty to skip verification
 client = Client(
-    host="127.0.0.1", port=6000,
-    tls=True,
-    ca_file="/path/to/ca.crt",
+    transport=TCPTransport(
+        "127.0.0.1",
+        6000,
+        tls=True,
+        ca="/path/to/ca.crt",
+    ),
 )
 conn = client.connect()
 ```

@@ -4,7 +4,9 @@ Async integration tests for duplicate app_name handling.
 Mirrors tests/integration/test_duplicate_name.py using daffi.aio.
 Last-connection-wins: a new peer with the same name evicts the existing one.
 """
+
 from __future__ import annotations
+from tests.conftest import active_runtime
 
 import asyncio
 import multiprocessing as mp
@@ -21,42 +23,46 @@ from .conftest import (
 )
 
 
-def _router_only(port: int, name: str = "dup-aio-router") -> None:
-    silence_subprocess()
+def _router_only(runtime: str, port: int, name: str = "dup-aio-router") -> None:
+    silence_subprocess(runtime)
 
     async def _main():
         from daffi.aio import AsyncRouter
-        r = AsyncRouter(app_name=name, host=HOST, port=port)
+        from daffi import TCPTransport
+
+        r = AsyncRouter(app_name=name, transport=TCPTransport(HOST, port), runtime=runtime)
         await r.start()
         await r.join()
 
     asyncio.run(_main())
 
 
-def _service_only(port: int, name: str = "dup-aio-service") -> None:
-    silence_subprocess()
+def _service_only(runtime: str, port: int, name: str = "dup-aio-service") -> None:
+    silence_subprocess(runtime)
 
     async def _main():
         from daffi.aio import AsyncService
-        s = AsyncService(app_name=name, host=HOST, port=port, workers=2)
+        from daffi import TCPTransport
+
+        s = AsyncService(app_name=name, workers=2, transport=TCPTransport(HOST, port), runtime=runtime)
         await s.start()
         await s.join()
 
     asyncio.run(_main())
 
 
-def _client_only(port: int, name: str) -> None:
-    silence_subprocess()
+def _client_only(runtime: str, port: int, name: str) -> None:
+    silence_subprocess(runtime)
 
     async def _main():
-        from daffi import callback
+        from daffi import callback, TCPTransport
         from daffi.aio import AsyncClient
 
         @callback
         async def ping():
             return "pong"
 
-        client = AsyncClient(app_name=name, host=HOST, port=port)
+        client = AsyncClient(app_name=name, transport=TCPTransport(HOST, port), runtime=runtime)
         await client.connect()
         await client.join()
 
@@ -65,7 +71,7 @@ def _client_only(port: int, name: str) -> None:
 
 @pytest.fixture
 def router_fixture(free_port):
-    proc = mp.Process(target=_router_only, args=(free_port,), daemon=True)
+    proc = mp.Process(target=_router_only, args=(active_runtime(), free_port,), daemon=True)
     proc.start()
     wait_for_port(free_port)
     yield free_port
@@ -74,7 +80,7 @@ def router_fixture(free_port):
 
 @pytest.fixture
 def service_fixture(free_port):
-    proc = mp.Process(target=_service_only, args=(free_port,), daemon=True)
+    proc = mp.Process(target=_service_only, args=(active_runtime(), free_port,), daemon=True)
     proc.start()
     wait_for_port(free_port)
     time.sleep(0.15)
@@ -88,11 +94,18 @@ class TestDuplicateNameRouterAsync:
     async def test_second_connect_same_name_succeeds(self, router_fixture):
         """Two AsyncClients with the same app_name both connect (eviction)."""
         from daffi.aio import AsyncClient
+        from daffi import TCPTransport
 
-        client1 = AsyncClient(app_name="dup-aio-client", host=HOST, port=router_fixture)
+        client1 = AsyncClient(
+            app_name="dup-aio-client", transport=TCPTransport(HOST, router_fixture),
+            runtime=active_runtime(),
+        )
         await client1.connect()
 
-        client2 = AsyncClient(app_name="dup-aio-client", host=HOST, port=router_fixture)
+        client2 = AsyncClient(
+            app_name="dup-aio-client", transport=TCPTransport(HOST, router_fixture),
+            runtime=active_runtime(),
+        )
         conn2 = await client2.connect()
 
         try:
@@ -107,14 +120,21 @@ class TestDuplicateNameRouterAsync:
     async def test_reconnect_after_stop_succeeds(self, router_fixture):
         """AsyncClient can reconnect after explicit stop()."""
         from daffi.aio import AsyncClient
+        from daffi import TCPTransport
 
         name = "dup-aio-reconnect"
-        client1 = AsyncClient(app_name=name, host=HOST, port=router_fixture)
+        client1 = AsyncClient(
+            app_name=name, transport=TCPTransport(HOST, router_fixture),
+            runtime=active_runtime(),
+        )
         await client1.connect()
         await client1.stop()
         await asyncio.sleep(0.1)
 
-        client2 = AsyncClient(app_name=name, host=HOST, port=router_fixture)
+        client2 = AsyncClient(
+            app_name=name, transport=TCPTransport(HOST, router_fixture),
+            runtime=active_runtime(),
+        )
         await client2.connect()
         try:
             assert client2._conn_num is not None
@@ -127,11 +147,18 @@ class TestDuplicateNameServiceAsync:
 
     async def test_second_connect_same_name_succeeds(self, service_fixture):
         from daffi.aio import AsyncClient
+        from daffi import TCPTransport
 
-        client1 = AsyncClient(app_name="dup-aio-svc-c", host=HOST, port=service_fixture)
+        client1 = AsyncClient(
+            app_name="dup-aio-svc-c", transport=TCPTransport(HOST, service_fixture),
+            runtime=active_runtime(),
+        )
         await client1.connect()
 
-        client2 = AsyncClient(app_name="dup-aio-svc-c", host=HOST, port=service_fixture)
+        client2 = AsyncClient(
+            app_name="dup-aio-svc-c", transport=TCPTransport(HOST, service_fixture),
+            runtime=active_runtime(),
+        )
         await client2.connect()
 
         try:

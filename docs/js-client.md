@@ -24,11 +24,8 @@ The Python side sees the browser as a regular daffi Client — no special config
 `app.wasm` is fetched automatically from the same CDN release — **you do not need to host or specify it yourself.**
 
 ```html
-<!-- daffi.js client library (pinned to release 2.0.0) -->
+<!-- daffi.js client library (pinned to release 2.0.0). MessagePack is built in. -->
 <script src="https://cdn.jsdelivr.net/gh/600apples/daffi@2.0.0/js-client/daffi.js"></script>
-
-<!-- Optional: msgpack-lite (only needed for serde: "msgpack") -->
-<script src="https://unpkg.com/msgpack-lite/dist/msgpack.min.js"></script>
 ```
 
 ---
@@ -51,6 +48,7 @@ const client = new DaffiClient(options);
 | `options.wsUrl` | `string` | **required** | WebSocket URL of the Python backend. No default — must always be provided explicitly (e.g. `"ws://127.0.0.1:5000"`). |
 | `options.autoreconnect` | `boolean` | `false` | Reconnect automatically when the server drops the link. |
 | `options.reconnectDelay` | `number` (ms) | `2000` | Base delay before the first retry. Doubles after each failure, capped at 60 s. |
+| `options.authToken` | `string` | `""` | Token of a server started with `auth_token=`. Requires an explicit `name`. Anyone who can read the page can read it. |
 
 !!! note
     `app.wasm` is loaded automatically from the CDN release that matches the `daffi.js` version — there is no `wasmPath` option.
@@ -100,7 +98,7 @@ const result = await conn.rpc({ timeout: 5000 }).add(3, 4);
 |---|---|---|--------------------------------------|
 | `receiver` | `string` | `""` | Pin to a specific worker name.       |
 | `timeout` | `number` (ms) | `null` | Reject if no reply within this time. |
-| `serde` | `"json"` \| `"msgpack"` \| `"raw"` | `"json"` | Serialisation format.                |
+| `serde` | `"json"` \| `"msgpack"` \| `"raw"` | `"msgpack"` | Serialisation format.                |
 
 ### `conn.rpc_nowait(options)` — one target, fire-and-forget
 
@@ -124,7 +122,7 @@ const results = await conn.cast({ timeout: 5000 }).ping();
 |---|---|---|-----------------------------------------------|
 | `receiver` | `string \| string[]` | `null` | Restrict to these worker names. `null` = all. |
 | `timeout` | `number` (ms) | `null` | Per-peer timeout.                             |
-| `serde` | `string` | `"json"` | Serialisation format.                         |
+| `serde` | `string` | `"msgpack"` | Serialisation format.                         |
 
 ### `conn.cast_nowait(options)` — all workers, fire-and-forget
 
@@ -191,9 +189,9 @@ await conn.waitForMembers(['worker-A', 'worker-B'], { timeout: 30000 });
 
 | `serde` value | Description |
 |---|---|
-| `"json"` \| `1` | JSON (default). Works with any JS-serialisable value. |
+| `"msgpack"` \| `3` | MessagePack (default). Built into `daffi.js`. |
+| `"json"` \| `1` | JSON. Works with any JS-serialisable value. |
 | `"raw"` \| `0` | OPAQUE. Pass a `Uint8Array` or string; receive raw bytes. |
-| `"msgpack"` \| `3` | Binary MessagePack. Requires `msgpack-lite` loaded before `daffi.js`. |
 
 !!! note
     PICKLE (`2`) is Python-only and is not supported in the JS client.
@@ -232,10 +230,9 @@ auto-reconnect loop.
 
 ## Securing the connection
 
-Authentication and confidentiality are delegated to TLS — there is no
-application-level password. Run the Python backend with `tls=True`
-(plus `cert_file` / `key_file`) and connect from the browser using a
-`wss://` URL:
+Confidentiality is delegated to TLS. Run the Python backend with a TLS
+`TCPTransport` (`tls=True` plus `cert` / `key`) and connect from the
+browser using a `wss://` URL:
 
 ```javascript
 const client = new DaffiClient("my-app", { wsUrl: "wss://example.com:5000" });
@@ -244,6 +241,21 @@ const conn   = await client.connect();
 
 The browser will refuse the upgrade unless the server presents a
 certificate that chains to a CA the browser already trusts.
+
+Any web page the user opens can try to connect to a WebSocket on their
+machine. Limit which pages may connect by setting
+`websocket_allowed_origins` on the listening transport after construction;
+an upgrade from another `Origin`, or without one, is refused with 403.
+Native daffi clients don't use WebSocket and are not affected:
+
+```python
+transport = TCPTransport("0.0.0.0", 5000)
+transport.websocket_allowed_origins = ["https://app.example.com"]
+```
+
+A server started with `auth_token=` also needs the token from the page
+(`authToken` option). It only keeps out clients that don't have it: anyone
+who can load the page can read it.
 
 ---
 

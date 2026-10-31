@@ -3,46 +3,59 @@ Async integration tests for services with many @callback functions.
 
 Mirrors tests/integration/test_many_callbacks.py using daffi.aio.
 """
+
 from __future__ import annotations
+from tests.conftest import active_runtime
 
 import asyncio
 import multiprocessing as mp
 
 import pytest
 
-from .conftest import HOST, TIMEOUT, wait_for_port, wait_for_members, silence_subprocess, quiet_kill
+from .conftest import (
+    HOST,
+    TIMEOUT,
+    wait_for_port,
+    wait_for_members,
+    silence_subprocess,
+    quiet_kill,
+)
 
 N_CALLBACKS = 10
 
 
-def _proc_service_many(port: int) -> None:
-    silence_subprocess()
+def _proc_service_many(runtime: str, port: int) -> None:
+    silence_subprocess(runtime)
 
     async def _main():
-        from daffi import callback
+        from daffi import callback, TCPTransport
         from daffi.aio import AsyncService
 
         def _make_cb(idx: int):
             async def fn():
                 return idx
-            fn.__name__     = f"cb_{idx}"
+
+            fn.__name__ = f"cb_{idx}"
             fn.__qualname__ = f"cb_{idx}"
             return fn
 
         registered = [callback(_make_cb(i)) for i in range(N_CALLBACKS)]  # noqa: F841
 
-        svc = AsyncService(app_name="many-cb-aio-svc", host=HOST, port=port)
+        svc = AsyncService(
+            app_name="many-cb-aio-svc", transport=TCPTransport(HOST, port),
+            runtime=runtime,
+        )
         await svc.start()
         await svc.join()
 
     asyncio.run(_main())
 
 
-def _proc_service_args(port: int) -> None:
-    silence_subprocess()
+def _proc_service_args(runtime: str, port: int) -> None:
+    silence_subprocess(runtime)
 
     async def _main():
-        from daffi import callback
+        from daffi import callback, TCPTransport
         from daffi.aio import AsyncService
 
         @callback
@@ -53,7 +66,10 @@ def _proc_service_args(port: int) -> None:
         async def multiply(a: int, b: int) -> int:
             return a * b
 
-        svc = AsyncService(app_name="many-args-aio-svc", host=HOST, port=port)
+        svc = AsyncService(
+            app_name="many-args-aio-svc", transport=TCPTransport(HOST, port),
+            runtime=runtime,
+        )
         await svc.start()
         await svc.join()
 
@@ -62,7 +78,7 @@ def _proc_service_args(port: int) -> None:
 
 @pytest.fixture
 def many_cb_svc(free_port):
-    proc = mp.Process(target=_proc_service_many, args=(free_port,), daemon=True)
+    proc = mp.Process(target=_proc_service_many, args=(active_runtime(), free_port,), daemon=True)
     proc.start()
     wait_for_port(free_port)
     wait_for_members(free_port, {"many-cb-aio-svc"})
@@ -72,7 +88,7 @@ def many_cb_svc(free_port):
 
 @pytest.fixture
 def args_svc(free_port):
-    proc = mp.Process(target=_proc_service_args, args=(free_port,), daemon=True)
+    proc = mp.Process(target=_proc_service_args, args=(active_runtime(), free_port,), daemon=True)
     proc.start()
     wait_for_port(free_port)
     wait_for_members(free_port, {"many-args-aio-svc"})
@@ -85,8 +101,12 @@ class TestManyCallbacksAsync:
 
     async def test_all_callbacks_callable(self, many_cb_svc):
         from daffi.aio import AsyncClient
+        from daffi import TCPTransport
 
-        client = AsyncClient(app_name="mcb-caller", host=HOST, port=many_cb_svc)
+        client = AsyncClient(
+            app_name="mcb-caller", transport=TCPTransport(HOST, many_cb_svc),
+            runtime=active_runtime(),
+        )
         conn = await client.connect()
         proxy = conn.rpc(timeout=TIMEOUT)
         try:
@@ -98,24 +118,32 @@ class TestManyCallbacksAsync:
 
     async def test_concurrent_calls_to_all_callbacks(self, many_cb_svc):
         from daffi.aio import AsyncClient
+        from daffi import TCPTransport
 
-        client = AsyncClient(app_name="mcb-concurrent", host=HOST, port=many_cb_svc)
+        client = AsyncClient(
+            app_name="mcb-concurrent", transport=TCPTransport(HOST, many_cb_svc),
+            runtime=active_runtime(),
+        )
         conn = await client.connect()
         proxy = conn.rpc(timeout=TIMEOUT)
         try:
             # Sharing one proxy across concurrent coroutines is safe: __getattr__
             # returns an immutable _AsyncBoundRpc per call, never mutating proxy.
-            results = await asyncio.gather(*[
-                getattr(proxy, f"cb_{i}")() for i in range(N_CALLBACKS)
-            ])
+            results = await asyncio.gather(
+                *[getattr(proxy, f"cb_{i}")() for i in range(N_CALLBACKS)]
+            )
             assert list(results) == list(range(N_CALLBACKS))
         finally:
             await client.stop()
 
     async def test_echo_and_multiply(self, args_svc):
         from daffi.aio import AsyncClient
+        from daffi import TCPTransport
 
-        client = AsyncClient(app_name="mcb-args", host=HOST, port=args_svc)
+        client = AsyncClient(
+            app_name="mcb-args", transport=TCPTransport(HOST, args_svc),
+            runtime=active_runtime(),
+        )
         conn = await client.connect()
         proxy = conn.rpc(timeout=TIMEOUT)
         try:
@@ -126,15 +154,19 @@ class TestManyCallbacksAsync:
 
     async def test_mixed_concurrent(self, args_svc):
         from daffi.aio import AsyncClient
+        from daffi import TCPTransport
 
-        client = AsyncClient(app_name="mcb-mixed", host=HOST, port=args_svc)
+        client = AsyncClient(
+            app_name="mcb-mixed", transport=TCPTransport(HOST, args_svc),
+            runtime=active_runtime(),
+        )
         conn = await client.connect()
         proxy = conn.rpc(timeout=TIMEOUT)
         try:
             # One shared proxy, two different function names, gathered concurrently.
             # Safe because __getattr__ returns a new _AsyncBoundRpc each time.
             echo_coros = [proxy.echo(f"msg-{i}") for i in range(10)]
-            mul_coros  = [proxy.multiply(i, 2) for i in range(10)]
+            mul_coros = [proxy.multiply(i, 2) for i in range(10)]
             results = await asyncio.gather(*echo_coros, *mul_coros)
             for i, r in enumerate(results[:10]):
                 assert r == f"msg-{i}"

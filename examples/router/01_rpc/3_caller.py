@@ -7,15 +7,17 @@ pins the call to a specific worker.
 
 Run 1_router.py and 2_worker.py first.
 """
-from daffi import Client
+
+from daffi import Client, TCPTransport
 import time
 
 if __name__ == "__main__":
-    caller = Client(app_name="calc-caller", host="192.168.1.101", port=6001)
+    caller = Client(
+        app_name="calc-caller", transport=TCPTransport("192.168.1.101", 6001)
+    )
     conn = caller.connect()
 
     rpc = conn.rpc(timeout=100)
-
 
     result = rpc.multiply(6, 7)
     print(f"multiply(6, 7) = {result}")
@@ -27,6 +29,3 @@ if __name__ == "__main__":
 
         result = rpc_pinned.multiply(3, 3)
         print(f"multiply(3, 3) [pinned to calc-worker] = {result}")
-
-    caller.stop()
-    print("Done.")

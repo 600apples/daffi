@@ -2,6 +2,8 @@
 Global executor registry — maps callback names to :class:`Executor` wrappers.
 """
 
+import inspect
+import threading
 from typing import Callable, Any, Optional, Dict, List
 
 from daffi.exceptions import InitializationError
@@ -16,6 +18,7 @@ class Executor:
         self.func = func
         self.name = name
         self.cls = cls
+        self.is_coroutine = inspect.iscoroutinefunction(func)
 
     def __str__(self):
         if self.cls:
@@ -32,8 +35,7 @@ class Executor:
     __repr__ = __str__
 
     def __call__(self, *args, **kwargs):
-        if self.cls:
-            return getattr(self.cls, self.name)(*args, **kwargs)
+        # For a class this is the bound method; ``name`` may be an alias.
         return self.func(*args, **kwargs)
 
 
@@ -47,9 +49,11 @@ class ExecutorRegistry:
     def __init__(self):
         self.registry: Dict[str, Executor] = {}
         self.subscribers: List[Callable[[Executor], Any]] = []
+        self._lock = threading.RLock()
 
     def __iter__(self):
-        return iter(self.registry.items())
+        with self._lock:
+            return iter(list(self.registry.items()))
 
     def __bool__(self):
         return bool(self.registry)
@@ -62,22 +66,43 @@ class ExecutorRegistry:
         Raises:
             InitializationError: If *name* is already registered.
         """
-        if existing := self.get(name):
-            raise InitializationError(
-                f"Callback {existing!r} is already registered. "
-                "Please use another name or set a custom alias."
-            )
-        self.registry[name] = Executor(func, name, cls)
-        for subscriber in self.subscribers:
-            subscriber(self.registry[name])
+        with self._lock:
+            if existing := self.registry.get(name):
+                raise InitializationError(
+                    f"Callback {existing!r} is already registered. "
+                    "Please use another name or set a custom alias."
+                )
+            self.registry[name] = Executor(func, name, cls)
+            subscribers = list(self.subscribers)
+            executor = self.registry[name]
+        for subscriber in subscribers:
+            subscriber(executor)
+
+    def rename(self, old: str, new: str) -> None:
+        """Move the executor registered as *old* to *new*."""
+        if old == new:
+            return
+        with self._lock:
+            executor = self.registry.get(old)
+            if executor is None:
+                raise InitializationError(f"No callback is registered as {old!r}.")
+            if existing := self.registry.get(new):
+                raise InitializationError(
+                    f"Callback {existing!r} is already registered. "
+                    "Please use another name or set a custom alias."
+                )
+            del self.registry[old]
+        self.register(new, executor.func, executor.cls)
 
     def unregister(self, name: str) -> None:
         """Remove the executor registered under *name*.  No-op if absent."""
-        del self.registry[name]
+        with self._lock:
+            self.registry.pop(name, None)
 
     def get(self, name: str) -> Optional[Executor]:
         """Look up an executor by *name*, returning ``None`` if not found."""
-        return self.registry.get(name)
+        with self._lock:
+            return self.registry.get(name)
 
 
 EXECUTOR_REGISTRY = ExecutorRegistry()

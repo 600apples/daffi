@@ -32,6 +32,13 @@ Run::
 """
 
 from __future__ import annotations
+import sys
+from pathlib import Path
+
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+from tests.conftest import active_runtime
 
 import asyncio
 import logging
@@ -49,20 +56,26 @@ if _PROJECT_ROOT not in sys.path:
 
 # ── tunables ──────────────────────────────────────────────────────────────────
 
-N_TASKS        = 5
-SLEEP_SECONDS  = 120.0
-SLACK_SECONDS  = 2.0
-RPC_TIMEOUT    = SLEEP_SECONDS + 60
-HOST           = "127.0.0.1"
+N_TASKS = 5
+SLEEP_SECONDS = 120.0
+SLACK_SECONDS = 2.0
+RPC_TIMEOUT = SLEEP_SECONDS + 60
+HOST = "127.0.0.1"
 
 # ── subprocess silence helpers ────────────────────────────────────────────────
 
-def _silence_subprocess() -> None:
+
+def _silence_subprocess(runtime: str) -> None:
     devnull_fd = os.open(os.devnull, os.O_WRONLY)
     os.dup2(devnull_fd, 1)
     os.dup2(devnull_fd, 2)
     os.close(devnull_fd)
     logging.disable(logging.CRITICAL)
+
+    import tests.conftest as _runtime_state
+    _runtime_state.SELECTED_RUNTIME = runtime
+    from daffi import dfcore
+    dfcore.setRuntime(runtime)
 
 
 def _quiet_kill(proc: mp.Process) -> None:
@@ -80,7 +93,9 @@ def _quiet_kill(proc: mp.Process) -> None:
         os.close(saved[1])
     proc.join(timeout=10)
 
+
 # ── port helpers ──────────────────────────────────────────────────────────────
+
 
 def _free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -102,25 +117,30 @@ def _wait_for_port(port: int, timeout: float = 20.0) -> None:
 
 # ── subprocess entry points ───────────────────────────────────────────────────
 
-def _proc_router(port: int) -> None:
-    _silence_subprocess()
+
+def _proc_router(runtime: str, port: int) -> None:
+    _silence_subprocess(runtime)
 
     async def _main():
         from daffi.aio import AsyncRouter
+        from daffi import TCPTransport
 
-        router = AsyncRouter(app_name="longtask-router-aio", host=HOST, port=port)
+        router = AsyncRouter(
+            app_name="longtask-router-aio", transport=TCPTransport(HOST, port),
+            runtime=runtime,
+        )
         await router.start()
         await router.join()
 
     asyncio.run(_main())
 
 
-def _proc_worker(port: int, sleep_s: float, n_workers: int) -> None:
+def _proc_worker(runtime: str, port: int, sleep_s: float, n_workers: int) -> None:
     """AsyncWorker with *n_workers* concurrent asyncio tasks and an async slow_job."""
-    _silence_subprocess()
+    _silence_subprocess(runtime)
 
     async def _main():
-        from daffi import callback
+        from daffi import callback, TCPTransport
         from daffi.aio import AsyncClient
 
         @callback
@@ -132,9 +152,9 @@ def _proc_worker(port: int, sleep_s: float, n_workers: int) -> None:
 
         client = AsyncClient(
             app_name="longtask-worker-aio",
-            host=HOST,
-            port=port,
             workers=n_workers,
+            transport=TCPTransport(HOST, port),
+            runtime=runtime,
         )
         await client.connect()
         await client.join()
@@ -144,12 +164,13 @@ def _proc_worker(port: int, sleep_s: float, n_workers: int) -> None:
 
 # ── worker readiness probe ─────────────────────────────────────────────────────
 
+
 def _wait_for_worker(port: int, timeout: float = 30.0) -> None:
     """Block (sync) until the longtask-worker-aio is visible with 'slow_job'."""
-    from daffi import Client
+    from daffi import Client, TCPTransport
     from daffi._bindings import get_available_members
 
-    probe = Client(app_name="longtask-probe-aio", host=HOST, port=port)
+    probe = Client(app_name="longtask-probe-aio", transport=TCPTransport(HOST, port), runtime=active_runtime())
     probe.connect()
     conn_num = probe._conn_num
 
@@ -168,10 +189,13 @@ def _wait_for_worker(port: int, timeout: float = 30.0) -> None:
         time.sleep(0.2)
 
     probe.stop()
-    raise TimeoutError(f"longtask-worker-aio did not register 'slow_job' within {timeout}s")
+    raise TimeoutError(
+        f"longtask-worker-aio did not register 'slow_job' within {timeout}s"
+    )
 
 
 # ── caller load ───────────────────────────────────────────────────────────────
+
 
 async def _run_callers(port: int, n_tasks: int) -> float:
     """Connect *n_tasks* AsyncClients, fire one slow_job each simultaneously.
@@ -180,23 +204,27 @@ async def _run_callers(port: int, n_tasks: int) -> float:
     event loop thread.  Returns wall-clock seconds from start to last result.
     """
     from daffi.aio import AsyncClient
+    from daffi import TCPTransport
 
     # Connect all callers before the measurement window.
     callers: list[tuple] = []
     for i in range(n_tasks):
-        c = AsyncClient(app_name=f"longtask-caller-{i}-aio", host=HOST, port=port)
+        c = AsyncClient(
+            app_name=f"longtask-caller-{i}-aio", transport=TCPTransport(HOST, port),
+            runtime=active_runtime(),
+        )
         conn = await c.connect()
         callers.append((c, conn))
 
     results: list = [None] * n_tasks
-    errors:  list = []
+    errors: list = []
 
     # asyncio.Barrier synchronises all tasks at the same instant (Python ≥ 3.11).
     barrier = asyncio.Barrier(n_tasks)
 
     async def _call(idx: int, client, conn) -> None:
         try:
-            await barrier.wait()              # all tasks released together
+            await barrier.wait()  # all tasks released together
             rpc = conn.rpc(timeout=RPC_TIMEOUT)
             result = await rpc.slow_job(idx)
             results[idx] = result
@@ -209,9 +237,7 @@ async def _run_callers(port: int, n_tasks: int) -> float:
                 pass
 
     t0 = time.perf_counter()
-    await asyncio.gather(*[
-        _call(i, c, conn) for i, (c, conn) in enumerate(callers)
-    ])
+    await asyncio.gather(*[_call(i, c, conn) for i, (c, conn) in enumerate(callers)])
     wall = time.perf_counter() - t0
 
     if errors:
@@ -228,6 +254,7 @@ async def _run_callers(port: int, n_tasks: int) -> float:
 
 # ── scenario ──────────────────────────────────────────────────────────────────
 
+
 async def run_scenario() -> None:
     label = (
         f"Parallel long tasks (async) — {N_TASKS} callers → AsyncRouter → AsyncWorker "
@@ -236,15 +263,19 @@ async def run_scenario() -> None:
     sep = "=" * 78
     print(f"\n{sep}")
     print(f"  {label}")
-    print(f"  All {N_TASKS} jobs run concurrently via asyncio — zero OS threads on caller/worker.")
-    print(f"  Expected wall time: ~{SLEEP_SECONDS:.0f}s  (max: {SLEEP_SECONDS + SLACK_SECONDS:.0f}s)")
+    print(
+        f"  All {N_TASKS} jobs run concurrently via asyncio — zero OS threads on caller/worker."
+    )
+    print(
+        f"  Expected wall time: ~{SLEEP_SECONDS:.0f}s  (max: {SLEEP_SECONDS + SLACK_SECONDS:.0f}s)"
+    )
     print(sep, flush=True)
 
-    port        = _free_port()
-    router_proc = mp.Process(target=_proc_router, args=(port,), daemon=True)
+    port = _free_port()
+    router_proc = mp.Process(target=_proc_router, args=(active_runtime(), port,), daemon=True)
     worker_proc = mp.Process(
         target=_proc_worker,
-        args=(port, SLEEP_SECONDS, N_TASKS),
+        args=(active_runtime(), port, SLEEP_SECONDS, N_TASKS),
         daemon=True,
     )
 
@@ -270,7 +301,9 @@ async def run_scenario() -> None:
 
         print(f"\n  ── Result")
         print(f"     tasks        : {N_TASKS}")
-        print(f"     job sleep    : {SLEEP_SECONDS:.0f} s  (await asyncio.sleep — no OS thread)")
+        print(
+            f"     job sleep    : {SLEEP_SECONDS:.0f} s  (await asyncio.sleep — no OS thread)"
+        )
         print(f"     wall time    : {wall:.3f} s")
         print(f"     expected     : [{lo:.0f} s … {hi:.0f} s]")
         print(f"     verdict      : {status}")
@@ -293,8 +326,11 @@ async def run_scenario() -> None:
 
 # ── main ──────────────────────────────────────────────────────────────────────
 
+
 async def _async_main() -> None:
-    print("\ndaffi.aio — parallel long-tasks benchmark  (asyncio.gather, no OS threads)")
+    print(
+        "\ndaffi.aio — parallel long-tasks benchmark  (asyncio.gather, no OS threads)"
+    )
     print(
         f"host: {HOST}  tasks: {N_TASKS}  "
         f"sleep: {SLEEP_SECONDS:.0f}s  slack: {SLACK_SECONDS:.1f}s"
@@ -306,7 +342,7 @@ async def _async_main() -> None:
 def main() -> None:
     logging.disable(logging.CRITICAL)
 
-    devnull    = os.open(os.devnull, os.O_WRONLY)
+    devnull = os.open(os.devnull, os.O_WRONLY)
     saved_stderr = os.dup(2)
     os.dup2(devnull, 2)
     os.close(devnull)

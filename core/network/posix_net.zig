@@ -1,43 +1,52 @@
 //! Minimal POSIX/C-socket networking — replaces std.net (removed in Zig 0.16).
 //! Requires linking with libc (-lc).
 
-const c = @cImport({
-    @cInclude("sys/socket.h");
-    @cInclude("sys/un.h");
-    @cInclude("netdb.h");
-    @cInclude("unistd.h");
-    @cInclude("arpa/inet.h");
-    @cInclude("netinet/in.h");
-    @cInclude("errno.h");
-    @cInclude("string.h");
-});
+const c = @import("posix_c");
 
 // ── fcntl — declared manually to avoid glibc bits/fcntl2.h ──────────────────
 const F_GETFL: c_int = 3;
 const F_SETFL: c_int = 4;
 /// O_NONBLOCK: 0x800 on Linux/x86-64 and most Linux arches; 0x4 on Darwin.
-const O_NONBLOCK: c_int = switch (@import("builtin").os.tag) {
+const O_NONBLOCK: c_int = switch (@import("builtin").target.os.tag) {
     .macos, .ios, .watchos, .tvos, .visionos => 0x0004,
     else => 0x0800,
 };
 extern "c" fn fcntl(fd: c_int, cmd: c_int, ...) c_int;
+
+/// Keeps a write to a closed peer an error instead of a SIGPIPE (Linux; on
+/// macOS the process ignores SIGPIPE, as Python does).
+const no_sigpipe: c_int = if (@import("builtin").target.os.tag == .linux) std.c.MSG.NOSIGNAL else 0;
+
+/// `struct iovec` for writev (same layout on every POSIX target).
+const IoVec = extern struct { base: [*]const u8, len: usize };
+extern "c" fn writev(fd: c_int, iov: [*]const IoVec, iovcnt: c_int) isize;
+
+const F_SETFD: c_int = 2;
+const FD_CLOEXEC: c_int = 1;
+
+/// Mark *fd* close-on-exec so sockets are not inherited by subprocesses the
+/// host application spawns (an inherited copy would keep the connection alive
+/// after we close ours).
+fn setCloexec(fd: c_int) void {
+    _ = fcntl(fd, F_SETFD, FD_CLOEXEC);
+}
 
 // ── TCP keepalive + user timeout — declared manually ─────────────────────────
 const IPPROTO_TCP: c_int = 6;
 
 /// TCP_KEEPIDLE (Linux) / TCP_KEEPALIVE (Darwin): seconds of inactivity before
 /// the kernel sends the first keepalive probe.
-const TCP_KEEPIDLE: c_int = switch (@import("builtin").os.tag) {
+const TCP_KEEPIDLE: c_int = switch (@import("builtin").target.os.tag) {
     .macos, .ios, .watchos, .tvos, .visionos => 0x10,
     else => 4,
 };
 /// TCP_KEEPINTVL: seconds between consecutive keepalive probes.
-const TCP_KEEPINTVL: c_int = switch (@import("builtin").os.tag) {
+const TCP_KEEPINTVL: c_int = switch (@import("builtin").target.os.tag) {
     .macos, .ios, .watchos, .tvos, .visionos => 0x101,
     else => 5,
 };
 /// TCP_KEEPCNT: number of unanswered probes before the connection is declared dead.
-const TCP_KEEPCNT: c_int = switch (@import("builtin").os.tag) {
+const TCP_KEEPCNT: c_int = switch (@import("builtin").target.os.tag) {
     .macos, .ios, .watchos, .tvos, .visionos => 0x102,
     else => 6,
 };
@@ -82,21 +91,121 @@ fn applyKeepalive(fd: c_int) void {
 }
 
 // ── poll — declared manually ─────────────────────────────────────────────────
+const POLLIN: c_short = 1;
 const POLLOUT: c_short = 4;
-const PollFd = extern struct {
+pub const PollFd = extern struct {
     fd:      c_int,
     events:  c_short,
     revents: c_short,
 };
-extern "c" fn poll(fds: [*]PollFd, nfds: c_uint, timeout: c_int) c_int;
+pub extern "c" fn poll(fds: [*]PollFd, nfds: c_uint, timeout: c_int) c_int;
+
+pub const WAIT_READ: c_short = POLLIN;
+pub const WAIT_WRITE: c_short = POLLOUT;
+
+/// Block until *fd* is ready for `events` (WAIT_READ / WAIT_WRITE), a hang-up
+/// or error is reported, or `timeout_ms` elapses (-1 = forever).
+/// Returns false only on timeout.  Used by the TLS layer, which runs its
+/// sockets in non-blocking mode so that reader and writer threads can share
+/// one SSL object under a mutex.
+pub fn waitFd(fd: c_int, events: c_short, timeout_ms: c_int) bool {
+    var pfd = PollFd{ .fd = fd, .events = events, .revents = 0 };
+    while (true) {
+        const n = poll(@as([*]PollFd, @ptrCast(&pfd)), 1, timeout_ms);
+        if (n > 0) return true;
+        if (n == 0) return false;
+        if (Stream.lastErrno() != .INTR) return true; // let the I/O call report the error
+    }
+}
+
+/// Put *fd* into non-blocking mode.
+pub fn setNonBlocking(fd: c_int) void {
+    const flags = fcntl(fd, F_GETFL, @as(c_int, 0));
+    if (flags >= 0) _ = fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+}
+
+pub fn setBlocking(fd: c_int) void {
+    const flags = fcntl(fd, F_GETFL, @as(c_int, 0));
+    if (flags >= 0 and flags & O_NONBLOCK != 0) _ = fcntl(fd, F_SETFL, flags & ~O_NONBLOCK);
+}
+
+/// A write to an accepted peer that makes no progress for this long fails,
+/// and the connection is dropped.
+pub const SEND_STALL_TIMEOUT_MS: u32 = 5_000;
 
 const std = @import("std");
+const nofile = @import("../nofile.zig");
+const misc = @import("../misc.zig");
+
+/// Last connect/listen/accept failure on this thread. `Client.init` fails
+/// with a coarse Zig error (`ConnectionRefused`, `SocketCreateFailed`); the
+/// OS reason (EMFILE, ECONNREFUSED, timeout) lives here so Python can put it
+/// in the traceback. Cleared at the start of each attempt.
+threadlocal var fail_buf: [160]u8 = undefined;
+threadlocal var fail_len: usize = 0;
+
+pub fn noteOsFailure(what: []const u8) void {
+    noteErrno(what);
+}
+
+fn noteErrno(what: []const u8) void {
+    noteCode(what, std.c._errno().*);
+}
+
+fn noteCode(what: []const u8, code: c_int) void {
+    const label = errnoLabel(code);
+    const msg = if (label.len == 0)
+        std.fmt.bufPrint(&fail_buf, "{s}: errno {d}", .{ what, code }) catch what
+    else
+        std.fmt.bufPrint(&fail_buf, "{s}: {s} (errno {d})", .{ what, label, code }) catch what;
+    fail_len = msg.len;
+}
+
+fn noteLiteral(text: []const u8) void {
+    const n = @min(text.len, fail_buf.len);
+    @memcpy(fail_buf[0..n], text[0..n]);
+    fail_len = n;
+}
+
+fn errnoLabel(code: c_int) []const u8 {
+    const names = .{
+        "EPERM",         "ENOENT",       "ENOMEM",       "EACCES",      "EINVAL",
+        "ENFILE",        "EMFILE",       "ENOSPC",       "EPIPE",       "EADDRINUSE",
+        "EADDRNOTAVAIL", "ECONNRESET",   "ENOBUFS",      "ETIMEDOUT",   "ECONNREFUSED",
+        "EHOSTDOWN",     "EHOSTUNREACH", "ENETUNREACH",  "ENETDOWN",    "EAFNOSUPPORT",
+    };
+    inline for (names) |name| {
+        if (code == @field(c, name)) return name;
+    }
+    return "";
+}
+
+pub fn connectFailure() []const u8 {
+    return fail_buf[0..fail_len];
+}
+
+pub fn clearConnectFailure() void {
+    fail_len = 0;
+}
+
+pub fn setConnectFailure(text: []const u8) void {
+    const n = @min(text.len, fail_buf.len);
+    @memcpy(fail_buf[0..n], text[0..n]);
+    fail_len = n;
+}
+
+fn isFileLimit(code: c_int) bool {
+    return code == 23 or code == 24;
+}
 const posix = std.posix;
 const Allocator = std.mem.Allocator;
 
 
 pub const Address = struct {
-    bytes: [28]u8 = [_]u8{0} ** 28,
+    // sizeof(sockaddr_storage): must hold a sockaddr_un (106/110 bytes), not just
+    // a sockaddr_in6 (28), or long Unix-socket paths are truncated and the
+    // casts to `*const sockaddr_un` read past the end of the buffer.
+    bytes: [128]u8 align(8) = @splat(0),
     family: u16 = 0,
     port: u16 = 0,
 
@@ -135,13 +244,45 @@ pub const Address = struct {
 };
 
 
+comptime {
+    std.debug.assert(@sizeOf(c.sockaddr_un) <= @sizeOf(@FieldType(Address, "bytes")));
+    std.debug.assert(@sizeOf(c.sockaddr_in6) <= @sizeOf(@FieldType(Address, "bytes")));
+}
+
 pub const Stream = struct {
     handle: posix.socket_t,
 
+    fn lastErrno() std.c.E {
+        return @fromBackingInt(@intCast(std.c._errno().*));
+    }
+
     pub fn read(self: Stream, buf: []u8) !usize {
-        const result = c.read(self.handle, buf.ptr, buf.len);
-        if (result < 0) return error.ReadError;
-        return @intCast(result);
+        while (true) {
+            const result = c.read(self.handle, buf.ptr, buf.len);
+            if (result >= 0) return @intCast(result);
+            switch (lastErrno()) {
+                .INTR => continue,
+                // SO_RCVTIMEO expired.
+                .AGAIN => return error.Timeout,
+                else => return error.ReadError,
+            }
+        }
+    }
+
+    /// Read whatever is available without blocking, regardless of the
+    /// descriptor's mode.  Returns 0 on end-of-stream (or reset/shutdown) and
+    /// `error.WouldBlock` when nothing is pending.
+    pub fn readSome(self: Stream, buf: []u8) !usize {
+        while (true) {
+            const result = std.c.recv(self.handle, buf.ptr, buf.len, std.c.MSG.DONTWAIT);
+            if (result >= 0) return @intCast(result);
+            switch (lastErrno()) {
+                .INTR => continue,
+                .AGAIN => return error.WouldBlock,
+                .CONNRESET, .NOTCONN, .PIPE, .TIMEDOUT => return 0,
+                else => return error.ReadError,
+            }
+        }
     }
 
     pub fn readAll(self: Stream, buf: []u8) !usize {
@@ -155,9 +296,16 @@ pub const Stream = struct {
     }
 
     pub fn write(self: Stream, data: []const u8) !usize {
-        const result = c.write(self.handle, data.ptr, data.len);
-        if (result < 0) return error.WriteError;
-        return @intCast(result);
+        while (true) {
+            const result = c.write(self.handle, data.ptr, data.len);
+            if (result >= 0) return @intCast(result);
+            switch (lastErrno()) {
+                .INTR => continue,
+                // SO_SNDTIMEO expired.
+                .AGAIN => return error.WriteTimeout,
+                else => return error.WriteError,
+            }
+        }
     }
 
     pub fn writeAll(self: Stream, data: []const u8) !void {
@@ -167,24 +315,125 @@ pub const Stream = struct {
         }
     }
 
-    pub fn close(self: Stream) void {
-        // shutdown(SHUT_RDWR) reliably unblocks any thread currently blocked in
-        // recv()/read() on this fd before we release the fd with close().
-        // POSIX close() alone does not guarantee that a concurrent recv() is
-        // interrupted — this is the canonical fix for that race.
+    /// Send what the socket buffer takes without waiting; returns how much.
+    /// The caller must be the only writer.
+    pub fn writeNonBlocking(self: Stream, data: []const u8) !usize {
+        // Darwin ignores MSG_DONTWAIT on send: make the socket non-blocking
+        // for the duration instead.
+        const darwin = comptime @import("builtin").target.os.tag.isDarwin();
+        const flags = if (darwin) fcntl(self.handle, F_GETFL, @as(c_int, 0)) else 0;
+        if (flags < 0) return 0;
+        if (darwin) _ = fcntl(self.handle, F_SETFL, flags | O_NONBLOCK);
+        defer if (darwin) {
+            _ = fcntl(self.handle, F_SETFL, flags);
+        };
+        var sent: usize = 0;
+        while (sent < data.len) {
+            const result = std.c.send(self.handle, data[sent..].ptr, data.len - sent, std.c.MSG.DONTWAIT | no_sigpipe);
+            if (result >= 0) {
+                sent += @intCast(result);
+                continue;
+            }
+            switch (lastErrno()) {
+                .INTR => continue,
+                .AGAIN => return sent,
+                else => return error.WriteError,
+            }
+        }
+        return sent;
+    }
+
+    /// `writeAll(head)` then `writeAll(body)` in as few system calls as the
+    /// socket takes (writev).
+    pub fn writeAllParts(self: Stream, head: []const u8, body: []const u8) !void {
+        var iov = [2]IoVec{ .{ .base = head.ptr, .len = head.len }, .{ .base = body.ptr, .len = body.len } };
+        var first: usize = 0;
+        while (first < iov.len) {
+            const result = writev(self.handle, iov[first..].ptr, @intCast(iov.len - first));
+            if (result < 0) switch (lastErrno()) {
+                .INTR => continue,
+                .AGAIN => return error.WriteTimeout,
+                else => return error.WriteError,
+            };
+            var sent: usize = @intCast(result);
+            while (first < iov.len and sent >= iov[first].len) {
+                sent -= iov[first].len;
+                first += 1;
+            }
+            if (first < iov.len) {
+                iov[first].base += sent;
+                iov[first].len -= sent;
+            }
+        }
+    }
+
+    /// Set (or, with 0, clear) the receive and send timeouts of the socket.
+    pub fn setIoTimeout(self: Stream, ms: u32) void {
+        self.setReadTimeout(ms);
+        self.setWriteTimeout(ms);
+    }
+
+    pub fn setReadTimeout(self: Stream, ms: u32) void {
+        const tv = timeval(ms);
+        _ = c.setsockopt(self.handle, c.SOL_SOCKET, c.SO_RCVTIMEO, &tv, @sizeOf(posix.timeval));
+    }
+
+    pub fn setWriteTimeout(self: Stream, ms: u32) void {
+        const tv = timeval(ms);
+        _ = c.setsockopt(self.handle, c.SOL_SOCKET, c.SO_SNDTIMEO, &tv, @sizeOf(posix.timeval));
+    }
+
+    fn timeval(ms: u32) posix.timeval {
+        return .{ .sec = @intCast(ms / 1000), .usec = @intCast((ms % 1000) * 1000) };
+    }
+
+    /// Shut both directions down *without* releasing the descriptor.
+    ///
+    /// This is the only thing that is safe to do to a socket while another
+    /// thread may be blocked in read()/write() on it: the blocked call returns
+    /// immediately, and the descriptor number cannot be recycled by an
+    /// unrelated open() until `close()` is called by the (single) owner.
+    /// Idempotent.
+    pub fn shutdown(self: Stream) void {
         _ = c.shutdown(self.handle, c.SHUT_RDWR);
+    }
+
+    /// Shut down and release the descriptor.  Must be called exactly once,
+    /// when no other thread can still be using the socket.
+    pub fn close(self: Stream) void {
+        self.shutdown();
         _ = c.close(self.handle);
+        nofile.release(1);
     }
 };
-
 
 /// Maximum time (ms) to wait for a TCP connect() to complete.
 /// Overrides the kernel's default retransmission timeout (~75 s on Linux).
 const CONNECT_TIMEOUT_MS: c_int = 15_000;
 
+/// Open a socket, counting it before the syscall so the soft limit grows
+/// first. If the kernel still returns EMFILE/ENFILE (descriptors this
+/// counter does not own), double the limit once and retry.
+fn openSocket(family: c_int, socktype: c_int, protocol: c_int) !c_int {
+    var grew = false;
+    while (true) {
+        nofile.acquire(1);
+        const fd = c.socket(family, socktype, protocol);
+        if (fd >= 0) return fd;
+        const err = std.c._errno().*;
+        nofile.release(1);
+        if (!grew and isFileLimit(err) and nofile.bump()) {
+            grew = true;
+            continue;
+        }
+        noteCode("socket", err);
+        return error.SocketCreateFailed;
+    }
+}
+
 pub fn tcpConnectToHost(_: Allocator, host: []const u8, port: u16) !Stream {
     var port_buf: [8]u8 = undefined;
-    const port_str = std.fmt.bufPrintZ(&port_buf, "{d}", .{port}) catch return error.BadPort;
+    const port_str = std.fmt.bufPrintSentinel(&port_buf, "{d}", .{port}, 0) catch return error.BadPort;
 
     var hints: c.addrinfo = std.mem.zeroes(c.addrinfo);
     hints.ai_family = c.AF_UNSPEC;
@@ -195,14 +444,21 @@ pub fn tcpConnectToHost(_: Allocator, host: []const u8, port: u16) !Stream {
     @memcpy(host_buf[0..host.len], host);
     host_buf[host.len] = 0;
 
+    clearConnectFailure();
     var res: ?*c.addrinfo = null;
-    if (c.getaddrinfo(&host_buf, port_str.ptr, &hints, &res) != 0) return error.UnknownHostName;
+    const gai = c.getaddrinfo(&host_buf, port_str.ptr, &hints, &res);
+    if (gai != 0) {
+        var gai_buf: [48]u8 = undefined;
+        const text = std.fmt.bufPrint(&gai_buf, "getaddrinfo failed ({d})", .{gai}) catch "getaddrinfo failed";
+        noteLiteral(text);
+        return error.UnknownHostName;
+    }
     defer if (res) |r| c.freeaddrinfo(r);
 
     var it = res;
     while (it) |rp| : (it = rp.ai_next) {
-        const fd = c.socket(rp.ai_family, rp.ai_socktype, rp.ai_protocol);
-        if (fd < 0) continue;
+        const fd = openSocket(rp.ai_family, rp.ai_socktype, rp.ai_protocol) catch continue;
+        setCloexec(fd);
 
         // Switch to non-blocking so connect() returns immediately instead of
         // blocking for the kernel's full retransmission timeout (~75 s).
@@ -214,19 +470,33 @@ pub fn tcpConnectToHost(_: Allocator, host: []const u8, port: u16) !Stream {
             // Rare fast path: connected synchronously (e.g. loopback).
             _ = fcntl(fd, F_SETFL, orig_flags);
             applyKeepalive(fd);
+            clearConnectFailure();
             return Stream{ .handle = fd };
         }
 
-        // For non-blocking sockets, EINPROGRESS means "in progress" — use
-        // poll() to wait up to CONNECT_TIMEOUT_MS for the result.
-        // Any other errno (ECONNREFUSED, ENETUNREACH, …) causes poll() to
-        // return immediately with POLLERR, so SO_ERROR will be non-zero and
-        // we fall through to the failure path below without extra errno checks.
-        var pfd = PollFd{ .fd = fd, .events = POLLOUT, .revents = 0 };
-        const nready = poll(@as([*]PollFd, @ptrCast(&pfd)), 1, CONNECT_TIMEOUT_MS);
-        if (nready <= 0) {
-            // 0 = timeout, -1 = poll error.
+        // EINPROGRESS (or EINTR, after which the attempt carries on) means the
+        // outcome is pending: poll() for it.  Any other errno is final, and
+        // poll() on that socket may not wake until the timeout (macOS).
+        const connect_err = std.c._errno().*;
+        if (connect_err != c.EINPROGRESS and connect_err != c.EINTR) {
+            noteCode("connect", connect_err);
             _ = c.close(fd);
+            nofile.release(1);
+            continue;
+        }
+        var pfd = PollFd{ .fd = fd, .events = POLLOUT, .revents = 0 };
+        const deadline = misc.monotonicMs() + CONNECT_TIMEOUT_MS;
+        var nready: c_int = undefined;
+        while (true) {
+            const left: c_int = @intCast(@max(0, deadline - misc.monotonicMs()));
+            nready = poll(@as([*]PollFd, @ptrCast(&pfd)), 1, left);
+            if (nready >= 0 or std.c._errno().* != c.EINTR) break;
+        }
+        if (nready <= 0) {
+            // 0 = timeout, -1 = poll error. Record it before close().
+            if (nready < 0) noteErrno("poll") else noteLiteral("connect: timed out");
+            _ = c.close(fd);
+            nofile.release(1);
             continue;
         }
 
@@ -235,16 +505,72 @@ pub fn tcpConnectToHost(_: Allocator, host: []const u8, port: u16) !Stream {
         var so_len: c.socklen_t = @sizeOf(c_int);
         _ = c.getsockopt(fd, c.SOL_SOCKET, c.SO_ERROR, &so_err, &so_len);
         if (so_err != 0) {
+            noteCode("connect", so_err);
             _ = c.close(fd);
+            nofile.release(1);
             continue;
         }
 
         // Restore blocking mode for normal send/recv I/O.
         _ = fcntl(fd, F_SETFL, orig_flags);
         applyKeepalive(fd);
+        clearConnectFailure();
         return Stream{ .handle = fd };
     }
     return error.ConnectionRefused;
+}
+
+/// Scheme of a host that names a Unix-domain socket: `unix:<path>`.  A host
+/// without it is always resolved as a TCP host, so a name that fails to
+/// resolve is never mistaken for a socket file.
+pub const unix_scheme = "unix:";
+
+/// The socket path of a `unix:<path>` host, or null for a TCP host.
+pub fn unixPath(host: []const u8) ?[]const u8 {
+    if (!std.mem.startsWith(u8, host, unix_scheme)) return null;
+    return host[unix_scheme.len..];
+}
+
+/// Make way for a listener at `path`: remove a socket file left behind by a
+/// server that is gone.  Refuses to remove anything that is not a socket,
+/// or a socket some server still accepts on.
+pub fn removeStaleSocket(path: []const u8) !void {
+    var path_buf: [256]u8 = undefined;
+    if (path.len >= path_buf.len) return error.NameTooLong;
+    @memcpy(path_buf[0..path.len], path);
+    path_buf[path.len] = 0;
+    const path_z: [*:0]const u8 = @ptrCast(&path_buf);
+
+    const is_sock = blk: {
+        if (comptime @import("builtin").os.tag == .linux) {
+            var stx = std.mem.zeroes(std.os.linux.Statx);
+            const rc = std.os.linux.statx(
+                std.os.linux.AT.FDCWD,
+                path_z,
+                std.os.linux.AT.SYMLINK_NOFOLLOW,
+                .{ .TYPE = true, .MODE = true },
+                &stx,
+            );
+            const signed: isize = @bitCast(rc);
+            if (signed < 0) return; // absent / unreachable — bind reports it
+            break :blk std.os.linux.S.ISSOCK(stx.mode);
+        } else {
+            var st: std.c.Stat = undefined;
+            if (std.c.stat(path_z, &st) != 0) return;
+            break :blk std.c.S.ISSOCK(@intCast(st.mode));
+        }
+    };
+    if (!is_sock) {
+        noteLiteral("the path exists and is not a socket");
+        return error.PathAlreadyExists;
+    }
+    if (connectUnixSocket(path)) |live| {
+        live.close();
+        noteLiteral("another server is listening on this socket");
+        return error.AddressInUse;
+    } else |_| {}
+    clearConnectFailure();
+    _ = c.unlink(path_z);
 }
 
 pub fn connectUnixSocket(path: []const u8) !Stream {
@@ -253,13 +579,16 @@ pub fn connectUnixSocket(path: []const u8) !Stream {
     if (path.len >= sun.sun_path.len) return error.NameTooLong;
     @memcpy(sun.sun_path[0..path.len], path);
 
-    const fd = c.socket(c.AF_UNIX, c.SOCK_STREAM, 0);
-    if (fd < 0) return error.SocketCreateFailed;
+    const fd = openSocket(c.AF_UNIX, c.SOCK_STREAM, 0) catch return error.SocketCreateFailed;
+    setCloexec(fd);
 
     if (c.connect(fd, @ptrCast(&sun), @sizeOf(c.sockaddr_un)) != 0) {
+        noteErrno("connect");
         _ = c.close(fd);
+        nofile.release(1);
         return error.ConnectionRefused;
     }
+    clearConnectFailure();
     return Stream{ .handle = fd };
 }
 
@@ -276,7 +605,7 @@ pub const AddressList = struct {
 
 pub fn getAddressList(allocator: Allocator, host: []const u8, port: u16) !*AddressList {
     var port_buf: [8]u8 = undefined;
-    const port_str = std.fmt.bufPrintZ(&port_buf, "{d}", .{port}) catch return error.BadPort;
+    const port_str = std.fmt.bufPrintSentinel(&port_buf, "{d}", .{port}, 0) catch return error.BadPort;
 
     var hints: c.addrinfo = std.mem.zeroes(c.addrinfo);
     hints.ai_family = c.AF_UNSPEC;
@@ -326,35 +655,77 @@ pub const Server = struct {
     handle: posix.socket_t,
     listen_address: Address,
 
-    pub fn accept(self: *Server) !ServerConn {
-        var addr_storage: c.sockaddr_storage = std.mem.zeroes(c.sockaddr_storage);
-        var addr_len: c.socklen_t = @sizeOf(c.sockaddr_storage);
-        const fd = c.accept(self.handle, @ptrCast(&addr_storage), &addr_len);
-        if (fd < 0) return error.AcceptError;
-        applyKeepalive(fd);
-
-        var addr = Address{ .family = addr_storage.ss_family };
-        const copy_len = @min(@sizeOf(Address), addr_len);
-        @memcpy(addr.bytes[0..copy_len], std.mem.asBytes(&addr_storage)[0..copy_len]);
-        if (addr_storage.ss_family == c.AF_INET) {
-            const sa4: *const c.sockaddr_in = @ptrCast(&addr_storage);
-            addr.port = std.mem.bigToNative(u16, sa4.sin_port);
-        } else if (addr_storage.ss_family == c.AF_INET6) {
-            const sa6: *const c.sockaddr_in6 = @ptrCast(&addr_storage);
-            addr.port = std.mem.bigToNative(u16, sa6.sin6_port);
+    /// Wait up to `timeout_ms` for an inbound connection.  Returns
+    /// `error.Timeout` when none arrived, so callers can re-check a shutdown
+    /// flag; closing a listening fd from another thread does not reliably wake a
+    /// blocked accept() on all platforms.
+    pub fn acceptTimeout(self: *Server, timeout_ms: c_int) !ServerConn {
+        // The listening socket is non-blocking: try it directly.
+        if (timeout_ms == 0) return self.accept();
+        var pfd = PollFd{ .fd = self.handle, .events = POLLIN, .revents = 0 };
+        const n = poll(@as([*]PollFd, @ptrCast(&pfd)), 1, timeout_ms);
+        if (n == 0) return error.Timeout;
+        if (n < 0) {
+            if (Stream.lastErrno() == .INTR) return error.Timeout;
+            noteErrno("poll");
+            return error.AcceptError;
         }
-        return ServerConn{ .stream = .{ .handle = fd }, .address = addr };
+        return self.accept();
+    }
+
+    pub fn accept(self: *Server) !ServerConn {
+        var grew = false;
+        while (true) {
+            var addr_storage: c.sockaddr_storage = std.mem.zeroes(c.sockaddr_storage);
+            var addr_len: c.socklen_t = @sizeOf(c.sockaddr_storage);
+            nofile.acquire(1);
+            const fd = c.accept(self.handle, @ptrCast(&addr_storage), &addr_len);
+            if (fd < 0) {
+                const err = std.c._errno().*;
+                nofile.release(1);
+                if (!grew and isFileLimit(err) and nofile.bump()) {
+                    grew = true;
+                    continue;
+                }
+                return switch (Stream.lastErrno()) {
+                    .INTR, .CONNABORTED, .AGAIN => error.Timeout,
+                    else => {
+                        noteCode("accept", err);
+                        return error.AcceptError;
+                    },
+                };
+            }
+            setCloexec(fd);
+            applyKeepalive(fd);
+
+            var addr = Address{ .family = addr_storage.ss_family };
+            const copy_len = @min(@sizeOf(Address), addr_len);
+            @memcpy(addr.bytes[0..copy_len], std.mem.asBytes(&addr_storage)[0..copy_len]);
+            if (addr_storage.ss_family == c.AF_INET) {
+                const sa4: *const c.sockaddr_in = @ptrCast(&addr_storage);
+                addr.port = std.mem.bigToNative(u16, sa4.sin_port);
+            } else if (addr_storage.ss_family == c.AF_INET6) {
+                const sa6: *const c.sockaddr_in6 = @ptrCast(&addr_storage);
+                addr.port = std.mem.bigToNative(u16, sa6.sin6_port);
+            }
+            return ServerConn{ .stream = .{ .handle = fd }, .address = addr };
+        }
     }
 
     pub fn deinit(self: *Server) void {
         _ = c.close(self.handle);
+        nofile.release(1);
     }
 };
 
 fn listenOn(addr: *const Address, options: ListenOptions) !Server {
     const family: c_int = @intCast(addr.family);
-    const fd = c.socket(family, c.SOCK_STREAM, 0);
-    if (fd < 0) return error.SocketCreateFailed;
+    const fd = openSocket(family, c.SOCK_STREAM, 0) catch return error.SocketCreateFailed;
+    errdefer {
+        _ = c.close(fd);
+        nofile.release(1);
+    }
+    setCloexec(fd);
 
     if (options.reuse_address) {
         const opt: c_int = 1;
@@ -370,12 +741,65 @@ fn listenOn(addr: *const Address, options: ListenOptions) !Server {
     };
 
     if (c.bind(fd, sa, sa_len) != 0) {
-        _ = c.close(fd);
+        noteErrno("bind");
         return error.AddressInUse;
     }
     if (c.listen(fd, options.kernel_backlog) != 0) {
-        _ = c.close(fd);
+        noteErrno("listen");
         return error.ListenError;
     }
+    // Accept loops drain the backlog until EAGAIN instead of polling first.
+    setNonBlocking(fd);
+    clearConnectFailure();
     return Server{ .handle = fd, .listen_address = addr.* };
+}
+
+test "writeAllParts sends head then body across partial writes" {
+    var fds: [2]c_int = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), c.socketpair(c.AF_UNIX, c.SOCK_STREAM, 0, &fds));
+    defer for (fds) |fd| {
+        _ = c.close(fd);
+    };
+    const body = try std.testing.allocator.alloc(u8, 1 << 20);
+    defer std.testing.allocator.free(body);
+    for (body, 0..) |*b, i| b.* = @truncate(i *% 31);
+    const out = try std.testing.allocator.alloc(u8, 5 + body.len);
+    defer std.testing.allocator.free(out);
+
+    const Reader = struct {
+        fn run(fd: c_int, buf: []u8) void {
+            var got: usize = 0;
+            while (got < buf.len) {
+                const n = c.read(fd, buf[got..].ptr, buf.len - got);
+                if (n <= 0) return;
+                got += @intCast(n);
+            }
+        }
+    };
+    const reader = try std.Thread.spawn(.{}, Reader.run, .{ fds[1], out });
+    try (Stream{ .handle = fds[0] }).writeAllParts("head:", body);
+    reader.join();
+    try std.testing.expectEqualSlices(u8, "head:", out[0..5]);
+    try std.testing.expectEqualSlices(u8, body, out[5..]);
+}
+
+test "writeNonBlocking returns at a full buffer and leaves the socket blocking" {
+    var fds: [2]c_int = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), c.socketpair(c.AF_UNIX, c.SOCK_STREAM, 0, &fds));
+    defer for (fds) |fd| {
+        _ = c.close(fd);
+    };
+    // Bound the wait if the send does block, so a regression fails instead of hanging.
+    const stream = Stream{ .handle = fds[0] };
+    stream.setWriteTimeout(2000);
+    const flags_before = fcntl(fds[0], F_GETFL, @as(c_int, 0));
+
+    const data = try std.testing.allocator.alloc(u8, 8 << 20);
+    defer std.testing.allocator.free(data);
+    @memset(data, 7);
+    const started = misc.monotonicMs();
+    const sent = try stream.writeNonBlocking(data);
+    try std.testing.expect(sent < data.len);
+    try std.testing.expect(misc.monotonicMs() - started < 1000);
+    try std.testing.expectEqual(flags_before, fcntl(fds[0], F_GETFL, @as(c_int, 0)));
 }

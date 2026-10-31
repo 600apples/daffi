@@ -8,7 +8,9 @@ Layouts
 Direct  — AsyncClient → AsyncService         (one hop)
 Router  — AsyncClient → AsyncRouter → AsyncWorker  (two hops)
 """
+
 from __future__ import annotations
+from tests.conftest import active_runtime
 
 import json
 
@@ -17,23 +19,16 @@ import pytest
 from .conftest import HOST, TIMEOUT
 
 
-def _msgpack_available() -> bool:
-    try:
-        import msgpack  # noqa: F401
-        return True
-    except ImportError:
-        return False
-
-
 # ── async helper ──────────────────────────────────────────────────────────────
+
 
 async def _rpc(port: int, name: str, *args, serde=None, **kwargs):
     """Connect a fresh AsyncClient, fire one RPC call, stop, return result."""
     from daffi.aio import AsyncClient
-    from daffi import SerdeFormat
+    from daffi import SerdeFormat, TCPTransport
 
-    serde = serde if serde is not None else SerdeFormat.PICKLE
-    client = AsyncClient(app_name=name, host=HOST, port=port)
+    serde = serde if serde is not None else SerdeFormat.DEFAULT
+    client = AsyncClient(app_name=name, transport=TCPTransport(HOST, port), runtime=active_runtime())
     conn = await client.connect()
     try:
         proxy = conn.rpc(timeout=TIMEOUT, serde=serde)
@@ -44,6 +39,7 @@ async def _rpc(port: int, name: str, *args, serde=None, **kwargs):
 
 
 # ── Direct layout ──────────────────────────────────────────────────────────────
+
 
 @pytest.mark.asyncio
 class TestDirectRpcAsync:
@@ -103,34 +99,43 @@ class TestDirectRpcAsync:
 
     @pytest.mark.parametrize("serde_name", ["PICKLE", "JSON"])
     async def test_echo_serde(self, direct_service, serde_name):
-        from daffi import SerdeFormat
+        from daffi import SerdeFormat, TCPTransport
 
         serde = getattr(SerdeFormat, serde_name)
         payload = {"serde": serde_name, "data": [1, 2, 3], "flag": True}
-        result = await _rpc(direct_service, f"t-serde-{serde_name.lower()}", payload, serde=serde)
+        result = await _rpc(
+            direct_service, f"t-serde-{serde_name.lower()}", payload, serde=serde
+        )
         assert result == payload
 
-    @pytest.mark.skipif(not _msgpack_available(), reason="msgpack not installed")
     async def test_echo_serde_msgpack(self, direct_service):
-        from daffi import SerdeFormat
+        from daffi import SerdeFormat, TCPTransport
 
         payload = {"serde": "MSGPACK", "data": [1, 2, 3], "flag": True}
-        result = await _rpc(direct_service, "t-serde-msgpack", payload, serde=SerdeFormat.MSGPACK)
+        result = await _rpc(
+            direct_service, "t-serde-msgpack", payload, serde=SerdeFormat.MSGPACK
+        )
         assert result == payload
 
     async def test_echo_serde_opaque(self, direct_service):
-        from daffi import SerdeFormat
+        from daffi import SerdeFormat, TCPTransport
 
         payload = {"mode": "opaque", "values": [10, 20, 30]}
         wire = json.dumps(payload)
-        result = await _rpc(direct_service, "t-serde-opaque", wire, serde=SerdeFormat.OPAQUE)
+        result = await _rpc(
+            direct_service, "t-serde-opaque", wire, serde=SerdeFormat.OPAQUE
+        )
         assert result == wire
 
     async def test_repeated_calls_same_client(self, direct_service):
         """A single AsyncClient/connection can fire many sequential awaited calls."""
         from daffi.aio import AsyncClient
+        from daffi import TCPTransport
 
-        client = AsyncClient(app_name="t-repeated", host=HOST, port=direct_service)
+        client = AsyncClient(
+            app_name="t-repeated", transport=TCPTransport(HOST, direct_service),
+            runtime=active_runtime(),
+        )
         conn = await client.connect()
         proxy = conn.rpc(timeout=TIMEOUT)
         try:
@@ -141,6 +146,7 @@ class TestDirectRpcAsync:
 
 
 # ── Router layout ──────────────────────────────────────────────────────────────
+
 
 @pytest.mark.asyncio
 class TestRouterRpcAsync:
@@ -161,33 +167,42 @@ class TestRouterRpcAsync:
 
     @pytest.mark.parametrize("serde_name", ["PICKLE", "JSON"])
     async def test_echo_serde(self, router_with_worker, serde_name):
-        from daffi import SerdeFormat
+        from daffi import SerdeFormat, TCPTransport
 
         serde = getattr(SerdeFormat, serde_name)
         payload = {"serde": serde_name, "routed": True}
-        result = await _rpc(router_with_worker, f"r-serde-{serde_name.lower()}", payload, serde=serde)
+        result = await _rpc(
+            router_with_worker, f"r-serde-{serde_name.lower()}", payload, serde=serde
+        )
         assert result == payload
 
-    @pytest.mark.skipif(not _msgpack_available(), reason="msgpack not installed")
     async def test_echo_serde_msgpack(self, router_with_worker):
-        from daffi import SerdeFormat
+        from daffi import SerdeFormat, TCPTransport
 
         payload = {"serde": "MSGPACK", "routed": True, "data": [1, 2, 3]}
-        result = await _rpc(router_with_worker, "r-serde-msgpack", payload, serde=SerdeFormat.MSGPACK)
+        result = await _rpc(
+            router_with_worker, "r-serde-msgpack", payload, serde=SerdeFormat.MSGPACK
+        )
         assert result == payload
 
     async def test_echo_serde_opaque(self, router_with_worker):
-        from daffi import SerdeFormat
+        from daffi import SerdeFormat, TCPTransport
 
         payload = {"mode": "opaque", "routed": True}
         wire = json.dumps(payload)
-        result = await _rpc(router_with_worker, "r-serde-opaque", wire, serde=SerdeFormat.OPAQUE)
+        result = await _rpc(
+            router_with_worker, "r-serde-opaque", wire, serde=SerdeFormat.OPAQUE
+        )
         assert result == wire
 
     async def test_repeated_calls_same_client(self, router_with_worker):
         from daffi.aio import AsyncClient
+        from daffi import TCPTransport
 
-        client = AsyncClient(app_name="r-repeated", host=HOST, port=router_with_worker)
+        client = AsyncClient(
+            app_name="r-repeated", transport=TCPTransport(HOST, router_with_worker),
+            runtime=active_runtime(),
+        )
         conn = await client.connect()
         proxy = conn.rpc(timeout=TIMEOUT)
         try:

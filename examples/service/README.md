@@ -16,6 +16,7 @@ for direct **Client → Service** communication.  Run the numbered files in orde
 | 08 | `08_unix_socket/` | Unix domain socket transport |
 | 09 | `09_events/` | `add_event_handler()` — connect/disconnect events |
 | 10 | `10_stream/` | Generator streaming with `stream()` / `stream_nowait()` |
+| 11 | `11_multitransport/` | One Service on TCP and a Unix socket |
 
 ## Quick Start
 
@@ -34,12 +35,12 @@ python examples/service/01_rpc/2_client.py
 | `PICKLE` | Any Python object | No | — |
 | `JSON` | dict, list, str, int, float, bool, None | Yes | — |
 | `OPAQUE` | `bytes` or `str` (pass-through) | Yes | — |
-| `MSGPACK` | Same as JSON (binary) | Yes | `pip install 'daffi[msgpack]'` |
+| `MSGPACK` | Same as JSON (binary) | Yes | included |
 
 ## API Reference
 
 ```python
-from daffi import Service, Client, callback
+from daffi import Service, Client, callback, TCPTransport
 from daffi.registry import local
 from daffi import SerdeFormat
 
@@ -53,13 +54,13 @@ class MyClass:
     @local
     def internal(self): ...   # not exported
 
-svc = Service(app_name="my-svc", host="127.0.0.1", port=5000)
+svc = Service(app_name="my-svc", transport=TCPTransport("127.0.0.1", 5000))
 svc.add_event_handler(lambda e: print(e))
 svc.start()
 svc.join()
 
 # --- Client side ---
-client = Client(app_name="my-client", host="127.0.0.1", port=5000)
+client = Client(app_name="my-client", transport=TCPTransport("127.0.0.1", 5000))
 conn = client.connect()
 
 rpc          = conn.rpc(timeout=5)                       # blocking, one worker

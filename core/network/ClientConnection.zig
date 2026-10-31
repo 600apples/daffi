@@ -13,9 +13,14 @@ const ClientConnection = @This();
 
 pub const op_table = OperationTable{
     .read = read,
+    .readSome = readSome,
     .readNoBuffer = readNoBuffer,
     .write = write,
+    .writeParts = writeParts,
+    .writeNonBlocking = writeNonBlocking,
     .accept = accept,
+    .handle = handle,
+    .hasPendingInput = hasPendingInput,
     .close = close,
     .destroy = destroy,
     .getAddr = getAddr,
@@ -29,14 +34,22 @@ ssl: ?*tls_impl.SslConn = null,
 /// Non-null when this connection owns its SSL_CTX (client-initiated TLS).
 /// Null for server-accepted TLS connections — the ServerConnection owns the ctx.
 ssl_ctx: ?*tls_impl.SslCtx = null,
+/// Set by close() once the socket has been shut down; destroy() then skips the
+/// TLS close_notify (it could no longer be delivered anyway).
+interrupted: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
 pub const Config = struct {
     host: []const u8,
     port: u16,
     tls: bool = false,
-    /// PEM file path for a CA bundle used to verify the server certificate.
-    /// Empty string disables peer verification.
-    ca_file: []const u8 = "",
+    /// CA trust: filesystem path or PEM material.  Empty uses the system
+    /// trust store.
+    ca: []const u8 = "",
+    /// Client identity for mutual TLS (filesystem path or PEM material).
+    cert: []const u8 = "",
+    key: []const u8 = "",
+    /// False accepts any server certificate.
+    verify: bool = true,
 };
 
 const zero_timeout = std.mem.toBytes(posix.timeval{ .tv_sec = 0, .tv_usec = 0 });
@@ -44,11 +57,15 @@ const zero_timeout = std.mem.toBytes(posix.timeval{ .tv_sec = 0, .tv_usec = 0 })
 /// Initiate an outbound TCP (or Unix-socket) connection.
 /// If config.tls is true, a TLS client handshake is performed after the TCP connect.
 pub fn init(allocator: Allocator, config: Config) !*ClientConnection {
-    const stream = net.tcpConnectToHost(allocator, config.host, config.port) catch blk: {
-        break :blk try net.connectUnixSocket(config.host);
-    };
+    const unix_path = net.unixPath(config.host);
+    const stream = if (unix_path) |path|
+        try net.connectUnixSocket(path)
+    else
+        try net.tcpConnectToHost(allocator, config.host, config.port);
+    errdefer stream.close();
 
     const self = try allocator.create(ClientConnection);
+    errdefer allocator.destroy(self);
     self.* = ClientConnection{
         .stream = stream,
         .addr = null,
@@ -57,30 +74,22 @@ pub fn init(allocator: Allocator, config: Config) !*ClientConnection {
 
     if (config.tls) {
         tls_impl.init();
-        // Build a null-terminated copy of ca_file for the C API.
-        var ca_buf: [512]u8 = undefined;
-        if (config.ca_file.len >= ca_buf.len) {
-            self.stream.close();
-            allocator.destroy(self);
-            return error.PathTooLong;
-        }
-        @memcpy(ca_buf[0..config.ca_file.len], config.ca_file);
-        ca_buf[config.ca_file.len] = 0;
-        const ssl_ctx = tls_impl.clientCtx(@ptrCast(&ca_buf)) catch |err| {
-            self.stream.close();
-            allocator.destroy(self);
-            return err;
-        };
+        const ssl_ctx = try tls_impl.clientCtx(config.ca, config.cert, config.key, config.verify);
+        errdefer tls_impl.freeCtx(ssl_ctx);
+        // Bound the blocking handshake so a server that accepts the TCP
+        // connection but never answers cannot hang the caller forever.
+        stream.setIoTimeout(tls_impl.HANDSHAKE_TIMEOUT_MS);
+        // A Unix socket has no host name to check the certificate against.
+        const ssl = try tls_impl.clientHandshake(ssl_ctx, @intCast(stream.handle), if (unix_path == null) config.host else "");
+        tls_impl.finishHandshake(ssl);
         self.ssl_ctx = ssl_ctx;
-        self.ssl = tls_impl.clientHandshake(ssl_ctx, @intCast(stream.handle)) catch |err| {
-            tls_impl.freeCtx(ssl_ctx);
-            self.stream.close();
-            allocator.destroy(self);
-            return err;
-        };
+        self.ssl = ssl;
+    } else {
+        // Same stall bound as accepted sockets.  1 s dropped large
+        // payloads on a slow window.
+        try self.writeTimeout(net.SEND_STALL_TIMEOUT_MS);
     }
 
-    try self.writeTimeout(1000);
     self.enableKeepalive(10, 5, 3);
     return self;
 }
@@ -107,10 +116,27 @@ pub fn initFromTlsHandshake(allocator: Allocator, fd: posix.socket_t, ssl: *tls_
     return self;
 }
 
+/// Block until some bytes arrive; returns how many (0 at end-of-stream).
 pub fn read(ctx: *anyopaque, buf: []u8) !usize {
     const self: *ClientConnection = @ptrCast(@alignCast(ctx));
-    if (self.ssl) |ssl| return tls_impl.sslReadAll(ssl, buf);
-    return try self.stream.readAll(buf);
+    if (self.ssl) |ssl| return tls_impl.sslRead(ssl, buf);
+    return try self.stream.read(buf);
+}
+
+pub fn readSome(ctx: *anyopaque, buf: []u8) !usize {
+    const self: *ClientConnection = @ptrCast(@alignCast(ctx));
+    if (self.ssl) |ssl| return tls_impl.sslReadSome(ssl, buf);
+    return self.stream.readSome(buf);
+}
+
+pub fn handle(ctx: *anyopaque) posix.socket_t {
+    const self: *ClientConnection = @ptrCast(@alignCast(ctx));
+    return self.stream.handle;
+}
+
+pub fn hasPendingInput(ctx: *anyopaque) bool {
+    const self: *ClientConnection = @ptrCast(@alignCast(ctx));
+    return if (self.ssl) |ssl| tls_impl.sslPending(ssl) else false;
 }
 
 pub fn readNoBuffer(_: *anyopaque) !?[]const u8 {
@@ -123,16 +149,54 @@ pub fn write(ctx: *anyopaque, data: []const u8) !void {
     return try self.stream.writeAll(data);
 }
 
-pub fn accept(_: *anyopaque) anyerror!AcceptedConnection {
+pub fn writeNonBlocking(ctx: *anyopaque, data: []const u8) !usize {
+    const self: *ClientConnection = @ptrCast(@alignCast(ctx));
+    // A TLS record cannot be half-written and resumed by another thread.
+    if (self.ssl != null) return 0;
+    return self.stream.writeNonBlocking(data);
+}
+
+pub fn writeParts(ctx: *anyopaque, head: []const u8, body: []const u8) !void {
+    const self: *ClientConnection = @ptrCast(@alignCast(ctx));
+    if (self.ssl) |ssl| {
+        const total = head.len + body.len;
+        if (total <= 16 * 1024) {
+            var tmp: [16 * 1024]u8 = undefined;
+            @memcpy(tmp[0..head.len], head);
+            @memcpy(tmp[head.len..][0..body.len], body);
+            return tls_impl.sslWrite(ssl, tmp[0..total]);
+        }
+        try tls_impl.sslWrite(ssl, head);
+        return tls_impl.sslWrite(ssl, body);
+    }
+    return self.stream.writeAllParts(head, body);
+}
+
+pub fn accept(_: *anyopaque, _: c_int) anyerror!AcceptedConnection {
     @panic("accept not supported for client connections");
 }
 
-/// Close the connection: tear down TLS (if active), then close the socket.
-/// Does NOT free the ClientConnection struct — call destroy() for that.
+/// Interrupt the connection: shut the socket down so that any thread blocked
+/// in read()/write() returns immediately.  Idempotent and safe to call while
+/// other threads are using the connection.
+///
+/// Nothing is freed here — the descriptor, the TLS session and the struct are
+/// released by destroy(), which runs once the last reference is dropped.  Tearing
+/// the SSL object down from this thread while the reader is inside SSL_read
+/// (as an earlier version did) is a use-after-free.
 pub fn close(ctx: *anyopaque) void {
     const self: *ClientConnection = @ptrCast(@alignCast(ctx));
+    self.interrupted.store(true, .release);
+    self.stream.shutdown();
+}
+
+/// Release every resource: TLS session, owned SSL_CTX, the socket descriptor
+/// and the struct itself.  Called exactly once, when no thread references the
+/// connection any more (see Connection.release).
+pub fn destroy(ctx: *anyopaque) void {
+    const self: *ClientConnection = @ptrCast(@alignCast(ctx));
     if (self.ssl) |ssl| {
-        tls_impl.sslClose(ssl);
+        tls_impl.sslClose(ssl, !self.interrupted.load(.acquire));
         self.ssl = null;
     }
     if (self.ssl_ctx) |ssl_ctx| {
@@ -140,10 +204,6 @@ pub fn close(ctx: *anyopaque) void {
         self.ssl_ctx = null;
     }
     self.stream.close();
-}
-
-pub fn destroy(ctx: *anyopaque) void {
-    const self: *ClientConnection = @ptrCast(@alignCast(ctx));
     self.allocator.destroy(self);
 }
 

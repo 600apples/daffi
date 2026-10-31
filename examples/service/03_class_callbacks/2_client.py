@@ -6,8 +6,8 @@ The @local 'reset' method is NOT remotely callable and is omitted.
 
 Run 1_service.py first.
 """
-from daffi import Client
 
+from daffi import Client, TCPTransport
 
 SENTENCES = [
     "the quick brown fox",
@@ -16,7 +16,7 @@ SENTENCES = [
 ]
 
 if __name__ == "__main__":
-    client = Client(app_name="text-client", host="0.0.0.0", port=5003)
+    client = Client(app_name="text-client", transport=TCPTransport("0.0.0.0", 5003))
     conn = client.connect()
 
     rpc = conn.rpc(timeout=5)

@@ -9,8 +9,9 @@ AsyncTaskDispatcher without spawning threads.
 
 Run first, then run 2_client.py.
 """
+
 import asyncio
-from daffi import callback
+from daffi import callback, TCPTransport
 from daffi.registry import local
 from daffi.aio import AsyncService
 
@@ -47,7 +48,9 @@ class TextProcessor:
 
 
 async def main():
-    svc = AsyncService(app_name="text-service", host="0.0.0.0", port=5003)
+    svc = AsyncService(
+        app_name="text-service", transport=TCPTransport("0.0.0.0", 5003)
+    )
     await svc.start()
     print("Service running on 0.0.0.0:5003 — press Ctrl+C to stop.")
     await svc.join()

@@ -24,19 +24,21 @@ classifiers = [
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
     "Programming Language :: Python :: 3.14",
+    "Programming Language :: Python :: 3.15",
     "Programming Language :: Python :: Implementation :: CPython",
     "Topic :: Software Development :: Libraries :: Python Modules",
     "Topic :: System :: Distributed Computing",
     "Topic :: System :: Networking",
 ]
-dependencies = []
+dependencies = [
+    "msgpack>=1.0",
+]
 
 [project.optional-dependencies]
-msgpack = ["msgpack>=1.0"]
 tests = [
     "pytest>=7.0",
     "pytest-asyncio>=0.23",
-    "msgpack>=1.0",
+    "wasmtime>=20",
 ]
 
 [project.urls]
@@ -55,13 +57,18 @@ path = "daffi/__about__.py"
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+markers = [
+    "memleak: steady-state RSS / resource checks (slower; run with -m memleak)",
+    "execution_models_self_managed: already covers threads+evented; skip on evented matrix pass",
+]
 
 
 [tool.cibuildwheel]
-# CPython 3.10 – 3.14; skip PyPy and 32-bit.  Each OS section below sets its
-# own archs so a single runner only builds its native architecture.
-build = "cp310-* cp311-* cp312-* cp313-* cp314-*"
-skip  = "pp* *i686*"
+# CPython 3.10 – 3.15 only. Skip PyPy, 32-bit, and CPython 3.9 and older.
+# Each OS section below sets its own archs so a single runner only builds
+# its native architecture.
+build = "cp310-* cp311-* cp312-* cp313-* cp314-* cp315-*"
+skip  = "pp* *i686* cp36-* cp37-* cp38-* cp39-*"
 
 # Quick smoke test after every wheel build.
 test-command = "python -c \"import daffi; print('daffi', daffi.__version__)\""
@@ -72,7 +79,7 @@ test-command = "python -c \"import daffi; print('daffi', daffi.__version__)\""
 # aarch64 on ubuntu-24.04-arm).  No QEMU emulation needed.
 archs = ["native"]
 
-# manylinux_2_28 (AlmaLinux 8) — modern enough for Zig 0.16.
+# manylinux_2_28 (AlmaLinux 8) — modern enough for Zig 0.17.
 manylinux-x86_64-image  = "quay.io/pypa/manylinux_2_28_x86_64"
 manylinux-aarch64-image = "quay.io/pypa/manylinux_2_28_aarch64"
 

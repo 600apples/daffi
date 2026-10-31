@@ -4,7 +4,9 @@ Async integration tests for on_member_added / on_member_removed event handlers.
 Mirrors tests/integration/test_events.py using daffi.aio.
 Layout: AsyncClient (watcher) connected to an AsyncRouter.
 """
+
 from __future__ import annotations
+from tests.conftest import active_runtime
 
 import asyncio
 import multiprocessing as mp
@@ -24,18 +26,19 @@ _EVENT_TIMEOUT = 15
 
 # ── subprocess helpers ─────────────────────────────────────────────────────────
 
-def _worker_proc(port: int, name: str) -> None:
-    silence_subprocess()
+
+def _worker_proc(runtime: str, port: int, name: str) -> None:
+    silence_subprocess(runtime)
 
     async def _main():
-        from daffi import callback
+        from daffi import callback, TCPTransport
         from daffi.aio import AsyncClient
 
         @callback
         async def ping():
             return "pong"
 
-        client = AsyncClient(app_name=name, host=HOST, port=port)
+        client = AsyncClient(app_name=name, transport=TCPTransport(HOST, port), runtime=runtime)
         await client.connect()
         await client.join()
 
@@ -44,9 +47,10 @@ def _worker_proc(port: int, name: str) -> None:
 
 # ── fixtures ───────────────────────────────────────────────────────────────────
 
+
 @pytest.fixture
 def router_port(free_port):
-    proc = mp.Process(target=proc_router, args=(free_port,), daemon=True)
+    proc = mp.Process(target=proc_router, args=(active_runtime(), free_port,), daemon=True)
     proc.start()
     wait_for_port(free_port)
     yield free_port
@@ -55,17 +59,22 @@ def router_port(free_port):
 
 # ── tests ──────────────────────────────────────────────────────────────────────
 
+
 @pytest.mark.asyncio
 class TestMemberAddedEventAsync:
     """on_member_added fires when a new peer registers."""
 
     async def test_decorator_fires_on_join(self, router_port):
         from daffi.aio import AsyncClient
+        from daffi import TCPTransport
 
         received: list[str] = []
         event = asyncio.Event()
 
-        client = AsyncClient(app_name="evt-watcher-added", host=HOST, port=router_port)
+        client = AsyncClient(
+            app_name="evt-watcher-added", transport=TCPTransport(HOST, router_port),
+            runtime=active_runtime(),
+        )
         conn = await client.connect()
 
         @conn.on_member_added
@@ -73,7 +82,9 @@ class TestMemberAddedEventAsync:
             received.append(name)
             event.set()
 
-        proc = mp.Process(target=_worker_proc, args=(router_port, "evt-joiner"), daemon=True)
+        proc = mp.Process(
+            target=_worker_proc, args=(active_runtime(), router_port, "evt-joiner"), daemon=True
+        )
         proc.start()
         try:
             await asyncio.wait_for(event.wait(), timeout=_EVENT_TIMEOUT)
@@ -84,11 +95,15 @@ class TestMemberAddedEventAsync:
 
     async def test_watcher_does_not_see_itself(self, router_port):
         from daffi.aio import AsyncClient
+        from daffi import TCPTransport
 
         received: list[str] = []
         event = asyncio.Event()
 
-        client = AsyncClient(app_name="evt-watcher-self", host=HOST, port=router_port)
+        client = AsyncClient(
+            app_name="evt-watcher-self", transport=TCPTransport(HOST, router_port),
+            runtime=active_runtime(),
+        )
         conn = await client.connect()
 
         @conn.on_member_added
@@ -96,7 +111,9 @@ class TestMemberAddedEventAsync:
             received.append(name)
             event.set()
 
-        proc = mp.Process(target=_worker_proc, args=(router_port, "evt-other-self"), daemon=True)
+        proc = mp.Process(
+            target=_worker_proc, args=(active_runtime(), router_port, "evt-other-self"), daemon=True
+        )
         proc.start()
         try:
             await asyncio.wait_for(event.wait(), timeout=_EVENT_TIMEOUT)
@@ -107,11 +124,15 @@ class TestMemberAddedEventAsync:
 
     async def test_correct_name_passed(self, router_port):
         from daffi.aio import AsyncClient
+        from daffi import TCPTransport
 
         received: list[str] = []
         event = asyncio.Event()
 
-        client = AsyncClient(app_name="evt-watcher-name", host=HOST, port=router_port)
+        client = AsyncClient(
+            app_name="evt-watcher-name", transport=TCPTransport(HOST, router_port),
+            runtime=active_runtime(),
+        )
         conn = await client.connect()
 
         @conn.on_member_added
@@ -120,7 +141,9 @@ class TestMemberAddedEventAsync:
             event.set()
 
         expected_name = "evt-named-worker"
-        proc = mp.Process(target=_worker_proc, args=(router_port, expected_name), daemon=True)
+        proc = mp.Process(
+            target=_worker_proc, args=(active_runtime(), router_port, expected_name), daemon=True
+        )
         proc.start()
         try:
             await asyncio.wait_for(event.wait(), timeout=_EVENT_TIMEOUT)
@@ -131,13 +154,17 @@ class TestMemberAddedEventAsync:
 
     async def test_multiple_handlers_all_called(self, router_port):
         from daffi.aio import AsyncClient
+        from daffi import TCPTransport
 
         received_a: list[str] = []
         received_b: list[str] = []
         event_a = asyncio.Event()
         event_b = asyncio.Event()
 
-        client = AsyncClient(app_name="evt-multi-added", host=HOST, port=router_port)
+        client = AsyncClient(
+            app_name="evt-multi-added", transport=TCPTransport(HOST, router_port),
+            runtime=active_runtime(),
+        )
         conn = await client.connect()
 
         @conn.on_member_added
@@ -150,7 +177,9 @@ class TestMemberAddedEventAsync:
             received_b.append(name)
             event_b.set()
 
-        proc = mp.Process(target=_worker_proc, args=(router_port, "evt-multi-w"), daemon=True)
+        proc = mp.Process(
+            target=_worker_proc, args=(active_runtime(), router_port, "evt-multi-w"), daemon=True
+        )
         proc.start()
         try:
             await asyncio.gather(
@@ -170,12 +199,16 @@ class TestMemberRemovedEventAsync:
 
     async def test_fires_on_graceful_disconnect(self, router_port):
         from daffi.aio import AsyncClient
+        from daffi import TCPTransport
 
         removed: list[str] = []
         joined = asyncio.Event()
         event = asyncio.Event()
 
-        client = AsyncClient(app_name="evt-watcher-removed", host=HOST, port=router_port)
+        client = AsyncClient(
+            app_name="evt-watcher-removed", transport=TCPTransport(HOST, router_port),
+            runtime=active_runtime(),
+        )
         conn = await client.connect()
 
         @conn.on_member_added
@@ -189,7 +222,9 @@ class TestMemberRemovedEventAsync:
                 removed.append(name)
                 event.set()
 
-        proc = mp.Process(target=_worker_proc, args=(router_port, "evt-leaver"), daemon=True)
+        proc = mp.Process(
+            target=_worker_proc, args=(active_runtime(), router_port, "evt-leaver"), daemon=True
+        )
         proc.start()
         try:
             await asyncio.wait_for(joined.wait(), timeout=_EVENT_TIMEOUT)
@@ -202,12 +237,16 @@ class TestMemberRemovedEventAsync:
 
     async def test_added_not_called_on_remove(self, router_port):
         from daffi.aio import AsyncClient
+        from daffi import TCPTransport
 
         added: list[str] = []
         joined = asyncio.Event()
         removed_event = asyncio.Event()
 
-        client = AsyncClient(app_name="evt-no-add-on-rm", host=HOST, port=router_port)
+        client = AsyncClient(
+            app_name="evt-no-add-on-rm", transport=TCPTransport(HOST, router_port),
+            runtime=active_runtime(),
+        )
         conn = await client.connect()
 
         @conn.on_member_added
@@ -221,7 +260,9 @@ class TestMemberRemovedEventAsync:
             if name == "evt-rm-only":
                 removed_event.set()
 
-        proc = mp.Process(target=_worker_proc, args=(router_port, "evt-rm-only"), daemon=True)
+        proc = mp.Process(
+            target=_worker_proc, args=(active_runtime(), router_port, "evt-rm-only"), daemon=True
+        )
         proc.start()
         try:
             await asyncio.wait_for(joined.wait(), timeout=_EVENT_TIMEOUT)

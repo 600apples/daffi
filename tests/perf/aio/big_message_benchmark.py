@@ -33,7 +33,15 @@ Run::
 
     python3 tests/perf/aio/big_message_benchmark.py
 """
+
 from __future__ import annotations
+import sys
+from pathlib import Path
+
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+from tests.conftest import active_runtime
 
 import asyncio
 import logging
@@ -52,17 +60,17 @@ if _PROJECT_ROOT not in sys.path:
 
 # ── constants ──────────────────────────────────────────────────────────────────
 
-HOST    = "127.0.0.1"
+HOST = "127.0.0.1"
 TIMEOUT = 120
 
 MAX_BYTES_MESSAGE = (1 << 25) - 1
 
 SIZES: list[tuple[str, int]] = [
-    ("1 KiB",   1 << 10),
-    ("64 KiB",  1 << 16),
-    ("1 MiB",   1 << 20),
-    ("4 MiB",   1 << 22),
-    ("8 MiB",   8 * (1 << 20)),
+    ("1 KiB", 1 << 10),
+    ("64 KiB", 1 << 16),
+    ("1 MiB", 1 << 20),
+    ("4 MiB", 1 << 22),
+    ("8 MiB", 8 * (1 << 20)),
     ("16 MiB", 16 * (1 << 20)),
     ("28 MiB", 28 * (1 << 20)),
 ]
@@ -70,25 +78,33 @@ SIZES: list[tuple[str, int]] = [
 JSON_SIZES: list[tuple[str, int]] = [s for s in SIZES if s[1] <= 4 * (1 << 20)]
 
 N_CALLS = 5
-WARMUP  = 2
+WARMUP = 2
 
 # ── serde configs ─────────────────────────────────────────────────────────────
+
 
 def _json_payload(n: int) -> str:
     return "x" * n
 
 
 SERDE_CONFIGS: list[tuple[str, str, Callable[[int], object], list, str]] = [
-    ("OPAQUE",  "OPAQUE",  bytes,         SIZES,      "bytes, zero-copy pass-through"),
-    ("PICKLE",  "PICKLE",  bytes,         SIZES,      "bytes object via pickle"),
-    ("MSGPACK", "MSGPACK", bytes,         SIZES,      "bytes via msgpack (bin type)"),
-    ("JSON",    "JSON",    _json_payload, JSON_SIZES, "str of N chars (bytes unsupported by JSON)"),
+    ("OPAQUE", "OPAQUE", bytes, SIZES, "bytes, zero-copy pass-through"),
+    ("PICKLE", "PICKLE", bytes, SIZES, "bytes object via pickle"),
+    ("MSGPACK", "MSGPACK", bytes, SIZES, "bytes via msgpack (bin type)"),
+    (
+        "JSON",
+        "JSON",
+        _json_payload,
+        JSON_SIZES,
+        "str of N chars (bytes unsupported by JSON)",
+    ),
 ]
 
 
 def _msgpack_available() -> bool:
     try:
         import msgpack  # noqa: F401
+
         return True
     except ImportError:
         return False
@@ -96,17 +112,23 @@ def _msgpack_available() -> bool:
 
 # ── silence helpers ───────────────────────────────────────────────────────────
 
-def _silence_subprocess() -> None:
+
+def _silence_subprocess(runtime: str) -> None:
     devnull_fd = os.open(os.devnull, os.O_WRONLY)
     os.dup2(devnull_fd, 1)
     os.dup2(devnull_fd, 2)
     os.close(devnull_fd)
     logging.disable(logging.CRITICAL)
 
+    import tests.conftest as _runtime_state
+    _runtime_state.SELECTED_RUNTIME = runtime
+    from daffi import dfcore
+    dfcore.setRuntime(runtime)
+
 
 def _quiet_teardown(fn, *args, **kwargs) -> None:
     devnull = os.open(os.devnull, os.O_WRONLY)
-    saved   = (os.dup(1), os.dup(2))
+    saved = (os.dup(1), os.dup(2))
     os.dup2(devnull, 1)
     os.dup2(devnull, 2)
     os.close(devnull)
@@ -120,6 +142,7 @@ def _quiet_teardown(fn, *args, **kwargs) -> None:
 
 
 # ── port helpers ──────────────────────────────────────────────────────────────
+
 
 def _free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -136,54 +159,67 @@ def _wait_for_port(port: int, timeout: float = 15.0) -> None:
                 return
         except OSError:
             time.sleep(0.05)
-    raise TimeoutError(f"Server on {HOST}:{port} did not become ready within {timeout}s")
+    raise TimeoutError(
+        f"Server on {HOST}:{port} did not become ready within {timeout}s"
+    )
 
 
 # ── subprocess entry points ───────────────────────────────────────────────────
 
-def _proc_service(host: str, port: int) -> None:
-    _silence_subprocess()
+
+def _proc_service(runtime: str, host: str, port: int) -> None:
+    _silence_subprocess(runtime)
 
     async def _main():
-        from daffi import callback
+        from daffi import callback, TCPTransport
         from daffi.aio import AsyncService
 
         @callback
         async def echo(payload):
             return payload
 
-        svc = AsyncService(app_name="bigmsg-svc-aio", host=host, port=port)
+        svc = AsyncService(
+            app_name="bigmsg-svc-aio", transport=TCPTransport(host, port),
+            runtime=runtime,
+        )
         await svc.start()
         await svc.join()
 
     asyncio.run(_main())
 
 
-def _proc_router(host: str, port: int) -> None:
-    _silence_subprocess()
+def _proc_router(runtime: str, host: str, port: int) -> None:
+    _silence_subprocess(runtime)
 
     async def _main():
         from daffi.aio import AsyncRouter
+        from daffi import TCPTransport
 
-        r = AsyncRouter(app_name="bigmsg-router-aio", host=host, port=port)
+        r = AsyncRouter(
+            app_name="bigmsg-router-aio", transport=TCPTransport(host, port),
+            runtime=runtime,
+        )
         await r.start()
         await r.join()
 
     asyncio.run(_main())
 
 
-def _proc_worker(host: str, port: int) -> None:
-    _silence_subprocess()
+def _proc_worker(runtime: str, host: str, port: int) -> None:
+    _silence_subprocess(runtime)
 
     async def _main():
-        from daffi import callback
+        from daffi import callback, TCPTransport
         from daffi.aio import AsyncClient
 
         @callback
         async def echo(payload):
             return payload
 
-        client = AsyncClient(app_name="bigmsg-worker-aio", host=host, port=port)
+        client = AsyncClient(
+            app_name="bigmsg-worker-aio", transport=TCPTransport(host, port),
+            runtime=runtime,
+        )
         await client.connect()
         await client.join()
 
@@ -191,6 +227,7 @@ def _proc_worker(host: str, port: int) -> None:
 
 
 # ── measurement helpers ───────────────────────────────────────────────────────
+
 
 def _mib(n_bytes: int) -> str:
     return f"{n_bytes / (1 << 20):.2f} MiB"
@@ -228,10 +265,13 @@ async def _bench_size(proxy, payload, n_bytes: int) -> dict[str, float | str]:
 
 _COL_W = 82
 
+
 def _print_layout_header(layout_name: str) -> None:
     print(f"\n  Layout: {layout_name}")
-    print(f"  {'format':<8}  {'size':<8}  "
-          f"{'avg':>14}  {'min':>14}  {'max':>14}  {'throughput':>14}")
+    print(
+        f"  {'format':<8}  {'size':<8}  "
+        f"{'avg':>14}  {'min':>14}  {'max':>14}  {'throughput':>14}"
+    )
     print("  " + "─" * _COL_W)
 
 
@@ -251,16 +291,19 @@ def _print_row(fmt_label: str, size_label: str, stats: dict) -> None:
 
 # ── core benchmark loop ───────────────────────────────────────────────────────
 
+
 async def _run_all_formats(conn, layout_name: str) -> None:
-    from daffi import SerdeFormat
+    from daffi import SerdeFormat, TCPTransport
 
     _print_layout_header(layout_name)
 
     first_format = True
     for fmt_name, serde_attr, payload_fn, sizes, _note in SERDE_CONFIGS:
         if fmt_name == "MSGPACK" and not _msgpack_available():
-            print(f"  {'msgpack':<8}  (skipped — msgpack not installed; "
-                  "run: pip install 'daffi[msgpack]')")
+            print(
+                f"  {'msgpack':<8}  (skipped — msgpack not installed; "
+                "msgpack is a required daffi dependency")"
+            )
             continue
 
         if not first_format:
@@ -281,18 +324,23 @@ async def _run_all_formats(conn, layout_name: str) -> None:
 
 # ── layout entry points ───────────────────────────────────────────────────────
 
+
 async def bench_direct() -> None:
     from daffi.aio import AsyncClient
+    from daffi import TCPTransport
 
     port = _free_port()
-    proc = mp.Process(target=_proc_service, args=(HOST, port), daemon=True)
+    proc = mp.Process(target=_proc_service, args=(active_runtime(), HOST, port), daemon=True)
     proc.start()
     try:
         _wait_for_port(port)
         await asyncio.sleep(0.15)
 
-        client = AsyncClient(app_name="bigmsg-direct-caller-aio", host=HOST, port=port)
-        conn   = await client.connect()
+        client = AsyncClient(
+            app_name="bigmsg-direct-caller-aio", transport=TCPTransport(HOST, port),
+            runtime=active_runtime(),
+        )
+        conn = await client.connect()
         try:
             await _run_all_formats(conn, "Direct (AsyncClient → AsyncService)")
         finally:
@@ -304,10 +352,11 @@ async def bench_direct() -> None:
 
 async def bench_via_router() -> None:
     from daffi.aio import AsyncClient
+    from daffi import TCPTransport
 
-    port  = _free_port()
-    rproc = mp.Process(target=_proc_router, args=(HOST, port), daemon=True)
-    wproc = mp.Process(target=_proc_worker, args=(HOST, port), daemon=True)
+    port = _free_port()
+    rproc = mp.Process(target=_proc_router, args=(active_runtime(), HOST, port), daemon=True)
+    wproc = mp.Process(target=_proc_worker, args=(active_runtime(), HOST, port), daemon=True)
 
     rproc.start()
     try:
@@ -315,8 +364,11 @@ async def bench_via_router() -> None:
         wproc.start()
         await asyncio.sleep(0.5)
 
-        client = AsyncClient(app_name="bigmsg-router-caller-aio", host=HOST, port=port)
-        conn   = await client.connect()
+        client = AsyncClient(
+            app_name="bigmsg-router-caller-aio", transport=TCPTransport(HOST, port),
+            runtime=active_runtime(),
+        )
+        conn = await client.connect()
         try:
             await _run_all_formats(
                 conn, "Via Router (AsyncClient → AsyncRouter → AsyncWorker)"
@@ -332,12 +384,17 @@ async def bench_via_router() -> None:
 
 # ── main ──────────────────────────────────────────────────────────────────────
 
+
 async def _async_main() -> None:
     print("\ndaffi.aio big-message benchmark — serde format comparison")
     print(f"host      : {HOST}")
-    print(f"max legal : {_mib(MAX_BYTES_MESSAGE)}"
-          f"  (u25 field = 2²⁵ − 1 = {MAX_BYTES_MESSAGE:,} bytes)")
-    print(f"calls     : {N_CALLS} measured + {WARMUP} warmup per (format × layout × size)")
+    print(
+        f"max legal : {_mib(MAX_BYTES_MESSAGE)}"
+        f"  (u25 field = 2²⁵ − 1 = {MAX_BYTES_MESSAGE:,} bytes)"
+    )
+    print(
+        f"calls     : {N_CALLS} measured + {WARMUP} warmup per (format × layout × size)"
+    )
     print(f"throughput: (payload × 2) / avg_latency  (request + response)")
     print()
     print(f"  {'Format':<8}  {'Payload type':<38}  Max size")

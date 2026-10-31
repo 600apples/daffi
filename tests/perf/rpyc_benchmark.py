@@ -1,18 +1,18 @@
 """
-RPyC performance benchmark — comparable to perf_benchmark.py.
+RPyC vs daffi performance benchmark — comparable to zerorpc_benchmark.py.
 
 Layouts
 -------
-1. Direct     — Client → Server  (one TCP hop, ThreadedServer)
-2. Via Proxy  — Client → Proxy → Worker
-                The Proxy server receives each call and forwards it to a
-                backend Worker server — the closest RPyC equivalent to daffi's
-                Client → Router → Worker topology.
+1. Direct     — Client → Server / Service  (one TCP hop)
+2. Via hop    — RPyC Client → Proxy → Worker
+                daffi Client → Router → Worker
 
-Payload
--------
-Same ``data.json`` used by perf_benchmark.py — a realistic nested order record
-(~2 KB).  The server echoes it back unchanged so the comparison is apples-to-apples.
+Payload: ``data.json`` (~2 KB), echoed unchanged.  daffi uses PICKLE (object
+RPC peer to RPyC's brine serialization of the same dict).
+
+Requires::
+
+    pip install rpyc
 
 Run::
 
@@ -30,16 +30,18 @@ import sys
 import time
 from pathlib import Path
 
-# ── constants ──────────────────────────────────────────────────────────────────
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+from tests.conftest import active_runtime
 
 _DATA_FILE = Path(__file__).parent / "data.json"
 
-N      = 100_000  # measured calls per layout — same as perf_benchmark.py
+N = 100_000
 WARMUP = 20
 TIMEOUT = 30
-HOST   = "127.0.0.1"
+HOST = "127.0.0.1"
 
-# ── helpers ───────────────────────────────────────────────────────────────────
 
 def _free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -60,20 +62,48 @@ def _wait_for_port(port: int, timeout: float = 15.0) -> None:
 
 
 def _silence() -> None:
-    devnull = os.open(os.devnull, os.O_WRONLY)
-    os.dup2(devnull, 1)
-    os.dup2(devnull, 2)
-    os.close(devnull)
+    dn = os.open(os.devnull, os.O_WRONLY)
+    os.dup2(dn, 1)
+    os.dup2(dn, 2)
+    os.close(dn)
     logging.disable(logging.CRITICAL)
 
 
-def _report(label: str, latencies_ms: list[float]) -> None:
+def _silence_daffi(runtime: str) -> None:
+    _silence()
+    import tests.conftest as _runtime_state
+
+    _runtime_state.SELECTED_RUNTIME = runtime
+    from daffi import dfcore
+
+    dfcore.setRuntime(runtime)
+
+
+def _report(label: str, latencies_ms: list[float]) -> float:
     n = len(latencies_ms)
     total_s = sum(latencies_ms) / 1_000
-    print(f"  {label}: {total_s:.3f} s for {n} calls  ({n / total_s:.0f} calls/s)")
+    rate = n / total_s
+    print(f"  {label}: {total_s:.3f} s for {n} calls  ({rate:.0f} calls/s)")
+    return rate
 
 
-# ── subprocess entry points ────────────────────────────────────────────────────
+def _measure(tag: str, call) -> list[float]:
+    print(f"  [{tag}] warming up ({WARMUP} calls)…", end="", flush=True)
+    for _ in range(WARMUP):
+        call()
+    print(" done")
+    print(f"  [{tag}] measuring {N} calls…", end="", flush=True)
+    latencies: list[float] = []
+    for _ in range(N):
+        t0 = time.perf_counter()
+        call()
+        latencies.append((time.perf_counter() - t0) * 1_000)
+    print(" done")
+    return latencies
+
+
+# ── RPyC ──────────────────────────────────────────────────────────────────────
+
 
 def _proc_rpyc_server(port: int) -> None:
     _silence()
@@ -93,20 +123,7 @@ def _proc_rpyc_server(port: int) -> None:
 
 
 def _proc_rpyc_worker(port: int) -> None:
-    _silence()
-    import rpyc
-    from rpyc.utils.server import ThreadedServer
-
-    class EchoService(rpyc.Service):
-        def exposed_echo(self, payload):
-            return payload
-
-    ThreadedServer(
-        EchoService,
-        hostname=HOST,
-        port=port,
-        protocol_config={"allow_public_attrs": True},
-    ).start()
+    _proc_rpyc_server(port)
 
 
 def _proc_rpyc_proxy(proxy_port: int, worker_port: int) -> None:
@@ -134,8 +151,6 @@ def _proc_rpyc_proxy(proxy_port: int, worker_port: int) -> None:
     ).start()
 
 
-# ── benchmark functions ────────────────────────────────────────────────────────
-
 def bench_rpyc_direct(data: dict) -> list[float]:
     import rpyc
 
@@ -144,24 +159,16 @@ def bench_rpyc_direct(data: dict) -> list[float]:
     proc.start()
     try:
         _wait_for_port(port)
-        conn = rpyc.connect(HOST, port, config={"allow_public_attrs": True, "sync_request_timeout": TIMEOUT})
+        conn = rpyc.connect(
+            HOST,
+            port,
+            config={"allow_public_attrs": True, "sync_request_timeout": TIMEOUT},
+        )
         svc = conn.root
-
-        print(f"  [rpyc-direct] warming up ({WARMUP} calls)…", end="", flush=True)
-        for _ in range(WARMUP):
-            svc.echo(data)
-        print(" done")
-
-        print(f"  [rpyc-direct] measuring {N} calls…", end="", flush=True)
-        latencies: list[float] = []
-        for _ in range(N):
-            t0 = time.perf_counter()
-            svc.echo(data)
-            latencies.append((time.perf_counter() - t0) * 1_000)
-        print(" done")
-
-        conn.close()
-        return latencies
+        try:
+            return _measure("rpyc-direct", lambda: svc.echo(data))
+        finally:
+            conn.close()
     finally:
         proc.terminate()
         proc.join(timeout=5)
@@ -171,36 +178,27 @@ def bench_rpyc_via_proxy(data: dict) -> list[float]:
     import rpyc
 
     worker_port = _free_port()
-    proxy_port  = _free_port()
-
+    proxy_port = _free_port()
     worker_proc = mp.Process(target=_proc_rpyc_worker, args=(worker_port,), daemon=True)
-    proxy_proc  = mp.Process(target=_proc_rpyc_proxy,  args=(proxy_port, worker_port), daemon=True)
-
+    proxy_proc = mp.Process(
+        target=_proc_rpyc_proxy, args=(proxy_port, worker_port), daemon=True
+    )
     worker_proc.start()
     try:
         _wait_for_port(worker_port)
         proxy_proc.start()
         _wait_for_port(proxy_port)
         time.sleep(0.1)
-
-        conn = rpyc.connect(HOST, proxy_port, config={"allow_public_attrs": True, "sync_request_timeout": TIMEOUT})
+        conn = rpyc.connect(
+            HOST,
+            proxy_port,
+            config={"allow_public_attrs": True, "sync_request_timeout": TIMEOUT},
+        )
         svc = conn.root
-
-        print(f"  [rpyc-proxy] warming up ({WARMUP} calls)…", end="", flush=True)
-        for _ in range(WARMUP):
-            svc.echo(data)
-        print(" done")
-
-        print(f"  [rpyc-proxy] measuring {N} calls…", end="", flush=True)
-        latencies: list[float] = []
-        for _ in range(N):
-            t0 = time.perf_counter()
-            svc.echo(data)
-            latencies.append((time.perf_counter() - t0) * 1_000)
-        print(" done")
-
-        conn.close()
-        return latencies
+        try:
+            return _measure("rpyc-proxy", lambda: svc.echo(data))
+        finally:
+            conn.close()
     finally:
         proxy_proc.terminate()
         proxy_proc.join(timeout=5)
@@ -208,31 +206,143 @@ def bench_rpyc_via_proxy(data: dict) -> list[float]:
         worker_proc.join(timeout=5)
 
 
-# ── main ───────────────────────────────────────────────────────────────────────
+# ── daffi baselines ───────────────────────────────────────────────────────────
+
+
+def _proc_daffi_service(runtime: str, port: int) -> None:
+    _silence_daffi(runtime)
+    from daffi import Service, TCPTransport, callback
+
+    @callback
+    def echo(payload):
+        return payload
+
+    svc = Service(app_name="rpyc-cmp-svc", transport=TCPTransport(HOST, port), runtime=runtime)
+    svc.start()
+    svc.join()
+
+
+def _proc_daffi_router(runtime: str, port: int) -> None:
+    _silence_daffi(runtime)
+    from daffi import Router, TCPTransport
+
+    router = Router(app_name="rpyc-cmp-router", transport=TCPTransport(HOST, port), runtime=runtime)
+    router.start()
+    router.join()
+
+
+def _proc_daffi_worker(runtime: str, port: int) -> None:
+    _silence_daffi(runtime)
+    from daffi import Client, TCPTransport, callback
+
+    @callback
+    def echo(payload):
+        return payload
+
+    client = Client(app_name="rpyc-cmp-worker", transport=TCPTransport(HOST, port), runtime=runtime)
+    client.connect()
+    try:
+        while True:
+            time.sleep(1)
+    except (KeyboardInterrupt, SystemExit):
+        pass
+    finally:
+        client.stop()
+
+
+def bench_daffi_direct(data: dict) -> list[float]:
+    from daffi import Client, TCPTransport
+    from daffi._serialization import SerdeFormat
+
+    port = _free_port()
+    proc = mp.Process(target=_proc_daffi_service, args=(active_runtime(), port), daemon=True)
+    proc.start()
+    try:
+        _wait_for_port(port)
+        time.sleep(0.15)
+        client = Client(
+            app_name="rpyc-cmp-cli",
+            transport=TCPTransport(HOST, port),
+            runtime=active_runtime(),
+        )
+        c = client.connect().rpc(timeout=TIMEOUT)
+        try:
+            return _measure("daffi-direct", lambda: c.echo(data))
+        finally:
+            client.stop()
+    finally:
+        proc.terminate()
+        proc.join(timeout=5)
+
+
+def bench_daffi_via_router(data: dict) -> list[float]:
+    from daffi import Client, TCPTransport
+    from daffi._serialization import SerdeFormat
+
+    port = _free_port()
+    router_proc = mp.Process(target=_proc_daffi_router, args=(active_runtime(), port), daemon=True)
+    worker_proc = mp.Process(target=_proc_daffi_worker, args=(active_runtime(), port), daemon=True)
+    router_proc.start()
+    try:
+        _wait_for_port(port)
+        worker_proc.start()
+        time.sleep(0.4)
+        client = Client(
+            app_name="rpyc-cmp-router-cli",
+            transport=TCPTransport(HOST, port),
+            runtime=active_runtime(),
+        )
+        c = client.connect().rpc(timeout=TIMEOUT)
+        try:
+            return _measure("daffi-router", lambda: c.echo(data))
+        finally:
+            client.stop()
+    finally:
+        worker_proc.terminate()
+        worker_proc.join(timeout=5)
+        router_proc.terminate()
+        router_proc.join(timeout=5)
+
 
 def main() -> None:
     logging.disable(logging.INFO)
+    try:
+        import rpyc as _rpyc
+    except ImportError:
+        print("rpyc not installed — pip install rpyc", file=sys.stderr)
+        sys.exit(1)
 
-    import rpyc as _rpyc
-
-    data: dict = json.loads(_DATA_FILE.read_text())
+    data = json.loads(_DATA_FILE.read_text())
     payload_bytes = len(json.dumps(data).encode())
 
-    print(f"\nRPyC {_rpyc.__version__} performance benchmark  —  {N} sequential calls per layout")
-    print(f"host: {HOST}   warmup: {WARMUP} calls   timeout: {TIMEOUT}s")
-    print(f"payload: {_DATA_FILE.name}  ({payload_bytes} bytes JSON)\n")
+    print(f"\nRPyC {_rpyc.__version__} vs daffi  —  {N} sequential rpc calls")
+    print(f"host: {HOST}   warmup: {WARMUP}   payload: {_DATA_FILE.name} ({payload_bytes} bytes JSON)")
+    print("daffi serde=MSGPACK (object RPC peer)\n")
 
-    print("Layout 1: Direct (Client → Server)")
-    direct_lat = bench_rpyc_direct(data)
-    _report("Direct: Client → Server", direct_lat)
+    print("── Direct (Client → Server/Service) ─────────────────────")
+    print("  RPyC")
+    rpyc_direct = _report("RPyC direct", bench_rpyc_direct(data))
+    print("  daffi")
+    daffi_direct = _report("daffi direct", bench_daffi_direct(data))
 
-    print("\nLayout 2: Via Proxy (Client → Proxy → Worker)")
-    proxy_lat = bench_rpyc_via_proxy(data)
-    _report("Via Proxy: Client → Proxy → Worker", proxy_lat)
+    print("\n── Via hop (Proxy / Router) ─────────────────────────────")
+    print("  RPyC")
+    rpyc_hop = _report("RPyC proxy", bench_rpyc_via_proxy(data))
+    print("  daffi")
+    daffi_hop = _report("daffi router", bench_daffi_via_router(data))
 
-    d_avg_s = sum(direct_lat) / len(direct_lat) / 1_000
-    r_avg_s = sum(proxy_lat)  / len(proxy_lat)  / 1_000
-    print(f"\n  Proxy overhead vs direct: {(r_avg_s - d_avg_s) * 1000:+.3f} ms / call\n")
+    print("\n── Summary (calls/s) ───────────────────────────────────")
+    print(f"  {'layout':<10}  {'RPyC':>10}  {'daffi':>10}  {'daffi vs RPyC':>14}")
+    print(f"  {'----------':<10}  {'----------':>10}  {'----------':>10}  {'--------------':>14}")
+    print(
+        f"  {'Direct':<10}  {rpyc_direct:>10.0f}  {daffi_direct:>10.0f}  "
+        f"{daffi_direct / rpyc_direct:>13.2f}×"
+    )
+    print(
+        f"  {'Via hop':<10}  {rpyc_hop:>10.0f}  {daffi_hop:>10.0f}  "
+        f"{daffi_hop / rpyc_hop:>13.2f}×"
+    )
+    print()
 
 
 if __name__ == "__main__":

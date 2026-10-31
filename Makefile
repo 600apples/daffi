@@ -13,6 +13,10 @@ test:  ## Run unit + integration tests (requires built dfcore extension)
 test-unit:  ## Run unit tests only — fast, no server subprocess required
 	$(PYTEST) tests/unit $(PYTEST_OPTS)
 
+.PHONY: test-zig
+test-zig:  ## Run the Zig unit tests (needs Python headers + a shared libpython and OpenSSL libs)
+	python3 setup.py zig_test
+
 .PHONY: test-integration
 test-integration:  ## Run integration tests — spawns Service / Router subprocesses
 	$(PYTEST) tests/integration $(PYTEST_OPTS)
@@ -196,8 +200,8 @@ _check-clean:
 # ── Build ─────────────────────────────────────────────────────────────────────
 
 .PHONY: build
-build:  ## Build WASM (ReleaseFast) + Python C extension — no debug prints
-	zig build -Doptimize=ReleaseFast
+build:  ## Build WASM (fast) + Python C extension — no debug prints
+	zig build -Doptimize=fast
 	zig build python
 
 .PHONY: dev
@@ -205,8 +209,8 @@ dev:  ## Build C extension in Debug mode — enables connection debug prints
 	python3 setup.py build_ext --debug --inplace
 
 .PHONY: wasm
-wasm:  ## Compile app.wasm only (ReleaseFast); override with OPTIMIZE=Debug
-	zig build -Doptimize=$(if $(OPTIMIZE),$(OPTIMIZE),ReleaseFast)
+wasm:  ## Compile app.wasm only (fast); override with OPTIMIZE=debug
+	zig build -Doptimize=$(if $(OPTIMIZE),$(OPTIMIZE),fast)
 
 .PHONY: ext
 ext:  ## Build the Python C extension (dfcore) in-place

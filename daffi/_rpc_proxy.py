@@ -14,30 +14,35 @@ Five call styles are available on every :class:`ClientConnection`:
 
 from __future__ import annotations
 
+import itertools
 import json
-import select
+import math
 import time
 import logging
 import threading
-from itertools import repeat
-from typing import TYPE_CHECKING, Union, Tuple, List, Optional
+from typing import TYPE_CHECKING, Callable, Union, Tuple, List, Optional
 from contextlib import contextmanager
 
 if TYPE_CHECKING:
     from daffi.app import Client
 
 from daffi._serialization import SerdeFormat, Serializer
-from daffi.exceptions import InitializationError, CallTimeout, TransmissionFailure, RemoteCallError
+from daffi.exceptions import (
+    InitializationError,
+    CallTimeout,
+    Disconnected,
+    Evicted,
+    TransmissionFailure,
+    RemoteCallError,
+)
 from daffi.utils.misc import iterable
-from daffi._wakeup import WakeupFd
 from daffi.registry._executor_registry import EXECUTOR_REGISTRY
 from daffi._bindings import (
     send_message_from_client,
-    get_message_from_client_store,
-    mark_message_as_expired,
+    wait_message_from_client_store,
+    expire_message,
     set_service_methods,
     send_handshake_from_client,
-    set_response_fd,
     get_available_members,
     MessageFlag,
 )
@@ -46,122 +51,103 @@ from . import dfcore
 METADATA_SEPARATOR = ","
 
 
-class ResponseNotifier:
-    """Per-connection wakeup fd shared by every blocking RPC waiter.
+def coerce_timeout(timeout) -> float:
+    """Seconds to wait; ``None`` or ``0`` means wait forever.
 
-    Each :class:`~daffi.app.Client` connection owns exactly one notifier.
-    The notifier hands the write-side of an eventfd / pipe to the Zig layer
-    via :func:`set_response_fd`; Zig writes a single ``u64(1)`` to
-    it whenever a new response is inserted into ``ClientMessageStore``.
-
-    Each :meth:`RpcResult.result` call
-    blocks **directly** in ``select.select`` on :attr:`read_fd`, with the
-    remaining timeout passed straight through.  When several waiters share
-    the fd they all wake (``select`` is level-triggered), each tries to
-    drain (the read end is non-blocking so the racer that lost just sees
-    ``EAGAIN``), and each re-checks the store for its own uuid.  Whoever
-    finds their response returns; the others go straight back to
-    ``select`` for the next signal.
-
-    When the connection is torn down (disconnect or eviction) the lifecycle
-    watcher calls :meth:`signal_lifecycle_error`.  This sets
-    :attr:`_lifecycle_error` **before** writing to the wakeup fd so every
-    in-flight :meth:`RpcResult.result` waiter is guaranteed to see a
-    non-``None`` error after it wakes — even the one that drains the fd.
+    Fractional values are kept (``timeout=0.5`` is half a second).  Negatives
+    are rejected.
     """
-
-    _instances: "dict[int, ResponseNotifier]" = {}
-    _instances_lock = threading.Lock()
-
-    def __init__(self, conn_num: int) -> None:
-        self._conn_num = conn_num
-        self._wakeup = WakeupFd()
-        # Set by signal_lifecycle_error(); checked at the top of every
-        # RpcResult.result() loop iteration.
-        self._lifecycle_error: Optional[Exception] = None
-        set_response_fd(conn_num, self._wakeup.write_fd)
+    if timeout is None:
+        return 0.0
+    try:
+        value = float(timeout)
+    except (TypeError, ValueError) as exc:
+        raise TypeError(f"timeout must be a number of seconds, got {timeout!r}") from exc
+    if value < 0:
+        raise ValueError("timeout must be >= 0")
+    return value
 
 
-    @classmethod
-    def register(cls, conn_num: int) -> "ResponseNotifier":
-        """Create and register a notifier for *conn_num*.
+def _names(names: "list[str] | None") -> "list[str]":
+    if names is None:
+        return [name for name, _ in EXECUTOR_REGISTRY]
+    return names
 
-        If a stale notifier already exists for the same handle (e.g. after
-        an unclean reconnect) it is closed first so the fresh one owns
-        the slot.
-        """
-        with cls._instances_lock:
-            old = cls._instances.pop(conn_num, None)
-        if old is not None:
-            old.close()
-        notifier = cls(conn_num)
-        with cls._instances_lock:
-            cls._instances[conn_num] = notifier
-        return notifier
 
-    @classmethod
-    def unregister(cls, conn_num: int) -> None:
-        """Close and forget the notifier registered for *conn_num*, if any."""
-        with cls._instances_lock:
-            n = cls._instances.pop(conn_num, None)
-        if n is not None:
-            n.close()
+def connection_lost_error(evicted: bool, app_name: Optional[str] = None) -> Exception:
+    """The error for a call or connection that ended because the peer went away."""
+    if evicted:
+        who = f" (app_name={app_name!r})" if app_name else ""
+        return Evicted(
+            f"This client{who} was evicted — "
+            "a new connection with the same app_name took over its slot."
+        )
+    return Disconnected(
+        "Server disconnected unexpectedly.\n\n"
+        "  The router or service this client was connected to has stopped."
+    )
 
-    @classmethod
-    def for_conn(cls, conn_num: int) -> "Optional[ResponseNotifier]":
-        """Return the notifier for *conn_num*, or ``None`` if not registered."""
-        with cls._instances_lock:
-            return cls._instances.get(conn_num)
 
-    @classmethod
-    def signal_lifecycle_error(cls, conn_num: int, err: Exception) -> None:
-        """Wake every :meth:`RpcResult.result` waiter for *conn_num* with *err*.
+def unpack_response(res: Tuple, request_serde: Optional[int]) -> Tuple[bytes, int, int]:
+    """Return ``(data, flag, serde)`` for a RESPONSE, or raise the remote error.
 
-        The error is stored on the notifier **before** the wakeup fd is
-        signalled.  Because ``select.select`` is level-triggered, one write
-        wakes *all* threads currently blocked on the fd — each will drain
-        best-effort (races to drain are harmless) and then see
-        ``_lifecycle_error`` on the next loop iteration.
+    The response must use the request's format; an error may also come as
+    JSON (the native layer and OPAQUE callbacks report errors that way).
+    Anything else is refused, so a peer cannot get a PICKLE payload loaded
+    by a caller that never asked for one.
+    """
+    data, flag, serde = res
+    if request_serde is not None and serde != request_serde:
+        if not (flag == MessageFlag.ERROR and serde == SerdeFormat.JSON):
+            raise RemoteCallError(
+                f"Response format {serde} does not match the request format {request_serde}."
+            )
+    if flag == MessageFlag.ERROR:
+        (error_tuple,), _ = Serializer.deserialize(serde, data)
+        err_name, err_module, err_msg, tb = error_tuple
+        restored_exc = type(err_name, (RemoteCallError,), {"__module__": err_module})
+        if tb:
+            raise restored_exc(err_msg).with_traceback(tb)
+        raise restored_exc(err_msg)
+    return data, flag, serde
 
-        Safe to call from any thread, including the native-layer watcher.
-        No-op when no notifier is registered for *conn_num* (e.g. if the
-        connection was already stopped).
-        """
-        with cls._instances_lock:
-            n = cls._instances.get(conn_num)
-        if n is None:
-            return
-        n._lifecycle_error = err
-        n._wakeup.signal()
 
-    def close(self) -> None:
-        """Release both ends of the wakeup fd.
+class _Receivers:
+    """Where a single call may go: any worker (no names), or one of the named
+    workers, tried in turn starting from the next one along."""
 
-        Any waiter currently blocked in ``select.select`` will get
-        ``OSError: Bad file descriptor`` and bail out of its sleep — the
-        next loop iteration in :meth:`RpcResult.result` falls back to
-        the short fixed-interval polling path so a teardown in the
-        middle of an in-flight call still terminates cleanly.
-        """
-        try:
-            self._wakeup.close()
-        except Exception:
-            pass
+    def __init__(self, receiver: Union[str, List[str], None]) -> None:
+        if receiver is None or receiver == "":
+            names: List[str] = []
+        elif isinstance(receiver, str):
+            names = [receiver]
+        elif iterable(receiver):
+            names = list(receiver)
+            if not names or not all(isinstance(n, str) and n for n in names):
+                raise ValueError(f"receiver must list one or more names, not {receiver!r}")
+        else:
+            raise TypeError(f"receiver must be a name or a list of names, not {receiver!r}")
+        self.names = names
+        self._turn = itertools.count()
 
-    @property
-    def read_fd(self) -> int:
-        """File descriptor that callers should pass to ``select.select``."""
-        return self._wakeup.read_fd
+    def __str__(self) -> str:
+        return METADATA_SEPARATOR.join(self.names)
 
-    def drain(self) -> None:
-        """Best-effort drain of pending notifications.
-
-        Safe to call from multiple threads; the underlying ``os.read`` is
-        non-blocking (see :class:`~daffi.utils.wakeup.WakeupFd`) so a
-        racer that lost the drain just observes ``EAGAIN``.
-        """
-        self._wakeup.drain()
-
+    def send(self, send: Callable[[str], tuple]) -> tuple:
+        """``send(name)`` to the first of the names that is connected and
+        offers the callback; ``send("")`` lets the native layer pick."""
+        names = self.names
+        if not names:
+            return send("")
+        start = next(self._turn) % len(names)
+        order = names[start:] + names[:start]
+        for name in order[:-1]:
+            try:
+                return send(name)
+            except ValueError as e:
+                if str(e) != "ReceiverNotFound":
+                    raise
+        return send(order[-1])
 
 
 @contextmanager
@@ -192,6 +178,8 @@ def system_exception_handler(
         else:
             origin = str(e)
 
+        if origin == "Evicted":
+            raise connection_lost_error(True).with_traceback(None) from None
         if "ReceiverNotFound" in origin and conn_num:
             available = get_available_members(conn_num)
             if available:
@@ -200,9 +188,13 @@ def system_exception_handler(
                     methods = m.get("methods") or []
                     if methods:
                         cb_list = ", ".join(methods)
-                        peer_parts.append(f"      • {m['name']}\n          callbacks: [{cb_list}]")
+                        peer_parts.append(
+                            f"      • {m['name']}\n          callbacks: [{cb_list}]"
+                        )
                     else:
-                        peer_parts.append(f"      • {m['name']}\n          callbacks: (none)")
+                        peer_parts.append(
+                            f"      • {m['name']}\n          callbacks: (none)"
+                        )
                 peer_lines = "\n".join(peer_parts)
             else:
                 peer_lines = "      (none connected)"
@@ -216,6 +208,7 @@ def system_exception_handler(
 
         elif "ConnectionRefused" in origin and conn_info:
             import socket as _socket
+
             host, port, unix_sock_path = conn_info
             if unix_sock_path:
                 addr = f"unix://{unix_sock_path}"
@@ -233,9 +226,7 @@ def system_exception_handler(
                     except OSError:
                         pass
                 if in_use:
-                    hint = (
-                        f"\n  Port {port} on {host} is already occupied by another process."
-                    )
+                    hint = f"\n  Port {port} on {host} is already occupied by another process."
                 else:
                     hint = (
                         f"\n  The server could not bind to {addr}.\n"
@@ -279,7 +270,7 @@ class _BoundRpc:
         if self._proxy.return_result:
             return self._proxy._process_rpc(self._func_name, *args, **kwargs)
         else:
-            self._proxy._process_stream(self._func_name, *args, **kwargs)
+            self._proxy._process_nowait(self._func_name, *args, **kwargs)
 
 
 class RpcProxy:
@@ -308,14 +299,12 @@ class RpcProxy:
         logger: logging.Logger,
     ):
         self.conn = conn
-        self.timeout = int(timeout or 0)
-        self.receiver = (
-            METADATA_SEPARATOR.join(receiver) if iterable(receiver) else receiver or ""
-        )
+        self.timeout = coerce_timeout(timeout)
+        self._to = _Receivers(receiver)
+        self.receiver = str(self._to)
         self.serde = serde
         self.return_result = return_result
         self.logger = logger
-        self._receiver = {receiver} if receiver else set()
 
     def __str__(self) -> str:
         req_name = "rpc call" if self.return_result else "rpc_nowait"
@@ -332,97 +321,83 @@ class RpcProxy:
         """Send a blocking RPC call and return the deserialised result."""
         conn_num = self.conn.client._conn_num
         data, is_bytes = Serializer.serialize(self.serde, *args, **kwargs)
-        label = f"rpc call(fn: {func_name!r})"
-        with system_exception_handler(
-            f"Unable to proceed with {label}: {{}}", TransmissionFailure, conn_num
-        ):
-            uuid, ts, found_receiver = send_message_from_client(
-                data=data,
-                flag=MessageFlag.REQUEST,
-                serde=self.serde,
-                receiver=self.receiver,
-                func_name=func_name,
-                return_result=self.return_result,
-                conn_num=conn_num,
-                is_bytes=is_bytes,
+        try:
+            uuid, ts, found_receiver = self._to.send(
+                lambda receiver: dfcore.sendMessageFromClient(
+                    data,
+                    0,
+                    MessageFlag.REQUEST,
+                    self.serde,
+                    is_bytes,
+                    receiver,
+                    func_name,
+                    True,
+                    conn_num,
+                )
             )
-        found_receivers = (
-            None
-            if not found_receiver
-            else set(found_receiver.split(METADATA_SEPARATOR))
-        )
-        if not found_receivers:
+        except (SystemError, ValueError):
+            label = f"rpc call(fn: {func_name!r})"
+            with system_exception_handler(
+                f"Unable to proceed with {label}: {{}}", TransmissionFailure, conn_num
+            ):
+                raise
+        if not found_receiver:
             members = (
                 ""
                 if not (_memebers := get_available_members(conn_num))
                 else f"\nAvailable receivers: {_memebers}"
             )
-            raise TransmissionFailure(f"No receivers found for {label}." + members)
-        elif missing_receivers := self._receiver - found_receivers:
-            self.logger.warning(
-                f"Receiver(s): {missing_receivers} seems to be offline."
+            raise TransmissionFailure(
+                f"No receivers found for rpc call(fn: {func_name!r})." + members
             )
-        result = RpcResult(
+        found_receivers = {found_receiver}
+        data, flag, serde = RpcResult(
             conn_num=conn_num,
             uuid=uuid,
             ts=ts,
             timeout=self.timeout,
             receivers=found_receivers,
             proxy=self,
-        )
-        data, flag, serde = result.result()
+            serde=self.serde,
+        ).result()
         return Serializer.deserialize(serde, data)[0][0]
 
-    def _process_stream(self, func_name: str, *args, **kwargs):
-        """Send one or more fire-and-forget messages without waiting for replies."""
+    def _process_nowait(self, func_name: str, *args, **kwargs):
+        """Send one fire-and-forget call with exactly these arguments."""
         conn_num = self.conn.client._conn_num
-        if args:
-            data = args[0]
-        elif kwargs:
-            data = kwargs[next(iter(kwargs))]
-        else:
-            data = None
-        if not iterable(data):
-            items = [(args, kwargs)]
-        else:
-            items = iter(zip(data, repeat({})))
         label = f"rpc_nowait(fn: {func_name!r})"
-        for a, k in items:
-            data, is_bytes = Serializer.serialize(self.serde, *a, **k)
-            with system_exception_handler(
-                f"Unable to proceed with {label}: {{}}", TransmissionFailure, conn_num
-            ):
-                uuid, ts, found_receiver = send_message_from_client(
+        data, is_bytes = Serializer.serialize(self.serde, *args, **kwargs)
+        with system_exception_handler(
+            f"Unable to proceed with {label}: {{}}", TransmissionFailure, conn_num
+        ):
+            uuid, ts, found_receiver = self._to.send(
+                lambda receiver: send_message_from_client(
                     data=data,
                     flag=MessageFlag.REQUEST,
                     serde=self.serde,
-                    receiver=self.receiver,
+                    receiver=receiver,
                     func_name=func_name,
                     return_result=self.return_result,
                     conn_num=conn_num,
                     is_bytes=is_bytes,
                 )
-            if not found_receiver:
-                members = (
-                    ""
-                    if not (_memebers := get_available_members(conn_num))
-                    else f"\nAvailable receivers: {_memebers}"
-                )
-                raise TransmissionFailure(f"No receivers found for {label}." + members)
-            elif missing_receivers := self._receiver - set(
-                found_receiver.split(METADATA_SEPARATOR)
-            ):
-                self.logger.warning(
-                    f"Receiver(s): {missing_receivers} seems to be offline."
-                )
+            )
+        if not found_receiver:
+            members = (
+                ""
+                if not (_memebers := get_available_members(conn_num))
+                else f"\nAvailable receivers: {_memebers}"
+            )
+            raise TransmissionFailure(f"No receivers found for {label}." + members)
 
     @classmethod
-    def _process_client_handshake(cls, conn_num: int) -> dict:
+    def _process_client_handshake(cls, conn_num: int, names: "list[str] | None" = None) -> dict:
         """Perform the initial client→server handshake and return the parsed
         JSON response (contains ``meta.type`` indicating router vs service).
 
         Args:
             conn_num: Native connection handle.
+            names:    The callbacks to announce (default: every registered one).
 
         Raises:
             TransmissionFailure: If the handshake times out or the native layer
@@ -435,7 +410,7 @@ class RpcProxy:
         with system_exception_handler(
             "unable to establish handshake: {}", TransmissionFailure
         ):
-            data = METADATA_SEPARATOR.join([name for name, _ in EXECUTOR_REGISTRY])
+            data = METADATA_SEPARATOR.join(_names(names))
             uuid, ts, found_receiver = send_handshake_from_client(
                 methods=data,
                 conn_num=conn_num,
@@ -448,6 +423,7 @@ class RpcProxy:
                     timeout=30,
                     receivers=None,
                     proxy=None,
+                    serde=None,
                 ).result()
                 payload = json.loads(data)
             except CallTimeout:
@@ -461,19 +437,31 @@ class RpcProxy:
             return payload
 
     @classmethod
-    def _process_service_handshake(cls, conn_num: int) -> None:
+    def _advertise_service_methods(cls, conn_num: int, names: "list[str] | None" = None) -> None:
+        """Publish this service's callback names before any client connects."""
+        data = METADATA_SEPARATOR.join(_names(names))
+        set_service_methods(data, conn_num)
+
+    @classmethod
+    def _process_service_handshake(cls, conn_num: int, names: "list[str] | None" = None) -> None:
         """Notify the native layer of this service's exported method names.
 
         Args:
             conn_num: Native connection handle.
+            names:    The callbacks to announce (default: every registered one).
         """
-        data = METADATA_SEPARATOR.join([name for name, _ in EXECUTOR_REGISTRY])
-        set_service_methods(data, conn_num)
+        cls._advertise_service_methods(conn_num, names)
 
 
 class RpcResult:
-    """Polls the native message store until the response for a given *uuid*
-    arrives, then returns ``(data, flag, serde)``."""
+    """Waits for the response to one request and returns ``(data, flag, serde)``."""
+
+    # Longest single native wait.  Bounds how late a silent receiver
+    # disconnect is noticed.
+    _LIVENESS_INTERVAL = 1.0
+    # Signal handlers run only once the main thread is back in Python, so it
+    # waits in shorter slices to keep Ctrl+C prompt.
+    _MAIN_THREAD_SLICE = 0.1
 
     def __init__(
         self,
@@ -483,6 +471,7 @@ class RpcResult:
         timeout: int,
         receivers: Optional[set] = None,
         proxy: Optional[RpcProxy] = None,
+        serde: Optional[int] = None,
     ):
         self.conn_num = conn_num
         self.uuid = uuid
@@ -490,159 +479,76 @@ class RpcResult:
         self.timeout = timeout
         self.receivers = receivers
         self.proxy = proxy
-
-    # Cap on a single ``select.select`` wait so a silent peer disconnect is
-    # detected via the liveness re-check below within at most this many
-    # seconds.  Only applied when ``self.receivers`` is non-empty — for an
-    # untargeted RPC there is nothing to liveness-check against.
-    _LIVENESS_INTERVAL = 1.0
-
-    # Fallback poll interval for environments where no ResponseNotifier is
-    # registered (unit tests that exercise the bindings without going
-    # through ``Client.connect``).  Kept short so the fallback behaves
-    # similarly to the previous adaptive backoff at its tight end.
-    _FALLBACK_POLL_INTERVAL = 0.001
+        self.serde = serde
+        self._started = time.monotonic()
 
     def result(self) -> Tuple[bytes, int, int]:
         """Block until the response arrives and return ``(data, flag, serde)``.
 
-        Each iteration:
-
-        1. Look up the response in the client message store.  Always done
-           first — in ``cast()`` all sub-calls share roughly the same
-           ``send_ts``, so a peer's response may already be sitting in the
-           store from an earlier waiter.  Skipping this just because the
-           deadline elapsed would raise a spurious ``TimeoutError``.
-        2. Re-evaluate the deadline; raise ``TimeoutError`` if expired.
-        3. Block in ``select.select`` on the connection's response wakeup
-           fd, with the remaining time (or 1 s liveness cap) used directly
-           as the ``select`` timeout.  Any thread that wakes drains the fd
-           best-effort — the read end is non-blocking, so concurrent
-           waiters racing to drain just see ``EAGAIN`` instead of hanging.
+        The wait itself happens in the native layer without the GIL.  Every
+        exit other than a delivered response expires the uuid, so a late
+        response is dropped instead of parked.
 
         Raises:
             RemoteCallError: If the remote returned an error payload.
             TransmissionFailure: If an expected receiver disconnected mid-call.
+            Disconnected, Evicted: If the connection ended first.
             CallTimeout: If *timeout* seconds elapse with no response.
         """
-        notifier = ResponseNotifier.for_conn(self.conn_num)
-        wait_fds = [notifier.read_fd] if notifier is not None else []
-        deadline = (self.send_ts + self.timeout) if self.timeout > 0 else None
-
-        while True:
-            # Check the message store FIRST — a response that arrived at the
-            # same moment as a disconnect signal must not be lost.  This
-            # matters because the Zig dispatcher inserts the response into
-            # msg_store and signals response_fd in the *same* loop iteration,
-            # then immediately calls triggerDisconnect after hitting EOF on
-            # the *next* receive.  The lifecycle watcher can therefore set
-            # _lifecycle_error before Python has a chance to drain
-            # msg_store, so checking lifecycle error first would silently
-            # discard a valid response.
-            if res := get_message_from_client_store(self.uuid, self.conn_num):
-                return self._unpack_response(res)
-
-            # Only raise a lifecycle error when there is no response waiting.
-            # We capture and clear in one step so the slot is clean if the
-            # notifier is ever reused (e.g. the native layer recycles the
-            # same conn_num after a reconnect).  Multiple threads that woke
-            # simultaneously each capture the non-None value before any one
-            # of them clears it, so all of them still raise the correct error.
-            if notifier is not None and (
-                _lifecycle_err := notifier._lifecycle_error
-            ) is not None:
-                notifier._lifecycle_error = None
-                raise _lifecycle_err
-
-            if deadline is not None:
-                remaining = deadline - time.time()
-                if remaining <= 0:
-                    mark_message_as_expired(self.uuid, self.conn_num)
-                    raise CallTimeout(
-                        call=str(self.proxy) if self.proxy is not None else f"(uuid: {self.uuid})",
-                        timeout=self.timeout,
-                        elapsed=time.time() - self.send_ts,
-                        receivers=self.receivers or None,
-                    )
-            else:
-                remaining = None
-
-            # Cap each wait at the liveness interval when we have a known
-            # receiver set, so a silent peer disconnect surfaces within
-            # ~1 s instead of waiting the full call deadline.
-            if remaining is None:
-                wait_chunk = self._LIVENESS_INTERVAL if self.receivers else None
-            elif self.receivers:
-                wait_chunk = min(remaining, self._LIVENESS_INTERVAL)
-            else:
-                wait_chunk = remaining
-
-            if wait_fds:
-                try:
-                    readable, _, _ = select.select(wait_fds, [], [], wait_chunk)
-                except (OSError, ValueError):
-                    # fd was closed (notifier teardown during stop) — fall
-                    # back to a brief sleep and let the next iteration
-                    # re-evaluate everything.
-                    time.sleep(self._FALLBACK_POLL_INTERVAL)
-                    readable = ()
-                if readable:
-                    notifier.drain()
-                    # The wakeup means a response was just inserted into the
-                    # store — skip the liveness check and let the next loop
-                    # iteration return it.  This is the hot path for every
-                    # successful RPC: avoiding the ``get_available_members``
-                    # call here saves a Zig-side mutex acquisition + JSON
-                    # build + Python json.loads per call (the dominant cost
-                    # under high concurrency).
-                    continue
-            else:
-                # No notifier registered (e.g. RpcResult exercised outside
-                # of Client.connect).  Sleep the smaller of the remaining
-                # deadline and the fallback interval.
-                time.sleep(
-                    self._FALLBACK_POLL_INTERVAL
-                    if wait_chunk is None
-                    else min(wait_chunk, self._FALLBACK_POLL_INTERVAL)
+        deadline = self._started + self.timeout if self.timeout > 0 else None
+        current = threading.current_thread()
+        hand_off = getattr(current, "_daffi_hand_off", None)
+        if hand_off is not None:
+            # A callback running on the dispatcher's poller: the answer may
+            # need that poller, so it must not wait on it.
+            hand_off()
+        step = (
+            self._MAIN_THREAD_SLICE
+            if current is threading.main_thread()
+            else self._LIVENESS_INTERVAL
+        )
+        check_at = self._started + self._LIVENESS_INTERVAL
+        try:
+            while True:
+                wait = step
+                if deadline is not None:
+                    # Past the deadline this still takes a response that is
+                    # already parked (e.g. a cast reply awaited late).
+                    wait = max(0.0, min(wait, deadline - time.monotonic()))
+                res = wait_message_from_client_store(
+                    self.uuid, math.ceil(wait * 1000), self.conn_num
                 )
+                if res is None:
+                    if deadline is not None and time.monotonic() >= deadline:
+                        raise self._timeout()
+                    if self.receivers and time.monotonic() >= check_at:
+                        self._check_receivers()
+                        check_at = time.monotonic() + self._LIVENESS_INTERVAL
+                    continue
+                break
+        except BaseException:
+            expire_message(self.uuid, self.conn_num)
+            raise
+        if isinstance(res, str):
+            app_name = self.proxy.conn.client.app_name if self.proxy else None
+            raise connection_lost_error(res == "evicted", app_name)
+        return unpack_response(res, self.serde)
 
-            # Only reach here on a ``select`` timeout (or fallback sleep) —
-            # a genuine "no message yet" event.  This is when a silent peer
-            # disconnect could have happened, so verify the expected
-            # receivers are still in the local channel mapper.
-            if self.receivers:
-                if missing_receivers := self.receivers - {
-                    m["name"] for m in get_available_members(self.conn_num)
-                }:
-                    raise TransmissionFailure(
-                        f"The anticipated receivers(s) {missing_receivers}"
-                        f" unexpectedly disconnected, causing an interruption in the awaiting result of {self.proxy}."
-                        f" All receivers: {self.receivers}"
-                    )
+    def _timeout(self) -> CallTimeout:
+        return CallTimeout(
+            call=str(self.proxy) if self.proxy is not None else f"(uuid: {self.uuid})",
+            timeout=self.timeout,
+            elapsed=time.monotonic() - self._started,
+            receivers=self.receivers or None,
+        )
 
-    def _unpack_response(
-        self, res: Tuple
-    ) -> Tuple[bytes, int, int]:
-        """Decode a ``get_message_from_client_store`` tuple into a result.
-
-        Mirrors the original inline logic from ``result()``: a 1-tuple is an
-        unexpected error from the native layer, an ``ERROR`` flag carries a
-        pickled remote exception, and a normal RESPONSE is returned as-is.
-        """
-        if len(res) == 1:
-            raise RemoteCallError(f"Unexpected response: {res[0]}")
-        data, flag, serde = res
-        if flag == MessageFlag.ERROR:
-            (error_tuple,), _ = Serializer.deserialize(serde, data)
-            err_name, err_module, err_msg, tb = error_tuple
-            restored_exc = type(
-                err_name, (RemoteCallError,), {"__module__": err_module}
+    def _check_receivers(self) -> None:
+        if missing_receivers := set(dfcore.missingMembers(self.conn_num, self.receivers)):
+            raise TransmissionFailure(
+                f"The anticipated receivers(s) {missing_receivers}"
+                f" unexpectedly disconnected, causing an interruption in the awaiting result of {self.proxy}."
+                f" All receivers: {self.receivers}"
             )
-            if tb:
-                raise restored_exc(err_msg).with_traceback(tb)
-            else:
-                raise restored_exc(err_msg)
-        return data, flag, serde
 
 
 class _BoundBroadcast:
@@ -696,7 +602,7 @@ class BroadcastProxy:
         logger: logging.Logger,
     ):
         self.conn = conn
-        self.timeout = int(timeout or 0)
+        self.timeout = coerce_timeout(timeout)
         self.serde = serde
         self.return_result = return_result
         self.logger = logger
@@ -751,43 +657,65 @@ class BroadcastProxy:
             )
         # Send to each receiver and collect (uuid → name) handles.
         pending: dict[str, RpcResult] = {}
-        for receiver_name in receivers:
-            with system_exception_handler(
-                f"Unable to dispatch call_all to {receiver_name!r}: {{}}",
-                TransmissionFailure,
-                conn_num,
-            ):
-                uuid, ts, found = send_message_from_client(
-                    data=data,
-                    flag=MessageFlag.REQUEST,
-                    serde=self.serde,
-                    receiver=receiver_name,
-                    func_name=func_name,
-                    return_result=True,
-                    conn_num=conn_num,
-                    is_bytes=is_bytes,
-                )
-            if found:
-                pending[receiver_name] = RpcResult(
-                    conn_num=conn_num,
-                    uuid=uuid,
-                    ts=ts,
-                    timeout=self.timeout,
-                    receivers={receiver_name},
-                )
+        try:
+            for receiver_name in receivers:
+                with system_exception_handler(
+                    f"Unable to dispatch call_all to {receiver_name!r}: {{}}",
+                    TransmissionFailure,
+                    conn_num,
+                ):
+                    uuid, ts, found = send_message_from_client(
+                        data=data,
+                        flag=MessageFlag.REQUEST,
+                        serde=self.serde,
+                        receiver=receiver_name,
+                        func_name=func_name,
+                        return_result=True,
+                        conn_num=conn_num,
+                        is_bytes=is_bytes,
+                    )
+                if found:
+                    pending[receiver_name] = RpcResult(
+                        conn_num=conn_num,
+                        uuid=uuid,
+                        ts=ts,
+                        timeout=self.timeout,
+                        receivers={receiver_name},
+                        serde=self.serde,
+                    )
+                else:
+                    self.logger.warning(
+                        f"call_all: receiver {receiver_name!r} not reachable, skipping."
+                    )
+            # Wait in parallel: a hung peer must not delay results already parked.
+            results: dict = {}
+            names = list(pending)
+
+            def _take(name: str):
+                rpc_result = pending.pop(name)
+                try:
+                    result_data, _, serde_r = rpc_result.result()
+                    return name, Serializer.deserialize(serde_r, result_data)[0][0]
+                except Exception as exc:
+                    return name, exc
+
+            if len(names) == 1:
+                key, value = _take(names[0])
+                results[key] = value
             else:
-                self.logger.warning(
-                    f"call_all: receiver {receiver_name!r} not reachable, skipping."
-                )
-        # Wait for every response and collect into a dict.
-        results: dict = {}
-        for name, rpc_result in pending.items():
-            try:
-                result_data, _, serde_r = rpc_result.result()
-                results[name] = Serializer.deserialize(serde_r, result_data)[0][0]
-            except Exception as exc:
-                results[name] = exc
-        return results
+                from concurrent.futures import ThreadPoolExecutor, as_completed
+
+                with ThreadPoolExecutor(max_workers=len(names)) as pool:
+                    futs = [pool.submit(_take, name) for name in names]
+                    for fut in as_completed(futs):
+                        key, value = fut.result()
+                        results[key] = value
+            return results
+        finally:
+            # Requests nobody will wait for any more keep their uuid taken
+            # until expired.
+            for rpc_result in pending.values():
+                expire_message(rpc_result.uuid, conn_num)
 
     def _process_cast_all(self, func_name: str, *args, **kwargs) -> None:
         """Fan out to all matching peers, fire-and-forget."""
@@ -859,6 +787,7 @@ class _BoundStreamBlocking(_BoundStream):
                 timeout=self._proxy.timeout,
                 receivers=self._proxy._receiver or None,
                 proxy=self._proxy,
+                serde=self._proxy.serde,
             ).result()
 
 
@@ -870,7 +799,9 @@ class _BoundStreamNowait(_BoundStream):
         conn_num = self._proxy.conn.client._conn_num
         chunks = gen if iterable(gen) else [gen]
         for chunk in chunks:
-            self._proxy._send_chunk(self._func_name, conn_num, chunk, return_result=False)
+            self._proxy._send_chunk(
+                self._func_name, conn_num, chunk, return_result=False
+            )
 
 
 class _StreamBase:
@@ -891,7 +822,7 @@ class _StreamBase:
         self.conn = conn
         self.receiver = receiver or ""
         self.serde = serde
-        self.timeout = int(timeout or 0)
+        self.timeout = coerce_timeout(timeout)
         self.logger = logger
         self._receiver = {receiver} if receiver else set()
 
@@ -1011,8 +942,13 @@ class ClientConnection:
         native-layer message.
         """
         client = self.client
-        if not client._disconnected:
+        if client._intentionally_stopped:
+            raise TransmissionFailure("Client was stopped.")
+        if not client._disconnected and client._conn_num is not None:
             return
+        if isinstance(client._connection_error, Evicted):
+            # Reconnecting would evict the connection that took the name.
+            raise client._connection_error
         client.logger.info(
             "Connection was lost in the background; attempting one reconnect..."
         )
@@ -1028,8 +964,8 @@ class ClientConnection:
     def rpc(
         self,
         timeout: Union[int, None] = None,
-        receiver: Union[str, None] = None,
-        serde: SerdeFormat = SerdeFormat.PICKLE,
+        receiver: Union[str, List[str], None] = None,
+        serde: SerdeFormat = SerdeFormat.DEFAULT,
     ) -> RpcProxy:
         """Configure a **blocking** call to a single worker and return a proxy.
 
@@ -1041,11 +977,12 @@ class ClientConnection:
         Args:
             timeout:  Seconds to wait for the response.  ``None`` (or ``0``)
                       means wait indefinitely.
-            receiver: Name of the target worker.  ``None`` picks a worker
-                      using round-robin among all peers that expose the
-                      requested method.
+            receiver: Name of the target worker, or a list of names to send
+                      to whichever of them is connected (taking turns).
+                      ``None`` picks a worker using round-robin among all
+                      peers that expose the requested method.
             serde:    Serialisation format.  Defaults to
-                      :attr:`~daffi.serialization.SerdeFormat.PICKLE`.
+                      :attr:`~daffi._serialization.SerdeFormat.MSGPACK`.
 
         Example::
 
@@ -1063,8 +1000,8 @@ class ClientConnection:
 
     def rpc_nowait(
         self,
-        receiver: Union[str, None] = None,
-        serde: SerdeFormat = SerdeFormat.PICKLE,
+        receiver: Union[str, List[str], None] = None,
+        serde: SerdeFormat = SerdeFormat.DEFAULT,
     ) -> RpcProxy:
         """Configure a **fire-and-forget** call to a single worker and return a proxy.
 
@@ -1072,10 +1009,11 @@ class ClientConnection:
         No result is returned.
 
         Args:
-            receiver: Name of the target worker.  ``None`` picks one using
-                      round-robin.
+            receiver: Name of the target worker, or a list of names to send
+                      to whichever of them is connected (taking turns).
+                      ``None`` picks one using round-robin.
             serde:    Serialisation format.  Defaults to
-                      :attr:`~daffi.serialization.SerdeFormat.PICKLE`.
+                      :attr:`~daffi._serialization.SerdeFormat.MSGPACK`.
 
         Example::
 
@@ -1095,7 +1033,7 @@ class ClientConnection:
         self,
         timeout: Union[int, None] = None,
         receiver: Union[str, List[str], None] = None,
-        serde: SerdeFormat = SerdeFormat.PICKLE,
+        serde: SerdeFormat = SerdeFormat.DEFAULT,
     ) -> BroadcastProxy:
         """Configure a **blocking broadcast** to all matching workers and return a proxy.
 
@@ -1132,7 +1070,7 @@ class ClientConnection:
     def cast_nowait(
         self,
         receiver: Union[str, List[str], None] = None,
-        serde: SerdeFormat = SerdeFormat.PICKLE,
+        serde: SerdeFormat = SerdeFormat.DEFAULT,
     ) -> BroadcastProxy:
         """Configure a **fire-and-forget broadcast** to all matching workers and return a proxy.
 
@@ -1263,10 +1201,21 @@ class ClientConnection:
         """
         if not members:
             return
+        client = self.client
+        if client._disconnected or client._conn_num is None:
+            err = client._connection_error
+            if err is not None:
+                raise err
+            raise Disconnected("Client is not connected.")
         needed = set(members)
         start = time.monotonic()
         while True:
-            raw = get_available_members(self.client._conn_num)
+            if client._disconnected or client._conn_num is None:
+                err = client._connection_error
+                if err is not None:
+                    raise err
+                raise Disconnected("Client disconnected while waiting for members.")
+            raw = get_available_members(client._conn_num)
             current = {m["name"] for m in raw}
             if needed.issubset(current):
                 return

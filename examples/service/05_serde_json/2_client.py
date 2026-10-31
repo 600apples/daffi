@@ -7,21 +7,21 @@ or any other language that can speak daffi's wire protocol.
 
 Run 1_service.py first.
 """
-from daffi import Client
-from daffi import SerdeFormat
 
+from daffi import Client, TCPTransport
+from daffi import SerdeFormat, TCPTransport
 
 CART = {
     "customer": "Bob",
     "items": [
-        {"name": "Apple",  "price": 0.99, "qty": 6},
+        {"name": "Apple", "price": 0.99, "qty": 6},
         {"name": "Banana", "price": 0.49, "qty": 10},
         {"name": "Cherry", "price": 2.99, "qty": 2},
     ],
 }
 
 if __name__ == "__main__":
-    client = Client(app_name="json-client", host="0.0.0.0", port=5005)
+    client = Client(app_name="json-client", transport=TCPTransport("0.0.0.0", 5005))
     conn = client.connect()
 
     rpc = conn.rpc(timeout=5, serde=SerdeFormat.JSON)

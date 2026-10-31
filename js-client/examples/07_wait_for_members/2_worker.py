@@ -7,14 +7,15 @@ this script and the browser page does not matter.
 
 Start after 1_router.py.
 """
+
 import time
-from daffi import Client, callback
+from daffi import Client, callback, TCPTransport
 
 
 @callback
 def process(value: int) -> dict:
     time.sleep(0.05)  # simulate work
-    result = value ** 2
+    result = value**2
     print(f"[py-worker] process({value}) = {result}")
     return {"input": value, "result": result}
 
@@ -26,7 +27,7 @@ def ping() -> str:
 
 
 if __name__ == "__main__":
-    worker = Client(app_name="py-worker", host="127.0.0.1", port=6030)
+    worker = Client(app_name="py-worker", transport=TCPTransport("127.0.0.1", 6030))
     worker.connect()
     print("Worker connected to router — press Ctrl+C to stop.")
     worker.join()
