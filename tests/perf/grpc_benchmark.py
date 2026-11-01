@@ -5,9 +5,9 @@ Layout
 ------
 Direct — unary Client → Server  (HTTP/2 over TCP loopback)
 
-Payload is the same ``data.json`` pre-encoded as JSON bytes and carried in a
-protobuf ``bytes`` field.  daffi baseline uses ``SerdeFormat.OPAQUE`` so both
-sides avoid object serialization and only pay RPC + transport overhead.
+Payload is the same ``data.json``: gRPC carries it as JSON bytes in a
+protobuf ``bytes`` field; daffi uses ``SerdeFormat.MSGPACK`` on the parsed
+object (the default structured wire format).
 
 Requires::
 
@@ -204,7 +204,7 @@ def _proc_daffi(runtime: str, port: int) -> None:
     svc.join()
 
 
-def bench_daffi_opaque(wire_str: str) -> list[float]:
+def bench_daffi_msgpack(payload: object) -> list[float]:
     from daffi import Client, TCPTransport
     from daffi._serialization import SerdeFormat
 
@@ -219,9 +219,9 @@ def bench_daffi_opaque(wire_str: str) -> list[float]:
             transport=TCPTransport(HOST, port),
             runtime=active_runtime(),
         )
-        c = client.connect().rpc(timeout=TIMEOUT, serde=SerdeFormat.OPAQUE)
+        c = client.connect().rpc(timeout=TIMEOUT, serde=SerdeFormat.MSGPACK)
         try:
-            return _measure("daffi-opaque", lambda: c.echo(wire_str))
+            return _measure("daffi-msgpack", lambda: c.echo(payload))
         finally:
             client.stop()
     finally:
@@ -240,25 +240,24 @@ def main() -> None:
     _ensure_grpc_stubs()
 
     data = json.loads(_DATA_FILE.read_text())
-    wire_str = json.dumps(data)
-    wire_bytes = wire_str.encode()
+    wire_bytes = json.dumps(data).encode()
     payload_bytes = len(wire_bytes)
 
     print(f"\ngRPC {grpc.__version__} vs daffi  —  {N} sequential unary rpc calls")
     print(f"host: {HOST}   warmup: {WARMUP}   payload: {_DATA_FILE.name} ({payload_bytes} bytes JSON)")
-    print("wire: JSON bytes in protobuf `bytes` field; daffi serde=OPAQUE\n")
+    print("wire: JSON bytes in protobuf `bytes` field; daffi serde=MSGPACK\n")
 
     print("── gRPC ─────────────────────────────────────────────────")
     grpc_rate = _report("gRPC", bench_grpc(wire_bytes))
 
-    print("\n── daffi (OPAQUE) ──────────────────────────────────────")
-    daffi_rate = _report("daffi OPAQUE", bench_daffi_opaque(wire_str))
+    print("\n── daffi (MSGPACK) ─────────────────────────────────────")
+    daffi_rate = _report("daffi MSGPACK", bench_daffi_msgpack(data))
 
     print("\n── Summary (calls/s) ───────────────────────────────────")
     print(f"  {'stack':<16}  {'calls/s':>10}")
     print(f"  {'----------------':<16}  {'----------':>10}")
     print(f"  {'gRPC':<16}  {grpc_rate:>10.0f}")
-    print(f"  {'daffi OPAQUE':<16}  {daffi_rate:>10.0f}")
+    print(f"  {'daffi MSGPACK':<16}  {daffi_rate:>10.0f}")
     if grpc_rate > 0:
         print(f"\n  daffi vs gRPC: {daffi_rate / grpc_rate:.2f}×\n")
 

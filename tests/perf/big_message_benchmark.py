@@ -32,7 +32,9 @@ throughput = (payload_size × 2) / avg_round_trip_latency
 
 Run::
 
-    python3 tests/perf/big_message_benchmark.py
+    python3 tests/perf/big_message_benchmark.py                  # threads, then evented
+    python3 tests/perf/big_message_benchmark.py --runtime threads
+    python3 tests/perf/big_message_benchmark.py --runtime evented
 """
 
 from __future__ import annotations
@@ -48,6 +50,7 @@ import logging
 import multiprocessing as mp
 import os
 import socket
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -302,7 +305,7 @@ def _run_all_formats(conn, layout_name: str) -> None:
         if fmt_name == "MSGPACK" and not _msgpack_available():
             print(
                 f"  {'msgpack':<8}  (skipped — msgpack not installed; "
-                "msgpack is a required daffi dependency")"
+                "msgpack is a required daffi dependency)"
             )
             continue
 
@@ -383,7 +386,12 @@ def bench_via_router() -> None:
 # ── main ──────────────────────────────────────────────────────────────────────
 
 
-def main() -> None:
+def _run_one(runtime: str) -> None:
+    import tests.conftest as _runtime_state
+    _runtime_state.SELECTED_RUNTIME = runtime
+    from daffi import dfcore
+    dfcore.setRuntime(runtime)
+
     logging.disable(logging.CRITICAL)
 
     # Suppress Zig async-teardown noise on stderr.
@@ -394,6 +402,7 @@ def main() -> None:
 
     try:
         print("\ndaffi big-message benchmark — serde format comparison")
+        print(f"runtime   : {runtime}")
         print(f"host      : {HOST}")
         print(
             f"max legal : {_mib(MAX_BYTES_MESSAGE)}"
@@ -423,10 +432,35 @@ def main() -> None:
         os.close(saved_stderr)
 
 
+def main(runtime: str = "both") -> None:
+    """Run the sweep. Default ``both`` uses a fresh interpreter per runtime
+    (the native model is locked for the life of the process)."""
+    if runtime == "both":
+        script = str(Path(__file__).resolve())
+        for model in ("threads", "evented"):
+            print("=" * 70)
+            print(f"  runtime={model}")
+            print("=" * 70)
+            result = subprocess.run([sys.executable, script, "--runtime", model])
+            if result.returncode != 0:
+                raise SystemExit(result.returncode)
+        return
+    _run_one(runtime)
+
+
 if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--runtime",
+        choices=("threads", "evented", "both"),
+        default="both",
+        help="Native runtime. Default: both (threads, then evented).",
+    )
+    args = parser.parse_args()
     mp.set_start_method("spawn", force=True)
     try:
-        main()
+        main(args.runtime)
     except KeyboardInterrupt:
         print("\nInterrupted.", file=sys.stderr)
         sys.exit(1)
