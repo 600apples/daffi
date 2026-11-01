@@ -37,16 +37,20 @@ pub fn partialBytes() usize {
 
 pub const MessagePool = struct {
     allocator: Allocator,
-    /// Recycles receive buffers and Message shells for this client/server.
-    freelist: RecvFreelist = .{},
+    /// Heap-allocated, refcounted.  Live Messages retain it, so CFFI can
+    /// still `Message.deinit` after this pool is destroyed.
+    freelist: *RecvFreelist,
     // web_connection: ?*WebConnection,
 
     const Self = @This();
 
     pub fn init(allocator: Allocator) !*Self {
+        const freelist = try RecvFreelist.create(allocator);
+        errdefer freelist.release(Message);
         const self = try allocator.create(Self);
         self.* = .{
             .allocator = allocator,
+            .freelist = freelist,
             // .web_connection = null,
         };
         return self;
@@ -54,7 +58,7 @@ pub const MessagePool = struct {
 
     pub fn deinit(self: *Self) void {
         // if (self.web_connection) |web_connection| web_connection.deinit();
-        self.freelist.deinit(self.allocator, Message);
+        self.freelist.release(Message);
         self.allocator.destroy(self);
     }
 
@@ -115,10 +119,10 @@ pub const MessagePool = struct {
     pub fn buildWsMessage(self: *Self, data: []const u8) !*Message {
         const header = try Header.parse(data);
         if (data.len != @as(usize, serde.HEADER_SIZE) + header.msg_len) return error.LengthMismatch;
-        const buf = try self.freelist.allocBuf(self.allocator, data.len);
-        errdefer self.freelist.freeBuf(self.allocator, buf);
+        const buf = try self.freelist.allocBuf(data.len);
+        errdefer self.freelist.freeBuf(buf);
         @memcpy(buf[0..data.len], data);
-        return try Message.createWithCapacity(self.allocator, header, buf[0..data.len], buf.len, &self.freelist);
+        return try Message.createWithCapacity(self.allocator, header, buf[0..data.len], buf.len, self.freelist);
     }
 };
 
@@ -155,14 +159,14 @@ pub const FrameDecoder = struct {
     }
 
     fn allocFrame(self: *FrameDecoder, min_len: usize) ![]u8 {
-        if (self.freelist) |fl| return try fl.allocBuf(self.allocator, min_len);
+        if (self.freelist) |fl| return try fl.allocBuf(min_len);
         return try self.allocator.alloc(u8, min_len);
     }
 
     fn reallocFrame(self: *FrameDecoder, new_len: usize) !void {
         if (self.frame.len >= new_len) return;
         if (self.freelist) |fl| {
-            self.frame = try fl.reallocBuf(self.allocator, self.frame, self.filled, new_len);
+            self.frame = try fl.reallocBuf(self.frame, self.filled, new_len);
             return;
         }
         self.frame = try self.allocator.realloc(self.frame, new_len);
@@ -170,7 +174,7 @@ pub const FrameDecoder = struct {
 
     fn freeFrame(self: *FrameDecoder, buf: []u8) void {
         if (self.freelist) |fl| {
-            fl.freeBuf(self.allocator, buf);
+            fl.freeBuf(buf);
             return;
         }
         self.allocator.free(buf);
@@ -541,19 +545,19 @@ test "drainReadable reads a large body in place" {
 
 test "FrameDecoder freelist recycles buffer and Message shell" {
     const allocator = std.testing.allocator;
-    var freelist: RecvFreelist = .{};
-    defer freelist.deinit(allocator, Message);
+    const freelist = try RecvFreelist.create(allocator);
+    defer freelist.release(Message);
 
     const payload = "freelist-rpc";
     const raw = try RawMessage.create(allocator, payload, 42, .REQUEST, .OPAQUE, true, false, "tx", "rx", "fn");
     defer allocator.free(raw.data);
 
-    var decoder = FrameDecoder.initPooled(allocator, &freelist);
+    var decoder = FrameDecoder.initPooled(allocator, freelist);
     defer decoder.deinit();
 
     var input: []const u8 = raw.data;
     const msg1 = (try decoder.next(&input)).?;
-    try expect(msg1.freelist == &freelist);
+    try expect(msg1.freelist == freelist);
     try expect(msg1.data_capacity >= msg1.data.len);
     const buf_ptr = msg1.data.ptr;
     const shell_ptr: *anyopaque = msg1;
@@ -572,8 +576,8 @@ test "FrameDecoder freelist recycles buffer and Message shell" {
 
 test "FrameDecoder freelist does not swallow the next frame into spare capacity" {
     const allocator = std.testing.allocator;
-    var freelist: RecvFreelist = .{};
-    defer freelist.deinit(allocator, Message);
+    const freelist = try RecvFreelist.create(allocator);
+    defer freelist.release(Message);
 
     const raw1 = try RawMessage.create(allocator, "one", 1, .REQUEST, .OPAQUE, true, false, "tx", "rx", "fn");
     defer allocator.free(raw1.data);
@@ -582,7 +586,7 @@ test "FrameDecoder freelist does not swallow the next frame into spare capacity"
     const stream = try std.mem.concat(allocator, u8, &.{ raw1.data, raw2.data });
     defer allocator.free(stream);
 
-    var decoder = FrameDecoder.initPooled(allocator, &freelist);
+    var decoder = FrameDecoder.initPooled(allocator, freelist);
     defer decoder.deinit();
     var input: []const u8 = stream;
     const a = (try decoder.next(&input)).?;
@@ -594,4 +598,138 @@ test "FrameDecoder freelist does not swallow the next frame into spare capacity"
     try expect(std.mem.eql(u8, a.getData(), "one"));
     try expect(std.mem.eql(u8, b.getData(), "two-two"));
     try expect(input.len == 0);
+}
+
+/// Allocator that hands the most recently freed `RecvFreelist`-sized slot back
+/// on the next matching alloc — so a test can reclaim the freelist object and
+/// observe a use-after-free write from a late `Message.deinit`.
+const FreelistSlotReuse = struct {
+    parent: Allocator,
+    freed: ?[]u8 = null,
+
+    fn allocator(self: *FreelistSlotReuse) Allocator {
+        return .{ .ptr = self, .vtable = &.{
+            .alloc = alloc,
+            .resize = resize,
+            .remap = remap,
+            .free = free,
+        } };
+    }
+
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const self: *FreelistSlotReuse = @ptrCast(@alignCast(ctx));
+        if (self.freed) |slot| {
+            if (slot.len == len and alignment.compare(.lte, .of(RecvFreelist))) {
+                self.freed = null;
+                return slot.ptr;
+            }
+        }
+        return self.parent.rawAlloc(len, alignment, ret_addr);
+    }
+
+    fn resize(ctx: *anyopaque, buf: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+        const self: *FreelistSlotReuse = @ptrCast(@alignCast(ctx));
+        return self.parent.rawResize(buf, alignment, new_len, ret_addr);
+    }
+
+    fn remap(ctx: *anyopaque, buf: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+        const self: *FreelistSlotReuse = @ptrCast(@alignCast(ctx));
+        return self.parent.rawRemap(buf, alignment, new_len, ret_addr);
+    }
+
+    fn free(ctx: *anyopaque, buf: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        const self: *FreelistSlotReuse = @ptrCast(@alignCast(ctx));
+        if (buf.len == @sizeOf(RecvFreelist) and alignment.compare(.gte, .of(RecvFreelist))) {
+            if (self.freed) |prev| self.parent.rawFree(prev, .of(RecvFreelist), ret_addr);
+            @memset(buf, 0xA5); // poison — live freelist fields must not stay like this
+            self.freed = buf;
+            return;
+        }
+        self.parent.rawFree(buf, alignment, ret_addr);
+    }
+};
+
+test "CFFI late Message.deinit: refcounted freelist vs pre-fix pool-owned UAF" {
+    // getMessage* acquires, pops, releases users; stop() can then msgpool.deinit
+    // while taskTuple/responseTuple still hold the Message and defer deinit.
+    //
+    // Pre-fix: freelist lived inside MessagePool → late deinit was UAF.
+    // Now: Message retains the heap freelist until its own deinit.
+    const backing = std.testing.allocator;
+    const payload = "cffi-late-deinit";
+    const raw = try RawMessage.create(backing, payload, 9, .REQUEST, .OPAQUE, true, false, "tx", "rx", "fn");
+    defer backing.free(raw.data);
+
+    // ── NEW: Message.deinit after MessagePool.deinit stays valid ────────────
+    {
+        const pool = try MessagePool.init(backing);
+        const freelist = pool.freelist;
+        try expect(freelist.refcount.load(.monotonic) == 1);
+
+        var decoder = FrameDecoder.initPooled(backing, freelist);
+        defer decoder.deinit();
+        var input: []const u8 = raw.data;
+        const msg = (try decoder.next(&input)).?;
+        try expect(msg.freelist == freelist);
+        try expect(freelist.refcount.load(.monotonic) == 2); // pool + message
+
+        pool.deinit(); // CFFI release → stop → msgpool.deinit
+        try expect(freelist.refcount.load(.monotonic) == 1);
+        // Freelist is still alive — recycling must work (would UAF if destroyed).
+        const probe = try freelist.allocBuf(64);
+        freelist.freeBuf(probe);
+        try expect(std.mem.eql(u8, msg.getData(), payload));
+        msg.deinit(); // taskTuple defer — drops last retain, frees freelist
+    }
+
+    // ── OLD: Message holds freelist with no retain; pool destroy frees it ───
+    // Reconstruct the pre-fix lifetime and show late deinit writes into a
+    // recycled freelist slot (the UAF the retain fix prevents).
+    {
+        var reuse_state: FreelistSlotReuse = .{ .parent = backing };
+        defer if (reuse_state.freed) |slot| {
+            // Slot was held for aliasing, not returned to the testing allocator.
+            backing.rawFree(slot, .of(RecvFreelist), @returnAddress());
+        };
+        const allocator = reuse_state.allocator();
+
+        const freelist = try RecvFreelist.create(allocator);
+        const buf = try freelist.allocBuf(raw.data.len);
+        @memcpy(buf[0..raw.data.len], raw.data);
+        const header = try Header.parse(raw.data);
+        // Shell from the plain heap; freelist pointer set WITHOUT retain —
+        // same lifetime as when the freelist was embedded in MessagePool.
+        const msg = try backing.create(Message);
+        msg.* = .{
+            .header = header,
+            .data = buf[0..raw.data.len],
+            .allocator = backing,
+            .data_capacity = buf.len,
+            .freelist = freelist,
+        };
+        try msg.metadata.initFromMetadataFromStr(msg.getMetadata());
+        try expect(freelist.refcount.load(.monotonic) == 1);
+
+        const dangling: *RecvFreelist = freelist;
+        freelist.release(Message); // MessagePool.deinit with no Message retain
+        try expect(reuse_state.freed != null);
+
+        // Reclaim the freelist object address (deterministic with FreelistSlotReuse).
+        const decoy = try RecvFreelist.create(allocator);
+        defer decoy.release(Message);
+        try expect(decoy == dangling);
+        try expect(decoy.refcount.load(.monotonic) == 1);
+        try expect(decoy.msg_len == 0);
+        try expect(decoy.buf_len[0] + decoy.buf_len[1] + decoy.buf_len[2] == 0);
+        // Hold an extra ref so Message.deinit's freelist.release does not
+        // destroy decoy before we can inspect the UAF writes.
+        decoy.retain();
+
+        // Pre-fix bug: taskTuple still calls Message.deinit → freeBuf /
+        // releaseMessage on the destroyed freelist (here: the decoy).
+        msg.deinit();
+        // UAF write landed on the reclaimed slot: buffer and shell were pushed.
+        try expect(decoy.msg_len == 1);
+        try expect(decoy.buf_len[0] + decoy.buf_len[1] + decoy.buf_len[2] == 1);
+    }
 }

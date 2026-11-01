@@ -359,6 +359,8 @@ const Runtime = struct {
 
     fn deinit(self: *Runtime) void {
         destroyListeners(self.allocator, self.listeners);
+        // Drain queued Messages before releasing the pool's freelist retain;
+        // in-flight Messages (CFFI pop before taskTuple) keep the freelist alive.
         self.server_handler.deinit();
         self.msgpool.deinit();
         self.live.deinit(self.allocator);
@@ -1032,7 +1034,7 @@ fn connectionMain(comptime mode: HandlerMode, rt: *Runtime, listener: *ServerCon
     if (client.is_websocket) {
         serverWsLoop(client, rt.msgpool, handler);
     } else {
-        serverLoop(client, rt.allocator, &rt.msgpool.freelist, handler);
+        serverLoop(client, rt.allocator, rt.msgpool.freelist, handler);
     }
     releaseConnection(rt, client);
 }
@@ -1099,7 +1101,7 @@ fn ConnectionSource(comptime mode: HandlerMode) type {
                 .source = .{ .fd = conn.handle(), .onReadable = onReadable, .onRemoved = onRemoved },
                 .rt = rt,
                 .conn = conn,
-                .decoder = .initPooled(rt.allocator, &rt.msgpool.freelist),
+                .decoder = .initPooled(rt.allocator, rt.msgpool.freelist),
             };
             try loop.register(&self.source);
         }

@@ -280,6 +280,8 @@ pub const Message = struct {
 
     /// Like `create`, but `capacity` is the allocated size of the buffer
     /// (`>= data.len`) and an optional freelist recycles both on `deinit`.
+    /// When `freelist` is set the Message retains it so `deinit` stays valid
+    /// after the owning `MessagePool` is destroyed.
     pub fn createWithCapacity(
         allocator: Allocator,
         header: Header,
@@ -291,18 +293,24 @@ pub const Message = struct {
         if (data.len != @as(usize, serde.HEADER_SIZE) + header.msg_len) return error.LengthMismatch;
         if (capacity < data.len) return error.LengthMismatch;
         const self = if (freelist) |fl|
-            try fl.acquireMessage(allocator, Message)
+            try fl.acquireMessage(Message)
         else
             try allocator.create(Message);
-        errdefer if (freelist) |fl| fl.releaseMessage(allocator, Message, self) else allocator.destroy(self);
+        errdefer if (freelist) |fl| fl.releaseMessage(Message, self) else allocator.destroy(self);
+        // Spare capacity (class size, or a future oversized alloc) must be
+        // recorded even without a freelist, or `deinit` frees only `data.len`.
         self.* = .{
             .header = header,
             .data = data,
             .allocator = allocator,
-            .data_capacity = if (freelist != null) capacity else 0,
-            .freelist = freelist,
+            .data_capacity = if (capacity > data.len) capacity else 0,
+            .freelist = null,
         };
         try self.metadata.initFromMetadataFromStr(self.getMetadata());
+        if (freelist) |fl| {
+            fl.retain();
+            self.freelist = fl;
+        }
         return self;
     }
 
@@ -319,16 +327,18 @@ pub const Message = struct {
         const cap = self.bufferCapacity();
         const buf = if (cap == 0) self.data else self.data.ptr[0..cap];
         if (self.freelist) |fl| {
-            fl.freeBuf(self.allocator, buf);
+            fl.freeBuf(buf);
             self.metadata = .{};
             self.queue_node = .{};
             self.header = undefined;
             self.data = &.{};
             self.data_capacity = 0;
-            const allocator = self.allocator;
-            const freelist = fl;
             self.freelist = null;
-            freelist.releaseMessage(allocator, Message, self);
+            // Recycle the shell, then drop this Message's freelist retain.
+            // Order matters: releaseMessage may push `self` onto the freelist;
+            // release may then destroy the freelist (and that recycled shell).
+            fl.releaseMessage(Message, self);
+            fl.release(Message);
             return;
         }
         if (buf.len != 0) self.allocator.free(buf);
@@ -430,10 +440,12 @@ pub const Message = struct {
         } else {
             const new_data = try serde.concatenateSlicesAlloc(self.allocator, &[_][]const u8{ self.data[0..serde.HEADER_OFFSET_END], self.getMetadata(), data });
             if (self.freelist) |fl| {
-                fl.freeBuf(self.allocator, self.data.ptr[0..cap]);
-                // Replacement buffer is exact-sized and no longer pooled.
+                fl.freeBuf(self.data.ptr[0..cap]);
+                // Replacement buffer is exact-sized; shell stays with Message
+                // (destroyed on deinit) and the freelist retain is dropped.
                 self.freelist = null;
                 self.data_capacity = 0;
+                fl.release(Message);
             } else {
                 self.allocator.free(self.data.ptr[0..cap]);
                 self.data_capacity = 0;
@@ -478,9 +490,10 @@ pub const Message = struct {
         const new_data = try serde.concatenateSlicesAlloc(self.allocator, &[_][]const u8{ self.data[0..serde.HEADER_OFFSET_END], ptransmitter, SECTION_SEPARATOR_SEQ, preceiver, SECTION_SEPARATOR_SEQ, pfun_name, data });
         const cap = self.bufferCapacity();
         if (self.freelist) |fl| {
-            fl.freeBuf(self.allocator, self.data.ptr[0..cap]);
+            fl.freeBuf(self.data.ptr[0..cap]);
             self.freelist = null;
             self.data_capacity = 0;
+            fl.release(Message);
         } else {
             self.allocator.free(self.data.ptr[0..cap]);
             self.data_capacity = 0;
