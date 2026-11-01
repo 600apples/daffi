@@ -7,8 +7,10 @@ joins or leaves.
 
 Run 1_router.py and 2_worker.py first.
 """
+
 import asyncio
 from daffi.aio import AsyncClient
+from daffi import TCPTransport
 
 
 async def main():
@@ -17,7 +19,9 @@ async def main():
         status = event["type"]
         print(f"[caller] event: {name!r} → {status}")
 
-    caller = AsyncClient(app_name="event-caller", host="0.0.0.0", port=6008)
+    caller = AsyncClient(
+        app_name="event-caller", transport=TCPTransport("0.0.0.0", 6008)
+    )
     caller.add_event_handler(on_event)
     conn = await caller.connect()
 

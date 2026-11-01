@@ -29,13 +29,13 @@ A **Service** listens on a TCP port (or Unix socket) and exposes functions decor
 
 ```python
 # service.py
-from daffi import Service, callback
+from daffi import Service, callback, TCPTransport
 
 @callback
 def process(task: str) -> str:
     return f"done: {task}"
 
-svc = Service(host="127.0.0.1", port=6000)
+svc = Service(transport=TCPTransport("127.0.0.1", 6000))
 svc.start()
 svc.join()   # blocks until Ctrl+C / SIGTERM
 ```
@@ -57,13 +57,13 @@ The Router matches calls to workers — callers and workers never connect direct
 
 ```python
 # worker.py
-from daffi import Client, callback
+from daffi import Client, callback, TCPTransport
 
 @callback
 def process(task: str) -> str:
     return f"done: {task}"
 
-client = Client(app_name="worker-1", host="127.0.0.1", port=6000)
+client = Client(app_name="worker-1", transport=TCPTransport("127.0.0.1", 6000))
 client.connect()
 client.join()   # blocks until Ctrl+C / SIGTERM
 ```
@@ -90,7 +90,7 @@ Scalable / distributed workloads, worker pools, fan-out broadcasting, bidirectio
 `@callback` can decorate a **plain function** or an **entire class**.
 
 ```python
-from daffi import callback
+from daffi import callback, TCPTransport
 from daffi.registry import local
 
 # ── plain function ────────────────────────────────────────────────────────────
@@ -132,7 +132,7 @@ daffi supports four wire formats — see [Serialization](usage/serialization.md)
 
 | Format | Cross-language | Best for |
 |---|---|---|
-| `PICKLE` | No (Python only) | Python dataclasses, Enums, arbitrary objects |
+| `MSGPACK` | Yes | Default; compact binary, cross-language |
 | `JSON` | Yes | Simple dicts / lists, cross-language |
-| `MSGPACK` | Yes | Binary-efficient alternative to JSON |
 | `OPAQUE` | Yes | Raw bytes, custom encoding |
+| `PICKLE` | No (Python only) | Opt-in; dataclasses, Enums, arbitrary objects |

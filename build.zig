@@ -3,13 +3,13 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     {
         const target = b.resolveTargetQuery(.{ .cpu_arch = .wasm32, .os_tag = .freestanding });
-        // Default to ReleaseFast so `zig build` (no flags) produces an optimised WASM.
-        // Override with -Doptimize=Debug for a debuggable build.
+        // Default to `fast` so `zig build` (no flags) produces an optimised WASM.
+        // Override with -Doptimize=debug for a debuggable build.
         const optimize = b.option(
-            std.builtin.OptimizeMode,
+            std.lang.Optimize,
             "optimize",
-            "Prioritize performance, safety, or binary size (default: ReleaseFast)",
-        ) orelse .ReleaseFast;
+            "Prioritize performance, safety, or binary size (default: fast)",
+        ) orelse .fast;
 
         const root_module = b.createModule(.{
             .root_source_file = b.path("core/wasm.zig"),

@@ -6,6 +6,7 @@ include builder.py
 include setup.py
 include pyproject.toml
 include README.md
+include CHANGELOG.md
 include LICENSE
 
 # Python package

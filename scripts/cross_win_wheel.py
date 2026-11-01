@@ -24,8 +24,8 @@ Usage
     # build wheel for a specific Python version:
     python3 scripts/cross_win_wheel.py --py-version 3.13
 
-    # use ReleaseFast instead of ReleaseSafe:
-    ZIG_OPT=ReleaseFast python3 scripts/cross_win_wheel.py
+    # use the `fast` optimize mode instead of `safe`:
+    ZIG_OPT=fast python3 scripts/cross_win_wheel.py
 
 Output
 ------
@@ -53,9 +53,12 @@ import zipfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
 
+from setup import _ensure_zig, zig_c_module_args  # noqa: E402
 
 # ── helpers ───────────────────────────────────────────────────────────────────
+
 
 def _download(url: str, dest: Path) -> None:
     print(f"    {url}")
@@ -79,16 +82,17 @@ def _openssl_branch() -> str:
     import json
 
     import re as _re
+
     _BRANCH_RE = _re.compile(r"^openssl-bin-(\d+)\.(\d+)$")
 
     api_url = (
-        "https://api.github.com/repos/python/cpython-bin-deps/branches"
-        "?per_page=100"
+        "https://api.github.com/repos/python/cpython-bin-deps/branches" "?per_page=100"
     )
     ctx = ssl.create_default_context()
     try:
-        req = urllib.request.Request(api_url,
-                                     headers={"Accept": "application/vnd.github+json"})
+        req = urllib.request.Request(
+            api_url, headers={"Accept": "application/vnd.github+json"}
+        )
         with urllib.request.urlopen(req, context=ctx) as r:
             branches = json.loads(r.read())
         available = sorted(
@@ -104,9 +108,11 @@ def _openssl_branch() -> str:
     # Try to find the highest branch <= the host OpenSSL version.
     try:
         import ssl as _ssl
+
         host_mm = tuple(int(x) for x in _ssl.OPENSSL_VERSION.split()[1].split(".")[:2])
         candidates = [
-            b for b in available
+            b
+            for b in available
             if tuple(int(x) for x in b.split("-")[-1].split(".")) <= host_mm
         ]
         return candidates[-1] if candidates else available[-1]
@@ -114,30 +120,13 @@ def _openssl_branch() -> str:
         return available[-1]
 
 
-def _find_zig() -> str:
-    zig = shutil.which("zig")
-    if zig:
-        return zig
-    # Ask setup.py to download it (same logic as wheel builds).
-    subprocess.check_call(
-        [sys.executable, str(ROOT / "setup.py"), "ensure_zig",
-         "--symlink", "/usr/local/bin/zig"],
-        cwd=ROOT,
-    )
-    zig = shutil.which("zig")
-    if not zig:
-        raise RuntimeError(
-            "zig not found after ensure_zig. "
-            "Install manually from https://ziglang.org/download/"
-        )
-    return zig
-
-
 # ── main ──────────────────────────────────────────────────────────────────────
 
+
 def main() -> None:
-    ap = argparse.ArgumentParser(description=__doc__,
-                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
     ap.add_argument(
         "--py-version",
         default=f"{sys.version_info.major}.{sys.version_info.minor}",
@@ -147,8 +136,8 @@ def main() -> None:
     args = ap.parse_args()
 
     py_maj, py_min = (int(x) for x in args.py_version.split("."))
-    py_tag    = f"cp{py_maj}{py_min}"
-    pyd_name  = f"dfcore.{py_tag}-win_amd64.pyd"
+    py_tag = f"cp{py_maj}{py_min}"
+    pyd_name = f"dfcore.{py_tag}-win_amd64.pyd"
 
     # Read version from __about__.py
     about: dict = {}
@@ -156,29 +145,31 @@ def main() -> None:
     version = about["__version__"]
 
     wheel_name = f"daffi-{version}-{py_tag}-{py_tag}-win_amd64.whl"
-    out_dir    = ROOT / "wheelhouse"
+    out_dir = ROOT / "wheelhouse"
     out_dir.mkdir(exist_ok=True)
     wheel_path = out_dir / wheel_name
 
     print(f"\nBuilding  {wheel_name}")
     print(f"Zig target: x86_64-windows-gnu")
-    print(f"Optimization: {os.environ.get('ZIG_OPT', 'ReleaseSafe')}\n")
+    print(f"Optimization: {os.environ.get('ZIG_OPT', 'safe')}\n")
 
     with tempfile.TemporaryDirectory(prefix="daffi_cross_win_") as _tmp:
         tmp = Path(_tmp)
 
         # ── 1. Python C headers ───────────────────────────────────────────────
         print("[1/4] Python headers")
-        linux_inc  = Path(sysconfig.get_path("include"))
+        linux_inc = Path(sysconfig.get_path("include"))
         py_inc_dir = tmp / "py_include"
         shutil.copytree(linux_inc, py_inc_dir)
 
         # The only platform-specific header is pyconfig.h.  Swap it for the
         # Windows version so compiled code gets the right #defines (MS_WINDOWS,
         # MS_WIN64, Py_HAVE_PTHREAD_H absence, etc.).
-        cpython_ver = (f"{sys.version_info.major}."
-                       f"{sys.version_info.minor}."
-                       f"{sys.version_info.micro}")
+        cpython_ver = (
+            f"{sys.version_info.major}."
+            f"{sys.version_info.minor}."
+            f"{sys.version_info.micro}"
+        )
         pyconfig_url = (
             f"https://raw.githubusercontent.com/python/cpython"
             f"/v{cpython_ver}/PC/pyconfig.h"
@@ -188,7 +179,7 @@ def main() -> None:
 
         # ── 2. OpenSSL Windows dev files ──────────────────────────────────────
         print("\n[2/4] OpenSSL Windows dev files (cpython-bin-deps)")
-        branch      = _openssl_branch()
+        branch = _openssl_branch()
         archive_url = (
             f"https://github.com/python/cpython-bin-deps"
             f"/archive/refs/heads/{branch}.tar.gz"
@@ -210,8 +201,8 @@ def main() -> None:
                 f"Expected amd64/ in cpython-bin-deps, found: {list(top.iterdir())}"
             )
 
-        openssl_inc  = amd64 / "include"
-        openssl_lib  = amd64           # contains libssl.lib / libcrypto.lib
+        openssl_inc = amd64 / "include"
+        openssl_lib = amd64  # contains libssl.lib / libcrypto.lib
         openssl_dlls = sorted(amd64.glob("*.dll"))
 
         # Zig (LLD in MinGW mode) searches for "ssl.lib" / "crypto.lib" when
@@ -229,24 +220,30 @@ def main() -> None:
 
         # ── 3. Cross-compile ──────────────────────────────────────────────────
         print("\n[3/4] Compiling dfcore for Windows AMD64")
-        zig      = _find_zig()
-        pyd_out  = tmp / pyd_name
-        opt_mode = os.environ.get("ZIG_OPT", "ReleaseSafe")
+        zig = _ensure_zig()
+        pyd_out = tmp / pyd_name
+        opt_mode = os.environ.get("ZIG_OPT", "safe")
 
         cmd = [
-            zig, "build-lib",
-            "-O", opt_mode,
-            "-target", "x86_64-windows-gnu",
+            zig,
+            "build-lib",
+            "-O",
+            opt_mode,
+            "-target",
+            "x86_64-windows-gnu",
             "-lc",
             f"-femit-bin={pyd_out}",
             "-fallow-shlib-undefined",
             "-dynamic",
-            f"-I{py_inc_dir}",
-            f"-I{openssl_inc}",
             f"-L{openssl_lib}",
             "-lssl",
             "-lcrypto",
-            str(ROOT / "core" / "core.zig"),
+            *zig_c_module_args(
+                zig,
+                str(tmp / "zig_c"),
+                [str(py_inc_dir), str(openssl_inc)],
+                "x86_64-windows-gnu",
+            ),
         ]
 
         print("  $ " + " ".join(str(c) for c in cmd))
@@ -258,7 +255,7 @@ def main() -> None:
 
         # ── 4. Assemble wheel ─────────────────────────────────────────────────
         print(f"\n[4/4] Assembling wheel")
-        dist_info   = f"daffi-{version}.dist-info"
+        dist_info = f"daffi-{version}.dist-info"
         wheel_files: list[tuple[str, bytes]] = []
 
         def add(arc_path: str, data: bytes) -> None:
@@ -281,26 +278,30 @@ def main() -> None:
             add(f"daffi/{dll.name}", dll.read_bytes())
 
         # .dist-info/WHEEL
-        add(f"{dist_info}/WHEEL", (
-            f"Wheel-Version: 1.0\n"
-            f"Generator: daffi-cross-win\n"
-            f"Root-Is-Purelib: false\n"
-            f"Tag: {py_tag}-{py_tag}-win_amd64\n"
-        ).encode())
+        add(
+            f"{dist_info}/WHEEL",
+            (
+                f"Wheel-Version: 1.0\n"
+                f"Generator: daffi-cross-win\n"
+                f"Root-Is-Purelib: false\n"
+                f"Tag: {py_tag}-{py_tag}-win_amd64\n"
+            ).encode(),
+        )
 
         # .dist-info/METADATA (minimal — enough for pip install)
-        add(f"{dist_info}/METADATA", (
-            f"Metadata-Version: 2.3\n"
-            f"Name: daffi\n"
-            f"Version: {version}\n"
-            f"Summary: Lightweight inter-process RPC framework\n"
-            f"Requires-Python: >={py_maj}.{py_min}\n"
-        ).encode())
+        add(
+            f"{dist_info}/METADATA",
+            (
+                f"Metadata-Version: 2.3\n"
+                f"Name: daffi\n"
+                f"Version: {version}\n"
+                f"Summary: Lightweight inter-process RPC framework\n"
+                f"Requires-Python: >={py_maj}.{py_min}\n"
+            ).encode(),
+        )
 
         # .dist-info/RECORD
-        record_lines = [
-            f"{p},{_sha256_record(d)},{len(d)}" for p, d in wheel_files
-        ]
+        record_lines = [f"{p},{_sha256_record(d)},{len(d)}" for p, d in wheel_files]
         record_lines.append(f"{dist_info}/RECORD,,")
         record_data = "\n".join(record_lines).encode()
 

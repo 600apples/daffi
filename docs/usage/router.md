@@ -11,10 +11,10 @@ The Router topology decouples callers from workers. The **Router** is a pure mes
 The Router has no callbacks of its own — it only forwards messages.
 
 ```python
-from daffi import Router
+from daffi import Router, TCPTransport
 
 if __name__ == "__main__":
-    router = Router(host="127.0.0.1", port=6001)
+    router = Router(transport=TCPTransport("127.0.0.1", 6001))
     router.start()
     print("Router running on 127.0.0.1:6001 — press Ctrl+C to stop.")
     router.join()
@@ -24,9 +24,14 @@ if __name__ == "__main__":
 
 | Parameter | Type | Description |
 |---|---|---|
-| `host` | `str` | TCP host to listen on. |
-| `port` | `int` | TCP port to listen on. |
-| `tls` | `bool` | Enable TLS (requires `cert_file` / `key_file`). |
+| `transport` | transport or sequence | One `TCPTransport` or `UnixTransport`, or several. Every listener shares this router's membership. `start()` brings all of them up at once or none of them. TLS (`tls`, `cert`, `key`) is set on each `TCPTransport`. |
+| `runtime` | `Runtime` | `THREADS` or `EVENTED` for this process. Omit for `threads`. One process, one choice. |
+| `auth_token` | `str` | Shared secret. Every peer must send the same token in its handshake (`auth_token=` on `Client`, `authToken` in the JS client); a peer without it is disconnected before it can call anything or take a name. Omit to accept any peer. |
+
+Requests are only accepted from peers that have completed the handshake, under
+the name they registered; a request that names another peer as its sender is
+answered with `UnknownSender`. A reply is only accepted from the peer the
+request was routed to.
 
 ---
 
@@ -36,7 +41,7 @@ Workers are **Clients** that expose `@callback` functions.
 Start as many instances as you need — the Router load-balances across them.
 
 ```python
-from daffi import Client, callback
+from daffi import Client, callback, TCPTransport
 
 @callback
 def multiply(a: int, b: int) -> int:
@@ -44,7 +49,7 @@ def multiply(a: int, b: int) -> int:
     return a * b
 
 if __name__ == "__main__":
-    worker = Client(app_name="calc-worker", host="127.0.0.1", port=6001)
+    worker = Client(app_name="calc-worker", transport=TCPTransport("127.0.0.1", 6001))
     worker.connect()
     print("Worker connected — press Ctrl+C to stop.")
     worker.join()
@@ -70,10 +75,8 @@ a thread pool:
 # Each worker node handles up to 8 callbacks concurrently via threads.
 worker = Client(
     app_name="io-worker",
-    host="127.0.0.1",
-    port=6001,
     workers=8,
-)
+    transport=TCPTransport("127.0.0.1", 6001))
 worker.connect()
 worker.join()
 ```
@@ -84,14 +87,13 @@ limits true CPU parallelism inside a single process.  Scale out by running
 increasing `workers` on a single node:
 
 ```python
+from daffi import TCPTransport
 # Start N instances of this process — one per core.  The Router load-balances
 # RPCs across them so all cores run callbacks in parallel.
 worker = Client(
     app_name=f"cpu-worker-{os.getpid()}",
-    host="127.0.0.1",
-    port=6001,
     workers=1,
-)
+    transport=TCPTransport("127.0.0.1", 6001))
 worker.connect()
 worker.join()
 ```
@@ -106,10 +108,10 @@ for more on choosing a `workers` value.
 Callers are also **Clients** — they just don't expose any `@callback` functions.
 
 ```python
-from daffi import Client
+from daffi import Client, TCPTransport
 
 if __name__ == "__main__":
-    caller = Client(app_name="calc-caller", host="127.0.0.1", port=6001)
+    caller = Client(app_name="calc-caller", transport=TCPTransport("127.0.0.1", 6001))
     conn = caller.connect()
 
     # Round-robin — any available worker handles this call.
@@ -133,13 +135,13 @@ and call each other.
 
 ```python
 # node_a.py
-from daffi import Client, callback
+from daffi import Client, callback, TCPTransport
 
 @callback
 def hello_from_a(msg: str) -> str:
     return f"A received: {msg}"
 
-node_a = Client(app_name="node-A", host="127.0.0.1", port=6003)
+node_a = Client(app_name="node-A", transport=TCPTransport("127.0.0.1", 6003))
 conn = node_a.connect()
 
 # Call node-B's callback
@@ -149,13 +151,13 @@ print(reply)
 
 ```python
 # node_b.py
-from daffi import Client, callback
+from daffi import Client, callback, TCPTransport
 
 @callback
 def hello_from_b(msg: str) -> str:
     return f"B received: {msg}"
 
-node_b = Client(app_name="node-B", host="127.0.0.1", port=6003)
+node_b = Client(app_name="node-B", transport=TCPTransport("127.0.0.1", 6003))
 conn = node_b.connect()
 node_b.join()
 ```
@@ -190,10 +192,10 @@ try/except retry loop, use `conn.wait_for_members()` to **block until the
 required peers appear** in the Router's member registry:
 
 ```python
-from daffi import Client
+from daffi import Client, TCPTransport
 
 if __name__ == "__main__":
-    caller = Client(app_name="calc-caller", host="127.0.0.1", port=6001)
+    caller = Client(app_name="calc-caller", transport=TCPTransport("127.0.0.1", 6001))
     conn = caller.connect()
 
     # Block until both workers have registered — start order doesn't matter.
@@ -211,9 +213,9 @@ The method polls the native ChannelsMapper every `interval` seconds (default
 `timeout` parameter raises `TimeoutError` if the deadline is exceeded:
 
 ```python
-from daffi import Client
+from daffi import Client, TCPTransport
 
-conn = Client(app_name="caller", host="127.0.0.1", port=6001).connect()
+conn = Client(app_name="caller", transport=TCPTransport("127.0.0.1", 6001)).connect()
 
 # Raise TimeoutError after 30 s if the worker hasn't joined yet.
 conn.wait_for_members("slow-worker", timeout=30)
@@ -243,3 +245,4 @@ conn.wait_for_members("worker-1", "worker-2", interval=0.5)
 | MSGPACK serde | `examples/router/07_serde_msgpack/` |
 | Events via router | `examples/router/08_events/` |
 | Waiting for members | `examples/router/09_wait_for_members/` |
+| TCP and Unix on one Router | `examples/router/10_multitransport/` |

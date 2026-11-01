@@ -3,7 +3,9 @@ Async integration tests for connection interruption scenarios.
 
 Mirrors tests/integration/test_interruptions.py using daffi.aio.
 """
+
 from __future__ import annotations
+from tests.conftest import active_runtime
 
 import asyncio
 import multiprocessing as mp
@@ -13,55 +15,63 @@ import time
 
 import pytest
 
-from .conftest import HOST, TIMEOUT, wait_for_port, wait_for_members, silence_subprocess, quiet_kill
+from .conftest import (
+    HOST,
+    TIMEOUT,
+    wait_for_port,
+    wait_for_members,
+    silence_subprocess,
+    quiet_kill,
+)
 from daffi.exceptions import InitializationError, TransmissionFailure
-
 
 # ── subprocess entry points ───────────────────────────────────────────────────
 
-def _proc_service(port: int) -> None:
-    silence_subprocess()
+
+def _proc_service(runtime: str, port: int) -> None:
+    silence_subprocess(runtime)
 
     async def _main():
-        from daffi import callback
+        from daffi import callback, TCPTransport
         from daffi.aio import AsyncService
 
         @callback
         async def echo(payload):
             return payload
 
-        svc = AsyncService(app_name="intr-aio-svc", host=HOST, port=port)
+        svc = AsyncService(app_name="intr-aio-svc", transport=TCPTransport(HOST, port), runtime=runtime)
         await svc.start()
         await svc.join()
 
     asyncio.run(_main())
 
 
-def _proc_router(port: int) -> None:
-    silence_subprocess()
+def _proc_router(runtime: str, port: int) -> None:
+    silence_subprocess(runtime)
 
     async def _main():
         from daffi.aio import AsyncRouter
+        from daffi import TCPTransport
 
-        r = AsyncRouter(app_name="intr-aio-router", host=HOST, port=port)
+        r = AsyncRouter(app_name="intr-aio-router", transport=TCPTransport(HOST, port), runtime=runtime)
         await r.start()
         await r.join()
 
     asyncio.run(_main())
 
 
-def _proc_worker(port: int, name: str = "intr-aio-worker") -> None:
-    silence_subprocess()
+def _proc_worker(runtime: str, port: int, name: str = "intr-aio-worker") -> None:
+    silence_subprocess(runtime)
 
     async def _main():
-        from daffi import callback
+        from daffi import callback, TCPTransport
         from daffi.aio import AsyncClient
 
         @callback
         async def echo(payload):
             return payload
 
-        client = AsyncClient(app_name=name, host=HOST, port=port)
+        client = AsyncClient(app_name=name, transport=TCPTransport(HOST, port), runtime=runtime)
         await client.connect()
         await client.join()
 
@@ -70,9 +80,10 @@ def _proc_worker(port: int, name: str = "intr-aio-worker") -> None:
 
 # ── fixtures ──────────────────────────────────────────────────────────────────
 
+
 @pytest.fixture
 def live_service(free_port):
-    proc = mp.Process(target=_proc_service, args=(free_port,), daemon=True)
+    proc = mp.Process(target=_proc_service, args=(active_runtime(), free_port,), daemon=True)
     proc.start()
     wait_for_port(free_port)
     time.sleep(0.15)
@@ -82,11 +93,11 @@ def live_service(free_port):
 
 @pytest.fixture
 def router_with_one_worker(free_port):
-    rproc = mp.Process(target=_proc_router, args=(free_port,), daemon=True)
+    rproc = mp.Process(target=_proc_router, args=(active_runtime(), free_port,), daemon=True)
     rproc.start()
     wait_for_port(free_port)
 
-    wproc = mp.Process(target=_proc_worker, args=(free_port,), daemon=True)
+    wproc = mp.Process(target=_proc_worker, args=(active_runtime(), free_port,), daemon=True)
     wproc.start()
     wait_for_members(free_port, {"intr-aio-worker"})
     yield free_port, rproc, wproc
@@ -96,15 +107,17 @@ def router_with_one_worker(free_port):
 
 # ── tests ──────────────────────────────────────────────────────────────────────
 
+
 @pytest.mark.asyncio
 class TestServiceKilledAsync:
 
     async def test_service_killed_raises_transmission_failure(self, live_service):
         """After the service is killed, the next rpc() call raises TransmissionFailure."""
         from daffi.aio import AsyncClient
+        from daffi import TCPTransport
 
         port, svc_proc = live_service
-        client = AsyncClient(app_name="intr-killed", host=HOST, port=port)
+        client = AsyncClient(app_name="intr-killed", transport=TCPTransport(HOST, port), runtime=active_runtime())
         conn = await client.connect()
 
         # Give one good call to confirm the connection is live.
@@ -116,7 +129,9 @@ class TestServiceKilledAsync:
         await asyncio.sleep(0.3)
 
         try:
-            with pytest.raises((TransmissionFailure, OSError, ConnectionError, Exception)):
+            with pytest.raises(
+                (TransmissionFailure, OSError, ConnectionError, Exception)
+            ):
                 await conn.rpc(timeout=5).echo("dead")
         finally:
             await client.stop()
@@ -124,17 +139,22 @@ class TestServiceKilledAsync:
     async def test_connect_to_dead_service_raises(self, free_port):
         """connect() to a port with no listener raises InitializationError."""
         from daffi.aio import AsyncClient
+        from daffi import TCPTransport
 
-        client = AsyncClient(app_name="intr-dead-connect", host=HOST, port=free_port)
+        client = AsyncClient(
+            app_name="intr-dead-connect", transport=TCPTransport(HOST, free_port),
+            runtime=active_runtime(),
+        )
         with pytest.raises(InitializationError):
             await client.connect()
 
     async def test_service_frozen_raises_timeout(self, live_service):
         """SIGSTOP-frozen service: rpc() with short timeout raises TimeoutError."""
         from daffi.aio import AsyncClient
+        from daffi import TCPTransport
 
         port, svc_proc = live_service
-        client = AsyncClient(app_name="intr-frozen", host=HOST, port=port)
+        client = AsyncClient(app_name="intr-frozen", transport=TCPTransport(HOST, port), runtime=active_runtime())
         conn = await client.connect()
 
         os.kill(svc_proc.pid, signal.SIGSTOP)
@@ -148,9 +168,13 @@ class TestServiceKilledAsync:
     async def test_service_resumed_call_succeeds(self, live_service):
         """SIGSTOP then SIGCONT: rpc() eventually succeeds."""
         from daffi.aio import AsyncClient
+        from daffi import TCPTransport
 
         port, svc_proc = live_service
-        client = AsyncClient(app_name="intr-resumed", host=HOST, port=port)
+        client = AsyncClient(
+            app_name="intr-resumed", transport=TCPTransport(HOST, port),
+            runtime=active_runtime(),
+        )
         conn = await client.connect()
 
         os.kill(svc_proc.pid, signal.SIGSTOP)
@@ -167,18 +191,26 @@ class TestServiceKilledAsync:
 @pytest.mark.asyncio
 class TestWorkerKilledAsync:
 
-    async def test_one_worker_killed_cast_to_remaining_succeeds(self, router_with_one_worker):
+    async def test_one_worker_killed_cast_to_remaining_succeeds(
+        self, router_with_one_worker
+    ):
         """After killing one worker, a fresh cast() to surviving workers still works."""
         from daffi.aio import AsyncClient
+        from daffi import TCPTransport
 
         port, rproc, wproc = router_with_one_worker
 
         # Add a second worker so there's one surviving after we kill the first.
-        proc2 = mp.Process(target=_proc_worker, args=(port, "intr-aio-worker2"), daemon=True)
+        proc2 = mp.Process(
+            target=_proc_worker, args=(active_runtime(), port, "intr-aio-worker2"), daemon=True
+        )
         proc2.start()
         wait_for_members(port, {"intr-aio-worker2"})
 
-        client = AsyncClient(app_name="intr-cast-caller", host=HOST, port=port)
+        client = AsyncClient(
+            app_name="intr-cast-caller", transport=TCPTransport(HOST, port),
+            runtime=active_runtime(),
+        )
         conn = await client.connect()
 
         # Verify both workers are reachable.

@@ -8,6 +8,7 @@ Current public surface (daffi.utils.misc):
   is_lambda_function(obj) — True iff obj is an anonymous lambda
   iterable(obj)           — True iff obj is a non-str, non-bytes, non-dict Iterable
 """
+
 from __future__ import annotations
 
 import pytest
@@ -16,10 +17,10 @@ from daffi.utils.misc import is_lambda_function, iterable
 from daffi.utils.misc import uuid as daffi_uuid
 from daffi.utils.misc import string_uuid
 
-
 # ══════════════════════════════════════════════════════════════════════════════
 # is_lambda_function
 # ══════════════════════════════════════════════════════════════════════════════
+
 
 class TestIsLambdaFunction:
     """is_lambda_function returns True only for anonymous lambdas."""
@@ -94,6 +95,7 @@ class TestIsLambdaFunction:
 # ══════════════════════════════════════════════════════════════════════════════
 # iterable
 # ══════════════════════════════════════════════════════════════════════════════
+
 
 class TestIterable:
     """iterable(obj) → True for non-str / non-bytes / non-dict Iterables."""
@@ -182,6 +184,7 @@ class TestIterable:
 # uuid  (32-bit unsigned integer)
 # ══════════════════════════════════════════════════════════════════════════════
 
+
 class TestUuid:
     """daffi_uuid() returns a random 32-bit unsigned integer."""
 
@@ -210,6 +213,7 @@ class TestUuid:
 # string_uuid  (hex string)
 # ══════════════════════════════════════════════════════════════════════════════
 
+
 class TestStringUuid:
     """string_uuid() returns a short hex string like '0x3f2a1c08'."""
 
@@ -222,7 +226,7 @@ class TestStringUuid:
     def test_is_valid_hex(self):
         """The whole string must parse as a hexadecimal integer."""
         s = string_uuid()
-        parsed = int(s, 16)   # raises ValueError on invalid hex
+        parsed = int(s, 16)  # raises ValueError on invalid hex
         assert parsed >= 0
 
     def test_encodes_u32(self):

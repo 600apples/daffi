@@ -62,7 +62,8 @@ pub const Handshake = struct {
 
     pub fn parse(buf: []u8, headers: *KeyValue) !Handshake {
         var data = buf;
-        const request_line_end = mem.indexOfScalar(u8, data, '\r') orelse unreachable;
+        const request_line_end = mem.indexOfScalar(u8, data, '\r') orelse return error.InvalidRequestLine;
+        if (request_line_end + 2 > data.len) return error.InvalidRequestLine;
         var request_line = data[0..request_line_end];
 
         if (!ascii.endsWithIgnoreCase(request_line, "http/1.1")) {
@@ -77,7 +78,8 @@ pub const Handshake = struct {
         data = data[request_line_end + 2 ..];
 
         while (data.len > 4) {
-            const index = mem.indexOfScalar(u8, data, '\r') orelse unreachable;
+            const index = mem.indexOfScalar(u8, data, '\r') orelse return error.InvalidHeader;
+            if (index + 2 > data.len) return error.InvalidHeader;
             const separator = mem.indexOfScalar(u8, data[0..index], ':') orelse return error.InvalidHeader;
 
             const name = mem.trim(u8, toLower(data[0..separator]), &ascii.whitespace);
@@ -97,7 +99,7 @@ pub const Handshake = struct {
             } else if (mem.eql(u8, "connection", name)) {
                 // find if connection header has upgrade in it, example header:
                 //  Connection: keep-alive, Upgrade
-                if (ascii.indexOfIgnoreCase(value, "upgrade") == null) {
+                if (ascii.findIgnoreCase(value, "upgrade") == null) {
                     return error.InvalidConnection;
                 }
                 required_headers |= 4;
@@ -118,6 +120,9 @@ pub const Handshake = struct {
         // us some leeway into parsing it
         const separator = mem.indexOfScalar(u8, request_line, ' ') orelse return error.InvalidRequestLine;
         const method = request_line[0..separator];
+        // "GET HTTP/1.1" (no URL) makes `len - 9 < separator + 1`; slicing that
+        // used to be an out-of-range panic reachable by any unauthenticated peer.
+        if (request_line.len < separator + 1 + 9) return error.InvalidRequestLine;
         const url = mem.trim(u8, request_line[separator + 1 .. request_line.len - 9], &ascii.whitespace);
 
         return .{
@@ -125,8 +130,28 @@ pub const Handshake = struct {
             .url = url,
             .method = method,
             .headers = headers,
-            .raw_header = buf[request_line_end + 2 .. request_length + 2],
+            .raw_header = buf[request_line_end + 2 .. @max(request_line_end + 2, @min(request_length + 2, buf.len))],
         };
+    }
+
+    /// `allowed` is a newline-separated list of origins.
+    /// Empty refuses every upgrade (fail closed). `"*"` allows any origin
+    /// (used when the node has an auth_token). With a list, a request
+    /// without an Origin header is refused too: browsers always send one,
+    /// so only other clients omit it.
+    pub fn originAllowed(self: Handshake, allowed: []const u8) bool {
+        if (allowed.len == 0) return false;
+        if (allowed.len == 1 and allowed[0] == '*') return true;
+        const origin = self.headers.get("origin") orelse return false;
+        var it = mem.splitScalar(u8, allowed, '\n');
+        while (it.next()) |entry| {
+            if (entry.len > 0 and ascii.eqlIgnoreCase(entry, origin)) return true;
+        }
+        return false;
+    }
+
+    pub fn refuseOrigin(stream: anytype) !void {
+        try stream.writeAll("HTTP/1.1 403 Forbidden\r\nerror: origin not allowed\r\ncontent-length: 0\r\n\r\n");
     }
 
     pub fn close(stream: anytype, err: anyerror) !void {
@@ -165,6 +190,25 @@ pub const Handshake = struct {
         try stream.writeAll(&buf);
     }
 };
+
+test "origin allow-list" {
+    var headers = try KeyValue.init(std.testing.allocator, 10);
+    defer headers.deinit(std.testing.allocator);
+    var request = "GET /x HTTP/1.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nOrigin: https://App.example\r\n\r\n".*;
+    const h = try Handshake.parse(&request, &headers);
+    try std.testing.expect(!h.originAllowed(""));
+    try std.testing.expect(h.originAllowed("*"));
+    try std.testing.expect(h.originAllowed("https://other.example\nhttps://app.example"));
+    try std.testing.expect(!h.originAllowed("https://other.example"));
+    try std.testing.expect(!h.originAllowed("https://app.example.evil"));
+
+    headers.reset();
+    var anonymous = "GET /x HTTP/1.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n".*;
+    const no_origin = try Handshake.parse(&anonymous, &headers);
+    try std.testing.expect(!no_origin.originAllowed(""));
+    try std.testing.expect(no_origin.originAllowed("*"));
+    try std.testing.expect(!no_origin.originAllowed("https://app.example"));
+}
 
 fn toLower(str: []u8) []u8 {
     for (str, 0..) |c, i| {
@@ -234,6 +278,7 @@ pub const Pool = struct {
             s.deinit(allocator);
         }
         allocator.free(self.states);
+        allocator.destroy(self);
     }
 
     pub fn acquire(self: *Pool) !*HandshakeState {

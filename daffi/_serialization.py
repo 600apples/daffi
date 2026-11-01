@@ -2,49 +2,29 @@
 Serialisation and deserialisation for the four supported wire formats.
 """
 
+from __future__ import annotations
+
 import json
 import pickle
+from enum import IntEnum
 from typing import Union, Tuple, Dict, Callable
 
-
-# Lazy import — msgpack is an optional extra (``pip install daffi[msgpack]``).
-# We import on first use so users without the extra installed can still use
-# OPAQUE / JSON / PICKLE without any import errors at module load time.
-_msgpack = None
+import msgpack
 
 
-def _require_msgpack():
-    """Return the imported ``msgpack`` module or raise a helpful ImportError.
-
-    The first call performs the import and caches it; subsequent calls reuse
-    the cached reference.
-    """
-    global _msgpack
-    if _msgpack is not None:
-        return _msgpack
-    try:
-        import msgpack as _m
-    except ImportError as exc:
-        raise ImportError(
-            "SerdeFormat.MSGPACK requires the optional 'msgpack' dependency. "
-            "Install it with:  pip install 'daffi[msgpack]'"
-        ) from exc
-    _msgpack = _m
-    return _m
-
-
-class SerdeFormat:
+class SerdeFormat(IntEnum):
     """Wire serialisation format selector.
 
-    Pass one of these constants to :meth:`~daffi.app.ClientConnection.rpc` or
+    Pass one of these members to :meth:`~daffi.app.ClientConnection.rpc` or
     :meth:`~daffi.app.ClientConnection.stream` via the *serde* argument.
+    Values are integers on the wire (``IntEnum``).
     """
 
     OPAQUE = 0
     """Zero-copy pass-through.  daffi does not interpret the payload and
     ships it on the wire unchanged.  The single argument must already be
-    ``bytes`` or ``str`` — both are accepted and the wire layer preserves the
-    original type for the receiver."""
+    ``bytes``, ``bytearray``, ``memoryview``, or ``str``.  Received binary
+    payloads are always immutable ``bytes``."""
 
     JSON = 1
     """All positional and keyword arguments are encoded as a JSON object
@@ -52,14 +32,40 @@ class SerdeFormat:
 
     PICKLE = 2
     """All positional and keyword arguments are pickled as a ``(args, kwargs)``
-    tuple."""
+    tuple.  Callers pass ``serde=SerdeFormat.PICKLE``.  Accepted by default
+    (see :attr:`ALL`); pass ``serdes=SerdeFormat.SAFE`` to refuse it.
+    Unpickling runs code the sender chooses.  Always refused from WebSocket
+    peers."""
 
     MSGPACK = 3
     """All positional and keyword arguments are msgpack-encoded as an
-    ``[args, kwargs]`` array.  Smaller and language-agnostic compared to
-    PICKLE, but supports a narrower set of types (no tuples, custom classes,
-    or tracebacks).  Requires the optional ``msgpack`` package — install with
-    ``pip install 'daffi[msgpack]'``."""
+    ``[args, kwargs]`` array.  Default for ``rpc()`` / ``cast()``.  Language
+    agnostic; supports a narrower set of types than PICKLE (no tuples,
+    custom classes, or tracebacks)."""
+
+    @classmethod
+    def name_of(cls, serde: int) -> str:
+        """``"PICKLE"`` for ``SerdeFormat.PICKLE``; the number itself if unknown."""
+        try:
+            return cls(serde).name
+        except ValueError:
+            return str(serde)
+
+
+# Non-member class attributes (not IntEnum values).
+SerdeFormat.DEFAULT = SerdeFormat.MSGPACK  # type: ignore[misc]
+"""Default ``serde=`` for ``rpc()`` / ``cast()`` / ``rpc_nowait()`` /
+``cast_nowait()``."""
+
+SerdeFormat.ALL = frozenset(  # type: ignore[misc]
+    (SerdeFormat.OPAQUE, SerdeFormat.JSON, SerdeFormat.PICKLE, SerdeFormat.MSGPACK)
+)
+"""Every format, including PICKLE.  Default for ``serdes=`` when omitted."""
+
+SerdeFormat.SAFE = frozenset(  # type: ignore[misc]
+    (SerdeFormat.OPAQUE, SerdeFormat.JSON, SerdeFormat.MSGPACK)
+)
+"""JSON, MSGPACK, and OPAQUE only.  Pass as ``serdes=`` to refuse PICKLE."""
 
 
 class Serializer:
@@ -77,7 +83,8 @@ class Serializer:
         Raises:
             TypeError: If more than one argument (positional or keyword) is
                        supplied, since OPAQUE has no framing to separate
-                       multiple values.
+                       multiple values.  Also if the value is not ``bytes``
+                       or ``str``.
         """
         n_args, n_kwargs = len(args), len(kwargs)
         if n_args + n_kwargs > 1:
@@ -92,7 +99,18 @@ class Serializer:
             data = next(iter(kwargs.values()))
         else:
             data = b""
-        return data, isinstance(data, bytes)
+        # Void callbacks (``return`` / ``return None``) reply with empty bytes
+        # so stream acks and similar OPAQUE round-trips stay usable.
+        if data is None:
+            data = b""
+        elif isinstance(data, str):
+            return data, False
+        elif not isinstance(data, (bytes, bytearray, memoryview)):
+            raise TypeError(
+                f"SerdeFormat.OPAQUE accepts bytes, bytearray, memoryview, or str, "
+                f"got {type(data).__name__}."
+            )
+        return data, True
 
     @staticmethod
     def _serialize_json(*args, **kwargs) -> Tuple[str, bool]:
@@ -128,7 +146,6 @@ class Serializer:
         ``use_bin_type=True`` keeps ``bytes`` and ``str`` distinguishable on
         the wire (msgpack's default since 1.0, but we set it explicitly).
         """
-        msgpack = _require_msgpack()
         return msgpack.packb([args, kwargs], use_bin_type=True), True
 
     @staticmethod
@@ -139,7 +156,6 @@ class Serializer:
         ``strict_map_key=False`` allows non-string dict keys, matching
         Python's permissiveness.
         """
-        msgpack = _require_msgpack()
         args, kwargs = msgpack.unpackb(data, raw=False, strict_map_key=False)
         return args, kwargs
 
@@ -177,6 +193,27 @@ class Serializer:
             return cls._DESERIALIZE[serde](data)
         except KeyError:
             raise ValueError(f"Unknown serde format: {serde!r}")
+
+    @classmethod
+    def unpack_result(cls, serde: SerdeFormat, data: Union[bytes, str]):
+        """Return the single RPC result value from a RESPONSE payload.
+
+        OPAQUE skips the ``(args,), {}`` envelope and returns *data* as-is.
+        """
+        if serde == SerdeFormat.OPAQUE:
+            return data
+        return cls.deserialize(serde, data)[0][0]
+
+    @classmethod
+    def invoke(cls, serde: SerdeFormat, callback, data: Union[bytes, str]):
+        """Call *callback* with arguments decoded from *data*.
+
+        OPAQUE passes *data* as the sole positional argument (no tuple/dict).
+        """
+        if serde == SerdeFormat.OPAQUE:
+            return callback(data)
+        args, kwargs = cls.deserialize(serde, data)
+        return callback(*args, **kwargs)
 
     # Dispatch tables — populated after the class body so the static methods
     # are already defined when referenced here.

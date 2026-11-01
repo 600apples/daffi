@@ -3,7 +3,8 @@ js/05_cast — Worker B.
 
 Start after 1_router.py.
 """
-from daffi import Client, callback
+
+from daffi import Client, callback, TCPTransport
 
 NAME = "worker-B"
 
@@ -22,7 +23,7 @@ def square(n: float) -> dict:
 
 
 if __name__ == "__main__":
-    client = Client(app_name=NAME, host="127.0.0.1", port=6020)
+    client = Client(app_name=NAME, transport=TCPTransport("127.0.0.1", 6020))
     client.connect()
     print(f"'{NAME}' connected — press Ctrl+C to stop.")
     client.join()

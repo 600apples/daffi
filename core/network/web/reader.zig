@@ -121,6 +121,7 @@ pub const Reader = struct {
                         const byte1 = msg[0];
                         const byte2 = msg[1];
                         masked = byte2 & 128 == 128;
+                        if (!masked) return error.UnmaskedFrame;
                         length_of_length = switch (byte2 & 127) {
                             126 => 2,
                             127 => 8,
@@ -160,7 +161,12 @@ pub const Reader = struct {
                             8 => @as(u64, @intCast(msg[9])) | @as(u64, @intCast(msg[8])) << 8 | @as(u64, @intCast(msg[7])) << 16 | @as(u64, @intCast(msg[6])) << 24 | @as(u64, @intCast(msg[5])) << 32 | @as(u64, @intCast(msg[4])) << 40 | @as(u64, @intCast(msg[3])) << 48 | @as(u64, @intCast(msg[2])) << 56,
                             else => msg[1] & 127,
                         };
-                        data_needed += payload_length;
+                        // payload_length is attacker-controlled (up to 2^64-1).  Reject
+                        // anything over the configured limit *before* doing arithmetic
+                        // with it; `data_needed += payload_length` used to overflow and
+                        // abort the process in safe builds.
+                        if (payload_length > self.max_size) return error.TooLarge;
+                        data_needed += @as(usize, @intCast(payload_length));
                         phase = ParsePhase.payload;
                     },
                     .payload => {

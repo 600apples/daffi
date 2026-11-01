@@ -9,11 +9,8 @@
  * Load daffi.js from jsDelivr.  app.wasm is fetched automatically from the
  * same CDN release — you do NOT need to host or specify it yourself.
  *
- *   <!-- Load the JS client (pin to a specific release tag) -->
+ *   <!-- Load the JS client (pin to a specific release tag). MessagePack is built in. -->
  *   <script src="https://cdn.jsdelivr.net/gh/600apples/daffi@2.0.0/js-client/daffi.js"></script>
- *
- *   <!-- (optional) msgpack-lite — only needed for serde: "msgpack" -->
- *   <script src="https://unpkg.com/msgpack-lite/dist/msgpack.min.js"></script>
  *
  *   <script>
  *     // wsUrl is REQUIRED — there is no default.
@@ -62,6 +59,11 @@
  *                                    60 s).  Default: false.
  *
  *   options.reconnectDelay number (ms) — Base reconnect delay.  Default: 2000.
+ *
+ *   options.authToken string — Shared secret for a server started with
+ *                              ``auth_token=``.  Anyone who can read this
+ *                              page can read it, so it only keeps out
+ *                              clients that were never given the page.
  *
  * ─────────────────────────────────────────────────────────────────────────────
  * client.connect() → Promise<Connection>
@@ -140,25 +142,232 @@
  * ─────────────────────────────────────────────────────────────────────────────
  * SERDE — serialisation formats
  * ─────────────────────────────────────────────────────────────────────────────
- *   "json"    | 1  — JSON (default).  Works with any JSON-serialisable value.
+ *   "msgpack" | 3  — MessagePack (default).  Compact binary; works with
+ *                    JSON-serialisable values plus Uint8Array / bytes.
+ *                    Encoder and decoder are built into this file.
+ *
+ *   "json"    | 1  — JSON.  Works with any JSON-serialisable value.
  *
  *   "raw"     | 0  — OPAQUE / raw bytes.  Pass a single Uint8Array or string;
  *                    receive a Uint8Array (or parsed JSON if the bytes happen
  *                    to be valid JSON).  Use when the Python side is decorated
  *                    with @callback and expects bytes.
  *
- *   "msgpack" | 3  — Binary MessagePack.  More compact than JSON for
- *                    structured data.  Requires msgpack-lite to be loaded
- *                    before this file:
- *                      <script src="https://unpkg.com/msgpack-lite/dist/msgpack.min.js"></script>
- *
  *   Note: PICKLE (2) is Python-only and is not supported in the JS client.
  */
+
+// Compact MessagePack codec matching Python msgpack 1.0 (use_bin_type,
+// raw=False).  Covers nil/bool/int/float/str/bin/array/map — enough for
+// daffi's [args, kwargs] envelope.
+const _mp = (() => {
+    const textEnc = new TextEncoder();
+    const textDec = new TextDecoder();
+
+    function encode(value) {
+        const out = [];
+        write(out, value);
+        let total = 0;
+        for (const chunk of out) total += chunk.length;
+        const buf = new Uint8Array(total);
+        let off = 0;
+        for (const chunk of out) { buf.set(chunk, off); off += chunk.length; }
+        return buf;
+    }
+
+    function u8(n) { return Uint8Array.of(n); }
+    function putUint(tag, n, bytes) {
+        const a = new Uint8Array(1 + bytes);
+        const view = new DataView(a.buffer);
+        view.setUint8(0, tag);
+        if (bytes === 1) view.setUint8(1, n);
+        else if (bytes === 2) view.setUint16(1, n);
+        else if (bytes === 4) view.setUint32(1, n);
+        else view.setBigUint64(1, BigInt(n));
+        return a;
+    }
+    function putInt(tag, n, bytes) {
+        const a = new Uint8Array(1 + bytes);
+        const view = new DataView(a.buffer);
+        view.setUint8(0, tag);
+        if (bytes === 1) view.setInt8(1, n);
+        else if (bytes === 2) view.setInt16(1, n);
+        else if (bytes === 4) view.setInt32(1, n);
+        else view.setBigInt64(1, BigInt(n));
+        return a;
+    }
+
+    function write(out, v) {
+        if (v === null || v === undefined) { out.push(u8(0xc0)); return; }
+        if (v === false) { out.push(u8(0xc2)); return; }
+        if (v === true) { out.push(u8(0xc3)); return; }
+        if (typeof v === 'number') {
+            if (Number.isInteger(v) && Number.isSafeInteger(v)) {
+                if (v >= 0) {
+                    if (v <= 0x7f) out.push(u8(v));
+                    else if (v <= 0xff) out.push(putUint(0xcc, v, 1));
+                    else if (v <= 0xffff) out.push(putUint(0xcd, v, 2));
+                    else if (v <= 0xffffffff) out.push(putUint(0xce, v, 4));
+                    else out.push(putUint(0xcf, v, 8));
+                } else if (v >= -0x20) {
+                    out.push(u8(v & 0xff));
+                } else if (v >= -0x80) {
+                    out.push(putInt(0xd0, v, 1));
+                } else if (v >= -0x8000) {
+                    out.push(putInt(0xd1, v, 2));
+                } else if (v >= -0x80000000) {
+                    out.push(putInt(0xd2, v, 4));
+                } else {
+                    out.push(putInt(0xd3, v, 8));
+                }
+                return;
+            }
+            const a = new Uint8Array(9);
+            const view = new DataView(a.buffer);
+            view.setUint8(0, 0xcb);
+            view.setFloat64(1, v);
+            out.push(a);
+            return;
+        }
+        if (typeof v === 'string') {
+            const bytes = textEnc.encode(v);
+            headerBin(out, bytes.length, 0xa0, 0xd9, 0xda, 0xdb, true);
+            out.push(bytes);
+            return;
+        }
+        if (v instanceof ArrayBuffer) v = new Uint8Array(v);
+        if (ArrayBuffer.isView(v) && !(v instanceof DataView)) {
+            const bytes = new Uint8Array(v.buffer, v.byteOffset, v.byteLength);
+            headerBin(out, bytes.length, 0, 0xc4, 0xc5, 0xc6, false);
+            out.push(bytes);
+            return;
+        }
+        if (Array.isArray(v)) {
+            headerLen(out, v.length, 0x90, 0xdc, 0xdd, 15);
+            for (const item of v) write(out, item);
+            return;
+        }
+        if (typeof v === 'object') {
+            const keys = Object.keys(v);
+            headerLen(out, keys.length, 0x80, 0xde, 0xdf, 15);
+            for (const k of keys) { write(out, k); write(out, v[k]); }
+            return;
+        }
+        throw new TypeError(`msgpack: cannot encode ${typeof v}`);
+    }
+
+    function headerBin(out, n, fix, t8, t16, t32, isStr) {
+        if (isStr && n <= 31) { out.push(u8(fix | n)); return; }
+        if (n <= 0xff) out.push(putUint(t8, n, 1));
+        else if (n <= 0xffff) out.push(putUint(t16, n, 2));
+        else out.push(putUint(t32, n, 4));
+    }
+    function headerLen(out, n, fix, t16, t32, fixMax) {
+        if (n <= fixMax) out.push(u8(fix | n));
+        else if (n <= 0xffff) out.push(putUint(t16, n, 2));
+        else out.push(putUint(t32, n, 4));
+    }
+
+    function decode(bytes) {
+        const buf = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+        const view = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
+        let i = 0;
+        function need(n) {
+            if (i + n > buf.length) throw new RangeError('msgpack: truncated');
+        }
+        function u(n) {
+            need(n);
+            let v;
+            if (n === 1) v = view.getUint8(i);
+            else if (n === 2) v = view.getUint16(i);
+            else if (n === 4) v = view.getUint32(i);
+            else v = Number(view.getBigUint64(i));
+            i += n;
+            return v;
+        }
+        function s(n) {
+            need(n);
+            let v;
+            if (n === 1) v = view.getInt8(i);
+            else if (n === 2) v = view.getInt16(i);
+            else if (n === 4) v = view.getInt32(i);
+            else v = Number(view.getBigInt64(i));
+            i += n;
+            return v;
+        }
+        function read() {
+            need(1);
+            const b = buf[i++];
+            if (b <= 0x7f) return b;
+            if (b >= 0xe0) return b - 256;
+            if (b >= 0xa0 && b <= 0xbf) return str(b & 0x1f);
+            if (b >= 0x90 && b <= 0x9f) return arr(b & 0x0f);
+            if (b >= 0x80 && b <= 0x8f) return map(b & 0x0f);
+            switch (b) {
+                case 0xc0: return null;
+                case 0xc2: return false;
+                case 0xc3: return true;
+                case 0xcc: return u(1);
+                case 0xcd: return u(2);
+                case 0xce: return u(4);
+                case 0xcf: return u(8);
+                case 0xd0: return s(1);
+                case 0xd1: return s(2);
+                case 0xd2: return s(4);
+                case 0xd3: return s(8);
+                case 0xca: { need(4); const v = view.getFloat32(i); i += 4; return v; }
+                case 0xcb: { need(8); const v = view.getFloat64(i); i += 8; return v; }
+                case 0xd9: return str(u(1));
+                case 0xda: return str(u(2));
+                case 0xdb: return str(u(4));
+                case 0xc4: return bin(u(1));
+                case 0xc5: return bin(u(2));
+                case 0xc6: return bin(u(4));
+                case 0xdc: return arr(u(2));
+                case 0xdd: return arr(u(4));
+                case 0xde: return map(u(2));
+                case 0xdf: return map(u(4));
+                default: throw new TypeError(`msgpack: unsupported type 0x${b.toString(16)}`);
+            }
+        }
+        function str(n) {
+            need(n);
+            const s = textDec.decode(buf.subarray(i, i + n));
+            i += n;
+            return s;
+        }
+        function bin(n) {
+            need(n);
+            const s = buf.slice(i, i + n);
+            i += n;
+            return s;
+        }
+        function arr(n) {
+            const a = new Array(n);
+            for (let k = 0; k < n; k++) a[k] = read();
+            return a;
+        }
+        function map(n) {
+            const o = {};
+            for (let k = 0; k < n; k++) o[read()] = read();
+            return o;
+        }
+        const value = read();
+        return value;
+    }
+
+    return { encode, decode };
+})();
+
 function _generateClientName() {
     // location.hostname → bare host only ("localhost", "example.com"), no port/protocol.
     const host = (typeof location !== 'undefined' && location.hostname) ? location.hostname : 'browser';
-    const rand = (Math.random() * 0x100000000) >>> 0;   // unsigned 32-bit random
-    return `${host}-0x${rand.toString(16).padStart(8, '0')}`;
+    const bytes = new Uint32Array(1);
+    if (typeof crypto !== 'undefined' && crypto.getRandomValues) {
+        crypto.getRandomValues(bytes);
+    } else {
+        bytes[0] = (Math.random() * 0x100000000) >>> 0;
+    }
+    return `${host}-0x${bytes[0].toString(16).padStart(8, '0')}`;
 }
 
 // Build an ordered list of candidate URLs to probe for app.wasm.
@@ -168,7 +377,7 @@ function _generateClientName() {
 //
 // Local dev (any other origin):
 //   1. Script-relative  — same directory as daffi.js  (best case)
-//   2. Page-relative climb — walk up to 5 parent dirs from the HTML page.
+//   2. Page-relative climb — walk up two parent dirs from the HTML page.
 //      This handles JetBrains / VS Code "open in browser" workflows where
 //      the HTML sits inside examples/01_.../ but app.wasm is in js-client/.
 const _CDN_RE = /^https?:\/\/(?:cdn\.jsdelivr\.net|unpkg\.com|cdnjs\.cloudflare\.com)\//;
@@ -190,7 +399,7 @@ const _WASM_CANDIDATES = (() => {
 
     // 2. Walk up from the current page URL
     let base = new URL('.', location.href);
-    for (let i = 0; i < 6; i++) {
+    for (let i = 0; i < 3; i++) {
         add(new URL('app.wasm', base).href);
         const up = new URL('..', base);
         if (up.href === base.href) break;
@@ -237,11 +446,15 @@ function DaffiClient(name, options) {
         '[daffi] options.wsUrl is required — there is no default. ' +
         'Pass the WebSocket URL explicitly, e.g. { wsUrl: "ws://127.0.0.1:5000" }.'
     );
+    if (options.authToken && (name === undefined || name === null || name === '')) {
+        throw new Error('[daffi] options.authToken requires an explicit client name');
+    }
     this.name           = name || _generateClientName();
     this.wsUrl          = options.wsUrl;
     this.wasmPath       = _WASM_CANDIDATES[0];  // informational; actual load probes all candidates
     this.autoreconnect  = options.autoreconnect  || false;
     this.reconnectDelay = options.reconnectDelay != null ? options.reconnectDelay : 2000;
+    this.authToken      = options.authToken || '';
     this.pendingMessages = {};
     this.eventHandlers   = [];
     this.closed = true;
@@ -253,9 +466,8 @@ function DaffiClient(name, options) {
     let _wasmExports    = null;
     let _memory         = null;
     let _decodeString   = null;
-    let _encodeStringZ  = null;
+    let _encodeString   = null;
     let _encodeBuffer   = null;
-    let _encodeBufferZ  = null;
     // Current active WebSocket.
     let _socket = null;
     // Set to true when stop() is called so reconnect loop does not restart.
@@ -267,34 +479,15 @@ function DaffiClient(name, options) {
     // fire for the same failed attempt.
     let _reconnecting = false;
 
-    const _mp = () => {
-        const lib = globalThis.msgpack || globalThis.MessagePack;
-        if (!lib) throw new Error(
-            'msgpack library not loaded. ' +
-            'Add <script src="https://unpkg.com/msgpack-lite/dist/msgpack.min.js"> before daffi.js.'
-        );
-        return lib;
-    };
-
     const _initWasm = async () => {
         if (_wasmExports) return; // already done
 
         if (!_module) _module = await _loadWasm();
 
-        const INITIAL_PAGES = 256; // 16 MB
-        _memory = new WebAssembly.Memory({ initial: INITIAL_PAGES, maximum: 65536 });
-        const indirectFunctionTable = new WebAssembly.Table({ initial: 128, element: 'anyfunc' });
-        const stackPointer = new WebAssembly.Global({ value: 'i32', mutable: true  }, INITIAL_PAGES * 65536);
-        const memoryBase   = new WebAssembly.Global({ value: 'i32', mutable: false }, 0);
-        const tableBase    = new WebAssembly.Global({ value: 'i32', mutable: false }, 0);
-
+        // The module defines and exports its own memory.  Always go through
+        // `_memory.buffer`: it is replaced whenever the memory grows.
         const { exports } = await WebAssembly.instantiate(_module, {
             env: {
-                memory: _memory,
-                __indirect_function_table: indirectFunctionTable,
-                __stack_pointer:           stackPointer,
-                __memory_base:             memoryBase,
-                __table_base:              tableBase,
                 _throwError(ptr, len) { throw new Error(_decodeString(ptr, len)); },
                 _consoleLog(ptr, len)  { console.log(_decodeString(ptr, len));   },
             },
@@ -311,7 +504,7 @@ function DaffiClient(name, options) {
                     let message;
                     if (decoder === 3) {
                         const raw = new Uint8Array(_memory.buffer, ptr, len).slice();
-                        const decoded = _mp().decode(raw);
+                        const decoded = _mp.decode(raw);
                         // Python serialises return value as [[result], {}]
                         message = Array.isArray(decoded) ? decoded[0][0] : decoded;
                     } else if (decoder === 0) {
@@ -341,10 +534,10 @@ function DaffiClient(name, options) {
                 _triggerEvent(ptr, len) {
                     const event = JSON.parse(_decodeString(ptr, len));
                     if (event.type === 'disconnected') {
-                        for (const msgData of Object.values(self.pendingMessages)) {
+                        for (const [uuid, msgData] of Object.entries(self.pendingMessages)) {
                             if (!Array.isArray(msgData) && msgData.receiver === event.member) {
                                 if (msgData.timeoutId) clearTimeout(msgData.timeoutId);
-                                delete self.pendingMessages[msgData.uuid];
+                                delete self.pendingMessages[uuid];
                                 msgData.reject(`"${event.member}" disconnected`);
                             }
                         }
@@ -355,13 +548,7 @@ function DaffiClient(name, options) {
                         _intentionalClose = true;
                         self.closed = true;
                         const msg = `Evicted: a new connection with app_name "${self.name}" took over this slot.`;
-                        for (const msgData of Object.values(self.pendingMessages)) {
-                            if (!Array.isArray(msgData)) {
-                                if (msgData.timeoutId) clearTimeout(msgData.timeoutId);
-                                msgData.reject(msg);
-                            }
-                        }
-                        self.pendingMessages = {};
+                        _rejectAllPending(msg);
                         if (_socket) _socket.close();
                     }
                     for (const h of self.eventHandlers) h(event);
@@ -370,33 +557,34 @@ function DaffiClient(name, options) {
         });
 
         _wasmExports = exports;
+        _memory = exports.memory;
         const { allocUint8 } = exports;
 
         _decodeString = (ptr, len) =>
             new TextDecoder().decode(new Uint8Array(_memory.buffer, ptr, len));
 
-        _encodeStringZ = (str) => {
-            const buf = new TextEncoder().encode(str);
-            const ptr = allocUint8(buf.length + 1);
-            const sl  = new Uint8Array(_memory.buffer, ptr, buf.length + 1);
-            sl.set(buf); sl[buf.length] = 0;
-            return ptr;
-        };
-
+        // Buffers cross into wasm as [ptr, len]: payloads may contain NUL
+        // bytes, and wasm frees them by length.
         _encodeBuffer = (buf) => {
             const len = buf.byteLength;
             const ptr = allocUint8(len);
             new Uint8Array(_memory.buffer, ptr, len).set(buf);
-            return ptr;
+            return [ptr, len];
         };
 
-        _encodeBufferZ = (buf) => {
-            const len = buf.byteLength;
-            const ptr = allocUint8(len + 1);
-            const sl  = new Uint8Array(_memory.buffer, ptr, len + 1);
-            sl.set(buf); sl[len] = 0;
-            return ptr;
-        };
+        _encodeString = (str) => _encodeBuffer(new TextEncoder().encode(str));
+    };
+
+    /** Reject waiters and drop early-arrival entries so u16 uuids cannot
+     *  satisfy a later RPC after reconnect resets the counter. */
+    const _rejectAllPending = (reason) => {
+        for (const msgData of Object.values(self.pendingMessages)) {
+            if (!Array.isArray(msgData)) {
+                if (msgData.timeoutId) clearTimeout(msgData.timeoutId);
+                try { msgData.reject(reason); } catch (_) {}
+            }
+        }
+        self.pendingMessages = {};
     };
 
     const _scheduleReconnect = () => {
@@ -433,25 +621,24 @@ function DaffiClient(name, options) {
         get(target, prop) {
             const handler = this;
             return async (...args) => {
-                const { sendMessage, free } = _wasmExports;
-                let argsZ;
+                const { sendMessage, freeSendResult } = _wasmExports;
+                let payload;
                 if (handler.serde === 1) {
-                    argsZ = _encodeStringZ(JSON.stringify({ args, kwargs: {} }));
+                    payload = _encodeString(JSON.stringify({ args, kwargs: {} }));
                 } else if (handler.serde === 3) {
-                    const enc = _mp().encode([args, {}]);
-                    argsZ = _encodeBufferZ(enc instanceof Uint8Array ? enc : new Uint8Array(enc));
+                    const enc = _mp.encode([args, {}]);
+                    payload = _encodeBuffer(enc instanceof Uint8Array ? enc : new Uint8Array(enc));
                 } else {
                     // OPAQUE — single buffer or string
                     if (args.length !== 1) throw new Error('OPAQUE serde expects exactly one argument.');
                     const buf = args[0] instanceof Uint8Array ? args[0] : new TextEncoder().encode(args[0]);
-                    argsZ = _encodeBufferZ(buf);
+                    payload = _encodeBuffer(buf);
                 }
 
-                const receiverZ = _encodeStringZ(handler.receiver);
-                const funcNameZ = _encodeStringZ(prop);
-                const msgPtr    = sendMessage(argsZ, receiverZ, funcNameZ, handler.serde, handler.returnResult, handler.connNum);
-
-                if (!handler.returnResult) { free(msgPtr); return; }
+                // sendMessage takes ownership of all three buffers.
+                const receiver = _encodeString(handler.receiver);
+                const funcName = _encodeString(prop);
+                const msgPtr   = sendMessage(...payload, ...receiver, ...funcName, handler.serde, handler.returnResult, handler.connNum);
 
                 const view           = new DataView(_memory.buffer, msgPtr, 16);
                 const uuid           = view.getUint32(0, true);
@@ -459,6 +646,9 @@ function DaffiClient(name, options) {
                 const ptr            = view.getUint32(8, true);
                 const isJsonFlag     = view.getUint32(12, true);
                 const actualReceiver = _decodeString(ptr, ptrLen);
+                freeSendResult(msgPtr);
+
+                if (!handler.returnResult) return;
 
                 const raw = handler.timeout
                     ? await handler._waitWithTimeout(uuid, handler.timeout, actualReceiver)
@@ -477,7 +667,7 @@ function DaffiClient(name, options) {
                     delete self.pendingMessages[uuid];
                     return isError ? reject(msg) : resolve(msg);
                 }
-                self.pendingMessages[uuid] = { resolve, reject, timeoutId: null, receiver };
+                self.pendingMessages[uuid] = { resolve, reject, timeoutId: null, receiver, uuid };
             });
         }
 
@@ -494,7 +684,7 @@ function DaffiClient(name, options) {
                     delete self.pendingMessages[uuid];
                     return isError ? reject(msg) : resolve(msg);
                 }
-                self.pendingMessages[uuid] = { resolve, reject, timeoutId, receiver };
+                self.pendingMessages[uuid] = { resolve, reject, timeoutId, receiver, uuid };
             });
         }
     }
@@ -503,7 +693,8 @@ function DaffiClient(name, options) {
     // a transparent reconnect is invisible to existing Connection objects.
     class Connection {
         _serde(opt) {
-            switch (opt || 'json') {
+            if (opt == null) opt = 'msgpack';
+            switch (opt) {
                 case 'json':    case 1: return 1;
                 case 'raw':     case 0: return 0;
                 case 'msgpack': case 3: return 3;
@@ -591,8 +782,9 @@ function DaffiClient(name, options) {
         _members() {
             const { getAvailableMembers, free } = _wasmExports;
             const ptr = getAvailableMembers(self.connNum);
-            const json = _decodeString(ptr, new Uint8Array(_memory.buffer, ptr).indexOf(0));
-            free(ptr);
+            const len = new Uint8Array(_memory.buffer, ptr).indexOf(0);
+            const json = _decodeString(ptr, len);
+            free(ptr, len + 1);
             return JSON.parse(json).members || [];
         }
 
@@ -726,18 +918,13 @@ function DaffiClient(name, options) {
 
         _socket.onmessage = (event) => {
             const buf = new Uint8Array(event.data);
-            _wasmExports.parseAndStoreMessage(_encodeBuffer(buf), buf.byteLength, self.connNum);
+            _wasmExports.parseAndStoreMessage(..._encodeBuffer(buf), self.connNum);
         };
 
         _socket.onclose = () => {
-            // Reject any outstanding RPC promises.
-            for (const msgData of Object.values(self.pendingMessages)) {
-                if (!Array.isArray(msgData)) {
-                    if (msgData.timeoutId) clearTimeout(msgData.timeoutId);
-                    delete self.pendingMessages[msgData.uuid];
-                    msgData.reject('Connection closed unexpectedly');
-                }
-            }
+            // Reject waiters and clear early-arrival entries — initClient
+            // resets the u16 uuid counter, so leftovers would mis-resolve.
+            _rejectAllPending('Connection closed unexpectedly');
             self.closed = true;
             _scheduleReconnect();
         };
@@ -784,12 +971,15 @@ function DaffiClient(name, options) {
         });
 
         self.closed = false;
+        // Drop any leftover pending map before uuid counter resets.
+        _rejectAllPending('Connection reset');
         // Free any previous WASM slot so it doesn't accumulate across reconnects.
         if (self.connNum != null) {
             try { _wasmExports.stopClient(self.connNum); } catch (_) {}
             self.connNum = null;
         }
-        const connNum = initClient(_encodeStringZ(self.name));
+        const token = self.authToken ? _encodeString(self.authToken) : [0, 0];
+        const connNum = initClient(..._encodeString(self.name), ...token);
         self.connNum  = connNum;
         const hsUuid  = sendHandshake(connNum);
         const hsResult = await new Handler('', null, 1, true)

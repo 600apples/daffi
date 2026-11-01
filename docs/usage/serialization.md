@@ -3,12 +3,12 @@
 daffi supports four wire formats. Pass `serde=SerdeFormat.X` to any call proxy, or use the string shorthand where supported.
 
 ```python
-from daffi import SerdeFormat
+from daffi import SerdeFormat, TCPTransport
 ```
 
 ---
 
-## PICKLE (default)
+## PICKLE
 
 Python-native binary serialisation. Supports arbitrary Python objects — dataclasses, Enums, custom classes — as long as both sides share the same class definitions.
 
@@ -30,7 +30,7 @@ class Order:
 
 ```python
 # 1_service.py
-from daffi import Service, callback
+from daffi import Service, callback, TCPTransport
 from models import Order, Status
 
 @callback
@@ -38,17 +38,17 @@ def process_order(order: Order) -> Order:
     order.status = Status.DONE
     return order
 
-svc = Service(app_name="order-service", host="127.0.0.1", port=5004)
+svc = Service(app_name="order-service", transport=TCPTransport("127.0.0.1", 5004))
 svc.start(); svc.join()
 ```
 
 ```python
 # 2_client.py
-from daffi import Client
-from daffi import SerdeFormat
+from daffi import Client, TCPTransport
+from daffi import SerdeFormat, TCPTransport
 from models import Order
 
-client = Client(app_name="order-client", host="127.0.0.1", port=5004)
+client = Client(app_name="order-client", transport=TCPTransport("127.0.0.1", 5004))
 conn = client.connect()
 
 order = Order(order_id="ORD-001", amount=99.95)
@@ -59,6 +59,25 @@ print(result.status)   # Status.DONE
 !!! warning
     PICKLE is Python-only. Use JSON or MSGPACK when interoperating with non-Python processes.
 
+!!! danger "PICKLE runs code the sender chooses"
+    Unpickling a payload is code execution. The default allow-list
+    (`serdes=SerdeFormat.ALL`) accepts PICKLE from TCP / Unix peers. Pass
+    `serdes=SerdeFormat.SAFE` to refuse it:
+
+    ```python
+    svc = Service(
+        app_name="safe-service",
+        serdes=SerdeFormat.SAFE,
+        transport=TCPTransport("127.0.0.1", 5004),
+    )
+    ```
+
+    PICKLE from a WebSocket peer is always refused: any web page can open a
+    WebSocket to a server on the user's machine. A request in a format
+    outside `serdes=` is answered with `SerdeNotAllowed` and never decoded.
+    TLS with client certificates (`cert` / `key` / `ca` on
+    `TCPTransport`) limits who can connect at all.
+
 ---
 
 ## JSON
@@ -67,7 +86,7 @@ Language-agnostic. Works with plain Python types: `dict`, `list`, `str`, `int`, 
 
 ```python
 # 1_service.py
-from daffi import Service, callback
+from daffi import Service, callback, TCPTransport
 
 @callback
 def summarise(data: dict) -> dict:
@@ -75,16 +94,16 @@ def summarise(data: dict) -> dict:
     total = sum(i["price"] * i["qty"] for i in items)
     return {"item_count": len(items), "total": round(total, 2)}
 
-svc = Service(app_name="json-service", host="127.0.0.1", port=5005)
+svc = Service(app_name="json-service", transport=TCPTransport("127.0.0.1", 5005))
 svc.start(); svc.join()
 ```
 
 ```python
 # 2_client.py
-from daffi import Client
-from daffi import SerdeFormat
+from daffi import Client, TCPTransport
+from daffi import SerdeFormat, TCPTransport
 
-client = Client(app_name="json-client", host="127.0.0.1", port=5005)
+client = Client(app_name="json-client", transport=TCPTransport("127.0.0.1", 5005))
 conn = client.connect()
 
 payload = {"items": [{"price": 9.99, "qty": 2}, {"price": 4.99, "qty": 5}]}
@@ -94,15 +113,13 @@ print(result)   # {"item_count": 2, "total": 44.93}
 
 ---
 
-## MSGPACK
+## MSGPACK (default)
 
-Binary MessagePack encoding — more compact than JSON, same type support. Ideal for high-throughput pipelines or when bandwidth matters.
-
-Requires: `pip install "daffi[msgpack]"`
+Binary MessagePack encoding — more compact than JSON, same type support. Ideal for high-throughput pipelines or when bandwidth matters. This is the default for `rpc()` / `cast()` and is a required dependency of daffi.
 
 ```python
 # 1_service.py
-from daffi import Service, callback
+from daffi import Service, callback, TCPTransport
 
 @callback
 def transform(record: dict) -> dict:
@@ -111,16 +128,16 @@ def transform(record: dict) -> dict:
         result["full_name"] = f"{result['first_name']} {result['last_name']}"
     return result
 
-svc = Service(app_name="msgpack-service", host="127.0.0.1", port=5007)
+svc = Service(app_name="msgpack-service", transport=TCPTransport("127.0.0.1", 5007))
 svc.start(); svc.join()
 ```
 
 ```python
 # 2_client.py
-from daffi import Client
-from daffi import SerdeFormat
+from daffi import Client, TCPTransport
+from daffi import SerdeFormat, TCPTransport
 
-client = Client(app_name="msgpack-client", host="127.0.0.1", port=5007)
+client = Client(app_name="msgpack-client", transport=TCPTransport("127.0.0.1", 5007))
 conn = client.connect()
 
 result = conn.rpc(timeout=5, serde=SerdeFormat.MSGPACK).transform(
@@ -140,23 +157,23 @@ Passes raw bytes through with no serialisation. The callback receives a `bytes` 
 
 ```python
 # 1_service.py
-from daffi import Service, callback
+from daffi import Service, callback, TCPTransport
 
 @callback
 def echo_raw(data: bytes) -> bytes:
     print(f"[service] received {len(data)} bytes")
     return data   # echo back
 
-svc = Service(app_name="raw-service", host="127.0.0.1", port=5006)
+svc = Service(app_name="raw-service", transport=TCPTransport("127.0.0.1", 5006))
 svc.start(); svc.join()
 ```
 
 ```python
 # 2_client.py
-from daffi import Client
-from daffi import SerdeFormat
+from daffi import Client, TCPTransport
+from daffi import SerdeFormat, TCPTransport
 
-client = Client(app_name="raw-client", host="127.0.0.1", port=5006)
+client = Client(app_name="raw-client", transport=TCPTransport("127.0.0.1", 5006))
 conn = client.connect()
 
 payload = b"\x01\x02\x03\x04"

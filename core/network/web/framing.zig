@@ -100,7 +100,7 @@ fn simpleMask(m: []const u8, payload: []u8) void {
 
 pub fn frame(op_code: OpCode, comptime msg: []const u8) [frameLen(msg)]u8 {
     var framed: [frameLen(msg)]u8 = undefined;
-    framed[0] = @intFromEnum(op_code);
+    framed[0] = @backingInt(op_code);
 
     const len = msg.len;
     if (len <= 125) {

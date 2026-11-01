@@ -5,7 +5,9 @@ All integration tests use the current public API:
   Router / Service / Client / callback / alias
 instead of the removed Global / FG / BG / PERIOD / fetcher layer.
 """
+
 from __future__ import annotations
+from tests.conftest import active_runtime
 
 import logging
 import multiprocessing as mp
@@ -36,11 +38,12 @@ mp.set_start_method("spawn", force=True)
 
 # ── constants available to all test modules ────────────────────────────────────
 
-HOST    = "127.0.0.1"
-TIMEOUT = 30   # per-call RPC timeout in seconds
+HOST = "127.0.0.1"
+TIMEOUT = 30  # per-call RPC timeout in seconds
 
 
 # ── low-level helpers (importable by test modules) ─────────────────────────────
+
 
 def wait_for_port(port: int, timeout: float = 15.0) -> None:
     """Block until the TCP port on HOST is accepting connections."""
@@ -70,10 +73,14 @@ def wait_for_members(
     start method, where per-subprocess startup can easily exceed a second
     on macOS.
     """
-    from daffi import Client  # noqa: PLC0415 — import lazily so fresh spawned
-                              # children don't pull daffi in during fixture
-                              # import.
-    client = Client(app_name=probe_name, host=HOST, port=port)
+    from daffi import (
+        Client,
+        TCPTransport,
+    )  # noqa: PLC0415 — import lazily so fresh spawned
+
+    # children don't pull daffi in during fixture
+    # import.
+    client = Client(app_name=probe_name, transport=TCPTransport(HOST, port), runtime=active_runtime())
     conn = client.connect()
     try:
         conn.wait_for_members(*expected, timeout=timeout)
@@ -81,7 +88,7 @@ def wait_for_members(
         client.stop()
 
 
-def silence_subprocess() -> None:
+def silence_subprocess(runtime: str) -> None:
     """Redirect stdout/stderr to /dev/null and disable Python logging.
 
     Called at the very start of every subprocess target so that Zig native
@@ -97,7 +104,13 @@ def silence_subprocess() -> None:
     os.close(devnull)
     logging.disable(logging.CRITICAL)
 
+    import tests.conftest as _runtime_state
+    _runtime_state.SELECTED_RUNTIME = runtime
+    from daffi import dfcore
+    dfcore.setRuntime(runtime)
+
     from daffi.registry._executor_registry import EXECUTOR_REGISTRY  # noqa: PLC0415
+
     EXECUTOR_REGISTRY.subscribers.clear()
     EXECUTOR_REGISTRY.registry.clear()
 
@@ -121,10 +134,11 @@ def quiet_kill(proc: mp.Process, timeout: float = 5.0) -> None:
 
 # ── common subprocess entry points ─────────────────────────────────────────────
 
-def proc_service(port: int, app_name: str = "integ-service", workers: int = 4) -> None:
+
+def proc_service(runtime: str, port: int, app_name: str = "integ-service", workers: int = 4) -> None:
     """Service subprocess: registers echo + add callbacks, then joins."""
-    silence_subprocess()
-    from daffi import Service, callback
+    silence_subprocess(runtime)
+    from daffi import Service, callback, SerdeFormat, TCPTransport
 
     @callback
     def echo(payload):
@@ -134,26 +148,38 @@ def proc_service(port: int, app_name: str = "integ-service", workers: int = 4) -
     def add(a: int, b: int) -> int:
         return a + b
 
-    svc = Service(app_name=app_name, host=HOST, port=port, workers=workers)
+    transport = TCPTransport(HOST, port)
+    transport.websocket_allowed_origins = ["http://localhost"]
+    svc = Service(
+        app_name=app_name, workers=workers,
+        transport=transport,
+        runtime=runtime, serdes=SerdeFormat.ALL,
+    )
     svc.start()
     svc.join()
 
 
-def proc_router(port: int, app_name: str = "integ-router") -> None:
+def proc_router(runtime: str, port: int, app_name: str = "integ-router") -> None:
     """Router subprocess: pure message broker, no callbacks."""
-    silence_subprocess()
-    from daffi import Router
+    silence_subprocess(runtime)
+    from daffi import Router, TCPTransport
 
-    r = Router(app_name=app_name, host=HOST, port=port)
+    transport = TCPTransport(HOST, port)
+    transport.websocket_allowed_origins = ["http://localhost"]
+    r = Router(
+        app_name=app_name,
+        transport=transport,
+        runtime=runtime,
+    )
     r.start()
     r.join()
 
 
-def proc_worker(port: int, app_name: str, workers: int = 4) -> None:
+def proc_worker(runtime: str, port: int, app_name: str, workers: int = 4) -> None:
     """Client+callback worker subprocess: registers echo + add, keeps running."""
-    silence_subprocess()
+    silence_subprocess(runtime)
     import time as _time
-    from daffi import Client, callback
+    from daffi import Client, callback, SerdeFormat, TCPTransport
 
     @callback
     def echo(payload):
@@ -163,7 +189,10 @@ def proc_worker(port: int, app_name: str, workers: int = 4) -> None:
     def add(a: int, b: int) -> int:
         return a + b
 
-    client = Client(app_name=app_name, host=HOST, port=port, workers=workers)
+    client = Client(
+        app_name=app_name, workers=workers, transport=TCPTransport(HOST, port),
+        runtime=runtime, serdes=SerdeFormat.ALL,
+    )
     client.connect()
     try:
         while True:
@@ -175,6 +204,7 @@ def proc_worker(port: int, app_name: str, workers: int = 4) -> None:
 
 
 # ── pytest fixtures ────────────────────────────────────────────────────────────
+
 
 @pytest.fixture
 def free_port() -> int:
@@ -188,9 +218,7 @@ def free_port() -> int:
 @pytest.fixture
 def direct_service(free_port):
     """Start a Service subprocess; yield its port; terminate on teardown."""
-    proc = mp.Process(
-        target=proc_service, args=(free_port,), daemon=True
-    )
+    proc = mp.Process(target=proc_service, args=(active_runtime(), free_port,), daemon=True)
     proc.start()
     wait_for_port(free_port)
     wait_for_members(free_port, {"integ-service"})
@@ -201,12 +229,12 @@ def direct_service(free_port):
 @pytest.fixture
 def router_with_worker(free_port):
     """Start Router + one Worker subprocess; yield the router port."""
-    rproc = mp.Process(target=proc_router, args=(free_port,), daemon=True)
+    rproc = mp.Process(target=proc_router, args=(active_runtime(), free_port,), daemon=True)
     rproc.start()
     wait_for_port(free_port)
 
     wproc = mp.Process(
-        target=proc_worker, args=(free_port, "integ-worker"), daemon=True
+        target=proc_worker, args=(active_runtime(), free_port, "integ-worker"), daemon=True
     )
     wproc.start()
     wait_for_members(free_port, {"integ-worker"})

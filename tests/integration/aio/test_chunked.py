@@ -4,7 +4,9 @@ Async integration tests for multi-chunk (stream) data-integrity transfer.
 Mirrors tests/integration/test_chunked.py using daffi.aio.
 Uses ``await conn.stream()`` and ``conn.stream_nowait()`` with OPAQUE serde.
 """
+
 from __future__ import annotations
+from tests.conftest import active_runtime
 
 import asyncio
 import multiprocessing as mp
@@ -13,22 +15,26 @@ import pickle
 import pytest
 
 from .conftest import (
-    HOST, TIMEOUT,
-    quiet_kill, silence_subprocess,
-    wait_for_port, wait_for_members,
+    HOST,
+    TIMEOUT,
+    quiet_kill,
+    silence_subprocess,
+    wait_for_port,
+    wait_for_members,
 )
 
 CHUNK_SIZE = 64 * 1024
-LARGE_N    = 200_000
+LARGE_N = 200_000
 
 
 # ── subprocess: service with chunked-assembly callbacks ───────────────────────
 
-def _proc_service(port: int) -> None:
-    silence_subprocess()
+
+def _proc_service(runtime: str, port: int) -> None:
+    silence_subprocess(runtime)
 
     async def _main():
-        from daffi import callback
+        from daffi import callback, TCPTransport
         from daffi.aio import AsyncService
 
         _buf: list[bytes] = []
@@ -43,31 +49,38 @@ def _proc_service(port: int) -> None:
             _buf.clear()
             return data
 
-        svc = AsyncService(app_name="chunk-aio-svc", host=HOST, port=port, workers=1)
+        svc = AsyncService(
+            app_name="chunk-aio-svc", workers=1, transport=TCPTransport(HOST, port),
+            runtime=runtime,
+        )
         await svc.start()
         await svc.join()
 
     asyncio.run(_main())
 
 
-def _proc_router(port: int) -> None:
-    silence_subprocess()
+def _proc_router(runtime: str, port: int) -> None:
+    silence_subprocess(runtime)
 
     async def _main():
         from daffi.aio import AsyncRouter
+        from daffi import TCPTransport
 
-        r = AsyncRouter(app_name="chunk-aio-router", host=HOST, port=port)
+        r = AsyncRouter(
+            app_name="chunk-aio-router", transport=TCPTransport(HOST, port),
+            runtime=runtime,
+        )
         await r.start()
         await r.join()
 
     asyncio.run(_main())
 
 
-def _proc_worker(port: int) -> None:
-    silence_subprocess()
+def _proc_worker(runtime: str, port: int) -> None:
+    silence_subprocess(runtime)
 
     async def _main():
-        from daffi import callback
+        from daffi import callback, TCPTransport
         from daffi.aio import AsyncClient
 
         _buf: list[bytes] = []
@@ -82,7 +95,10 @@ def _proc_worker(port: int) -> None:
             _buf.clear()
             return data
 
-        client = AsyncClient(app_name="chunk-aio-worker", host=HOST, port=port, workers=1)
+        client = AsyncClient(
+            app_name="chunk-aio-worker", workers=1, transport=TCPTransport(HOST, port),
+            runtime=runtime,
+        )
         await client.connect()
         await client.join()
 
@@ -91,9 +107,10 @@ def _proc_worker(port: int) -> None:
 
 # ── fixtures ──────────────────────────────────────────────────────────────────
 
+
 @pytest.fixture
 def direct_svc(free_port):
-    proc = mp.Process(target=_proc_service, args=(free_port,), daemon=True)
+    proc = mp.Process(target=_proc_service, args=(active_runtime(), free_port,), daemon=True)
     proc.start()
     wait_for_port(free_port)
     wait_for_members(free_port, {"chunk-aio-svc"})
@@ -103,11 +120,11 @@ def direct_svc(free_port):
 
 @pytest.fixture
 def router_worker(free_port):
-    rproc = mp.Process(target=_proc_router, args=(free_port,), daemon=True)
+    rproc = mp.Process(target=_proc_router, args=(active_runtime(), free_port,), daemon=True)
     rproc.start()
     wait_for_port(free_port)
 
-    wproc = mp.Process(target=_proc_worker, args=(free_port,), daemon=True)
+    wproc = mp.Process(target=_proc_worker, args=(active_runtime(), free_port,), daemon=True)
     wproc.start()
     wait_for_members(free_port, {"chunk-aio-worker"})
     yield free_port
@@ -117,13 +134,14 @@ def router_worker(free_port):
 
 # ── helpers ───────────────────────────────────────────────────────────────────
 
+
 async def _transfer(conn, payload_obj: object, nowait: bool = False) -> object:
     """Pickle *payload_obj*, split into CHUNK_SIZE chunks, stream to service,
     retrieve assembled bytes and unpickle."""
-    from daffi import SerdeFormat
+    from daffi import SerdeFormat, TCPTransport
 
     raw = pickle.dumps(payload_obj)
-    chunks = [raw[i:i + CHUNK_SIZE] for i in range(0, len(raw), CHUNK_SIZE)]
+    chunks = [raw[i : i + CHUNK_SIZE] for i in range(0, len(raw), CHUNK_SIZE)]
 
     for chunk in chunks:
         if nowait:
@@ -133,18 +151,26 @@ async def _transfer(conn, payload_obj: object, nowait: bool = False) -> object:
         else:
             await conn.stream(serde=SerdeFormat.OPAQUE).receive_chunk(chunk)
 
-    assembled: bytes = await conn.rpc(timeout=TIMEOUT, serde=SerdeFormat.PICKLE).get_result()
+    assembled: bytes = await conn.rpc(
+        timeout=TIMEOUT, serde=SerdeFormat.PICKLE
+    ).get_result()
     return pickle.loads(assembled)
 
 
 # ── tests ─────────────────────────────────────────────────────────────────────
+
 
 @pytest.mark.asyncio
 class TestChunkedDirectAsync:
 
     async def test_small_list(self, direct_svc):
         from daffi.aio import AsyncClient
-        client = AsyncClient(app_name="chk-sml", host=HOST, port=direct_svc)
+        from daffi import TCPTransport
+
+        client = AsyncClient(
+            app_name="chk-sml", transport=TCPTransport(HOST, direct_svc),
+            runtime=active_runtime(),
+        )
         conn = await client.connect()
         payload = list(range(1_000))
         try:
@@ -154,7 +180,12 @@ class TestChunkedDirectAsync:
 
     async def test_large_list(self, direct_svc):
         from daffi.aio import AsyncClient
-        client = AsyncClient(app_name="chk-lrg", host=HOST, port=direct_svc)
+        from daffi import TCPTransport
+
+        client = AsyncClient(
+            app_name="chk-lrg", transport=TCPTransport(HOST, direct_svc),
+            runtime=active_runtime(),
+        )
         conn = await client.connect()
         payload = list(range(LARGE_N))
         try:
@@ -164,7 +195,12 @@ class TestChunkedDirectAsync:
 
     async def test_string(self, direct_svc):
         from daffi.aio import AsyncClient
-        client = AsyncClient(app_name="chk-str", host=HOST, port=direct_svc)
+        from daffi import TCPTransport
+
+        client = AsyncClient(
+            app_name="chk-str", transport=TCPTransport(HOST, direct_svc),
+            runtime=active_runtime(),
+        )
         conn = await client.connect()
         payload = "x" * (CHUNK_SIZE * 3)
         try:
@@ -175,7 +211,12 @@ class TestChunkedDirectAsync:
     async def test_nowait_chunks(self, direct_svc):
         """stream_nowait() chunks followed by rpc() get_result() arrive in order."""
         from daffi.aio import AsyncClient
-        client = AsyncClient(app_name="chk-nw", host=HOST, port=direct_svc)
+        from daffi import TCPTransport
+
+        client = AsyncClient(
+            app_name="chk-nw", transport=TCPTransport(HOST, direct_svc),
+            runtime=active_runtime(),
+        )
         conn = await client.connect()
         payload = list(range(10_000))
         try:
@@ -190,7 +231,12 @@ class TestChunkedRouterAsync:
 
     async def test_large_list_via_router(self, router_worker):
         from daffi.aio import AsyncClient
-        client = AsyncClient(app_name="chk-rtr", host=HOST, port=router_worker)
+        from daffi import TCPTransport
+
+        client = AsyncClient(
+            app_name="chk-rtr", transport=TCPTransport(HOST, router_worker),
+            runtime=active_runtime(),
+        )
         conn = await client.connect()
         payload = list(range(LARGE_N))
         try:
@@ -200,7 +246,12 @@ class TestChunkedRouterAsync:
 
     async def test_nowait_via_router(self, router_worker):
         from daffi.aio import AsyncClient
-        client = AsyncClient(app_name="chk-rtr-nw", host=HOST, port=router_worker)
+        from daffi import TCPTransport
+
+        client = AsyncClient(
+            app_name="chk-rtr-nw", transport=TCPTransport(HOST, router_worker),
+            runtime=active_runtime(),
+        )
         conn = await client.connect()
         payload = {"key": list(range(5_000))}
         try:

@@ -4,8 +4,6 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>daffi — JS client · MSGPACK</title>
-  <!-- msgpack-lite: exposes globalThis.msgpack -->
-  <script src="https://unpkg.com/msgpack-lite/dist/msgpack.min.js"></script>
   <script src="../../daffi.js"></script>
   <style>
     body { font-family: system-ui, sans-serif; max-width: 640px; margin: 40px auto; padding: 0 16px; background: #0f0f0f; color: #e0e0e0; }
@@ -28,7 +26,7 @@
 <body>
 
 <h1>daffi browser client — MSGPACK</h1>
-<p>Uses <strong>msgpack-lite</strong> for binary serialisation end-to-end.</p>
+<p>Uses the built-in MessagePack codec for binary serialisation end-to-end.</p>
 
 <div class="card">
   <label>WebSocket URL</label>

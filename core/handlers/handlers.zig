@@ -1,7 +1,5 @@
 const std = @import("std");
 const mem = std.mem;
-const fifo = std.fifo;
-const net = std.net;
 const handlers = @import("../handlers.zig");
 const serde = @import("../serde.zig");
 const network = @import("../network.zig");
@@ -21,7 +19,9 @@ const MessageHandler = handlers.MessageHandler;
 const ClientMessageStore = store.ClientMessageStore;
 const ChannelsMapper = store.ChannelsMapper;
 const TasksQueue = store.TasksQueue;
+const ReplyRoutes = store.ReplyRoutes;
 const misc = @import("../misc.zig");
+const runtime = @import("../runtime.zig");
 const Mutex = misc.Mutex;
 
 // Scoped loggers — each handler module gets a distinctive scope so log lines
@@ -58,6 +58,38 @@ fn RoundRobinIterator(comptime T: type) type {
     };
 }
 
+/// Send an ERROR reply for `request` back over `conn`.  Best effort: if it
+/// fails as well the requester times out.
+fn replyError(comptime log: type, allocator: Allocator, conn: anytype, request: *Message, name: []const u8, text: []const u8) void {
+    if (comptime misc.is_wasm) return;
+    const reply = serde.createErrorReply(allocator, request, name, text) catch |err| {
+        log.warn("cannot build error reply: {}", .{err});
+        return;
+    };
+    defer allocator.free(reply.data);
+    conn.write(reply.data) catch |err| log.debug("error reply not delivered: {}", .{err});
+}
+
+/// A browser can open a WebSocket to any local server from any page, so a
+/// PICKLE payload from a WebSocket peer is never passed on: unpickling it
+/// would run code chosen by that page.
+fn isPickleFromWeb(conn: anytype, message: *Message) bool {
+    return conn.is_websocket and message.getDecoder() == .PICKLE;
+}
+
+const PICKLE_FROM_WEB = "PICKLE is not accepted from WebSocket peers";
+
+const UNKNOWN_SENDER = "a request must come from the peer that handshook under its sender name";
+const UNAUTHORIZED = "Unauthorized: wrong or missing auth_token";
+
+/// uuid 0 is never issued, and a reply carries its request's uuid, so a
+/// request with uuid 0 could not be answered.
+fn hasNoUuid(comptime log: type, message: *Message) bool {
+    if (message.getUuid() != 0) return false;
+    log.warn("dropping {s} with uuid 0", .{@tagName(message.getFlag())});
+    return true;
+}
+
 const CommonHandlers = struct {
     pub fn onEmpty(ctx: *anyopaque, message: *Message) !void {
         _ = ctx;
@@ -76,16 +108,22 @@ pub fn ServerHandler(comptime HandlerConnectionT: ConnectionType) type {
         const HandlerUnion = @This();
         pub const ConnectionT = Connection(HandlerConnectionT);
         const ChannelsMapperT = ChannelsMapper(ConnectionT);
+        const ReplyRoutesT = ReplyRoutes(ConnectionT);
 
-        pub fn init(mode: HandlerMode, allocator: Allocator, app_name: []const u8) !*HandlerUnion {
+        /// `auth_token`, when given, is copied; a peer's handshake must carry
+        /// it.
+        pub fn init(mode: HandlerMode, allocator: Allocator, app_name: []const u8, auth_token: ?[]const u8) !*HandlerUnion {
             const self = try allocator.create(HandlerUnion);
+            errdefer allocator.destroy(self);
+            const token = if (auth_token) |t| try allocator.dupe(u8, t) else null;
+            errdefer if (token) |t| allocator.free(t);
             return switch (mode) {
                 .Service => blk: {
-                    self.* = .{ .Service = .{ .allocator = allocator, .chan_mapper = try ChannelsMapperT.init(allocator), .tasks_queue = try TasksQueue.init(allocator), .app_name = app_name } };
+                    self.* = .{ .Service = .{ .allocator = allocator, .chan_mapper = try ChannelsMapperT.init(allocator), .tasks_queue = .{}, .routes = .init(allocator), .app_name = app_name, .auth_token = token } };
                     break :blk self;
                 },
                 .Router => blk: {
-                    self.* = .{ .Router = .{ .allocator = allocator, .chan_mapper = try ChannelsMapperT.init(allocator), .app_name = app_name } };
+                    self.* = .{ .Router = .{ .allocator = allocator, .chan_mapper = try ChannelsMapperT.init(allocator), .routes = .init(allocator), .app_name = app_name, .auth_token = token } };
                     break :blk self;
                 },
             };
@@ -95,22 +133,49 @@ pub fn ServerHandler(comptime HandlerConnectionT: ConnectionType) type {
             const allocator = switch (self.*) {
                 .Service => |*s| blk: {
                     s.tasks_queue.deinit();
+                    s.routes.deinit();
                     s.chan_mapper.deinit();
+                    if (s.methods) |m| s.allocator.free(m);
+                    if (s.auth_token) |t| s.allocator.free(t);
                     break :blk s.allocator;
                 },
                 .Router => |*r| blk: {
+                    r.routes.deinit();
                     r.chan_mapper.deinit();
+                    if (r.auth_token) |t| r.allocator.free(t);
                     break :blk r.allocator;
                 },
             };
             allocator.destroy(self);
         }
 
+        /// Answer a handshake that lacks the server's `auth_token` with a
+        /// rejection and close the connection.  Call without the handler
+        /// mutex: the write may stall.
+        fn refuseUnauthorized(comptime log: anytype, allocator: Allocator, conn: *ConnectionT, message: *Message, comptime node_type: []const u8) !void {
+            log.warn("refusing handshake from '{s}': wrong or missing auth_token", .{message.getTransmitter()});
+            var rejection = try Handshake.createRejection(allocator, node_type, UNAUTHORIZED);
+            try message.setData(try rejection.toJson(allocator));
+            message.sendTo(conn) catch {};
+            conn.close();
+        }
+
+        /// Whether `name` is registered to `conn`, i.e. `conn` handshook
+        /// under it.
+        fn sentBy(chan_mapper: *ChannelsMapperT, conn: *ConnectionT, name: []const u8) bool {
+            const chan = chan_mapper.getChannel(name) catch return false;
+            return chan.conn == conn;
+        }
+
         const ServiceHandler = struct {
             chan_mapper: *ChannelsMapperT,
             tasks_queue: TasksQueue,
+            /// Who gets the reply to each request still being served.
+            routes: ReplyRoutesT,
             allocator: Allocator,
             app_name: []const u8,
+            /// Owned.  When set, handshakes must carry it.
+            auth_token: ?[]const u8 = null,
             methods: ?[]const u8 = null, // comma separated list of service methods
             task_cycle_position: usize = 0,
             mutex: Mutex = .{},
@@ -134,9 +199,15 @@ pub fn ServerHandler(comptime HandlerConnectionT: ConnectionType) type {
                 };
             }
 
+            /// `onHandshake` reads the list under `mutex`, so it is replaced
+            /// under it too.
             pub fn setServiceMethods(self: *Self, methods: []const u8) !void {
-                if (self.methods) |m| self.allocator.free(m);
-                self.methods = try self.allocator.dupe(u8, methods);
+                const copy = try self.allocator.dupe(u8, methods);
+                self.mutex.lock();
+                const old = self.methods;
+                self.methods = copy;
+                self.mutex.unlock();
+                if (old) |m| self.allocator.free(m);
             }
 
             fn sendToConnection(_: *Self, comptime MessageT: type, conn: *ParentConnT, message: *MessageT) !void {
@@ -156,8 +227,11 @@ pub fn ServerHandler(comptime HandlerConnectionT: ConnectionType) type {
 
             // ----------------------------- SERVICE HANDLERS -----------------------------
             fn onHandshake(self: *Self, conn: *ParentConnT, message: *Message, _: *bool) !void {
+                // The mutex only protects channel-map bookkeeping.  Socket writes
+                // (which can block on a slow peer) happen after it is released.
                 self.mutex.lock();
-                defer self.mutex.unlock();
+                var locked = true;
+                defer if (locked) self.mutex.unlock();
                 var arena = ArenaAllocator.init(self.allocator);
                 defer arena.deinit();
                 var allocator = arena.allocator();
@@ -168,7 +242,13 @@ pub fn ServerHandler(comptime HandlerConnectionT: ConnectionType) type {
                     return;
                 };
                 defer client_hs.deinit();
+                if (!Handshake.tokenMatches(self.auth_token, client_hs.value.meta.token)) {
+                    self.mutex.unlock();
+                    locked = false;
+                    return refuseUnauthorized(log_service, allocator, conn, message, "service");
+                }
                 const connection_name = try allocator.dupe(u8, message.getTransmitter());
+
                 // Last-connection-wins: if a slot for this name already exists
                 // (stale zombie from an abrupt network cut or process kill that
                 // never sent a TCP FIN), evict it and accept the new peer.
@@ -176,14 +256,16 @@ pub fn ServerHandler(comptime HandlerConnectionT: ConnectionType) type {
                 // map entry so that its reader thread's diconnectionHandler call
                 // finds no channel and returns cleanly.
                 //
-                // Push an "evicted" EVENT to tasks_queue so the service's
+                // An "evicted" EVENT is pushed to tasks_queue so the service's
                 // Python handlers can react before the "connected" event fires.
-                if (self.chan_mapper.evictChannel(connection_name)) |stale_conn| {
+                var stale_conn: ?*ParentConnT = null; // owned reference
+                defer if (stale_conn) |sc| sc.release();
+                var evict_event: ?*Message = null; // freed below unless handed to the queue
+                defer if (evict_event) |ev| ev.deinit();
+                if (self.chan_mapper.evictChannel(connection_name, conn)) |sc| {
+                    stale_conn = sc;
                     log_service.warn("evicting stale slot for '{s}' — new connection takes over", .{connection_name});
-                    const evict_event = try serde.createEventMessage(self.allocator, 0, connection_name, "evicted");
-                    try self.tasks_queue.pushMessageToQueue(evict_event);
-                    try self.sendToConnection(Message, stale_conn, evict_event);
-                    stale_conn.close();
+                    evict_event = try serde.createEventMessage(self.allocator, 0, connection_name, "evicted");
                 }
                 _ = try self.chan_mapper.getOrCreateChannel(conn, connection_name);
                 const methods = self.methods orelse serde.PLACEHOLDER;
@@ -191,45 +273,88 @@ pub fn ServerHandler(comptime HandlerConnectionT: ConnectionType) type {
                 var service_hs = try Handshake.create(allocator, &[_]Handshake.MemberData{.{ .name = self.app_name, .methods = methods }}, "service");
                 const data = try service_hs.toJson(allocator);
                 try message.setData(data);
-                for (self.chan_mapper.channels.values()) |c| try self.sendToConnection(Message, c.conn, message);
 
-                // Store event message for service itself.
+                // Event message for the service itself.
                 const event_message = try serde.createEventMessage(self.allocator, 0, connection_name, "connected");
-                try self.tasks_queue.pushMessageToQueue(event_message);
+                var event_pushed = false;
+                defer if (!event_pushed) event_message.deinit();
+
+                self.mutex.unlock();
+                locked = false;
+
+                // Reply only to the client that just connected, and before the
+                // stale peer is told: that write may stall on a dead socket.
+                // Writing to every older client as well made connect number N
+                // do N socket writes, so a few thousand clients never finished.
+                try self.sendToConnection(Message, conn, message);
+                if (stale_conn) |sc| {
+                    // Use the event BEFORE handing it to the queue: once pushed,
+                    // Python may dequeue and free it at any moment.
+                    try self.sendToConnection(Message, sc, evict_event.?);
+                    sc.close();
+                    self.tasks_queue.pushMessageToQueue(evict_event.?);
+                    evict_event = null;
+                }
+                self.tasks_queue.pushMessageToQueue(event_message);
+                event_pushed = true;
             }
 
-            fn onRequest(self: *Self, _: *ParentConnT, message: *Message, consumed: *bool) !void {
-                // Push message to the task queue for processing by service workers.
-                // NOTE: the handler-level mutex is intentionally NOT taken here.
-                // ``tasks_queue.pushMessageToQueue`` has its own internal mutex,
-                // so the queue is already thread-safe.  Taking ``self.mutex``
-                // here serialised all concurrent client reader threads through
-                // one lock on every single incoming RPC, making throughput
-                // proportional to 1/N instead of workers/N under high concurrency.
-                //
-                // Set consumed BEFORE pushing so the caller never reads message
-                // fields after the push (Python may free the message immediately).
-                consumed.* = true;
-                try self.tasks_queue.pushMessageToQueue(message);
+            fn onRequest(self: *Self, conn: *ParentConnT, message: *Message, consumed: *bool) !void {
+                // No handler mutex: the queue has its own, and taking
+                // ``self.mutex`` serialised every client reader thread.
+                // Once pushed, Python may free the message at any moment.
+                if (hasNoUuid(log_service, message)) return;
+                if (isPickleFromWeb(conn, message)) {
+                    log_service.warn("refusing PICKLE request uuid={d} from a WebSocket peer", .{message.getUuid()});
+                    if (message.getReturnResult()) replyError(log_service, self.allocator, conn, message, "SerdeNotAllowed", PICKLE_FROM_WEB);
+                    return;
+                }
+                const wants_reply = message.getReturnResult();
+                const uuid = message.getUuid();
+                // Callbacks run for peers that handshook, under the name
+                // they handshook with.
+                if (!sentBy(self.chan_mapper, conn, message.getTransmitter())) {
+                    log_service.warn("refusing request uuid={d} from a peer not registered as '{s}'", .{ uuid, message.getTransmitter() });
+                    if (wants_reply) replyError(log_service, self.allocator, conn, message, "UnknownSender", UNKNOWN_SENDER);
+                    return;
+                }
+                const id = if (wants_reply) self.routes.add(conn, uuid, null) catch {
+                    replyError(log_service, self.allocator, conn, message, "ServiceOverloaded", "the service has too many pending requests");
+                    return;
+                } else uuid;
+                message.setUuid(id);
+                if (self.tasks_queue.tryPushRequest(message)) {
+                    consumed.* = true;
+                    return;
+                }
+                log_service.warn("task queue full ({d} pending), refusing request uuid={d}", .{ TasksQueue.max_pending, uuid });
+                message.setUuid(uuid);
+                if (wants_reply) {
+                    self.routes.remove(null, id);
+                    replyError(log_service, self.allocator, conn, message, "ServiceOverloaded", "the service has too many pending requests");
+                }
             }
 
             // ---------------------- SERVICE CONNECTION LIFECYCLE ------------------------
             fn diconnectionHandler(self: *Self, conn: *ParentConnT) !void {
+                self.routes.dropConnection(conn);
                 self.mutex.lock();
                 defer self.mutex.unlock();
-                var arena = ArenaAllocator.init(self.allocator);
-                defer arena.deinit();
-                var allocator = arena.allocator();
-                const chan = self.chan_mapper.getChannelByConnection(conn) orelse {
-                    log_service.debug("diconnectionHandler: no channel for conn ptr=0x{x}", .{@intFromPtr(conn)});
-                    return;
-                };
-                const connection_name = try allocator.dupe(u8, chan.connection_name); // for event
-                self.chan_mapper.destroyChannel(chan);
-
-                // Store event message for service itself.
-                const event_message = try serde.createEventMessage(self.allocator, 0, connection_name, "disconnected");
-                try self.tasks_queue.pushMessageToQueue(event_message);
+                // Destroy first so an OOM building the event cannot leave a
+                // retain() on a connection that is about to be freed.
+                while (self.chan_mapper.getChannelByConnection(conn)) |chan| {
+                    const name = self.allocator.dupe(u8, chan.connection_name) catch {
+                        self.chan_mapper.destroyChannel(chan);
+                        continue;
+                    };
+                    self.chan_mapper.destroyChannel(chan);
+                    const event_message = serde.createEventMessage(self.allocator, 0, name, "disconnected") catch {
+                        self.allocator.free(name);
+                        continue;
+                    };
+                    self.allocator.free(name);
+                    self.tasks_queue.pushMessageToQueue(event_message);
+                }
             }
 
             fn errorHandler(_: *Self, conn: *ParentConnT, err: anyerror) !void {
@@ -249,7 +374,11 @@ pub fn ServerHandler(comptime HandlerConnectionT: ConnectionType) type {
 
         const RouterHandler = struct {
             chan_mapper: *ChannelsMapperT,
+            /// Who asked, and who must answer, each forwarded request.
+            routes: ReplyRoutesT,
             app_name: []const u8,
+            /// Owned.  When set, handshakes must carry it.
+            auth_token: ?[]const u8 = null,
             allocator: Allocator,
             mutex: Mutex = .{},
 
@@ -268,13 +397,27 @@ pub fn ServerHandler(comptime HandlerConnectionT: ConnectionType) type {
                 };
             }
 
-            fn findChannel(self: *Self, method: ?[]const u8, receiver: []const u8) ?ChannelsMapperT.Channel {
-                var chan = self.chan_mapper.getChannel(receiver) catch {
-                    log_router.debug("no channel for receiver: {s}", .{receiver});
-                    return null;
-                };
-                if (method == null or chan.containsMethod(method.?)) return chan;
-                return null;
+            const Route = struct {
+                /// Retained; the caller releases it.
+                target: ?*ParentConnT,
+                /// The sender handshook under the name it sends as.
+                sender_known: bool,
+            };
+
+            /// Where a request goes, in one pass under `self.mutex`.  The
+            /// router changes its channels only under that mutex, so they are
+            /// read here without the mapper's own lock.
+            fn lookupRoute(self: *Self, conn: *ParentConnT, message: *Message) Route {
+                self.chan_mapper.mutex.lock();
+                defer self.chan_mapper.mutex.unlock();
+                const channels = &self.chan_mapper.channels;
+                const target: ?*ParentConnT = if (channels.getPtr(message.getReceiver())) |chan|
+                    (if (chan.containsMethod(message.getFuncName())) chan.conn else null)
+                else
+                    null;
+                if (target) |t| t.retain();
+                const sender = channels.getPtr(message.getTransmitter());
+                return .{ .target = target, .sender_known = sender != null and sender.?.conn == conn };
             }
 
             fn sendToConnection(_: *Self, comptime MessageT: type, conn: *ParentConnT, message: *MessageT) !void {
@@ -310,17 +453,37 @@ pub fn ServerHandler(comptime HandlerConnectionT: ConnectionType) type {
                     try self.sendToConnection(Message, conn, message);
                     return;
                 };
+                // Before any eviction: a peer without the token must not
+                // take over anyone's name.
+                if (!Handshake.tokenMatches(self.auth_token, client_hs.value.meta.token)) {
+                    self.mutex.unlock();
+                    locked = false;
+                    return refuseUnauthorized(log_router, alloc, conn, message, "router");
+                }
+                // Evict stale slots (last-connection-wins).  Only the bookkeeping
+                // happens under the mutex; the "evicted" notifications and the
+                // close are done after it is released (see below).
+                const Evicted = struct { name: []const u8, conn: *ParentConnT };
+                var evicted: std.ArrayList(Evicted) = .empty;
+                defer {
+                    for (evicted.items) |e| e.conn.release();
+                    evicted.deinit(self.allocator);
+                }
                 for (client_hs.value.members) |mb| {
-                    if (self.chan_mapper.evictChannel(mb.name)) |stale_conn| {
+                    if (!std.mem.eql(u8, mb.name, connection_name)) {
+                        log_router.warn("ignoring extra handshake name '{s}' (connection is '{s}')", .{ mb.name, connection_name });
+                        continue;
+                    }
+                    if (self.chan_mapper.evictChannel(mb.name, conn)) |stale_conn| {
                         log_router.warn("evicting stale slot for '{s}' — new connection takes over", .{mb.name});
-                        var evicted_event = try serde.createEventMessage(self.allocator, 0, mb.name, "evicted");
-                        defer evicted_event.deinit();
-                        for (self.chan_mapper.channels.values()) |c| try self.sendToConnection(Message, c.conn, evicted_event);
-                        try self.sendToConnection(Message, stale_conn, evicted_event);
-                        stale_conn.close();
+                        evicted.append(self.allocator, .{ .name = try alloc.dupe(u8, mb.name), .conn = stale_conn }) catch |err| {
+                            stale_conn.release();
+                            return err;
+                        };
                     }
                 }
                 for (client_hs.value.members) |mb| {
+                    if (!std.mem.eql(u8, mb.name, connection_name)) continue;
                     var chan = try self.chan_mapper.getOrCreateChannel(conn, mb.name);
                     chan.clear();
                     if (mb.methods) |methods| {
@@ -335,16 +498,16 @@ pub fn ServerHandler(comptime HandlerConnectionT: ConnectionType) type {
                 var router_hs = try Handshake.create(alloc, memberdata, "router");
                 const hs_data = try router_hs.toJson(alloc);
                 try message.setData(hs_data);
-                // Send the full member list to the NEW client while still holding
-                // the mutex (conn is this thread's accepted socket — no UAF risk).
-                try self.sendToConnection(Message, conn, message);
 
                 // Build broadcast messages while holding mutex so channel state
                 // is consistent with what we captured above.
                 var mini_broadcast: ?*Message = null;
-                const new_chan = self.chan_mapper.channels.getPtr(connection_name) orelse unreachable;
-                if (new_chan.methods.hash_map.count() > 0) {
-                    const new_member_methods = try new_chan.joinedMethods(alloc, serde.UNIT_SEPARATOR);
+                // `connection_name` is the transmitter from the message metadata, while
+                // channels are registered under the names in the JSON body; a peer
+                // is free to make those differ, so the lookup can legitimately miss.
+                const new_chan = self.chan_mapper.channels.getPtr(connection_name);
+                if (new_chan != null and new_chan.?.methods.hash_map.count() > 0) {
+                    const new_member_methods = try new_chan.?.joinedMethods(alloc, serde.UNIT_SEPARATOR);
                     var mini_memberdata = try alloc.alloc(Handshake.MemberData, 1);
                     mini_memberdata[0] = .{ .name = connection_name, .methods = new_member_methods };
                     mini_broadcast = try serde.createHandshakeMessage(self.allocator, mini_memberdata, 0, "router");
@@ -371,10 +534,40 @@ pub fn ServerHandler(comptime HandlerConnectionT: ConnectionType) type {
                     };
                 }
 
-                // Release the mutex BEFORE the N TCP writes so concurrent RPCs
-                // are not blocked while we drain N socket buffers.
-                self.mutex.unlock();
-                locked = false;
+                // The member list goes out after the mutex is released, so a
+                // slow new peer cannot stall the router.  Its write side is
+                // taken first: a concurrent handshake that already sees this
+                // peer queues its broadcast behind the list instead of
+                // overtaking it (the list rebuilds the peer's routing table).
+                // Never wait for it under the mutex, though: a peer that
+                // handshakes again while a write to it is stalled would hold
+                // up all routing.  Only in that case can a broadcast overtake
+                // the list.  On an event loop writes never wait, so the
+                // list is simply queued before the mutex is released.
+                const list_sent = if (runtime.onLoopThread()) blk: {
+                    const sent = conn.write(message.data);
+                    self.mutex.unlock();
+                    locked = false;
+                    break :blk sent;
+                } else blk: {
+                    const held = conn.tryLockWrites();
+                    self.mutex.unlock();
+                    locked = false;
+                    if (!held) conn.lockWrites();
+                    defer conn.unlockWrites();
+                    break :blk conn.writeHeld(message.data);
+                };
+                list_sent catch |err| log_router.debug("member list not delivered to {s}: {}", .{ connection_name, err });
+
+                // 0. Tell everyone (and the evicted peer itself) that stale slots
+                //    were taken over, then drop the stale sockets.
+                for (evicted.items) |e| {
+                    var evicted_event = serde.createEventMessage(self.allocator, 0, e.name, "evicted") catch continue;
+                    defer evicted_event.deinit();
+                    for (bcast_conns.items) |c| self.sendToConnection(Message, c, evicted_event) catch {};
+                    self.sendToConnection(Message, e.conn, evicted_event) catch {};
+                    e.conn.close();
+                }
 
                 // 1. Mini-HANDSHAKE so receiving clients update their routing tables.
                 if (mini_broadcast) |mb| {
@@ -386,84 +579,114 @@ pub fn ServerHandler(comptime HandlerConnectionT: ConnectionType) type {
                     self.sendToConnection(Message, c, connected_event) catch {};
             }
 
-            fn onRequest(self: *Self, _: *ParentConnT, message: *Message, _: *bool) !void {
+            fn onRequest(self: *Self, conn: *ParentConnT, message: *Message, _: *bool) !void {
                 log_router.debug("onRequest func={s} receiver={s}", .{ message.getFuncName(), message.getReceiver() });
-                self.mutex.lock();
-                const target_conn: ?*ParentConnT = blk: {
-                    if (self.findChannel(message.getFuncName(), message.getReceiver())) |c| {
-                        c.conn.retain();
-                        break :blk c.conn;
-                    }
-                    break :blk null;
-                };
-                self.mutex.unlock();
-
-                if (target_conn) |c| {
-                    defer c.release();
-                    self.sendToConnection(Message, c, message) catch |err|
-                        log_router.debug("onRequest: send to {s} failed: {}", .{ message.getReceiver(), err });
-                } else {
-                    log_router.debug("no route for request to: {s}", .{message.getReceiver()});
+                if (hasNoUuid(log_router, message)) return;
+                if (isPickleFromWeb(conn, message)) {
+                    log_router.warn("refusing PICKLE request uuid={d} from a WebSocket peer", .{message.getUuid()});
+                    if (message.getReturnResult()) replyError(log_router, self.allocator, conn, message, "SerdeNotAllowed", PICKLE_FROM_WEB);
+                    return;
                 }
+                const route = self.lookupRoute(conn, message);
+                const target = route.target orelse {
+                    log_router.debug("no route for request to: {s}", .{message.getReceiver()});
+                    if (message.getReturnResult()) replyError(log_router, self.allocator, conn, message, "ReceiverNotFound", "no connected peer with that name exposes the requested callback");
+                    return;
+                };
+                defer target.release();
+                const wants_reply = message.getReturnResult();
+                const uuid = message.getUuid();
+                // The receiver sees the sender's name: it must be the one
+                // the sender handshook with.
+                if (!route.sender_known) {
+                    log_router.warn("refusing request uuid={d} from a peer not registered as '{s}'", .{ uuid, message.getTransmitter() });
+                    if (wants_reply) replyError(log_router, self.allocator, conn, message, "UnknownSender", UNKNOWN_SENDER);
+                    return;
+                }
+                const id = if (wants_reply) self.routes.add(conn, uuid, target) catch {
+                    replyError(log_router, self.allocator, conn, message, "RouterOverloaded", "the router has too many requests in flight");
+                    return;
+                } else uuid;
+                message.setUuid(id);
+                target.write(message.data) catch |err| {
+                    log_router.debug("onRequest: send to {s} failed: {}", .{ message.getReceiver(), err });
+                    message.setUuid(uuid);
+                    if (wants_reply) {
+                        self.routes.remove(target, id);
+                        replyError(log_router, self.allocator, conn, message, "DeliveryFailed", "the router could not forward the request to its receiver");
+                    }
+                };
             }
 
-            fn onResponse(self: *Self, _: *ParentConnT, message: *Message, _: *bool) !void {
+            fn onResponse(self: *Self, conn: *ParentConnT, message: *Message, _: *bool) !void {
                 log_router.debug("onResponse receiver={s} uuid={}", .{ message.getReceiver(), message.getUuid() });
-                // Same retain/release pattern as onRequest — see its comment.
-                self.mutex.lock();
-                const target_conn: ?*ParentConnT = blk: {
-                    if (self.findChannel(null, message.getReceiver())) |c| {
-                        c.conn.retain();
-                        break :blk c.conn;
-                    }
-                    break :blk null;
-                };
-                self.mutex.unlock();
-
-                if (target_conn) |c| {
-                    defer c.release();
-                    self.sendToConnection(Message, c, message) catch |err|
-                        log_router.debug("onResponse: send to {s} failed: {}", .{ message.getReceiver(), err });
-                } else {
-                    log_router.debug("no route for response to: {s}", .{message.getReceiver()});
+                if (isPickleFromWeb(conn, message)) {
+                    log_router.warn("dropping PICKLE response uuid={d} from a WebSocket peer", .{message.getUuid()});
+                    return;
                 }
+                // Only the peer the request went to may answer it, and the
+                // answer goes to the connection that asked.
+                const reply = self.routes.take(conn, message.getUuid()) orelse {
+                    log_router.debug("dropping response uuid={d} for '{s}': no such request in flight to this peer", .{ message.getUuid(), message.getReceiver() });
+                    return;
+                };
+                defer reply.requester.release();
+                message.setUuid(reply.uuid);
+                self.sendToConnection(Message, reply.requester, message) catch |err|
+                    log_router.debug("onResponse: send to {s} failed: {}", .{ message.getReceiver(), err });
             }
 
             // --------------------- ROUTER CONNECTION LIFECYCLE ----------------------
             fn diconnectionHandler(self: *Self, conn: *ParentConnT) !void {
+                self.routes.dropConnection(conn);
                 self.mutex.lock();
-                defer self.mutex.unlock();
+                var locked = true;
+                defer if (locked) self.mutex.unlock();
                 var arena = ArenaAllocator.init(self.allocator);
                 defer arena.deinit();
                 var allocator = arena.allocator();
 
-                const chan = self.chan_mapper.getChannelByConnection(conn) orelse {
-                    log_router.debug("diconnectionHandler: no channel found for conn ptr=0x{x}", .{@intFromPtr(conn)});
-                    return;
-                };
-                const connection_name = try allocator.dupe(u8, chan.connection_name);
-                self.chan_mapper.destroyChannel(chan);
+                // A client registers one channel per member it announced.
+                var departed: std.ArrayList([]const u8) = .empty;
+                while (self.chan_mapper.getChannelByConnection(conn)) |chan| {
+                    const name = allocator.dupe(u8, chan.connection_name) catch {
+                        self.chan_mapper.destroyChannel(chan);
+                        continue;
+                    };
+                    self.chan_mapper.destroyChannel(chan);
+                    departed.append(allocator, name) catch continue;
+                }
+                if (departed.items.len == 0) return;
 
                 // Send a "disconnected" EVENT to every remaining client.
                 //
-                // The full HANDSHAKE broadcast that was sent here previously
-                // (clearAllChannels + rebuild on each receiving client) has been
-                // removed for two reasons:
-                //   1. It was O(N) work per remaining client × N remaining clients
-                //      = O(N²) work and network traffic on every disconnect.
-                //   2. With the add-only HANDSHAKE path now used for *connect*
-                //      broadcasts, a full-rebuild HANDSHAKE would over-write the
-                //      live chan_mapper state rather than just removing the
-                //      departed member.
-                //
-                // The "disconnected" EVENT is now the sole mechanism for removing
-                // a departed peer: the client-side ``onEvent`` handler calls
+                // The "disconnected" EVENT is the sole mechanism for removing a
+                // departed peer: the client-side ``onEvent`` handler calls
                 // ``destroyChannelByName`` in Zig (updating the chan_mapper
                 // atomically) and then pushes the event to the Python task queue
-                // so ``@on_event("disconnected")`` handlers are notified.
-                var event_message = try serde.createEventMessage(self.allocator, 0, connection_name, "disconnected");
-                defer event_message.deinit();
-                for (self.chan_mapper.channels.values()) |c| try self.sendToConnection(Message, c.conn, event_message);
+                // so ``@on_event("disconnected")`` handlers are notified.  (A full
+                // HANDSHAKE rebuild here would be O(N^2) traffic per disconnect and
+                // would overwrite live chan_mapper state.)
+                //
+                // Targets are snapshotted with references and written to after the
+                // mutex is released, so one slow peer cannot stall the router.
+                var targets: std.ArrayList(*ParentConnT) = .empty;
+                defer {
+                    for (targets.items) |t| t.release();
+                    targets.deinit(self.allocator);
+                }
+                for (self.chan_mapper.channels.values()) |c| {
+                    try targets.ensureUnusedCapacity(self.allocator, 1);
+                    c.conn.retain();
+                    targets.appendAssumeCapacity(c.conn);
+                }
+                self.mutex.unlock();
+                locked = false;
+                for (departed.items) |name| {
+                    var event_message = serde.createEventMessage(self.allocator, 0, name, "disconnected") catch continue;
+                    defer event_message.deinit();
+                    for (targets.items) |t| self.sendToConnection(Message, t, event_message) catch {};
+                }
             }
 
             fn errorHandler(_: *Self, conn: *ParentConnT, err: anyerror) !void {
@@ -492,19 +715,34 @@ pub const ClientHandler = struct {
     tasks_queue: TasksQueue,
     chan_mapper: *ChannelsMapperT,
     app_name: []const u8,
+    /// Owned.  Sent in every handshake.
+    auth_token: ?[]const u8 = null,
     methods: ?[]const u8 = null, // comma separated list of service methods
     allocator: Allocator,
     mutex: Mutex = .{},
     chan_iterator: RoundRobinIterator(ChannelsMapperT.Channel) = .{},
+    /// Set by the handlers for the message being dispatched; `wakeupFn`
+    /// signals only the descriptor that has something new.  Only the one
+    /// receiver of this client touches them.
+    task_pushed: bool = false,
+    response_parked: bool = false,
+    /// The server announced that a newer connection took this client's name.
+    evicted: std.atomic.Value(bool) = .init(false),
 
     const Self = @This();
     pub const ParentConnT = Connection(.ClientConnectionType);
     const MessageHandlerT = MessageHandler(Self);
     const ChannelsMapperT = ChannelsMapper(ParentConnT);
 
-    pub fn init(allocator: Allocator, app_name: []const u8) !*ClientHandler {
+    pub fn init(allocator: Allocator, app_name: []const u8, auth_token: ?[]const u8) !*ClientHandler {
         const self = try allocator.create(ClientHandler);
-        self.* = .{ .chan_mapper = try ChannelsMapperT.init(allocator), .tasks_queue = try TasksQueue.init(allocator), .allocator = allocator, .msg_store = ClientMessageStore.init(allocator), .app_name = try allocator.dupe(u8, app_name) };
+        errdefer allocator.destroy(self);
+        const chan_mapper = try ChannelsMapperT.init(allocator);
+        errdefer chan_mapper.deinit();
+        const name = try allocator.dupe(u8, app_name);
+        errdefer allocator.free(name);
+        const token = if (auth_token) |t| try allocator.dupe(u8, t) else null;
+        self.* = .{ .chan_mapper = chan_mapper, .tasks_queue = .{}, .allocator = allocator, .msg_store = ClientMessageStore.init(allocator), .app_name = name, .auth_token = token };
         return self;
     }
 
@@ -512,21 +750,36 @@ pub const ClientHandler = struct {
         self.tasks_queue.deinit();
         self.chan_mapper.deinit();
         self.msg_store.deinit();
+        if (self.methods) |m| self.allocator.free(m);
+        if (self.auth_token) |t| self.allocator.free(t);
         self.allocator.free(self.app_name);
         self.allocator.destroy(self);
     }
 
+    /// Runs after the dispatcher is done with the message: once Python
+    /// wakes it may pop and free it.
     fn wakeupFn(self: *Self) void {
-        // Wake the task-dispatcher for incoming @callback requests.
-        self.tasks_queue.triggerWakeup();
-        // Wake any RpcResult waiters blocked on the response fd.
-        // This must be called *after* the dispatcher has finished
-        // inspecting message.metadata.durable (see messageDispatcherClientEntry
-        // in Client.zig).  ClientMessageStore.insert() deliberately does NOT
-        // self-signal for the same reason TasksQueue.pushMessageToQueue() does
-        // not: signalling before the ownership check would let Python free the
-        // message before the Zig dispatcher reads metadata.durable.
-        self.msg_store.triggerWakeup();
+        if (self.task_pushed) {
+            self.task_pushed = false;
+            self.tasks_queue.triggerWakeup();
+        }
+        if (self.response_parked) {
+            self.response_parked = false;
+            self.msg_store.triggerWakeup();
+        }
+    }
+
+    fn storeResponse(self: *Self, message: *Message, consumed: *bool) void {
+        const placed = self.msg_store.insert(message) catch |err| {
+            switch (err) {
+                // The caller timed out and gave up on this uuid: expected.
+                error.Expired => log_client.debug("dropping late response for uuid={}", .{message.getUuid()}),
+                else => log_client.warn("dropping response for uuid={}: {}", .{ message.getUuid(), err }),
+            }
+            return;
+        };
+        consumed.* = true;
+        if (placed == .parked) self.response_parked = true;
     }
 
     pub fn handler(self: *const Self) MessageHandlerT {
@@ -623,8 +876,12 @@ pub const ClientHandler = struct {
     }
 
     pub fn setClientMethods(self: *Self, methods: []const u8) !void {
-        if (self.methods) |m| self.allocator.free(m);
-        self.methods = try self.allocator.dupe(u8, methods);
+        const copy = try self.allocator.dupe(u8, methods);
+        self.mutex.lock();
+        const old = self.methods;
+        self.methods = copy;
+        self.mutex.unlock();
+        if (old) |m| self.allocator.free(m);
     }
 
     // ----------------------------- CLIENT HANDLERS -----------------------------
@@ -676,12 +933,7 @@ pub const ClientHandler = struct {
                     for (methods) |mt| try chan.addMethod(mt);
                 }
             }
-            // Transfer ownership to the message store; mark consumed so the
-            // caller (dispatcher) does NOT free the message.
-            // Set consumed BEFORE insert so it is always accurate even if the
-            // dispatcher resumes before insert() returns.
-            consumed.* = true;
-            try self.msg_store.insert(message);
+            self.storeResponse(message, consumed);
         } else {
             // Add-only broadcast update: parse with an arena to avoid permanent
             // allocations for member strings we will not keep.
@@ -750,40 +1002,36 @@ pub const ClientHandler = struct {
             self.mutex.lock();
             self.chan_mapper.destroyChannelByName(event.value.member);
             self.mutex.unlock();
+        } else if (std.mem.eql(u8, event.value.type, "evicted") and std.mem.eql(u8, event.value.member, self.app_name)) {
+            self.evicted.store(true, .release);
+            self.tasks_queue.triggerEviction();
         }
 
-        // Push to task queue so Python on_member_added / on_member_removed
-        // handlers are called by the task dispatcher.
-        // Mark consumed BEFORE push — same race-safety rule as onRequest.
+        self.tasks_queue.pushMessageToQueue(message);
         consumed.* = true;
-        try self.tasks_queue.pushMessageToQueue(message);
+        self.task_pushed = true;
     }
 
-    pub fn onRequest(self: *Self, _: *ParentConnT, message: *Message, consumed: *bool) !void {
-        // Mark consumed BEFORE pushing so the dispatcher never reads message
-        // fields after pushMessageToQueue() — Python can dequeue and free the
-        // message concurrently as soon as it is in the queue.
-        consumed.* = true;
-        try self.tasks_queue.pushMessageToQueue(message);
+    pub fn onRequest(self: *Self, conn: *ParentConnT, message: *Message, consumed: *bool) !void {
+        if (hasNoUuid(log_client, message)) return;
+        if (self.tasks_queue.tryPushRequest(message)) {
+            consumed.* = true;
+            self.task_pushed = true;
+            return;
+        }
+        log_client.warn("[{s}] task queue full ({d} pending), refusing request uuid={d}", .{ self.app_name, TasksQueue.max_pending, message.getUuid() });
+        if (message.getReturnResult()) replyError(log_client, self.allocator, conn, message, "ServiceOverloaded", "the worker has too many pending requests");
     }
 
     pub fn onResponse(self: *Self, _: *ParentConnT, message: *Message, consumed: *bool) !void {
-        self.msg_store.insert(message) catch {
-            // StoreFull: two RPCs share the same hash slot.  Leave consumed=false
-            // so the dispatcher frees the message via message.deinit().
-            log_client.warn("message store full, dropping response for uuid={}", .{message.getUuid()});
-            return;
-        };
-        // Transfer ownership to the message store.  Set consumed so the
-        // dispatcher will not call deinit() on this message.
-        consumed.* = true;
+        self.storeResponse(message, consumed);
     }
 
     // ---------------------- CLIENT CONNECTION LIFECYCLE ------------------------
     fn diconnectionHandler(_: *Self, _: *ParentConnT) !void {}
 
     fn errorHandler(_: *Self, conn: *ParentConnT, err: anyerror) !void {
-        conn.suspended = true;
+        conn.suspended.store(true, .release);
         switch (err) {
             error.EOF => {},
             error.IncompleteMessage => {
@@ -794,3 +1042,72 @@ pub const ClientHandler = struct {
         }
     }
 };
+
+test "a service's handshake reply never sees its method list half replaced" {
+    const c = @import("posix_c");
+    const alloc = std.testing.allocator;
+    const Handlers = ServerHandler(.ClientConnectionType);
+    const handler = try Handlers.init(.Service, alloc, "svc", null);
+    defer handler.deinit();
+    const service = &handler.Service;
+    try service.setServiceMethods("a,b");
+
+    var fds: [2]c_int = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), c.socketpair(c.AF_UNIX, c.SOCK_STREAM, 0, &fds));
+    defer _ = c.close(fds[1]);
+    const ClientConnection = network.ClientConnection;
+    const conn = try alloc.create(Handlers.ConnectionT);
+    conn.* = .{ .ctx = try ClientConnection.initFromAccepted(alloc, fds[0]), .op_table = ClientConnection.op_table, .allocator = alloc };
+    // Stream.close() releases a descriptor this socketpair never counted.
+    @import("../nofile.zig").acquire(1);
+    defer conn.release();
+
+    const Publisher = struct {
+        fn run(s: @TypeOf(service), stop: *std.atomic.Value(bool)) void {
+            var i: usize = 0;
+            while (!stop.load(.acquire)) : (i += 1) {
+                s.setServiceMethods(if (i % 2 == 0) "xx,yy,zz" else "a,b") catch return;
+            }
+        }
+    };
+    var stop = std.atomic.Value(bool).init(false);
+    const publisher = try std.Thread.spawn(.{}, Publisher.run, .{ service, &stop });
+    defer publisher.join();
+    defer stop.store(true, .release);
+
+    var arena = ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    var peer_hs = try Handshake.create(arena.allocator(), &[_]Handshake.MemberData{.{ .name = "peer", .methods = "m" }}, "client");
+    const peer_data = try peer_hs.toJson(arena.allocator());
+
+    var reply: [4096]u8 = undefined;
+    for (0..500) |_| {
+        var raw = try RawMessage.create(alloc, peer_data, 1, .HANDSHAKE, .JSON, false, true, "peer", serde.PLACEHOLDER, serde.PLACEHOLDER);
+        const message = try Message.fromRawMessage(alloc, &raw);
+        defer message.deinit();
+        var keep = true;
+        try service.onHandshake(conn, message, &keep);
+
+        const header_n = c.read(fds[1], &reply, serde.HEADER_SIZE);
+        try std.testing.expectEqual(@as(isize, @intCast(serde.HEADER_SIZE)), header_n);
+        const header = try serde.Header.parse(reply[0..serde.HEADER_SIZE]);
+        var got: usize = 0;
+        while (got < header.msg_len) {
+            const n = c.read(fds[1], reply[got..].ptr, header.msg_len - got);
+            try std.testing.expect(n > 0);
+            got += @intCast(n);
+        }
+        const data = reply[header.metadata_len..header.msg_len];
+        const whole = std.mem.indexOf(u8, data, "\"methods\":[\"a\",\"b\"]") != null or
+            std.mem.indexOf(u8, data, "\"methods\":[\"xx\",\"yy\",\"zz\"]") != null;
+        if (!whole) std.debug.print("handshake reply: {s}\n", .{data});
+        try std.testing.expect(whole);
+    }
+}
+
+test "ClientHandler frees its method list and token" {
+    const handler = try ClientHandler.init(std.testing.allocator, "client", "s3cret");
+    try handler.setClientMethods("a,b");
+    try handler.setClientMethods("a,b,c");
+    handler.deinit();
+}

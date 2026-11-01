@@ -2,36 +2,118 @@
 User-facing application classes: Router, Service, and Client.
 """
 
-import os
-import sys
 import socket
 import threading
 
 from abc import ABC
-from enum import IntEnum
+from enum import Enum, IntEnum
 from threading import Event
+from collections.abc import Iterable
 from typing import Optional, List, Callable, Any
 
 from . import dfcore
+from daffi._serialization import SerdeFormat
 
 from daffi.utils import colors
 from daffi.utils.logger import get_daffi_logger, sync_native_log_level
-from daffi.exceptions import InitializationError
+from daffi.exceptions import Evicted, InitializationError
 from daffi.utils.misc import string_uuid
-from daffi._bindings import set_lifecycle_fd, set_response_fd
 from daffi._rpc_proxy import (
     RpcProxy,
     ClientConnection,
-    ResponseNotifier,
     system_exception_handler,
 )
-from daffi._signals import set_signal_handler
-from daffi._task_dispatcher import TaskDispatcher
+from daffi._signals import SIGNAL_POLL_S, set_signal_handler
+from daffi._task_dispatcher import TaskDispatcher, shared_dispatcher
 from daffi.registry._executor_registry import EXECUTOR_REGISTRY
+from daffi.transports import (
+    TCPTransport,
+    Transport,
+    TransportArg,
+    UnixTransport,
+    normalize_transports,
+)
+
+
+class Runtime(str, Enum):
+    """Process-wide native runtime.
+
+    ``threads`` serves every connection on its own OS thread. ``evented``
+    multiplexes connections over a few event-loop threads. A
+    :class:`Client` uses the same runtime as a :class:`Router` or
+    :class:`Service`: the native core locks it once per process.
+    """
+
+    THREADS = "threads"
+    EVENTED = "evented"
+
+
+def _coerce_runtime(value: "Runtime | str") -> Runtime:
+    if isinstance(value, Runtime):
+        return value
+    try:
+        return Runtime(value)
+    except ValueError:
+        raise InitializationError(
+            "runtime must be 'threads' or 'evented', "
+            f"got {value!r}"
+        ) from None
+
+
+def _coerce_serdes(value: "Iterable[int] | None") -> frozenset:
+    if value is None:
+        return SerdeFormat.ALL
+    if isinstance(value, (str, bytes)) or not isinstance(value, Iterable):
+        raise InitializationError(
+            f"serdes must be a collection of SerdeFormat values, got {value!r}"
+        )
+    serdes = frozenset(value)
+    unknown = sorted(serdes - SerdeFormat.ALL, key=repr)
+    if unknown:
+        raise InitializationError(
+            f"serdes has unknown formats {unknown!r}; use SerdeFormat values"
+        )
+    if not serdes:
+        raise InitializationError("serdes must name at least one format")
+    return serdes
+
+
+def _callback_names(value) -> "frozenset[str] | None":
+    """The names ``callbacks=`` allows: strings as given, ``@callback``
+    objects by the names they registered, functions by alias or name."""
+    from daffi.registry._callback import callback as _callback
+
+    if value is None:
+        return None
+    if isinstance(value, (str, bytes)) or not isinstance(value, Iterable):
+        raise InitializationError(
+            f"callbacks must be a collection of names or callbacks, got {value!r}"
+        )
+    names: set[str] = set()
+    for item in value:
+        if isinstance(item, str) and item:
+            names.add(item)
+        elif isinstance(item, _callback):
+            names.update(item.names)
+        elif callable(item) and hasattr(item, "__name__"):
+            names.add(getattr(item, "alias", item.__name__))
+        else:
+            raise InitializationError(f"invalid entry in callbacks: {item!r}")
+    return frozenset(names)
+
+
+def _coerce_auth_token(value: "str | None") -> "str | None":
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise InitializationError(f"auth_token must be a str, got {type(value).__name__}")
+    if not value or "\0" in value:
+        raise InitializationError("auth_token must be a non-empty string without NUL characters")
+    return value
 
 
 class ServerMode(IntEnum):
-    """Numeric codes passed to the native ``dfcore.startServer`` C extension."""
+    """Numeric codes passed to the native ``dfcore.addListeners`` C extension."""
 
     ROUTER = 0
     SERVICE = 1
@@ -47,7 +129,7 @@ class EventsMixin:
 
     Both can be used as plain method calls **or** as decorators::
 
-        client = Client(app_name="watcher", host="127.0.0.1", port=6000)
+        client = Client(app_name="watcher", transport=TCPTransport("127.0.0.1", 6000))
 
         @client.on_member_added
         def handle_join(member: str) -> None:
@@ -95,14 +177,82 @@ class EventsMixin:
         return handler
 
 
+class SingleTransportMixin:
+    """Public single-address API used by Client and AsyncClient."""
+
+    _transports: list[Transport]
+
+    def __init__(self, *, transport: Transport, **kwargs) -> None:
+        if not isinstance(transport, (TCPTransport, UnixTransport)):
+            raise InitializationError(
+                "transport must be a TCPTransport or UnixTransport"
+            )
+        self._transports = [transport]
+        super().__init__(**kwargs)
+
+    @property
+    def transport(self) -> Transport:
+        """The one address this client connects to."""
+        return self._transports[0]
+
+    @property
+    def info(self) -> str:
+        """Human-readable connect address."""
+        return f"transport: {self.transport.describe()}"
+
+
+class MultipleTransportMixin:
+    """Public multi-address API used by Router and Service.
+
+    ``transport=`` accepts one :class:`TCPTransport` / :class:`UnixTransport`,
+    or a sequence of them.  Listeners live in :attr:`_transports`;
+    :attr:`transports` is a read-only view of that list.
+    """
+
+    _transports: list[Transport]
+
+    def __init__(self, *, transport: TransportArg, **kwargs) -> None:
+        self._transports = normalize_transports(transport)
+        super().__init__(**kwargs)
+
+    @property
+    def transports(self) -> list[Transport]:
+        """Normalized listen addresses (always a list)."""
+        return self._transports
+
+    @property
+    def info(self) -> str:
+        """Human-readable listen addresses."""
+        listed = ", ".join(item.describe() for item in self._transports)
+        return f"transports: [ {listed} ]"
+
+
 class Application(EventsMixin, ABC):
     """Abstract base shared by :class:`Router`, :class:`Service`, and
     :class:`Client`.
 
-    Handles common initialisation: name generation, logger setup, signal
-    handler registration, and transport selection (TCP vs Unix socket).
-    Inherits typed event-handler registration from :class:`EventsMixin`.
+    Owns common lifecycle state only. Subscribe it with a transport mixin,
+    ``Application[SingleTransportMixin]`` or
+    ``Application[MultipleTransportMixin]``. That subscription is a real base
+    class: the mixin is placed ahead of ``Application`` and normalizes
+    addresses before this initializer runs.
     """
+
+    _transport_specializations: dict[tuple[type, type], type] = {}
+
+    def __class_getitem__(cls, transport_api: type) -> type:
+        if not isinstance(transport_api, type):
+            raise TypeError("transport API must be a mixin class")
+        key = (cls, transport_api)
+        specialized = Application._transport_specializations.get(key)
+        if specialized is None:
+            specialized = type(
+                f"{cls.__name__}[{transport_api.__name__}]",
+                (transport_api, cls),
+                {"__module__": cls.__module__},
+            )
+            Application._transport_specializations[key] = specialized
+        return specialized
 
     server_mode: ServerMode = None
     _task_dispatcher: TaskDispatcher = None
@@ -110,50 +260,77 @@ class Application(EventsMixin, ABC):
     def __init__(
         self,
         app_name: Optional[str] = None,
-        host: Optional[str] = None,
-        port: Optional[int] = None,
-        unix_sock_path: Optional[os.PathLike] = None,
         workers: int = TaskDispatcher.DEFAULT_WORKERS,
-        tls: bool = False,
-        cert_file: str = "",
-        key_file: str = "",
-        ca_file: str = "",
+        runtime: Optional[Runtime | str] = None,
+        transport: TransportArg | None = None,
+        serdes: Optional[Iterable[int]] = None,
+        auth_token: Optional[str] = None,
+        callbacks: Optional[Iterable[Any]] = None,
     ):
         """
         Args:
             app_name:      Human-readable identifier for this node. A random
                            hex UUID is used when omitted.
-            host:          TCP hostname or IP address.
-            port:          TCP port number.
-            unix_sock_path: Path to a Unix-domain socket (mutually exclusive
-                           with *host*/*port*).
             workers:       Number of concurrent worker **threads** for executing
                            incoming ``@callback`` calls.  ``1`` (default) runs
                            callbacks inline with zero overhead.  ``N >= 2``
-                           spawns a pool of N-1 threads.  Ignored by
+                           spawns a pool of N threads.  Ignored by
                            :class:`Router` which never executes callbacks
                            itself.
-            tls:           Enable TLS encryption for the TCP connection.
-                           Servers require ``cert_file`` and ``key_file``.
-                           Clients may optionally supply ``ca_file``.
-            cert_file:     Path to a PEM server certificate
-                           (used by :class:`Router` and :class:`Service`).
-            key_file:      Path to a PEM server private key
-                           (used by :class:`Router` and :class:`Service`).
-            ca_file:       Path to a PEM CA bundle used by a :class:`Client`
-                           to verify the server certificate.  An empty string
-                           disables peer verification (connect without
-                           authenticating the server certificate).
+            runtime:       Native runtime for this process,
+                           :attr:`Runtime.THREADS` (default) or
+                           :attr:`Runtime.EVENTED`.  Omitting it, or passing
+                           ``None``, selects threads.  A Client, Router, and
+                           Service in one process share this choice; a
+                           conflicting value raises
+                           :class:`InitializationError`.
+            transport:     Listen/connect address(es).  Declared here so type
+                           checkers see it on :class:`Router`, :class:`Service`,
+                           and :class:`Client` (their ``Application[…]`` bases
+                           are built at runtime).  At runtime the transport
+                           mixin consumes this argument before this
+                           ``__init__`` runs and stores the result on
+                           ``_transports``.  TLS is configured on each
+                           :class:`~daffi.transports.TCPTransport`, not here.
+            serdes:        The :class:`SerdeFormat` values this node accepts
+                           in incoming ``@callback`` requests; a request in
+                           any other format is answered with a
+                           ``SerdeNotAllowed`` error and never decoded.
+                           ``None`` (default) accepts every format
+                           (:attr:`SerdeFormat.ALL`).  Pass
+                           :attr:`SerdeFormat.SAFE` to refuse PICKLE.
+                           PICKLE from a WebSocket peer is always refused.
+                           Ignored by :class:`Router`.
+            auth_token:    Shared secret.  A :class:`Router` or
+                           :class:`Service` given one refuses every peer
+                           whose handshake does not carry the same token; a
+                           :class:`Client` sends it.  On TCP it requires
+                           ``tls=True`` (the token travels in handshake JSON).
+                           Unix sockets may use it without TLS.  ``None``
+                           (default) accepts any peer.
+            callbacks:     The ``@callback`` functions (or their names) this
+                           node offers to peers.  The others are neither
+                           announced nor run: a request for one fails as an
+                           unknown callback.  ``None`` (default) offers
+                           every registered callback.  Ignored by
+                           :class:`Router`.
         """
+        # Mixins set ``_transports`` before calling us; ``transport`` itself
+        # never arrives here when constructed via Router/Service/Client.
+        if not getattr(self, "_transports", None):
+            raise InitializationError("transport is required")
+        if runtime is None:
+            runtime = Runtime.THREADS
+        self.runtime = _coerce_runtime(runtime)
+        try:
+            dfcore.setRuntime(self.runtime.value)
+        except ValueError as exc:
+            raise InitializationError(str(exc)) from exc
         self.app_name = app_name
-        self.host = host
-        self.port = port
-        self.unix_sock_path = str(unix_sock_path or "")
         self.workers = workers
-        self.tls = tls
-        self.cert_file = cert_file
-        self.key_file = key_file
-        self.ca_file = ca_file
+        self.serdes = _coerce_serdes(serdes)
+        self.auth_token = _coerce_auth_token(auth_token)
+        self.callbacks = _callback_names(callbacks)
         self._conn_num = None
         self._conn_type = None
         self._stop_event = Event()
@@ -161,7 +338,10 @@ class Application(EventsMixin, ABC):
         # user thread + the disconnect watcher) cannot race on native
         # teardown — without it both threads could read ``_conn_num`` as
         # non-None and both call ``dfcore.stopClient`` (double-free).
-        self._stop_lock = threading.Lock()
+        self._stop_lock = threading.RLock()
+        # Serialises Client reconnect attempts (unused by Router / Service).
+        self._reconnect_lock = threading.Lock()
+        self._stopping = False
         self._connection_error: Optional[Exception] = None
         # Set to True by the background lifecycle watcher when an unexpected
         # disconnect or eviction is detected.  Cleared by a successful
@@ -175,12 +355,20 @@ class Application(EventsMixin, ABC):
         # re-raise ``_connection_error``) or whether it must be raised
         # directly from the watcher thread to avoid being silently swallowed.
         self._joining: bool = False
+        # Set by :meth:`stop`; cleared by :meth:`connect` / :meth:`start`.
+        # Reconnect must not resurrect a client the user shut down.
+        self._intentionally_stopped: bool = False
         self.__init_events__()
         self._executors_subscribed: bool = False
 
         if self.app_name is None:
             self.app_name = f"{socket.gethostname()}-{string_uuid()}"
         self.app_name = str(self.app_name)
+        if "," in self.app_name:
+            raise InitializationError(
+                f"app_name cannot contain a comma (got {self.app_name!r})"
+            )
+        self._require_tls_for_token()
 
         process_ident = f"{self.__class__.__name__.lower()}[{self.app_name}]"
         if self.server_mode == ServerMode.ROUTER:
@@ -191,32 +379,64 @@ class Application(EventsMixin, ABC):
             color = colors.magenta
         self.logger = get_daffi_logger(process_ident, color)
 
-        if self.unix_sock_path and self.host:
-            raise InitializationError(
-                "Provide either 'unix_sock_path' argument or combination "
-                "of 'host' and 'port' to connect via unix socket or via tcp respectively"
-            )
-
-        if not self.host and sys.platform == "win32":
-            raise InitializationError(
-                "Windows platform doesn't support unix sockets. Provide host and port to use TCP"
-            )
-
         # Propagate Python's current log level to the native Zig layer so that
         # std.log.debug / .info / .warn calls in the extension respect whatever
         # level the caller configured (e.g. logging.basicConfig(level=DEBUG)).
         sync_native_log_level()
 
-        set_signal_handler(self.stop)
+        set_signal_handler(self._signal_stop)
 
-    @property
-    def info(self) -> str:
-        """Human-readable connection string shown in log messages."""
-        if self.unix_sock_path:
-            sock = "unix:///" + self.unix_sock_path.strip("unix:///")
-            return f"unix socket: [ {sock!r} ]"
-        else:
-            return f"tcp: [ host {self.host!r}, port: {self.port!r} ]"
+    def _require_tls_for_token(self) -> None:
+        """auth_token on TCP is sent in handshake JSON; require TLS there."""
+        if self.auth_token is None:
+            return
+        for t in self._transports:
+            if isinstance(t, TCPTransport) and not t.tls:
+                raise InitializationError(
+                    "auth_token on a TCP transport requires tls=True; "
+                    "the token is sent in the handshake JSON. "
+                    "Unix sockets may use auth_token without TLS."
+                )
+
+    def _signal_stop(self) -> None:
+        """Stop on SIGINT / SIGTERM / interpreter exit."""
+        self.stop()
+
+    def _add_native_listeners(self) -> int:
+        """Bind every transport at once and return the node's one conn_num.
+
+        This only adds the listeners.  Accepting starts later, from
+        ``dfcore.startServer``, after a Service has published its callbacks.
+        All or nothing: if one cannot be bound, none stays bound, and the
+        error names that transport.
+        """
+        allow_any_ws = self.auth_token is not None
+        listeners = [
+            t.native_listener(allow_any_origin=allow_any_ws)
+            if isinstance(t, TCPTransport)
+            else t.native_listener()
+            for t in self._transports
+        ]
+        try:
+            return dfcore.addListeners(
+                listeners,
+                self.server_mode,
+                self.app_name,
+                self.auth_token,
+            )
+        except ValueError as exc:
+            reason, *where = exc.args
+            failed = self._transports[where[0]] if where else None
+            with system_exception_handler(
+                "{}",
+                InitializationError,
+                conn_info=failed.conn_info() if failed else (),
+            ):
+                raise ValueError(reason) from None
+
+    def _exposed_names(self) -> "list[str]":
+        """The registered callbacks this node offers (see ``callbacks=``)."""
+        return [name for name, _ in EXECUTOR_REGISTRY if self.callbacks is None or name in self.callbacks]
 
     def _register_executors(self):
         """Log all currently registered callbacks and subscribe for future ones.
@@ -236,20 +456,24 @@ class Application(EventsMixin, ABC):
                 # subscriber list, or when @callback is applied after stop().
                 if self._conn_num is None:
                     return
+                if self.callbacks is not None and executor.name not in self.callbacks:
+                    return
                 try:
                     if self.server_mode is None:
-                        RpcProxy._process_client_handshake(self._conn_num)
+                        RpcProxy._process_client_handshake(self._conn_num, self._exposed_names())
                     elif self.server_mode == ServerMode.SERVICE:
-                        RpcProxy._process_service_handshake(self._conn_num)
+                        RpcProxy._process_service_handshake(self._conn_num, self._exposed_names())
                     else:
                         return
-                except (ValueError, OSError):
-                    # Native connection no longer valid — remove this stale
-                    # subscriber so it does not fire again.
-                    try:
-                        EXECUTOR_REGISTRY.subscribers.remove(registry_subscriber)
-                    except ValueError:
-                        pass
+                except Exception as exc:
+                    # Raised at the user's @callback line otherwise.
+                    if getattr(self, "_disconnected", False):
+                        try:
+                            EXECUTOR_REGISTRY.subscribers.remove(registry_subscriber)
+                        except ValueError:
+                            pass
+                    else:
+                        self.logger.warning(f"Could not announce {executor}: {exc}")
                     return
                 self.logger.debug(f"{executor} registered.")
 
@@ -272,6 +496,11 @@ class Application(EventsMixin, ABC):
             self._registry_subscriber = None
         self._executors_subscribed = False
 
+    def _wait_stopped(self) -> None:
+        while not self._stop_event.wait(SIGNAL_POLL_S):
+            if self._disconnected:
+                return
+
     def join(self):
         """Block the calling thread until :meth:`stop` is called (or until a
         registered signal handler triggers it).
@@ -280,7 +509,7 @@ class Application(EventsMixin, ABC):
         :class:`Client` alike.  This is the idiomatic way to keep a process
         alive without importing ``signal``::
 
-            client = Client(app_name="worker", host="127.0.0.1", port=6001)
+            client = Client(app_name="worker", transport=TCPTransport("127.0.0.1", 6001))
             client.connect()
             client.join()   # blocks until Ctrl+C (SIGINT/SIGTERM → stop())
 
@@ -296,7 +525,8 @@ class Application(EventsMixin, ABC):
         """
         self._joining = True
         try:
-            self._stop_event.wait()
+            if not self._disconnected:
+                self._wait_stopped()
         finally:
             self._joining = False
         # ``_stop_event`` is flipped only at the *end* of ``stop()``, so by
@@ -325,8 +555,11 @@ class ServerMixin:
         launch the task dispatcher and perform the initial handshake.
 
         Connection-level protection (encryption + peer authentication) is
-        delegated to TLS — pass ``tls=True`` together with ``cert_file`` /
-        ``key_file`` (server) and ``ca_file`` (client) on the constructor.
+        delegated to TLS — set ``tls=True`` with ``cert`` / ``key`` on each
+        listening :class:`~daffi.transports.TCPTransport`.
+
+        All or nothing: if any step fails, every listener is closed, every
+        peer that already connected is dropped, and the error is raised.
 
         Raises:
             RuntimeError: If the server is already started.
@@ -334,54 +567,84 @@ class ServerMixin:
 
         Example::
 
-            router = Router(host="127.0.0.1", port=6000)
+            router = Router(transport=TCPTransport("127.0.0.1", 6000))
             router.start()
 
-            client = Client(host="127.0.0.1", port=6000)
+            client = Client(transport=TCPTransport("127.0.0.1", 6000))
             conn = client.connect()
         """
         if self._conn_num is not None:
             raise RuntimeError(f"{self.__class__.__name__} is already started")
-        if self.server_mode == ServerMode.SERVICE:
-            # Start the worker-thread pool before native I/O threads are
-            # created.  Threads idle harmlessly until work arrives.
-            if not self._task_dispatcher:
-                self._task_dispatcher = TaskDispatcher(workers=self.workers)
-            self._task_dispatcher._start_workers()
-        with system_exception_handler(
-            "{}",
-            InitializationError,
-            conn_info=(self.host, self.port, self.unix_sock_path),
-        ):
-            self._conn_num = dfcore.startServer(
-                self.host,
-                self.port,
-                self.server_mode,
-                self.app_name,
-                self.tls,
-                self.cert_file,
-                self.key_file,
+        # A server can start again after stop(); stop() must then work again.
+        self._intentionally_stopped = False
+        self._stop_event.clear()
+        try:
+            if self.server_mode == ServerMode.SERVICE:
+                # Start the worker-thread pool before native I/O threads are
+                # created.  Threads idle harmlessly until work arrives.
+                if not self._task_dispatcher:
+                    self._task_dispatcher = shared_dispatcher()
+            self._conn_num = self._add_native_listeners()
+            self.logger.debug(
+                f"has been started successfully. connection info: {self.info}"
             )
-        self.logger.debug(
-            f"has been started successfully. connection info: {self.info}"
-        )
-        self._register_executors()
-        if self.server_mode == ServerMode.SERVICE:
-            self._task_dispatcher.start_for_connection(self)
-            RpcProxy._process_service_handshake(self._conn_num)
+            if self.server_mode == ServerMode.SERVICE:
+                self._task_dispatcher.start_for_connection(self)
+                # Before any socket accepts, so the first handshake already
+                # carries the callback list.
+                RpcProxy._advertise_service_methods(self._conn_num, self._exposed_names())
+            dfcore.startServer(self._conn_num)
+            self._register_executors()
+            if self.server_mode == ServerMode.SERVICE:
+                RpcProxy._process_service_handshake(self._conn_num, self._exposed_names())
+        except BaseException:
+            self._abort_start()
+            raise
 
-    def stop(self, *_, **__):
-        """Stop the server and release the native connection."""
-        if not self._stop_event.is_set():
+    def _abort_start(self) -> None:
+        """Undo a :meth:`start` that failed part-way, so it can be retried.
+
+        The dispatcher goes first, while ``_conn_num`` still names the
+        lifecycle fd that wakes its poller; then the native server, which
+        closes every listener and drops every peer on all of them.
+        """
+        dispatcher, self._task_dispatcher = self._task_dispatcher, None
+        try:
+            if dispatcher is not None:
+                dispatcher.stop_for_connection(self)
+        finally:
             if self._conn_num is not None:
                 dfcore.stopServer(self._conn_num)
                 self._conn_num = None
-        self._stop_event.set()
-        if self._task_dispatcher:
-            self._task_dispatcher.stop_for_connection(self)
+            self._unregister_executor_subscriber()
+
+    def stop(self, *_, **__):
+        """Stop the server and release the native connection.
+
+        The task dispatcher is stopped **before** the native server is torn
+        down, and while ``_conn_num`` is still set: ``stop_for_connection``
+        uses it to find the lifecycle fd it must signal to wake the poller
+        thread.  Clearing it first (as an earlier version did) made the signal
+        go nowhere and ``stop()`` block forever joining the poller.
+        """
+        self._intentionally_stopped = True
+        with self._stop_lock:
+            if self._stopping or self._stop_event.is_set():
+                return
+            self._stopping = True
+            try:
+                conn_num = self._conn_num
+                if self._task_dispatcher:
+                    self._task_dispatcher.stop_for_connection(self)
+                if conn_num is not None:
+                    dfcore.stopServer(conn_num)
+                    self._conn_num = None
+            finally:
+                self._stopping = False
+                self._stop_event.set()
 
 
-class Router(Application, ServerMixin):
+class Router(Application[MultipleTransportMixin], ServerMixin):
     """A routing server that forwards RPC calls between connected clients and
     services.
 
@@ -390,15 +653,23 @@ class Router(Application, ServerMixin):
 
     Example::
 
-        router = Router(host="127.0.0.1", port=6000)
+        router = Router(
+            transport=[
+                TCPTransport(host="0.0.0.0", port=6001),
+                UnixTransport(path="/tmp/daffi.sock"),
+            ]
+        )
         router.start()
         router.join()
+
+    A single transport may be passed without a list.  Every transport of one
+    Router or Service shares that node's membership.
     """
 
     server_mode = ServerMode.ROUTER
 
 
-class Service(Application, ServerMixin):
+class Service(Application[MultipleTransportMixin], ServerMixin):
     """A server that exposes ``@callback``-decorated functions to remote callers.
 
     Example::
@@ -409,7 +680,7 @@ class Service(Application, ServerMixin):
         def add(a: int, b: int) -> int:
             return a + b
 
-        svc = Service(host="127.0.0.1", port=5000)
+        svc = Service(transport=TCPTransport("127.0.0.1", 5000))
         svc.start()
         svc.join()
     """
@@ -417,64 +688,34 @@ class Service(Application, ServerMixin):
     server_mode = ServerMode.SERVICE
 
 
-class Client(Application):
+class Client(Application[SingleTransportMixin]):
     """A client that connects to a :class:`Router` or :class:`Service` and
     issues RPC calls.
 
     Example::
 
-        client = Client(app_name="my-client", host="127.0.0.1", port=5000)
+        client = Client(app_name="my-client", transport=TCPTransport("127.0.0.1", 5000))
         conn = client.connect()
         result = conn.rpc(timeout=5).add(1, 2)
         client.stop()
     """
 
-    def __init__(
-        self,
-        app_name: Optional[str] = None,
-        host: Optional[str] = None,
-        port: Optional[int] = None,
-        unix_sock_path: Optional[os.PathLike] = None,
-        workers: int = TaskDispatcher.DEFAULT_WORKERS,
-        tls: bool = False,
-        cert_file: str = "",
-        key_file: str = "",
-        ca_file: str = "",
-    ):
-        super().__init__(
-            app_name=app_name,
-            host=host,
-            port=port,
-            unix_sock_path=unix_sock_path,
-            workers=workers,
-            tls=tls,
-            cert_file=cert_file,
-            key_file=key_file,
-            ca_file=ca_file,
-        )
-        # Serialises concurrent reconnect attempts so only one thread
-        # performs the reconnect while others wait and then reuse the result.
-        self._reconnect_lock = threading.Lock()
-
     @property
     def info(self) -> str:
         """Human-readable connection string (includes the connection type once
         the handshake has completed)."""
-        if self.unix_sock_path:
-            sock = "unix:///" + self.unix_sock_path.strip("unix:///")
-            return f"unix socket: [ {sock!r} ]"
-        else:
-            type_part = (
-                f", type: {self._conn_type!r}" if self._conn_type is not None else ""
-            )
-            return f"tcp: [ host {self.host!r}, port: {self.port!r}{type_part} ]"
+        described = self.transport.describe()
+        type_part = (
+            f", type: {self._conn_type!r}" if self._conn_type is not None else ""
+        )
+        return f"transport: {described}{type_part}"
 
     def connect(self) -> "ClientConnection":
         """Connect to the server, perform the handshake, and return a connection handle.
 
         Connection-level protection (encryption + peer authentication) is
-        delegated to TLS — pass ``tls=True`` together with ``ca_file`` on the
-        constructor to authenticate the server's certificate.
+        delegated to TLS — set ``tls=True`` (and optionally ``ca``) on the
+        :class:`~daffi.transports.TCPTransport` to authenticate the server.
 
         Returns:
             A :class:`~daffi.rpc_proxy.ClientConnection`.
@@ -485,6 +726,11 @@ class Client(Application):
         """
         if self._conn_num is not None:
             raise RuntimeError("Client is already connected")
+        # A client can connect again after stop().
+        self._intentionally_stopped = False
+        self._stop_event.clear()
+        self._connection_error = None
+        self._disconnected = False
         self._do_connect()
         return ClientConnection(self)
 
@@ -495,40 +741,49 @@ class Client(Application):
         Its poller thread monitors both task-arrival fds and the lifecycle fd
         so no separate watcher thread is needed.
         """
-        # Always create the dispatcher so the poller thread runs unconditionally,
-        # even when no @callback functions are registered on this client.
+        # One shared poller for every client in this process. Callback
+        # threads, if this client asked for them, start with the connection
+        # and serve only this client.
         if self._task_dispatcher is None:
-            self._task_dispatcher = TaskDispatcher(workers=self.workers)
-        self._task_dispatcher._start_workers()
+            self._task_dispatcher = shared_dispatcher()
 
-        self._conn_num = dfcore.startClient(
-            self.host,
-            self.port,
-            self.app_name,
-            self.tls,
-            self.ca_file,
-        )
+        t = self.transport
+        try:
+            self._conn_num = dfcore.startClient(
+                t.native_host,
+                t.native_port,
+                self.app_name,
+                t.tls,
+                t.ca,
+                t.cert,
+                t.key,
+                t.verify,
+                self.auth_token,
+            )
+        except Exception as exc:
+            raise InitializationError(
+                f"Failed to connect to the server: {exc}. connection info: {self.info}"
+            ) from exc
         if self._conn_num is None:
             raise InitializationError(
                 f"Failed to connect to the server. connection info: {self.info}"
             )
-        # Register the response notifier *before* the handshake so the
-        # handshake's own RpcResult also benefits from event-driven wakeups
-        # rather than polling.  ``register`` clears any stale notifier left
-        # over from a previous (e.g. failed) connect on the same handle.
-        ResponseNotifier.register(self._conn_num)
         try:
-            handshake = RpcProxy._process_client_handshake(self._conn_num)
-        except Exception:
+            handshake = RpcProxy._process_client_handshake(self._conn_num, self._exposed_names())
+        except Exception as exc:
             # Tear the native slot down so the caller can retry connect()
-            # without hitting the "already connected" guard.
-            ResponseNotifier.unregister(self._conn_num)
+            # without hitting the "already connected" guard.  Remap to
+            # InitializationError so mTLS / TLS rejects look like a failed
+            # connect (TLS 1.3 can let startClient succeed before the server
+            # alert is visible).
             try:
                 dfcore.stopClient(self._conn_num)
             except Exception:
                 pass
             self._conn_num = None
-            raise
+            raise InitializationError(
+                f"Failed to connect to the server: {exc}. connection info: {self.info}"
+            ) from exc
         self._conn_type = handshake["meta"]["type"]
         self.logger.debug(
             f"has been connected successfully. connection info: {self.info}"
@@ -543,28 +798,53 @@ class Client(Application):
         to reconnect at the same time.  The second thread to acquire the lock
         finds ``_disconnected`` already cleared and returns immediately.
 
-        Resets all internal state so :meth:`_do_connect` starts from a clean
-        slate (fresh :class:`~daffi._task_dispatcher.TaskDispatcher`, cleared
-        stop-event, no stale error).
+        The dead connection is released first, then all internal state is
+        reset so :meth:`_do_connect` starts from a clean slate.
 
         Returns:
             ``True`` when the reconnect succeeded, ``False`` otherwise.
         """
         with self._reconnect_lock:
+            if self._intentionally_stopped:
+                return False
             if not self._disconnected:
-                # Another thread already reconnected while we were waiting.
-                return self._conn_num is not None
+                # Another thread already finished while we were waiting.
+                if self._conn_num is not None:
+                    return True
+                # Inconsistent: looks connected but has no handle — heal it.
+                self._disconnected = True
+            if isinstance(self._connection_error, Evicted):
+                # The name now belongs to a newer connection.
+                return False
+            saved_error = self._connection_error
             try:
-                self._stop_event.clear()
-                self._connection_error = None
-                self._disconnected = False
-                # Force a fresh dispatcher + poller thread; the old one has
-                # already exited because stop_event was set during teardown.
-                self._task_dispatcher = None
-                self._do_connect()
+                with self._stop_lock:
+                    if self._intentionally_stopped:
+                        return False
+                    self._release_connection()
+                    self._stop_event.clear()
+                    self._connection_error = None
+                    self._disconnected = False
+                    self._do_connect()
+                    if self._intentionally_stopped:
+                        self._release_connection()
+                        self._stop_event.set()
+                        return False
                 return True
             except Exception as exc:
                 self.logger.warning(f"Reconnect attempt failed: {exc!r}")
+                # Restore disconnected state so join()/RPC do not treat a
+                # missing handle as a healthy connection (and so join does
+                # not hang on a cleared _stop_event).
+                with self._stop_lock:
+                    if self._conn_num is not None:
+                        try:
+                            self._release_connection()
+                        except Exception:
+                            pass
+                    self._disconnected = True
+                    self._connection_error = saved_error
+                    self._stop_event.set()
                 return False
 
     def join(self):
@@ -579,7 +859,8 @@ class Client(Application):
         """
         self._joining = True
         try:
-            self._stop_event.wait()
+            if not self._disconnected:
+                self._wait_stopped()
         finally:
             self._joining = False
 
@@ -613,24 +894,22 @@ class Client(Application):
           fully-stopped client — no half-torn-down race window where
           ``_conn_num`` is still set.
         """
+        self._intentionally_stopped = True
+        self._unregister_executor_subscriber()
         with self._stop_lock:
-            if self._conn_num is not None:
-                try:
-                    set_lifecycle_fd(self._conn_num, -1)
-                except Exception:
-                    pass
-                try:
-                    set_response_fd(self._conn_num, -1)
-                except Exception:
-                    pass
-            if self._task_dispatcher:
-                self._task_dispatcher.stop_for_connection(self)
-            if self._conn_num is not None:
-                # Tear the notifier thread down before freeing the native
-                # slot — its select on the wakeup fd does not hold a
-                # reference to conn_num, but we want the thread to exit
-                # cleanly so it doesn't observe a freed Zig-side fd.
-                ResponseNotifier.unregister(self._conn_num)
-                dfcore.stopClient(self._conn_num)
-                self._conn_num = None
+            self._release_connection()
             self._stop_event.set()
+
+    def _release_connection(self) -> None:
+        """Detach from the dispatcher and free the native connection.
+
+        Callers hold ``_stop_lock``.
+        """
+        if self._task_dispatcher:
+            self._task_dispatcher.stop_for_connection(self)
+        if self._conn_num is not None:
+            from daffi._bindings import invalidate_members
+
+            invalidate_members(self._conn_num)
+            dfcore.stopClient(self._conn_num)
+            self._conn_num = None

@@ -4,6 +4,7 @@ Shared data models for the PICKLE serialisation example.
 Both 1_service.py and 2_client.py import from this module so that the
 same class definitions are available in both processes (required for pickle).
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field

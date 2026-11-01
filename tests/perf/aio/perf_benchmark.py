@@ -34,6 +34,13 @@ Run::
 """
 
 from __future__ import annotations
+import sys
+from pathlib import Path
+
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+from tests.conftest import active_runtime
 
 import asyncio
 import json
@@ -54,22 +61,25 @@ if _PROJECT_ROOT not in sys.path:
 _DATA_FILE = Path(__file__).parent.parent / "data.json"
 
 # ── constants ─────────────────────────────────────────────────────────────────
-N      = 100_000  # measured calls per (layout × serde) combination
+N = 100_000  # measured calls per (layout × serde) combination
 WARMUP = 20
 TIMEOUT = 30
-HOST   = "127.0.0.1"
+HOST = "127.0.0.1"
 
 # ── serde format list ─────────────────────────────────────────────────────────
 
+
 def _serde_modes():
     from daffi._serialization import SerdeFormat
+
     modes = [
-        (SerdeFormat.PICKLE,  "PICKLE"),
-        (SerdeFormat.JSON,    "JSON"),
-        (SerdeFormat.OPAQUE,  "OPAQUE"),
+        (SerdeFormat.PICKLE, "PICKLE"),
+        (SerdeFormat.JSON, "JSON"),
+        (SerdeFormat.OPAQUE, "OPAQUE"),
     ]
     try:
         import msgpack as _  # noqa: F401
+
         modes.insert(2, (SerdeFormat.MSGPACK, "MSGPACK"))
     except ImportError:
         print("  [note] msgpack not installed — MSGPACK format skipped")
@@ -77,6 +87,7 @@ def _serde_modes():
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
+
 
 def _free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -93,15 +104,22 @@ def _wait_for_port(port: int, timeout: float = 15.0) -> None:
                 return
         except OSError:
             time.sleep(0.05)
-    raise TimeoutError(f"Server on {HOST}:{port} did not become ready within {timeout}s")
+    raise TimeoutError(
+        f"Server on {HOST}:{port} did not become ready within {timeout}s"
+    )
 
 
-def _silence_subprocess() -> None:
+def _silence_subprocess(runtime: str) -> None:
     devnull_fd = os.open(os.devnull, os.O_WRONLY)
     os.dup2(devnull_fd, 1)
     os.dup2(devnull_fd, 2)
     os.close(devnull_fd)
     logging.disable(logging.CRITICAL)
+
+    import tests.conftest as _runtime_state
+    _runtime_state.SELECTED_RUNTIME = runtime
+    from daffi import dfcore
+    dfcore.setRuntime(runtime)
 
 
 def _quiet_teardown(fn, *args, **kwargs) -> None:
@@ -128,49 +146,57 @@ def _report(label: str, latencies_ms: list[float]) -> None:
 # ── subprocess entry points ───────────────────────────────────────────────────
 # Each subprocess runs its own asyncio event loop.
 
-def _proc_service(host: str, port: int) -> None:
-    _silence_subprocess()
+
+def _proc_service(runtime: str, host: str, port: int) -> None:
+    _silence_subprocess(runtime)
 
     async def _main():
-        from daffi import callback
+        from daffi import callback, TCPTransport
         from daffi.aio import AsyncService
 
         @callback
         async def echo(payload):
             return payload
 
-        svc = AsyncService(app_name="perf-svc-aio", host=host, port=port)
+        svc = AsyncService(app_name="perf-svc-aio", transport=TCPTransport(host, port), runtime=runtime)
         await svc.start()
         await svc.join()
 
     asyncio.run(_main())
 
 
-def _proc_router(host: str, port: int) -> None:
-    _silence_subprocess()
+def _proc_router(runtime: str, host: str, port: int) -> None:
+    _silence_subprocess(runtime)
 
     async def _main():
         from daffi.aio import AsyncRouter
+        from daffi import TCPTransport
 
-        router = AsyncRouter(app_name="perf-router-aio", host=host, port=port)
+        router = AsyncRouter(
+            app_name="perf-router-aio", transport=TCPTransport(host, port),
+            runtime=runtime,
+        )
         await router.start()
         await router.join()
 
     asyncio.run(_main())
 
 
-def _proc_worker(host: str, port: int) -> None:
-    _silence_subprocess()
+def _proc_worker(runtime: str, host: str, port: int) -> None:
+    _silence_subprocess(runtime)
 
     async def _main():
-        from daffi import callback
+        from daffi import callback, TCPTransport
         from daffi.aio import AsyncClient
 
         @callback
         async def echo(payload):
             return payload
 
-        client = AsyncClient(app_name="perf-worker-aio", host=host, port=port)
+        client = AsyncClient(
+            app_name="perf-worker-aio", transport=TCPTransport(host, port),
+            runtime=runtime,
+        )
         await client.connect()
         try:
             await client.join()
@@ -184,21 +210,26 @@ def _proc_worker(host: str, port: int) -> None:
 
 # ── benchmark functions ───────────────────────────────────────────────────────
 
+
 async def bench_direct(serde: int, data: dict, label: str) -> list[float]:
     """Direct: AsyncClient → AsyncService, single hop."""
     from daffi.aio import AsyncClient
+    from daffi import TCPTransport
     from daffi._serialization import SerdeFormat
 
     wire = json.dumps(data) if serde == SerdeFormat.OPAQUE else data
 
     port = _free_port()
-    proc = mp.Process(target=_proc_service, args=(HOST, port), daemon=True)
+    proc = mp.Process(target=_proc_service, args=(active_runtime(), HOST, port), daemon=True)
     proc.start()
     try:
         _wait_for_port(port)
         await asyncio.sleep(0.15)
 
-        client = AsyncClient(app_name="perf-direct-aio", host=HOST, port=port)
+        client = AsyncClient(
+            app_name="perf-direct-aio", transport=TCPTransport(HOST, port),
+            runtime=active_runtime(),
+        )
         conn = await client.connect()
         c = conn.rpc(timeout=TIMEOUT, serde=serde)
 
@@ -225,13 +256,14 @@ async def bench_direct(serde: int, data: dict, label: str) -> list[float]:
 async def bench_via_router(serde: int, data: dict, label: str) -> list[float]:
     """Via Router: AsyncClient → AsyncRouter → Async-Worker, two hops."""
     from daffi.aio import AsyncClient
+    from daffi import TCPTransport
     from daffi._serialization import SerdeFormat
 
     wire = json.dumps(data) if serde == SerdeFormat.OPAQUE else data
 
     router_port = _free_port()
-    router_proc = mp.Process(target=_proc_router, args=(HOST, router_port), daemon=True)
-    worker_proc = mp.Process(target=_proc_worker, args=(HOST, router_port), daemon=True)
+    router_proc = mp.Process(target=_proc_router, args=(active_runtime(), HOST, router_port), daemon=True)
+    worker_proc = mp.Process(target=_proc_worker, args=(active_runtime(), HOST, router_port), daemon=True)
 
     router_proc.start()
     try:
@@ -239,7 +271,10 @@ async def bench_via_router(serde: int, data: dict, label: str) -> list[float]:
         worker_proc.start()
         await asyncio.sleep(0.4)
 
-        client = AsyncClient(app_name="perf-router-caller-aio", host=HOST, port=router_port)
+        client = AsyncClient(
+            app_name="perf-router-caller-aio", transport=TCPTransport(HOST, router_port),
+            runtime=active_runtime(),
+        )
         conn = await client.connect()
         c = conn.rpc(timeout=TIMEOUT, serde=serde)
 
@@ -267,13 +302,16 @@ async def bench_via_router(serde: int, data: dict, label: str) -> list[float]:
 
 # ── main ──────────────────────────────────────────────────────────────────────
 
+
 async def _async_main() -> None:
     data: dict = json.loads(_DATA_FILE.read_text())
     payload_bytes = len(json.dumps(data).encode())
 
     modes = _serde_modes()
 
-    print(f"\ndaffi.aio performance benchmark  —  {N} sequential await rpc() calls per layout × serde")
+    print(
+        f"\ndaffi.aio performance benchmark  —  {N} sequential await rpc() calls per layout × serde"
+    )
     print(f"host: {HOST}   warmup: {WARMUP} calls   timeout: {TIMEOUT}s")
     print(f"payload: {_DATA_FILE.name}  ({payload_bytes} bytes JSON)\n")
 

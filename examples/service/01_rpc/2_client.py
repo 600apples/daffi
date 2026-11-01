@@ -6,11 +6,11 @@ The call blocks until the service returns the result.
 
 Run 1_service.py first.
 """
-from daffi import Client
 
+from daffi import Client, TCPTransport
 
 if __name__ == "__main__":
-    client = Client(app_name="calc-client", host="0.0.0.0", port=5001)
+    client = Client(app_name="calc-client", transport=TCPTransport("0.0.0.0", 5001))
     conn = client.connect()
 
     rpc = conn.rpc(timeout=5)

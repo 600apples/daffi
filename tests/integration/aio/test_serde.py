@@ -4,7 +4,9 @@ Async integration tests for all four wire serialisation formats.
 Mirrors tests/integration/test_serde.py using daffi.aio.
 All RPC calls use ``await conn.rpc()``.
 """
+
 from __future__ import annotations
+from tests.conftest import active_runtime
 
 import json
 import math
@@ -13,23 +15,11 @@ import pytest
 from .conftest import HOST, TIMEOUT
 
 
-def _msgpack_available() -> bool:
-    try:
-        import msgpack  # noqa: F401
-        return True
-    except ImportError:
-        return False
-
-
-skip_no_msgpack = pytest.mark.skipif(
-    not _msgpack_available(),
-    reason="msgpack not installed — run: pip install 'daffi[msgpack]'",
-)
-
-
 async def _rpc(port: int, name: str, method: str, *args, serde, **kwargs):
     from daffi.aio import AsyncClient
-    client = AsyncClient(app_name=name, host=HOST, port=port)
+    from daffi import TCPTransport
+
+    client = AsyncClient(app_name=name, transport=TCPTransport(HOST, port), runtime=active_runtime())
     conn = await client.connect()
     try:
         proxy = conn.rpc(timeout=TIMEOUT, serde=serde)
@@ -42,15 +32,19 @@ async def _rpc(port: int, name: str, method: str, *args, serde, **kwargs):
 # PICKLE
 # ══════════════════════════════════════════════════════════════════════════════
 
+
 @pytest.mark.asyncio
 class TestPickleAsync:
 
     async def _echo(self, port, name, payload):
-        from daffi import SerdeFormat
+        from daffi import SerdeFormat, TCPTransport
+
         return await _rpc(port, name, "echo", payload, serde=SerdeFormat.PICKLE)
 
     async def test_string(self, direct_service):
-        assert await self._echo(direct_service, "pk-str", "hello pickle") == "hello pickle"
+        assert (
+            await self._echo(direct_service, "pk-str", "hello pickle") == "hello pickle"
+        )
 
     async def test_bytes(self, direct_service):
         payload = b"\x00\x01\x02\xff"
@@ -103,8 +97,12 @@ class TestPickleAsync:
 
     async def test_multi_arg_kwargs(self, direct_service):
         from daffi.aio import AsyncClient
-        from daffi import SerdeFormat
-        client = AsyncClient(app_name="pk-multi", host=HOST, port=direct_service)
+        from daffi import SerdeFormat, TCPTransport
+
+        client = AsyncClient(
+            app_name="pk-multi", transport=TCPTransport(HOST, direct_service),
+            runtime=active_runtime(),
+        )
         conn = await client.connect()
         proxy = conn.rpc(timeout=TIMEOUT, serde=SerdeFormat.PICKLE)
         result = await proxy.add(100, 200)
@@ -116,11 +114,13 @@ class TestPickleAsync:
 # JSON
 # ══════════════════════════════════════════════════════════════════════════════
 
+
 @pytest.mark.asyncio
 class TestJsonAsync:
 
     async def _echo(self, port, name, payload):
-        from daffi import SerdeFormat
+        from daffi import SerdeFormat, TCPTransport
+
         return await _rpc(port, name, "echo", payload, serde=SerdeFormat.JSON)
 
     async def test_string(self, direct_service):
@@ -168,8 +168,12 @@ class TestJsonAsync:
 
     async def test_multi_arg(self, direct_service):
         from daffi.aio import AsyncClient
-        from daffi import SerdeFormat
-        client = AsyncClient(app_name="js-multi", host=HOST, port=direct_service)
+        from daffi import SerdeFormat, TCPTransport
+
+        client = AsyncClient(
+            app_name="js-multi", transport=TCPTransport(HOST, direct_service),
+            runtime=active_runtime(),
+        )
         conn = await client.connect()
         proxy = conn.rpc(timeout=TIMEOUT, serde=SerdeFormat.JSON)
         result = await proxy.add(7, 8)
@@ -178,8 +182,12 @@ class TestJsonAsync:
 
     async def test_kwargs(self, direct_service):
         from daffi.aio import AsyncClient
-        from daffi import SerdeFormat
-        client = AsyncClient(app_name="js-kwargs", host=HOST, port=direct_service)
+        from daffi import SerdeFormat, TCPTransport
+
+        client = AsyncClient(
+            app_name="js-kwargs", transport=TCPTransport(HOST, direct_service),
+            runtime=active_runtime(),
+        )
         conn = await client.connect()
         proxy = conn.rpc(timeout=TIMEOUT, serde=SerdeFormat.JSON)
         result = await proxy.add(a=3, b=4)
@@ -191,11 +199,13 @@ class TestJsonAsync:
 # OPAQUE
 # ══════════════════════════════════════════════════════════════════════════════
 
+
 @pytest.mark.asyncio
 class TestOpaqueAsync:
 
     async def _rpc_opaque(self, port, name, payload):
-        from daffi import SerdeFormat
+        from daffi import SerdeFormat, TCPTransport
+
         return await _rpc(port, name, "echo", payload, serde=SerdeFormat.OPAQUE)
 
     async def test_str_passthrough(self, direct_service):
@@ -229,7 +239,9 @@ class TestOpaqueAsync:
 
     async def test_bytes_large(self, direct_service):
         wire = bytes(range(256)) * 256
-        assert await self._rpc_opaque(direct_service, "op-large-bytes", wire) == wire
+        result = await self._rpc_opaque(direct_service, "op-large-bytes", wire)
+        assert result == wire
+        assert isinstance(result, bytes)
 
     async def test_bytes_preserves_type(self, direct_service):
         wire = b"binary payload"
@@ -241,10 +253,56 @@ class TestOpaqueAsync:
         result = await self._rpc_opaque(direct_service, "op-str-type", wire)
         assert isinstance(result, str)
 
+    async def test_bytearray_passthrough(self, direct_service):
+        wire = bytearray(b"\x00\x01\x02\xffdaffi")
+        result = await self._rpc_opaque(direct_service, "op-bytearray", wire)
+        assert result == bytes(wire)
+        assert isinstance(result, bytes)
+        assert not isinstance(result, bytearray)
+
+    async def test_bytearray_empty(self, direct_service):
+        result = await self._rpc_opaque(direct_service, "op-bytearray-empty", bytearray())
+        assert result == b""
+        assert isinstance(result, bytes)
+
+    async def test_bytearray_large(self, direct_service):
+        wire = bytearray(bytes(range(256)) * 256)
+        result = await self._rpc_opaque(direct_service, "op-bytearray-large", wire)
+        assert result == bytes(wire)
+        assert isinstance(result, bytes)
+
+    async def test_memoryview_passthrough(self, direct_service):
+        wire = memoryview(b"\x00\x01\x02\xffview")
+        result = await self._rpc_opaque(direct_service, "op-memoryview", wire)
+        assert result == wire.tobytes()
+        assert isinstance(result, bytes)
+        assert not isinstance(result, memoryview)
+
+    async def test_memoryview_of_bytearray(self, direct_service):
+        buf = bytearray(b"from-bytearray-view")
+        result = await self._rpc_opaque(direct_service, "op-mv-ba", memoryview(buf))
+        assert result == b"from-bytearray-view"
+        assert isinstance(result, bytes)
+
+    async def test_memoryview_empty(self, direct_service):
+        result = await self._rpc_opaque(direct_service, "op-mv-empty", memoryview(b""))
+        assert result == b""
+        assert isinstance(result, bytes)
+
+    async def test_memoryview_large(self, direct_service):
+        wire = memoryview(bytes(range(256)) * 256)
+        result = await self._rpc_opaque(direct_service, "op-mv-large", wire)
+        assert result == wire.tobytes()
+        assert isinstance(result, bytes)
+
     async def test_multiple_args_raises(self, direct_service):
         from daffi.aio import AsyncClient
-        from daffi import SerdeFormat
-        client = AsyncClient(app_name="op-multi-err", host=HOST, port=direct_service)
+        from daffi import SerdeFormat, TCPTransport
+
+        client = AsyncClient(
+            app_name="op-multi-err", transport=TCPTransport(HOST, direct_service),
+            runtime=active_runtime(),
+        )
         conn = await client.connect()
         proxy = conn.rpc(timeout=TIMEOUT, serde=SerdeFormat.OPAQUE)
         try:
@@ -255,8 +313,12 @@ class TestOpaqueAsync:
 
     async def test_keyword_arg_also_works(self, direct_service):
         from daffi.aio import AsyncClient
-        from daffi import SerdeFormat
-        client = AsyncClient(app_name="op-kwarg", host=HOST, port=direct_service)
+        from daffi import SerdeFormat, TCPTransport
+
+        client = AsyncClient(
+            app_name="op-kwarg", transport=TCPTransport(HOST, direct_service),
+            runtime=active_runtime(),
+        )
         conn = await client.connect()
         proxy = conn.rpc(timeout=TIMEOUT, serde=SerdeFormat.OPAQUE)
         wire = '{"via": "kwarg"}'
@@ -269,16 +331,20 @@ class TestOpaqueAsync:
 # MSGPACK
 # ══════════════════════════════════════════════════════════════════════════════
 
-@skip_no_msgpack
+
 @pytest.mark.asyncio
 class TestMsgpackAsync:
 
     async def _echo(self, port, name, payload):
-        from daffi import SerdeFormat
+        from daffi import SerdeFormat, TCPTransport
+
         return await _rpc(port, name, "echo", payload, serde=SerdeFormat.MSGPACK)
 
     async def test_string(self, direct_service):
-        assert await self._echo(direct_service, "mp-str", "hello msgpack") == "hello msgpack"
+        assert (
+            await self._echo(direct_service, "mp-str", "hello msgpack")
+            == "hello msgpack"
+        )
 
     async def test_int(self, direct_service):
         assert await self._echo(direct_service, "mp-int", 999) == 999
@@ -336,8 +402,12 @@ class TestMsgpackAsync:
 
     async def test_multi_arg(self, direct_service):
         from daffi.aio import AsyncClient
-        from daffi import SerdeFormat
-        client = AsyncClient(app_name="mp-multi", host=HOST, port=direct_service)
+        from daffi import SerdeFormat, TCPTransport
+
+        client = AsyncClient(
+            app_name="mp-multi", transport=TCPTransport(HOST, direct_service),
+            runtime=active_runtime(),
+        )
         conn = await client.connect()
         proxy = conn.rpc(timeout=TIMEOUT, serde=SerdeFormat.MSGPACK)
         result = await proxy.add(21, 21)
@@ -346,8 +416,12 @@ class TestMsgpackAsync:
 
     async def test_via_router(self, router_with_worker):
         from daffi.aio import AsyncClient
-        from daffi import SerdeFormat
-        client = AsyncClient(app_name="mp-router", host=HOST, port=router_with_worker)
+        from daffi import SerdeFormat, TCPTransport
+
+        client = AsyncClient(
+            app_name="mp-router", transport=TCPTransport(HOST, router_with_worker),
+            runtime=active_runtime(),
+        )
         conn = await client.connect()
         proxy = conn.rpc(timeout=TIMEOUT, serde=SerdeFormat.MSGPACK)
         payload = {"via": "async-router", "data": b"\xca\xfe"}
@@ -361,6 +435,7 @@ class TestMsgpackAsync:
 # Cross-format comparison
 # ══════════════════════════════════════════════════════════════════════════════
 
+
 @pytest.mark.asyncio
 class TestCrossFormatAsync:
 
@@ -368,42 +443,58 @@ class TestCrossFormatAsync:
 
     @pytest.mark.parametrize("serde_name", ["PICKLE", "JSON"])
     async def test_json_safe_payload(self, direct_service, serde_name):
-        from daffi import SerdeFormat
+        from daffi import SerdeFormat, TCPTransport
+
         serde = getattr(SerdeFormat, serde_name)
         result = await _rpc(
-            direct_service, f"cross-{serde_name.lower()}", "echo",
-            self.JSON_SAFE_PAYLOAD, serde=serde,
+            direct_service,
+            f"cross-{serde_name.lower()}",
+            "echo",
+            self.JSON_SAFE_PAYLOAD,
+            serde=serde,
         )
         assert result == self.JSON_SAFE_PAYLOAD
 
-    @skip_no_msgpack
     async def test_json_safe_payload_msgpack(self, direct_service):
-        from daffi import SerdeFormat
+        from daffi import SerdeFormat, TCPTransport
+
         result = await _rpc(
-            direct_service, "cross-msgpack", "echo",
-            self.JSON_SAFE_PAYLOAD, serde=SerdeFormat.MSGPACK,
+            direct_service,
+            "cross-msgpack",
+            "echo",
+            self.JSON_SAFE_PAYLOAD,
+            serde=SerdeFormat.MSGPACK,
         )
         assert result == self.JSON_SAFE_PAYLOAD
 
     async def test_opaque_str_is_independent_of_other_formats(self, direct_service):
-        from daffi import SerdeFormat
+        from daffi import SerdeFormat, TCPTransport
+
         payload = self.JSON_SAFE_PAYLOAD
         wire = json.dumps(payload)
         opaque_result = await _rpc(
-            direct_service, "cross-opaque", "echo", wire, serde=SerdeFormat.OPAQUE,
+            direct_service,
+            "cross-opaque",
+            "echo",
+            wire,
+            serde=SerdeFormat.OPAQUE,
         )
         assert opaque_result == wire
         assert json.loads(opaque_result) == payload
 
     async def test_pickle_preserves_what_json_loses(self, direct_service):
-        from daffi import SerdeFormat
+        from daffi import SerdeFormat, TCPTransport
+
         for payload, description in [
             (b"raw bytes", "bytes"),
             ((1, 2, 3), "tuple"),
             ({1, 2, 3}, "set"),
         ]:
             result = await _rpc(
-                direct_service, f"cross-pk-{description}", "echo",
-                payload, serde=SerdeFormat.PICKLE,
+                direct_service,
+                f"cross-pk-{description}",
+                "echo",
+                payload,
+                serde=SerdeFormat.PICKLE,
             )
             assert result == payload, f"{description} not preserved by PICKLE"

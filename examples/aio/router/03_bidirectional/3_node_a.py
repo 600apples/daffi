@@ -6,8 +6,9 @@ Uses AsyncClient as both a worker (registers 'status') and a caller
 
 Start 1_router.py and 2_node_b.py first, then this.
 """
+
 import asyncio
-from daffi import callback
+from daffi import callback, TCPTransport
 from daffi.aio import AsyncClient
 
 
@@ -19,7 +20,7 @@ async def status() -> str:
 
 
 async def main():
-    node = AsyncClient(app_name="node-a", host="0.0.0.0", port=6003)
+    node = AsyncClient(app_name="node-a", transport=TCPTransport("0.0.0.0", 6003))
     conn = await node.connect()
     print("node-a connected — waiting for node-b…")
 

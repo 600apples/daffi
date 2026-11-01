@@ -6,9 +6,10 @@ Node A does the symmetric thing — each node is both a caller and a worker.
 
 Start 1_router.py first, then this, then 3_node_a.py.
 """
+
 import time
 
-from daffi import Client, callback
+from daffi import Client, callback, TCPTransport
 
 
 @callback
@@ -18,7 +19,7 @@ def greet(name: str) -> str:
 
 
 if __name__ == "__main__":
-    node = Client(app_name="node-b", host="0.0.0.0", port=6003)
+    node = Client(app_name="node-b", transport=TCPTransport("0.0.0.0", 6003))
     conn = node.connect()
     print("node-b connected — waiting for node-a…")
 

@@ -8,20 +8,21 @@ Start after 1_router.py.  The caller (3_caller.py) blocks in
 wait_for_members() until this worker has registered itself, so the startup
 order of 2_worker.py and 3_caller.py does not matter.
 """
+
 import time
-from daffi import Client, callback
+from daffi import Client, callback, TCPTransport
 
 
 @callback
 def process(value: int) -> dict:
     time.sleep(0.1)  # simulate work
-    result = value ** 2
+    result = value**2
     print(f"[worker] process({value}) = {result}")
     return {"input": value, "result": result}
 
 
 if __name__ == "__main__":
-    worker = Client(app_name="calc-worker", host="0.0.0.0", port=6009)
+    worker = Client(app_name="calc-worker", transport=TCPTransport("0.0.0.0", 6009))
     worker.connect()
     print("Worker connected — press Ctrl+C to stop.")
     worker.join()

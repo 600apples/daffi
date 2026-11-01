@@ -3,7 +3,19 @@ Application-level exceptions for daffi.
 """
 
 
-class BaseException(Exception):
+__all__ = [
+    "DaffiError",
+    "InitializationError",
+    "Disconnected",
+    "Evicted",
+    "TransmissionFailure",
+    "RemoteCallError",
+    "SerdeNotAllowed",
+    "CallTimeout",
+]
+
+
+class DaffiError(Exception):
     """Base class for all daffi exceptions. Provides a ``fire()`` helper for
     raising the instance without an explicit ``raise`` statement."""
 
@@ -16,12 +28,12 @@ class BaseException(Exception):
         raise self
 
 
-class InitializationError(BaseException):
+class InitializationError(DaffiError):
     """Raised when a component (Router, Service, or Client) fails to start or
     connect, or is configured incorrectly."""
 
 
-class Disconnected(BaseException):
+class Disconnected(DaffiError):
     """Raised on a Client when the router or service it was connected to
     has stopped or closed the connection unexpectedly.
 
@@ -35,7 +47,7 @@ class Disconnected(BaseException):
     """
 
 
-class Evicted(BaseException):
+class Evicted(DaffiError):
     """Raised on a Client or Service-connected client when its slot in the
     router/service is taken over by a new connection with the same
     ``app_name`` (last-connection-wins semantics).
@@ -46,18 +58,26 @@ class Evicted(BaseException):
     than attempting to reconnect."""
 
 
-class TransmissionFailure(BaseException):
+class TransmissionFailure(DaffiError):
     """Raised when a message cannot be delivered.
 
     Common causes: no receiver found for the requested method, handshake
     timeout, or an expected receiver disconnected mid-call."""
 
 
-class RemoteCallError(BaseException):
+class RemoteCallError(DaffiError):
     """Raised on the caller side when the remote executor raised an exception."""
 
 
-class CallTimeout(BaseException, TimeoutError):
+class SerdeNotAllowed(DaffiError):
+    """Raised by a node refusing a request in a format it does not accept:
+    one outside its ``serdes=`` list, or PICKLE from a WebSocket peer.
+
+    The caller receives it as a :class:`RemoteCallError` named
+    ``SerdeNotAllowed``."""
+
+
+class CallTimeout(DaffiError, TimeoutError):
     """Raised when an outgoing RPC call does not receive a response within
     the configured timeout window.
 
@@ -98,3 +118,8 @@ class CallTimeout(BaseException, TimeoutError):
             f"  Receivers: {recv_str}\n"
             f"  Elapsed:   {elapsed:.1f}s"
         )
+
+
+# The old name of DaffiError.  Not in __all__: a star import would hide the
+# builtin BaseException.
+BaseException = DaffiError

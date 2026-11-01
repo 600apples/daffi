@@ -1,0 +1,16 @@
+syntax = "proto3";
+
+package daffi.perf;
+
+// Minimal unary echo — payload is opaque bytes (pre-encoded JSON from data.json).
+service Echo {
+  rpc Echo (EchoRequest) returns (EchoReply);
+}
+
+message EchoRequest {
+  bytes data = 1;
+}
+
+message EchoReply {
+  bytes data = 1;
+}

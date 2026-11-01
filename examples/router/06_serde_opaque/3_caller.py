@@ -6,13 +6,13 @@ Also shows cast_nowait() for fire-and-forget broadcasts.
 
 Run 1_router.py and 2_worker.py first.
 """
-import json
-from daffi import Client
-from daffi import SerdeFormat
 
+import json
+from daffi import Client, TCPTransport
+from daffi import SerdeFormat, TCPTransport
 
 if __name__ == "__main__":
-    caller = Client(app_name="opaque-caller", host="0.0.0.0", port=6006)
+    caller = Client(app_name="opaque-caller", transport=TCPTransport("0.0.0.0", 6006))
     conn = caller.connect()
 
     rpc = conn.rpc(timeout=5, serde=SerdeFormat.OPAQUE)

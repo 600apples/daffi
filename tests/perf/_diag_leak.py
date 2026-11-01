@@ -14,17 +14,25 @@ Log files:
     /tmp/dafi_worker.log   — worker process (Zig native log + faulthandler)
     /tmp/dafi_callers.log  — callers process (Zig native log)
 """
+import sys
+from pathlib import Path
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+from tests.conftest import active_runtime
 
 import multiprocessing as mp
+
 mp.set_start_method("spawn", force=True)
 
 import sys, time, socket, os, logging
 
-HOST    = "127.0.0.1"
+HOST = "127.0.0.1"
 PAYLOAD = {"x": 42, "msg": "hello"}
 
-ROUTER_LOG  = "/tmp/dafi_router.log"
-WORKER_LOG  = "/tmp/dafi_worker.log"
+ROUTER_LOG = "/tmp/dafi_router.log"
+WORKER_LOG = "/tmp/dafi_worker.log"
 CALLERS_LOG = "/tmp/dafi_callers.log"
 
 
@@ -38,13 +46,15 @@ def _redirect_native_log(log_path: str, native_level: int = 0) -> None:
     """Redirect fd-2 (stderr) to *log_path* and enable native Zig logging."""
     with open(log_path, "w") as f:
         os.dup2(f.fileno(), 2)  # native write(2,...) goes here
-    from daffi import dfcore
-    dfcore.setLogLevel(native_level)   # 0=DEBUG, 1=INFO, 2=WARN, 3=ERR, 4=off
+    from daffi import dfcore, TCPTransport
+
+    dfcore.setLogLevel(native_level)  # 0=DEBUG, 1=INFO, 2=WARN, 3=ERR, 4=off
 
 
 # ─── subprocesses ─────────────────────────────────────────────────────────────
 
-def proc_router(port):
+
+def proc_router(runtime: str, port):
     _redirect_native_log(ROUTER_LOG, native_level=0)
 
     # Python logging → same file so we see both Python and Zig events together
@@ -55,18 +65,20 @@ def proc_router(port):
         format="%(asctime)s [py-router] %(levelname)s %(message)s",
     )
 
-    from daffi import Router
-    r = Router(app_name="diag-router", host=HOST, port=port)
+    from daffi import Router, TCPTransport
+
+    r = Router(app_name="diag-router", transport=TCPTransport(HOST, port), runtime=runtime)
     r.start()
     r.join()
 
 
-def proc_worker(port, n_workers):
+def proc_worker(runtime: str, port, n_workers):
     _redirect_native_log(WORKER_LOG, native_level=0)
 
     # Enable faulthandler on fd-2 (now the log file) so SIGSEGV/SIGABRT dumps
     # a native Python stack trace into the log.
     import faulthandler
+
     faulthandler.enable()
 
     logging.basicConfig(
@@ -76,14 +88,17 @@ def proc_worker(port, n_workers):
         format="%(asctime)s [py-worker] %(levelname)s %(message)s",
     )
 
-    from daffi import Client, callback
+    from daffi import Client, callback, TCPTransport
 
     @callback
     def echo(p):
         return p
 
     logging.info(f"worker starting  n_workers={n_workers}")
-    c = Client(app_name="diag-worker", host=HOST, port=port, workers=n_workers)
+    c = Client(
+        app_name="diag-worker", workers=n_workers, transport=TCPTransport(HOST, port),
+        runtime=runtime,
+    )
     c.connect()
     logging.info("worker connected and ready")
 
@@ -100,7 +115,7 @@ def proc_worker(port, n_workers):
     logging.info("worker done")
 
 
-def proc_callers(port, n_callers, delay_s):
+def proc_callers(runtime: str, port, n_callers, delay_s):
     _redirect_native_log(CALLERS_LOG, native_level=1)  # INFO only — callers are noisy
 
     logging.basicConfig(
@@ -111,12 +126,12 @@ def proc_callers(port, n_callers, delay_s):
     )
 
     import threading
-    from daffi import Client
+    from daffi import Client, TCPTransport
 
     clients = []
     for i in range(n_callers):
         try:
-            cl = Client(app_name=f"dc-{i:03d}", host=HOST, port=port)
+            cl = Client(app_name=f"dc-{i:03d}", transport=TCPTransport(HOST, port), runtime=runtime)
             clients.append((cl, cl.connect()))
         except Exception as e:
             if i < 5:
@@ -125,7 +140,9 @@ def proc_callers(port, n_callers, delay_s):
     logging.warning(f"connected {len(clients)}/{n_callers} callers")
 
     stop = threading.Event()
-    calls = [0]; errors = [0]; lock = threading.Lock()
+    calls = [0]
+    errors = [0]
+    lock = threading.Lock()
 
     def run(cl, conn):
         rpc = conn.rpc(timeout=10)
@@ -161,6 +178,7 @@ def proc_callers(port, n_callers, delay_s):
 
 # ─── main monitor loop ────────────────────────────────────────────────────────
 
+
 def _tail(path: str, n: int = 60) -> str:
     """Return the last *n* lines of *path*, or an error message."""
     try:
@@ -172,10 +190,10 @@ def _tail(path: str, n: int = 60) -> str:
 
 
 if __name__ == "__main__":
-    N_CALLERS  = int(sys.argv[1])   if len(sys.argv) > 1 else 100
-    N_WORKERS  = int(sys.argv[2])   if len(sys.argv) > 2 else 100
-    DELAY      = float(sys.argv[3]) if len(sys.argv) > 3 else 0.01
-    MAX_WAIT_S = int(sys.argv[4])   if len(sys.argv) > 4 else 120
+    N_CALLERS = int(sys.argv[1]) if len(sys.argv) > 1 else 100
+    N_WORKERS = int(sys.argv[2]) if len(sys.argv) > 2 else 100
+    DELAY = float(sys.argv[3]) if len(sys.argv) > 3 else 0.01
+    MAX_WAIT_S = int(sys.argv[4]) if len(sys.argv) > 4 else 120
 
     # Clear previous logs
     for p in (ROUTER_LOG, WORKER_LOG, CALLERS_LOG):
@@ -187,27 +205,28 @@ if __name__ == "__main__":
         flush=True,
     )
     print(
-        f"logs: router={ROUTER_LOG}  worker={WORKER_LOG}  "
-        f"callers={CALLERS_LOG}",
+        f"logs: router={ROUTER_LOG}  worker={WORKER_LOG}  " f"callers={CALLERS_LOG}",
         flush=True,
     )
 
-    port   = _free_port()
-    router = mp.Process(target=proc_router,  args=(port,), daemon=True)
-    worker = mp.Process(target=proc_worker,  args=(port, N_WORKERS), daemon=True)
+    port = _free_port()
+    router = mp.Process(target=proc_router, args=(active_runtime(), port,), daemon=True)
+    worker = mp.Process(target=proc_worker, args=(active_runtime(), port, N_WORKERS), daemon=True)
 
     router.start()
     time.sleep(0.5)
     worker.start()
-    time.sleep(2.5)   # wait for worker to connect + handshake
+    time.sleep(2.5)  # wait for worker to connect + handshake
 
-    callers = mp.Process(target=proc_callers, args=(port, N_CALLERS, DELAY), daemon=True)
+    callers = mp.Process(
+        target=proc_callers, args=(active_runtime(), port, N_CALLERS, DELAY), daemon=True
+    )
     callers.start()
 
     # ── monitor ──────────────────────────────────────────────────────────────
-    poll_interval = 3   # seconds between liveness checks
-    elapsed       = 0
-    crash_at      = None
+    poll_interval = 3  # seconds between liveness checks
+    elapsed = 0
+    crash_at = None
 
     while elapsed < MAX_WAIT_S:
         time.sleep(poll_interval)
@@ -231,7 +250,9 @@ if __name__ == "__main__":
             print(f"t={elapsed:4d}s  router=OK  worker=OK  callers={c_ok}", flush=True)
 
     else:
-        print(f"\nAll processes survived {MAX_WAIT_S}s — no crash detected.", flush=True)
+        print(
+            f"\nAll processes survived {MAX_WAIT_S}s — no crash detected.", flush=True
+        )
 
     # ── kill everything ───────────────────────────────────────────────────────
     for p in (callers, worker, router):
