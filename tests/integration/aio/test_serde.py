@@ -253,6 +253,48 @@ class TestOpaqueAsync:
         result = await self._rpc_opaque(direct_service, "op-str-type", wire)
         assert isinstance(result, str)
 
+    async def test_bytearray_passthrough(self, direct_service):
+        wire = bytearray(b"\x00\x01\x02\xffdaffi")
+        result = await self._rpc_opaque(direct_service, "op-bytearray", wire)
+        assert result == bytes(wire)
+        assert isinstance(result, bytes)
+        assert not isinstance(result, bytearray)
+
+    async def test_bytearray_empty(self, direct_service):
+        result = await self._rpc_opaque(direct_service, "op-bytearray-empty", bytearray())
+        assert result == b""
+        assert isinstance(result, bytes)
+
+    async def test_bytearray_large(self, direct_service):
+        wire = bytearray(bytes(range(256)) * 256)
+        result = await self._rpc_opaque(direct_service, "op-bytearray-large", wire)
+        assert result == bytes(wire)
+        assert isinstance(result, bytes)
+
+    async def test_memoryview_passthrough(self, direct_service):
+        wire = memoryview(b"\x00\x01\x02\xffview")
+        result = await self._rpc_opaque(direct_service, "op-memoryview", wire)
+        assert result == wire.tobytes()
+        assert isinstance(result, bytes)
+        assert not isinstance(result, memoryview)
+
+    async def test_memoryview_of_bytearray(self, direct_service):
+        buf = bytearray(b"from-bytearray-view")
+        result = await self._rpc_opaque(direct_service, "op-mv-ba", memoryview(buf))
+        assert result == b"from-bytearray-view"
+        assert isinstance(result, bytes)
+
+    async def test_memoryview_empty(self, direct_service):
+        result = await self._rpc_opaque(direct_service, "op-mv-empty", memoryview(b""))
+        assert result == b""
+        assert isinstance(result, bytes)
+
+    async def test_memoryview_large(self, direct_service):
+        wire = memoryview(bytes(range(256)) * 256)
+        result = await self._rpc_opaque(direct_service, "op-mv-large", wire)
+        assert result == wire.tobytes()
+        assert isinstance(result, bytes)
+
     async def test_multiple_args_raises(self, direct_service):
         from daffi.aio import AsyncClient
         from daffi import SerdeFormat, TCPTransport

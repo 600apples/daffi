@@ -4,8 +4,9 @@ Integration tests for all four wire serialisation formats.
 Format summary
 --------------
 OPAQUE  (0) — Zero-copy pass-through.  Caller must supply exactly one argument
-              (``bytes`` or ``str``); it arrives at the callback unchanged.
-              Raises TypeError when more than one argument is provided.
+              (``bytes``, ``bytearray``, ``memoryview``, or ``str``).  Binary
+              payloads arrive as immutable ``bytes``.  Raises TypeError when
+              more than one argument is provided.
 
 JSON    (1) — ``{"args": [...], "kwargs": {...}}`` envelope via json.dumps/loads.
               Tuples become lists.  No bytes, sets, or non-string dict keys.
@@ -222,7 +223,7 @@ class TestJson:
 
 
 class TestOpaque:
-    """OPAQUE zero-copy pass-through: exactly one str or bytes argument."""
+    """OPAQUE zero-copy pass-through: one str / bytes / bytearray / memoryview."""
 
     def _rpc_opaque(self, port, name, payload):
         from daffi import SerdeFormat, TCPTransport
@@ -281,6 +282,52 @@ class TestOpaque:
         wire = "string payload"
         result = self._rpc_opaque(direct_service, "op-str-type", wire)
         assert isinstance(result, str)
+
+    # ── bytearray / memoryview (CFFI buffer protocol) ─────────────────────────
+
+    def test_bytearray_passthrough(self, direct_service):
+        """bytearray is accepted on send; the peer always receives bytes."""
+        wire = bytearray(b"\x00\x01\x02\xffdaffi")
+        result = self._rpc_opaque(direct_service, "op-bytearray", wire)
+        assert result == bytes(wire)
+        assert isinstance(result, bytes)
+        assert not isinstance(result, bytearray)
+
+    def test_bytearray_empty(self, direct_service):
+        result = self._rpc_opaque(direct_service, "op-bytearray-empty", bytearray())
+        assert result == b""
+        assert isinstance(result, bytes)
+
+    def test_bytearray_large(self, direct_service):
+        wire = bytearray(bytes(range(256)) * 256)  # 64 KiB
+        result = self._rpc_opaque(direct_service, "op-bytearray-large", wire)
+        assert result == bytes(wire)
+        assert isinstance(result, bytes)
+
+    def test_memoryview_passthrough(self, direct_service):
+        """memoryview is accepted on send; the peer always receives bytes."""
+        wire = memoryview(b"\x00\x01\x02\xffview")
+        result = self._rpc_opaque(direct_service, "op-memoryview", wire)
+        assert result == wire.tobytes()
+        assert isinstance(result, bytes)
+        assert not isinstance(result, memoryview)
+
+    def test_memoryview_of_bytearray(self, direct_service):
+        buf = bytearray(b"from-bytearray-view")
+        result = self._rpc_opaque(direct_service, "op-mv-ba", memoryview(buf))
+        assert result == b"from-bytearray-view"
+        assert isinstance(result, bytes)
+
+    def test_memoryview_empty(self, direct_service):
+        result = self._rpc_opaque(direct_service, "op-mv-empty", memoryview(b""))
+        assert result == b""
+        assert isinstance(result, bytes)
+
+    def test_memoryview_large(self, direct_service):
+        wire = memoryview(bytes(range(256)) * 256)
+        result = self._rpc_opaque(direct_service, "op-mv-large", wire)
+        assert result == wire.tobytes()
+        assert isinstance(result, bytes)
 
     # ── error case ────────────────────────────────────────────────────────────
 

@@ -324,14 +324,25 @@ pub const Stream = struct {
         return total;
     }
 
+    /// Evented sockets stay non-blocking.  `write` / `writeAllParts` from a
+    /// worker then see EAGAIN when the kernel buffer is full — wait, do not
+    /// treat that as SO_SNDTIMEO (which only applies to blocking sockets).
+    fn waitWritable(self: Stream) !void {
+        if (!isNonBlocking(self.handle)) return error.WriteTimeout;
+        if (!waitFd(self.handle, WAIT_WRITE, @intCast(SEND_STALL_TIMEOUT_MS)))
+            return error.WriteTimeout;
+    }
+
     pub fn write(self: Stream, data: []const u8) !usize {
         while (true) {
             const result = c.write(self.handle, data.ptr, data.len);
             if (result >= 0) return @intCast(result);
             switch (lastErrno()) {
                 .INTR => continue,
-                // SO_SNDTIMEO expired.
-                .AGAIN => return error.WriteTimeout,
+                .AGAIN => {
+                    try self.waitWritable();
+                    continue;
+                },
                 else => return error.WriteError,
             }
         }
@@ -405,7 +416,10 @@ pub const Stream = struct {
             const result = writev(self.handle, iov[first..].ptr, @intCast(iov.len - first));
             if (result < 0) switch (lastErrno()) {
                 .INTR => continue,
-                .AGAIN => return error.WriteTimeout,
+                .AGAIN => {
+                    try self.waitWritable();
+                    continue;
+                },
                 else => return error.WriteError,
             };
             var sent: usize = @intCast(result);
@@ -881,4 +895,39 @@ test "writeNonBlockingParts sends head and body in one write" {
     var got: [8]u8 = undefined;
     try std.testing.expectEqual(@as(isize, 8), c.read(fds[1], &got, got.len));
     try std.testing.expectEqualSlices(u8, "HEADBODY", &got);
+}
+
+test "writeAllParts waits on EAGAIN when the socket is non-blocking" {
+    var fds: [2]c_int = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), c.socketpair(c.AF_UNIX, c.SOCK_STREAM, 0, &fds));
+    defer for (fds) |fd| {
+        _ = c.close(fd);
+    };
+    setNonBlocking(fds[0]);
+    const writer = Stream{ .handle = fds[0] };
+
+    var filler: [4096]u8 = undefined;
+    @memset(&filler, 0xAB);
+    while (true) {
+        const n = try writer.writeNonBlocking(&filler);
+        if (n < filler.len) break;
+    }
+
+    const Reader = struct {
+        fn run(fd: c_int) void {
+            var buf: [4096]u8 = undefined;
+            while (true) {
+                const n = c.read(fd, &buf, buf.len);
+                if (n <= 0) return;
+            }
+        }
+    };
+    const t = try std.Thread.spawn(.{}, Reader.run, .{fds[1]});
+    defer t.join();
+
+    const head = "HEAD";
+    var body: [256 * 1024]u8 = undefined;
+    @memset(&body, 0xCD);
+    try writer.writeAllParts(head, &body);
+    _ = c.shutdown(fds[0], c.SHUT_WR);
 }
