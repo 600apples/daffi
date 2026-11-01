@@ -239,7 +239,9 @@ class TestOpaqueAsync:
 
     async def test_bytes_large(self, direct_service):
         wire = bytes(range(256)) * 256
-        assert await self._rpc_opaque(direct_service, "op-large-bytes", wire) == wire
+        result = await self._rpc_opaque(direct_service, "op-large-bytes", wire)
+        assert result == wire
+        assert isinstance(result, bytes)
 
     async def test_bytes_preserves_type(self, direct_service):
         wire = b"binary payload"

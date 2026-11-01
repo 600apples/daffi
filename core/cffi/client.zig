@@ -137,8 +137,10 @@ fn identTuple(msgident: Client.MessageIdentifier) [*c]PyObject {
 pub const Payload = struct {
     slice: []const u8,
     converted: ?*PyObject,
+    view: ?py.Py_buffer = null,
 
     pub fn deinit(self: *Payload) void {
+        if (self.view) |*v| py.PyBuffer_Release(v);
         if (self.converted) |obj| py.Py_DECREF(obj);
     }
 };
@@ -158,20 +160,18 @@ pub fn bytesOf(data: *PyObject) ?Payload {
         const utf8 = py.PyUnicode_AsUTF8AndSize(data, &size) orelse return null;
         return .{ .slice = @as([*]const u8, @ptrCast(utf8))[0..@intCast(size)], .converted = null };
     }
-    if (py.PyObject_CheckBuffer(data) == 0) {
-        const text = py.PyObject_Str(data) orelse return null;
-        const utf8 = py.PyUnicode_AsUTF8AndSize(text, &size) orelse {
-            py.Py_DECREF(text);
-            return null;
-        };
-        return .{ .slice = @as([*]const u8, @ptrCast(utf8))[0..@intCast(size)], .converted = text };
+    if (py.PyObject_CheckBuffer(data) != 0) {
+        var view: py.Py_buffer = std.mem.zeroes(py.Py_buffer);
+        if (py.PyObject_GetBuffer(data, &view, 0) < 0) return null;
+        const ptr: [*]const u8 = @ptrCast(view.buf);
+        return .{ .slice = ptr[0..@intCast(view.len)], .converted = null, .view = view };
     }
-    const converted = py.PyBytes_FromObject(data) orelse return null;
-    if (py.PyBytes_AsStringAndSize(converted, @ptrCast(&raw), &size) < 0) {
-        py.Py_DECREF(converted);
+    const text = py.PyObject_Str(data) orelse return null;
+    const utf8 = py.PyUnicode_AsUTF8AndSize(text, &size) orelse {
+        py.Py_DECREF(text);
         return null;
-    }
-    return .{ .slice = raw[0..@intCast(size)], .converted = converted };
+    };
+    return .{ .slice = @as([*]const u8, @ptrCast(utf8))[0..@intCast(size)], .converted = text };
 }
 
 /// Send the initial client handshake advertising exported method names.
@@ -190,9 +190,10 @@ pub fn sendHandshakeFromClient(_: [*c]PyObject, args: [*c]PyObject) callconv(.c)
     return identTuple(msgident);
 }
 
-/// The payload of `msg` as a new reference.  A text payload that is not
-/// valid UTF-8 comes back as `bytes`: it is the peer's data, and failing
-/// here would lose the message (and, in a dispatcher, the dispatcher).
+/// The payload of `msg` as a new `bytes` or `str`.  Always a copy: a
+/// memoryview over the native buffer would be a different type, could be
+/// written if exported writable, and would pin the Message until GC.
+/// A text payload that is not valid UTF-8 comes back as `bytes`.
 fn payloadObject(msg: *serde.Message) [*c]PyObject {
     const data: []const u8 = msg.getData();
     const len: py.Py_ssize_t = @intCast(data.len);

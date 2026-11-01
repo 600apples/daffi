@@ -18,6 +18,7 @@ pub const op_table = OperationTable{
     .write = write,
     .writeParts = writeParts,
     .writeNonBlocking = writeNonBlocking,
+    .writeNonBlockingParts = writeNonBlockingParts,
     .accept = accept,
     .handle = handle,
     .hasPendingInput = hasPendingInput,
@@ -154,6 +155,12 @@ pub fn writeNonBlocking(ctx: *anyopaque, data: []const u8) !usize {
     // A TLS record cannot be half-written and resumed by another thread.
     if (self.ssl != null) return 0;
     return self.stream.writeNonBlocking(data);
+}
+
+pub fn writeNonBlockingParts(ctx: *anyopaque, head: []const u8, body: []const u8) !usize {
+    const self: *ClientConnection = @ptrCast(@alignCast(ctx));
+    if (self.ssl != null) return 0;
+    return self.stream.writeNonBlockingParts(head, body);
 }
 
 pub fn writeParts(ctx: *anyopaque, head: []const u8, body: []const u8) !void {

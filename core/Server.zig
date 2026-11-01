@@ -1103,6 +1103,9 @@ fn ConnectionSource(comptime mode: HandlerMode) type {
                 .conn = conn,
                 .decoder = .initPooled(rt.allocator, rt.msgpool.freelist),
             };
+            // Evented sockets stay non-blocking so Darwin `writeNonBlocking`
+            // does not fcntl-toggle on every send.
+            net.setNonBlocking(conn.handle());
             try loop.register(&self.source);
         }
 

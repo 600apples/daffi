@@ -266,7 +266,9 @@ class TestOpaque:
 
     def test_bytes_large(self, direct_service):
         wire = bytes(range(256)) * 256  # 64 KiB
-        assert self._rpc_opaque(direct_service, "op-large-bytes", wire) == wire
+        result = self._rpc_opaque(direct_service, "op-large-bytes", wire)
+        assert result == wire
+        assert isinstance(result, bytes)
 
     def test_bytes_preserves_type(self, direct_service):
         """bytes sent → bytes received; not silently promoted to str."""

@@ -149,12 +149,16 @@ pub const FrameDecoder = struct {
     }
 
     pub fn initPooled(allocator: Allocator, freelist: *RecvFreelist) FrameDecoder {
+        // Same retain Messages take: a decoder may still free/alloc after
+        // MessagePool.deinit if stop's drain order changes.
+        freelist.retain();
         return .{ .allocator = allocator, .freelist = freelist };
     }
 
     pub fn deinit(self: *FrameDecoder) void {
         if (self.frame.len != 0) self.freeFrame(self.frame);
         self.releaseBudget();
+        if (self.freelist) |fl| fl.release(Message);
         self.* = undefined;
     }
 
@@ -671,10 +675,10 @@ test "CFFI late Message.deinit: refcounted freelist vs pre-fix pool-owned UAF" {
         var input: []const u8 = raw.data;
         const msg = (try decoder.next(&input)).?;
         try expect(msg.freelist == freelist);
-        try expect(freelist.refcount.load(.monotonic) == 2); // pool + message
+        try expect(freelist.refcount.load(.monotonic) == 3); // pool + decoder + message
 
         pool.deinit(); // CFFI release → stop → msgpool.deinit
-        try expect(freelist.refcount.load(.monotonic) == 1);
+        try expect(freelist.refcount.load(.monotonic) == 2); // decoder + message
         // Freelist is still alive — recycling must work (would UAF if destroyed).
         const probe = try freelist.allocBuf(64);
         freelist.freeBuf(probe);
@@ -732,4 +736,30 @@ test "CFFI late Message.deinit: refcounted freelist vs pre-fix pool-owned UAF" {
         try expect(decoy.msg_len == 1);
         try expect(decoy.buf_len[0] + decoy.buf_len[1] + decoy.buf_len[2] == 1);
     }
+}
+
+test "FrameDecoder retain keeps the freelist after MessagePool.deinit" {
+    const backing = std.testing.allocator;
+    const payload = "decoder-outlives-pool";
+    const raw = try RawMessage.create(backing, payload, 4, .REQUEST, .OPAQUE, true, false, "tx", "rx", "fn");
+    defer backing.free(raw.data);
+
+    const pool = try MessagePool.init(backing);
+    const freelist = pool.freelist;
+    var decoder = FrameDecoder.initPooled(backing, freelist);
+    try expect(freelist.refcount.load(.monotonic) == 2); // pool + decoder
+
+    // Header only: decoder holds a class buffer from the freelist.
+    var input: []const u8 = raw.data[0..serde.HEADER_SIZE];
+    try expect((try decoder.next(&input)) == null);
+    try expect(decoder.partial());
+
+    pool.deinit();
+    try expect(freelist.refcount.load(.monotonic) == 1);
+    // Would UAF here if the decoder had not retained.
+    input = raw.data[serde.HEADER_SIZE..];
+    const msg = (try decoder.next(&input)).?;
+    try expect(std.mem.eql(u8, msg.getData(), payload));
+    msg.deinit();
+    decoder.deinit();
 }

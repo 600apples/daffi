@@ -11,6 +11,7 @@ pub const op_table = OperationTable{
     .write = undefined, // wasm doesn't have net package functionality
     .writeParts = undefined, // wasm doesn't have net package functionality
     .writeNonBlocking = undefined, // wasm doesn't have net package functionality
+    .writeNonBlockingParts = undefined, // wasm doesn't have net package functionality
     .accept = undefined, // wasm doesn't have net package functionality
     .handle = undefined, // wasm doesn't have net package functionality
     .hasPendingInput = undefined, // wasm doesn't have net package functionality

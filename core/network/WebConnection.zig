@@ -26,6 +26,7 @@ pub const op_table = OperationTable{
     .write = write,
     .writeParts = writeParts,
     .writeNonBlocking = writeNonBlocking,
+    .writeNonBlockingParts = writeNonBlockingParts,
     .accept = accept,
     .handle = handle,
     .hasPendingInput = hasPendingInput,
@@ -116,6 +117,10 @@ pub fn write(ctx: *anyopaque, data: []const u8) !void {
 
 /// A frame header is only known for the whole message: always queued.
 pub fn writeNonBlocking(_: *anyopaque, _: []const u8) !usize {
+    return 0;
+}
+
+pub fn writeNonBlockingParts(_: *anyopaque, _: []const u8, _: []const u8) !usize {
     return 0;
 }
 

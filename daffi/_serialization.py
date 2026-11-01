@@ -23,8 +23,8 @@ class SerdeFormat(IntEnum):
     OPAQUE = 0
     """Zero-copy pass-through.  daffi does not interpret the payload and
     ships it on the wire unchanged.  The single argument must already be
-    ``bytes`` or ``str`` — both are accepted and the wire layer preserves the
-    original type for the receiver."""
+    ``bytes``, ``bytearray``, ``memoryview``, or ``str``.  Received binary
+    payloads are always immutable ``bytes``."""
 
     JSON = 1
     """All positional and keyword arguments are encoded as a JSON object
@@ -103,11 +103,14 @@ class Serializer:
         # so stream acks and similar OPAQUE round-trips stay usable.
         if data is None:
             data = b""
-        elif not isinstance(data, (bytes, str)):
+        elif isinstance(data, str):
+            return data, False
+        elif not isinstance(data, (bytes, bytearray, memoryview)):
             raise TypeError(
-                f"SerdeFormat.OPAQUE accepts bytes or str, got {type(data).__name__}."
+                f"SerdeFormat.OPAQUE accepts bytes, bytearray, memoryview, or str, "
+                f"got {type(data).__name__}."
             )
-        return data, isinstance(data, bytes)
+        return data, True
 
     @staticmethod
     def _serialize_json(*args, **kwargs) -> Tuple[str, bool]:

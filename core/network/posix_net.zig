@@ -13,6 +13,30 @@ const O_NONBLOCK: c_int = switch (@import("builtin").target.os.tag) {
 };
 extern "c" fn fcntl(fd: c_int, cmd: c_int, ...) c_int;
 
+/// Darwin ignores MSG_DONTWAIT on send, so a blocking socket is flipped
+/// non-blocking for the call.  Evented sockets already are; skip the dance.
+const darwinNonblock = struct {
+    const darwin = @import("builtin").target.os.tag.isDarwin();
+
+    const Guard = struct {
+        fd: c_int,
+        restore: ?c_int,
+
+        fn leave(self: @This()) void {
+            if (self.restore) |flags| _ = fcntl(self.fd, F_SETFL, flags);
+        }
+    };
+
+    fn enter(fd: c_int) ?Guard {
+        if (!darwin) return .{ .fd = fd, .restore = null };
+        const flags = fcntl(fd, F_GETFL, @as(c_int, 0));
+        if (flags < 0) return null;
+        if (flags & O_NONBLOCK != 0) return .{ .fd = fd, .restore = null };
+        _ = fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+        return .{ .fd = fd, .restore = flags };
+    }
+};
+
 /// Keeps a write to a closed peer an error instead of a SIGPIPE (Linux; on
 /// macOS the process ignores SIGPIPE, as Python does).
 const no_sigpipe: c_int = if (@import("builtin").target.os.tag == .linux) std.c.MSG.NOSIGNAL else 0;
@@ -127,6 +151,11 @@ pub fn setNonBlocking(fd: c_int) void {
 pub fn setBlocking(fd: c_int) void {
     const flags = fcntl(fd, F_GETFL, @as(c_int, 0));
     if (flags >= 0 and flags & O_NONBLOCK != 0) _ = fcntl(fd, F_SETFL, flags & ~O_NONBLOCK);
+}
+
+pub fn isNonBlocking(fd: c_int) bool {
+    const flags = fcntl(fd, F_GETFL, @as(c_int, 0));
+    return flags >= 0 and flags & O_NONBLOCK != 0;
 }
 
 /// A write to an accepted peer that makes no progress for this long fails,
@@ -318,15 +347,8 @@ pub const Stream = struct {
     /// Send what the socket buffer takes without waiting; returns how much.
     /// The caller must be the only writer.
     pub fn writeNonBlocking(self: Stream, data: []const u8) !usize {
-        // Darwin ignores MSG_DONTWAIT on send: make the socket non-blocking
-        // for the duration instead.
-        const darwin = comptime @import("builtin").target.os.tag.isDarwin();
-        const flags = if (darwin) fcntl(self.handle, F_GETFL, @as(c_int, 0)) else 0;
-        if (flags < 0) return 0;
-        if (darwin) _ = fcntl(self.handle, F_SETFL, flags | O_NONBLOCK);
-        defer if (darwin) {
-            _ = fcntl(self.handle, F_SETFL, flags);
-        };
+        const nb = darwinNonblock.enter(self.handle) orelse return 0;
+        defer nb.leave();
         var sent: usize = 0;
         while (sent < data.len) {
             const result = std.c.send(self.handle, data[sent..].ptr, data.len - sent, std.c.MSG.DONTWAIT | no_sigpipe);
@@ -341,6 +363,37 @@ pub const Stream = struct {
             }
         }
         return sent;
+    }
+
+    /// `writeNonBlocking` of `head` then `body` in one writev when the
+    /// socket takes both.
+    pub fn writeNonBlockingParts(self: Stream, head: []const u8, body: []const u8) !usize {
+        if (head.len == 0) return self.writeNonBlocking(body);
+        if (body.len == 0) return self.writeNonBlocking(head);
+        const nb = darwinNonblock.enter(self.handle) orelse return 0;
+        defer nb.leave();
+        var iov = [2]IoVec{ .{ .base = head.ptr, .len = head.len }, .{ .base = body.ptr, .len = body.len } };
+        var first: usize = 0;
+        var sent_total: usize = 0;
+        while (first < iov.len) {
+            const result = writev(self.handle, iov[first..].ptr, @intCast(iov.len - first));
+            if (result < 0) switch (lastErrno()) {
+                .INTR => continue,
+                .AGAIN => return sent_total,
+                else => return error.WriteError,
+            };
+            var sent: usize = @intCast(result);
+            sent_total += sent;
+            while (first < iov.len and sent >= iov[first].len) {
+                sent -= iov[first].len;
+                first += 1;
+            }
+            if (first < iov.len) {
+                iov[first].base += sent;
+                iov[first].len -= sent;
+            }
+        }
+        return sent_total;
     }
 
     /// `writeAll(head)` then `writeAll(body)` in as few system calls as the
@@ -802,4 +855,30 @@ test "writeNonBlocking returns at a full buffer and leaves the socket blocking" 
     try std.testing.expect(sent < data.len);
     try std.testing.expect(misc.monotonicMs() - started < 1000);
     try std.testing.expectEqual(flags_before, fcntl(fds[0], F_GETFL, @as(c_int, 0)));
+}
+
+test "writeNonBlocking leaves an already-nonblocking socket nonblocking" {
+    var fds: [2]c_int = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), c.socketpair(c.AF_UNIX, c.SOCK_STREAM, 0, &fds));
+    defer for (fds) |fd| {
+        _ = c.close(fd);
+    };
+    setNonBlocking(fds[0]);
+    try std.testing.expect(isNonBlocking(fds[0]));
+    const sent = try (Stream{ .handle = fds[0] }).writeNonBlocking("abc");
+    try std.testing.expectEqual(@as(usize, 3), sent);
+    try std.testing.expect(isNonBlocking(fds[0]));
+}
+
+test "writeNonBlockingParts sends head and body in one write" {
+    var fds: [2]c_int = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), c.socketpair(c.AF_UNIX, c.SOCK_STREAM, 0, &fds));
+    defer for (fds) |fd| {
+        _ = c.close(fd);
+    };
+    const sent = try (Stream{ .handle = fds[0] }).writeNonBlockingParts("HEAD", "BODY");
+    try std.testing.expectEqual(@as(usize, 8), sent);
+    var got: [8]u8 = undefined;
+    try std.testing.expectEqual(@as(isize, 8), c.read(fds[1], &got, got.len));
+    try std.testing.expectEqualSlices(u8, "HEADBODY", &got);
 }

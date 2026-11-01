@@ -136,6 +136,9 @@ pub const OperationTable = struct {
     /// Send what the socket takes without blocking and return how much that
     /// was; 0 when the transport cannot (TLS, WebSocket).
     writeNonBlocking: *const fn (ctx: *anyopaque, data: []const u8) anyerror!usize,
+    /// `writeNonBlocking` of `head` then `body` (writev).  0 when the
+    /// transport cannot (TLS, WebSocket).
+    writeNonBlockingParts: *const fn (ctx: *anyopaque, head: []const u8, body: []const u8) anyerror!usize,
     /// Write `head` then `body` as one message (one WebSocket frame).
     writeParts: *const fn (ctx: *anyopaque, head: []const u8, body: []const u8) anyerror!void,
     /// Wait up to `timeout_ms` for an inbound connection; `error.Timeout`
@@ -154,6 +157,25 @@ pub const OperationTable = struct {
     getAddr: *const fn (ctx: *anyopaque) ?NetAddress,
 };
 
+/// One queued write: prefix and body stay separate so drain can writev
+/// them instead of joining into one allocation.
+const OutboxEntry = struct {
+    parts: [2][]u8 = .{ &.{}, &.{} },
+    n: u8 = 0,
+
+    fn bytes(self: OutboxEntry) usize {
+        var total: usize = 0;
+        for (self.parts[0..self.n]) |p| total += p.len;
+        return total;
+    }
+
+    fn deinit(self: OutboxEntry, allocator: Allocator) void {
+        for (self.parts[0..self.n]) |p| {
+            if (p.len != 0) allocator.free(p);
+        }
+    }
+};
+
 pub fn Connection(comptime contype: ConnectionType) type {
     const T = switch (contype) {
         .ClientConnectionType => if (is_wasm) WasmConnection else ClientConnection,
@@ -170,7 +192,10 @@ pub fn Connection(comptime contype: ConnectionType) type {
         /// not take at once is queued here, in order, and a blocking-pool
         /// worker sends it (see `post`).
         outbox_mutex: Mutex = .{},
-        outbox: std.ArrayList([]u8) = .empty,
+        /// Ring of `OutboxEntry`.  `head` is the next to send.
+        outbox: []OutboxEntry = &.{},
+        outbox_head: usize = 0,
+        outbox_len: usize = 0,
         outbox_bytes: usize = 0,
         /// A worker owns the write side and is sending the outbox.
         outbox_draining: bool = false,
@@ -262,22 +287,33 @@ pub fn Connection(comptime contype: ConnectionType) type {
                 try self.enqueue(parts, 0);
                 return self.startDrain(false);
             }
-            var skip: usize = 0;
-            for (parts) |part| {
-                const sent = self.op_table.writeNonBlocking(self.ctx, part) catch |err| {
+            var sent: usize = 0;
+            if (parts.len == 2) {
+                sent = self.op_table.writeNonBlockingParts(self.ctx, parts[0], parts[1]) catch |err| {
                     self.wlock.unlock();
                     self.close();
                     return err;
                 };
-                skip += sent;
-                if (sent < part.len) break;
             } else {
+                for (parts) |part| {
+                    const got = self.op_table.writeNonBlocking(self.ctx, part) catch |err| {
+                        self.wlock.unlock();
+                        self.close();
+                        return err;
+                    };
+                    sent += got;
+                    if (got < part.len) break;
+                }
+            }
+            var total: usize = 0;
+            for (parts) |p| total += p.len;
+            if (sent >= total) {
                 self.wlock.unlock();
                 return;
             }
             // Part of a frame may be out: keep the write side, and hand it
             // to the worker that sends the rest.
-            self.enqueue(parts, skip) catch |err| {
+            self.enqueue(parts, sent) catch |err| {
                 self.wlock.unlock();
                 // Bytes already on the wire — drop the connection so a later
                 // write cannot continue mid-frame after a failed enqueue.
@@ -288,28 +324,77 @@ pub fn Connection(comptime contype: ConnectionType) type {
         }
 
         /// Queue `parts` minus their first `skip` bytes as one entry.  Call
-        /// with `outbox_mutex` held.
+        /// with `outbox_mutex` held.  Prefix and body stay two owned slices
+        /// so drain can writev them.
         fn enqueue(self: *Self, parts: []const []const u8, skip: usize) !void {
+            var leftover: [8][]const u8 = undefined;
+            var n: usize = 0;
+            var left = skip;
             var len: usize = 0;
-            for (parts) |part| len += part.len;
-            len -= skip;
+            for (parts) |part| {
+                const from = @min(left, part.len);
+                left -= from;
+                const slice = part[from..];
+                if (slice.len == 0) continue;
+                if (n >= leftover.len) return error.OutboxFull;
+                leftover[n] = slice;
+                n += 1;
+                len += slice.len;
+            }
+            if (len == 0) return;
             if (self.outbox_bytes + len > max_outbox_bytes) {
                 log.warn("closing a connection whose peer is not reading ({d} bytes queued)", .{self.outbox_bytes});
                 self.close();
                 return error.OutboxFull;
             }
-            const buf = try self.allocator.alloc(u8, len);
-            errdefer self.allocator.free(buf);
-            var at: usize = 0;
-            var left = skip;
-            for (parts) |part| {
-                const from = @min(left, part.len);
-                left -= from;
-                @memcpy(buf[at..][0 .. part.len - from], part[from..]);
-                at += part.len - from;
+            var entry = OutboxEntry{};
+            errdefer entry.deinit(self.allocator);
+            if (n <= 2) {
+                for (leftover[0..n], 0..) |slice, i| {
+                    const buf = try self.allocator.alloc(u8, slice.len);
+                    @memcpy(buf, slice);
+                    entry.parts[i] = buf;
+                    entry.n += 1;
+                }
+            } else {
+                const buf = try self.allocator.alloc(u8, len);
+                var at: usize = 0;
+                for (leftover[0..n]) |slice| {
+                    @memcpy(buf[at..][0..slice.len], slice);
+                    at += slice.len;
+                }
+                entry.parts[0] = buf;
+                entry.n = 1;
             }
-            try self.outbox.append(self.allocator, buf);
+            try self.pushOutbox(entry);
             self.outbox_bytes += len;
+        }
+
+        fn growOutbox(self: *Self) !void {
+            const new_cap: usize = if (self.outbox.len == 0) 8 else self.outbox.len * 2;
+            const fresh = try self.allocator.alloc(OutboxEntry, new_cap);
+            var i: usize = 0;
+            while (i < self.outbox_len) : (i += 1) {
+                fresh[i] = self.outbox[(self.outbox_head + i) % self.outbox.len];
+            }
+            if (self.outbox.len != 0) self.allocator.free(self.outbox);
+            self.outbox = fresh;
+            self.outbox_head = 0;
+        }
+
+        fn pushOutbox(self: *Self, entry: OutboxEntry) !void {
+            if (self.outbox_len == self.outbox.len) try self.growOutbox();
+            const i = (self.outbox_head + self.outbox_len) % self.outbox.len;
+            self.outbox[i] = entry;
+            self.outbox_len += 1;
+        }
+
+        fn popOutbox(self: *Self) ?OutboxEntry {
+            if (self.outbox_len == 0) return null;
+            const e = self.outbox[self.outbox_head];
+            self.outbox_head = (self.outbox_head + 1) % self.outbox.len;
+            self.outbox_len -= 1;
+            return e;
         }
 
         /// Start the worker that sends the outbox.  Call with `outbox_mutex`
@@ -329,19 +414,30 @@ pub fn Connection(comptime contype: ConnectionType) type {
         fn drainOutbox(self: *Self, holds_gate: bool) void {
             defer self.release();
             if (!holds_gate) self.wlock.lock();
+            // Evented sockets stay non-blocking for `post()`.  The drain
+            // worker uses blocking write (SO_SNDTIMEO); flip only here.
+            const posix_net = @import("posix_net.zig");
+            const fd = self.op_table.handle(self.ctx);
+            const was_nb = posix_net.isNonBlocking(fd);
+            if (was_nb) posix_net.setBlocking(fd);
+            defer if (was_nb) posix_net.setNonBlocking(fd);
             while (true) {
                 self.outbox_mutex.lock();
-                if (self.outbox.items.len == 0) {
+                if (self.outbox_len == 0) {
                     self.outbox_draining = false;
                     self.wlock.unlock();
                     self.outbox_mutex.unlock();
                     return;
                 }
-                const buf = self.outbox.orderedRemove(0);
-                self.outbox_bytes -= buf.len;
+                const entry = self.popOutbox().?;
+                self.outbox_bytes -= entry.bytes();
                 self.outbox_mutex.unlock();
-                defer self.allocator.free(buf);
-                self.writeHeld(buf) catch {
+                defer entry.deinit(self.allocator);
+                const write_err = if (entry.n >= 2)
+                    self.writeHeldParts(entry.parts[0], entry.parts[1])
+                else
+                    self.writeHeld(entry.parts[0]);
+                write_err catch {
                     self.outbox_mutex.lock();
                     self.dropOutbox();
                     self.outbox_draining = false;
@@ -354,8 +450,12 @@ pub fn Connection(comptime contype: ConnectionType) type {
 
         /// Free everything queued.  Call with `outbox_mutex` held.
         fn dropOutbox(self: *Self) void {
-            for (self.outbox.items) |buf| self.allocator.free(buf);
-            self.outbox.clearRetainingCapacity();
+            var i: usize = 0;
+            while (i < self.outbox_len) : (i += 1) {
+                self.outbox[(self.outbox_head + i) % self.outbox.len].deinit(self.allocator);
+            }
+            self.outbox_head = 0;
+            self.outbox_len = 0;
             self.outbox_bytes = 0;
         }
 
@@ -380,6 +480,14 @@ pub fn Connection(comptime contype: ConnectionType) type {
         pub fn writeHeld(self: *Self, data: []const u8) anyerror!void {
             comptime if (is_wasm or contype != .ClientConnectionType) @compileError("write() not available for this connection type");
             self.op_table.write(self.ctx, data) catch |err| {
+                self.close();
+                return err;
+            };
+        }
+
+        pub fn writeHeldParts(self: *Self, head: []const u8, body: []const u8) anyerror!void {
+            comptime if (is_wasm or contype != .ClientConnectionType) @compileError("writeHeldParts() not available for this connection type");
+            self.op_table.writeParts(self.ctx, head, body) catch |err| {
                 self.close();
                 return err;
             };
@@ -411,7 +519,7 @@ pub fn Connection(comptime contype: ConnectionType) type {
             if (self.refcount.fetchSub(1, .acq_rel) == 1) {
                 if (comptime !is_wasm) {
                     self.dropOutbox();
-                    self.outbox.deinit(self.allocator);
+                    if (self.outbox.len != 0) self.allocator.free(self.outbox);
                 }
                 self.op_table.destroy(self.ctx);
                 self.allocator.destroy(self);
@@ -593,6 +701,84 @@ const TestPeer = struct {
         _ = c.close(self.fd);
     }
 };
+
+test "outbox enqueue keeps parts separate and pops in order" {
+    if (comptime is_wasm) return;
+    const peer = try TestPeer.open();
+    defer peer.close() catch {};
+    peer.conn.outbox_mutex.lock();
+    defer peer.conn.outbox_mutex.unlock();
+
+    try peer.conn.enqueue(&.{ "AA", "BB" }, 0);
+    try peer.conn.enqueue(&.{ "CC" }, 0);
+    try std.testing.expectEqual(@as(usize, 2), peer.conn.outbox_len);
+
+    const a = peer.conn.popOutbox().?;
+    defer a.deinit(peer.conn.allocator);
+    try std.testing.expectEqual(@as(u8, 2), a.n);
+    try std.testing.expectEqualSlices(u8, "AA", a.parts[0]);
+    try std.testing.expectEqualSlices(u8, "BB", a.parts[1]);
+
+    const b = peer.conn.popOutbox().?;
+    defer b.deinit(peer.conn.allocator);
+    try std.testing.expectEqual(@as(u8, 1), b.n);
+    try std.testing.expectEqualSlices(u8, "CC", b.parts[0]);
+    try std.testing.expectEqual(@as(usize, 0), peer.conn.outbox_len);
+}
+
+test "outbox enqueue skip splits the first part" {
+    if (comptime is_wasm) return;
+    const peer = try TestPeer.open();
+    defer peer.close() catch {};
+    peer.conn.outbox_mutex.lock();
+    defer peer.conn.outbox_mutex.unlock();
+
+    try peer.conn.enqueue(&.{ "PREFIX", "BODY" }, 3);
+    const e = peer.conn.popOutbox().?;
+    defer e.deinit(peer.conn.allocator);
+    try std.testing.expectEqual(@as(u8, 2), e.n);
+    try std.testing.expectEqualSlices(u8, "FIX", e.parts[0]);
+    try std.testing.expectEqualSlices(u8, "BODY", e.parts[1]);
+}
+
+test "outbox ring wraps without shifting older entries" {
+    if (comptime is_wasm) return;
+    const peer = try TestPeer.open();
+    defer peer.close() catch {};
+    peer.conn.outbox_mutex.lock();
+    defer peer.conn.outbox_mutex.unlock();
+
+    var i: usize = 0;
+    while (i < 10) : (i += 1) {
+        var byte = [_]u8{@truncate(i)};
+        try peer.conn.enqueue(&.{&byte}, 0);
+    }
+    i = 0;
+    while (i < 8) : (i += 1) {
+        const e = peer.conn.popOutbox().?;
+        defer e.deinit(peer.conn.allocator);
+        try std.testing.expectEqual(@as(u8, @truncate(i)), e.parts[0][0]);
+    }
+    i = 0;
+    while (i < 8) : (i += 1) {
+        var byte = [_]u8{@truncate(100 + i)};
+        try peer.conn.enqueue(&.{&byte}, 0);
+    }
+    try std.testing.expectEqual(@as(usize, 10), peer.conn.outbox_len);
+    i = 0;
+    while (i < 2) : (i += 1) {
+        const e = peer.conn.popOutbox().?;
+        defer e.deinit(peer.conn.allocator);
+        try std.testing.expectEqual(@as(u8, @truncate(8 + i)), e.parts[0][0]);
+    }
+    i = 0;
+    while (i < 8) : (i += 1) {
+        const e = peer.conn.popOutbox().?;
+        defer e.deinit(peer.conn.allocator);
+        try std.testing.expectEqual(@as(u8, @truncate(100 + i)), e.parts[0][0]);
+    }
+    try std.testing.expectEqual(@as(usize, 0), peer.conn.outbox_len);
+}
 
 test "post does not wait for a slow peer and keeps the order of writes" {
     if (comptime is_wasm) return;

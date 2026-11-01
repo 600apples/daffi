@@ -335,6 +335,9 @@ const ClientSource = struct {
             .entry = entry,
             .decoder = .initPooled(entry.alloc, entry.msgpool.freelist),
         };
+        // Evented sockets stay non-blocking so Darwin `writeNonBlocking`
+        // does not fcntl-toggle on every send.
+        @import("network/posix_net.zig").setNonBlocking(entry.connection.handle());
         try loop.register(&self.source);
         return self;
     }
