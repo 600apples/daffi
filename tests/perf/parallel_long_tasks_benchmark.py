@@ -64,8 +64,10 @@ def _silence_subprocess(runtime: str) -> None:
     logging.disable(logging.CRITICAL)
 
     import tests.conftest as _runtime_state
+
     _runtime_state.SELECTED_RUNTIME = runtime
     from daffi import dfcore
+
     dfcore.setRuntime(runtime)
 
 
@@ -113,7 +115,9 @@ def _proc_router(runtime: str, port: int) -> None:
     _silence_subprocess(runtime)
     from daffi import Router, TCPTransport
 
-    router = Router(app_name="longtask-router", transport=TCPTransport(HOST, port), runtime=runtime)
+    router = Router(
+        app_name="longtask-router", transport=TCPTransport(HOST, port), runtime=runtime
+    )
     router.start()
     router.join()
 
@@ -153,7 +157,11 @@ def _wait_for_worker(port: int, timeout: float = 30.0) -> None:
     from daffi import Client, TCPTransport
     from daffi._bindings import get_available_members
 
-    probe = Client(app_name="longtask-probe", transport=TCPTransport(HOST, port), runtime=active_runtime())
+    probe = Client(
+        app_name="longtask-probe",
+        transport=TCPTransport(HOST, port),
+        runtime=active_runtime(),
+    )
     probe.connect()
     conn_num = probe._conn_num
 
@@ -189,7 +197,11 @@ def _run_callers(port: int, n_tasks: int) -> float:
     # Connect all callers before the measurement window.
     callers: list[tuple] = []
     for i in range(n_tasks):
-        c = Client(app_name=f"longtask-caller-{i}", transport=TCPTransport(HOST, port), runtime=active_runtime())
+        c = Client(
+            app_name=f"longtask-caller-{i}",
+            transport=TCPTransport(HOST, port),
+            runtime=active_runtime(),
+        )
         conn = c.connect()
         callers.append((c, conn))
 
@@ -258,7 +270,14 @@ def run_scenario() -> None:
     print(sep, flush=True)
 
     port = _free_port()
-    router_proc = mp.Process(target=_proc_router, args=(active_runtime(), port,), daemon=True)
+    router_proc = mp.Process(
+        target=_proc_router,
+        args=(
+            active_runtime(),
+            port,
+        ),
+        daemon=True,
+    )
     worker_proc = mp.Process(
         target=_proc_worker,
         args=(active_runtime(), port, SLEEP_SECONDS, N_TASKS),

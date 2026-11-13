@@ -64,7 +64,9 @@ def _proc_slow_service(runtime: str, port: int) -> None:
         return payload
 
     svc = Service(
-        app_name="timeout-svc", workers=4, transport=TCPTransport(HOST, port),
+        app_name="timeout-svc",
+        workers=4,
+        transport=TCPTransport(HOST, port),
         runtime=runtime,
     )
     svc.start()
@@ -76,7 +78,11 @@ def _proc_router_only(runtime: str, port: int) -> None:
     silence_subprocess(runtime)
     from daffi import Router, TCPTransport
 
-    r = Router(app_name="timeout-router-only", transport=TCPTransport(HOST, port), runtime=runtime)
+    r = Router(
+        app_name="timeout-router-only",
+        transport=TCPTransport(HOST, port),
+        runtime=runtime,
+    )
     r.start()
     r.join()
 
@@ -145,7 +151,8 @@ def _proc_all_slow_workers(runtime: str, port: int, n: int) -> None:
     clients = []
     for i in range(n):
         c = Client(
-            app_name=f"timeout-allslow-{i:02d}", transport=TCPTransport(HOST, port),
+            app_name=f"timeout-allslow-{i:02d}",
+            transport=TCPTransport(HOST, port),
             runtime=runtime,
         )
         c.connect()
@@ -167,7 +174,14 @@ def _proc_all_slow_workers(runtime: str, port: int, n: int) -> None:
 @pytest.fixture
 def slow_service(free_port):
     """Direct Service with a slow callback."""
-    proc = mp.Process(target=_proc_slow_service, args=(active_runtime(), free_port,), daemon=True)
+    proc = mp.Process(
+        target=_proc_slow_service,
+        args=(
+            active_runtime(),
+            free_port,
+        ),
+        daemon=True,
+    )
     proc.start()
     wait_for_port(free_port)
     time.sleep(0.2)
@@ -178,7 +192,14 @@ def slow_service(free_port):
 @pytest.fixture
 def router_no_workers(free_port):
     """Router with no workers — all rpc() calls fail with TransmissionFailure."""
-    proc = mp.Process(target=_proc_router_only, args=(active_runtime(), free_port,), daemon=True)
+    proc = mp.Process(
+        target=_proc_router_only,
+        args=(
+            active_runtime(),
+            free_port,
+        ),
+        daemon=True,
+    )
     proc.start()
     wait_for_port(free_port)
     time.sleep(0.15)
@@ -189,18 +210,29 @@ def router_no_workers(free_port):
 @pytest.fixture
 def cast_mixed(free_port):
     """Router + (N_WORKERS-1) fast workers + 1 slow worker."""
-    rproc = mp.Process(target=proc_router, args=(active_runtime(), free_port,), daemon=True)
+    rproc = mp.Process(
+        target=proc_router,
+        args=(
+            active_runtime(),
+            free_port,
+        ),
+        daemon=True,
+    )
     rproc.start()
     wait_for_port(free_port)
 
     worker_procs = []
     for i in range(N_WORKERS - 1):
-        p = mp.Process(target=_proc_fast_worker, args=(active_runtime(), free_port, i), daemon=True)
+        p = mp.Process(
+            target=_proc_fast_worker, args=(active_runtime(), free_port, i), daemon=True
+        )
         p.start()
         worker_procs.append(p)
 
     slow_p = mp.Process(
-        target=_proc_slow_worker, args=(active_runtime(), free_port, N_WORKERS - 1), daemon=True
+        target=_proc_slow_worker,
+        args=(active_runtime(), free_port, N_WORKERS - 1),
+        daemon=True,
     )
     slow_p.start()
     worker_procs.append(slow_p)
@@ -225,12 +257,21 @@ def cast_mixed(free_port):
 @pytest.fixture
 def cast_all_slow(free_port):
     """Router + N_WORKERS all-slow workers."""
-    rproc = mp.Process(target=proc_router, args=(active_runtime(), free_port,), daemon=True)
+    rproc = mp.Process(
+        target=proc_router,
+        args=(
+            active_runtime(),
+            free_port,
+        ),
+        daemon=True,
+    )
     rproc.start()
     wait_for_port(free_port)
 
     wproc = mp.Process(
-        target=_proc_all_slow_workers, args=(active_runtime(), free_port, N_WORKERS), daemon=True
+        target=_proc_all_slow_workers,
+        args=(active_runtime(), free_port, N_WORKERS),
+        daemon=True,
     )
     wproc.start()
     expected = {f"timeout-allslow-{i:02d}" for i in range(N_WORKERS)}
@@ -253,7 +294,8 @@ class TestRpcTimeout:
         from daffi import Client, TCPTransport
 
         client = Client(
-            app_name="to-rpc-slow", transport=TCPTransport(HOST, slow_service),
+            app_name="to-rpc-slow",
+            transport=TCPTransport(HOST, slow_service),
             runtime=active_runtime(),
         )
         conn = client.connect()
@@ -275,7 +317,8 @@ class TestRpcTimeout:
         from daffi import Client, TCPTransport
 
         client = Client(
-            app_name="to-rpc-wall", transport=TCPTransport(HOST, slow_service),
+            app_name="to-rpc-wall",
+            transport=TCPTransport(HOST, slow_service),
             runtime=active_runtime(),
         )
         conn = client.connect()
@@ -298,7 +341,8 @@ class TestRpcTimeout:
         from daffi import Client, TCPTransport
 
         client = Client(
-            app_name="to-rpc-recovery", transport=TCPTransport(HOST, slow_service),
+            app_name="to-rpc-recovery",
+            transport=TCPTransport(HOST, slow_service),
             runtime=active_runtime(),
         )
         conn = client.connect()
@@ -317,7 +361,8 @@ class TestRpcTimeout:
         from daffi import Client, TCPTransport
 
         client = Client(
-            app_name="to-rpc-repeat", transport=TCPTransport(HOST, slow_service),
+            app_name="to-rpc-repeat",
+            transport=TCPTransport(HOST, slow_service),
             runtime=active_runtime(),
         )
         conn = client.connect()
@@ -344,7 +389,8 @@ class TestRpcTimeout:
         from daffi.exceptions import TransmissionFailure
 
         client = Client(
-            app_name="to-rpc-norcv", transport=TCPTransport(HOST, router_no_workers),
+            app_name="to-rpc-norcv",
+            transport=TCPTransport(HOST, router_no_workers),
             runtime=active_runtime(),
         )
         conn = client.connect()
@@ -362,7 +408,8 @@ class TestRpcTimeout:
         from daffi import Client, TCPTransport
 
         client = Client(
-            app_name="to-rpc-inf", transport=TCPTransport(HOST, slow_service),
+            app_name="to-rpc-inf",
+            transport=TCPTransport(HOST, slow_service),
             runtime=active_runtime(),
         )
         conn = client.connect()
@@ -387,7 +434,8 @@ class TestCastTimeout:
         from daffi import Client, TCPTransport
 
         client = Client(
-            app_name="to-cast-allslow", transport=TCPTransport(HOST, cast_all_slow),
+            app_name="to-cast-allslow",
+            transport=TCPTransport(HOST, cast_all_slow),
             runtime=active_runtime(),
         )
         conn = client.connect()
@@ -418,7 +466,11 @@ class TestCastTimeout:
         port, slow_proc = cast_mixed
         slow_name = f"timeout-slow-worker-{N_WORKERS - 1:02d}"
 
-        client = Client(app_name="to-cast-mixed", transport=TCPTransport(HOST, port), runtime=active_runtime())
+        client = Client(
+            app_name="to-cast-mixed",
+            transport=TCPTransport(HOST, port),
+            runtime=active_runtime(),
+        )
         conn = client.connect()
         try:
             results = conn.cast(timeout=SHORT_TO).work("payload")
@@ -454,7 +506,8 @@ class TestCastTimeout:
         from daffi import Client, TCPTransport
 
         client = Client(
-            app_name="to-castnw-slow", transport=TCPTransport(HOST, cast_all_slow),
+            app_name="to-castnw-slow",
+            transport=TCPTransport(HOST, cast_all_slow),
             runtime=active_runtime(),
         )
         conn = client.connect()
@@ -473,7 +526,11 @@ class TestCastTimeout:
         from daffi import Client, TCPTransport
 
         port, _ = cast_mixed
-        client = Client(app_name="to-cast-alive", transport=TCPTransport(HOST, port), runtime=active_runtime())
+        client = Client(
+            app_name="to-cast-alive",
+            transport=TCPTransport(HOST, port),
+            runtime=active_runtime(),
+        )
         conn = client.connect()
         try:
             # first call: partial timeout (slow worker times out)
@@ -500,7 +557,8 @@ class TestRpcNowaitTimeout:
         from daffi import Client, TCPTransport
 
         client = Client(
-            app_name="to-nw-nodly", transport=TCPTransport(HOST, slow_service),
+            app_name="to-nw-nodly",
+            transport=TCPTransport(HOST, slow_service),
             runtime=active_runtime(),
         )
         conn = client.connect()
@@ -519,7 +577,8 @@ class TestRpcNowaitTimeout:
         from daffi import Client, TCPTransport
 
         client = Client(
-            app_name="to-nw-then-rpc", transport=TCPTransport(HOST, slow_service),
+            app_name="to-nw-then-rpc",
+            transport=TCPTransport(HOST, slow_service),
             runtime=active_runtime(),
         )
         conn = client.connect()

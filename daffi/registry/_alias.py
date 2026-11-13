@@ -20,7 +20,9 @@ def alias(value: str):
     if not isinstance(value, str) or not value:
         raise ValueError("Alias must be a non-empty string.")
     if "," in value:
-        raise ValueError("Alias cannot contain a comma (method lists are comma-separated on the wire).")
+        raise ValueError(
+            "Alias cannot contain a comma (method lists are comma-separated on the wire)."
+        )
 
     def dec(fn: Callable[..., Any]):
         from daffi.registry._callback import callback
@@ -28,7 +30,9 @@ def alias(value: str):
 
         if isinstance(fn, callback):
             if len(fn.names) != 1:
-                raise ValueError("@alias names one callback; put it on a method of the class instead.")
+                raise ValueError(
+                    "@alias names one callback; put it on a method of the class instead."
+                )
             EXECUTOR_REGISTRY.rename(fn.names[0], value)
             fn.names[0] = value
             return fn

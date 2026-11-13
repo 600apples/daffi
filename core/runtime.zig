@@ -84,6 +84,9 @@ fn resetAfterFork() callconv(.c) void {
     selected = .threads;
     @import("Client.zig").resetRegistryAfterFork();
     @import("Server.zig").resetSlotsAfterFork();
+    const connection = @import("network/connection.zig");
+    connection.Connection(.ClientConnectionType).resetDrainsAfterFork();
+    connection.Connection(.ServerConnectionType).resetDrainsAfterFork();
 }
 
 fn ensureInit() void {

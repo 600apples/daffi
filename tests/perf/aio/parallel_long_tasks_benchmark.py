@@ -73,8 +73,10 @@ def _silence_subprocess(runtime: str) -> None:
     logging.disable(logging.CRITICAL)
 
     import tests.conftest as _runtime_state
+
     _runtime_state.SELECTED_RUNTIME = runtime
     from daffi import dfcore
+
     dfcore.setRuntime(runtime)
 
 
@@ -126,7 +128,8 @@ def _proc_router(runtime: str, port: int) -> None:
         from daffi import TCPTransport
 
         router = AsyncRouter(
-            app_name="longtask-router-aio", transport=TCPTransport(HOST, port),
+            app_name="longtask-router-aio",
+            transport=TCPTransport(HOST, port),
             runtime=runtime,
         )
         await router.start()
@@ -170,7 +173,11 @@ def _wait_for_worker(port: int, timeout: float = 30.0) -> None:
     from daffi import Client, TCPTransport
     from daffi._bindings import get_available_members
 
-    probe = Client(app_name="longtask-probe-aio", transport=TCPTransport(HOST, port), runtime=active_runtime())
+    probe = Client(
+        app_name="longtask-probe-aio",
+        transport=TCPTransport(HOST, port),
+        runtime=active_runtime(),
+    )
     probe.connect()
     conn_num = probe._conn_num
 
@@ -210,7 +217,8 @@ async def _run_callers(port: int, n_tasks: int) -> float:
     callers: list[tuple] = []
     for i in range(n_tasks):
         c = AsyncClient(
-            app_name=f"longtask-caller-{i}-aio", transport=TCPTransport(HOST, port),
+            app_name=f"longtask-caller-{i}-aio",
+            transport=TCPTransport(HOST, port),
             runtime=active_runtime(),
         )
         conn = await c.connect()
@@ -272,7 +280,14 @@ async def run_scenario() -> None:
     print(sep, flush=True)
 
     port = _free_port()
-    router_proc = mp.Process(target=_proc_router, args=(active_runtime(), port,), daemon=True)
+    router_proc = mp.Process(
+        target=_proc_router,
+        args=(
+            active_runtime(),
+            port,
+        ),
+        daemon=True,
+    )
     worker_proc = mp.Process(
         target=_proc_worker,
         args=(active_runtime(), port, SLEEP_SECONDS, N_TASKS),

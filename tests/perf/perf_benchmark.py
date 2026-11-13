@@ -111,8 +111,10 @@ def _silence_subprocess(runtime: str) -> None:
     logging.disable(logging.CRITICAL)
 
     import tests.conftest as _runtime_state
+
     _runtime_state.SELECTED_RUNTIME = runtime
     from daffi import dfcore
+
     dfcore.setRuntime(runtime)
 
 
@@ -149,7 +151,9 @@ def _proc_service(runtime: str, host: str, port: int) -> None:
     def echo(payload):  # noqa: F811
         return payload
 
-    svc = Service(app_name="perf-service", transport=TCPTransport(host, port), runtime=runtime)
+    svc = Service(
+        app_name="perf-service", transport=TCPTransport(host, port), runtime=runtime
+    )
     svc.start()
     svc.join()
 
@@ -158,7 +162,9 @@ def _proc_router(runtime: str, host: str, port: int) -> None:
     _silence_subprocess(runtime)
     from daffi import Router, TCPTransport
 
-    router = Router(app_name="perf-router", transport=TCPTransport(host, port), runtime=runtime)
+    router = Router(
+        app_name="perf-router", transport=TCPTransport(host, port), runtime=runtime
+    )
     router.start()
     router.join()
 
@@ -171,7 +177,9 @@ def _proc_worker(runtime: str, host: str, port: int) -> None:
     def echo(payload):  # noqa: F811
         return payload
 
-    client = Client(app_name="perf-worker", transport=TCPTransport(host, port), runtime=runtime)
+    client = Client(
+        app_name="perf-worker", transport=TCPTransport(host, port), runtime=runtime
+    )
     client.connect()
     try:
         while True:
@@ -195,13 +203,19 @@ def bench_direct(serde: int, data: dict, label: str) -> list[float]:
     wire = json.dumps(data) if serde == SerdeFormat.OPAQUE else data
 
     port = _free_port()
-    proc = mp.Process(target=_proc_service, args=(active_runtime(), HOST, port), daemon=True)
+    proc = mp.Process(
+        target=_proc_service, args=(active_runtime(), HOST, port), daemon=True
+    )
     proc.start()
     try:
         _wait_for_port(port)
         time.sleep(0.15)
 
-        client = Client(app_name="perf-direct", transport=TCPTransport(HOST, port), runtime=active_runtime())
+        client = Client(
+            app_name="perf-direct",
+            transport=TCPTransport(HOST, port),
+            runtime=active_runtime(),
+        )
         conn = client.connect()
         c = conn.rpc(timeout=TIMEOUT, serde=serde)
 
@@ -233,8 +247,12 @@ def bench_via_router(serde: int, data: dict, label: str) -> list[float]:
     wire = json.dumps(data) if serde == SerdeFormat.OPAQUE else data
 
     router_port = _free_port()
-    router_proc = mp.Process(target=_proc_router, args=(active_runtime(), HOST, router_port), daemon=True)
-    worker_proc = mp.Process(target=_proc_worker, args=(active_runtime(), HOST, router_port), daemon=True)
+    router_proc = mp.Process(
+        target=_proc_router, args=(active_runtime(), HOST, router_port), daemon=True
+    )
+    worker_proc = mp.Process(
+        target=_proc_worker, args=(active_runtime(), HOST, router_port), daemon=True
+    )
 
     router_proc.start()
     try:
@@ -243,7 +261,8 @@ def bench_via_router(serde: int, data: dict, label: str) -> list[float]:
         time.sleep(0.4)
 
         client = Client(
-            app_name="perf-router-caller", transport=TCPTransport(HOST, router_port),
+            app_name="perf-router-caller",
+            transport=TCPTransport(HOST, router_port),
             runtime=active_runtime(),
         )
         conn = client.connect()

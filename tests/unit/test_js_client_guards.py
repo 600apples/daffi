@@ -28,16 +28,16 @@ def test_daffi_js_rejects_all_pending_on_close_and_before_init_client():
 
     # Waiters must carry uuid; selective delete by missing uuid was the bug.
     assert re.search(
-        r"pendingMessages\[uuid\]\s*=\s*\{[^}]*\buuid\b",
+        r"const waiter\s*=\s*\{[^}]*\buuid\b",
         src,
         re.DOTALL,
     ), "waiters must store uuid"
 
-    # onclose must clear the whole map (including early-arrival arrays), not
-    # only delete msgData.uuid on waiter objects.
-    onclose = src.split("_socket.onclose")[1].split("};", 1)[0]
-    assert "_rejectAllPending" in onclose
-    assert "delete self.pendingMessages[msgData.uuid]" not in onclose
+    # Losing the connection must clear the whole map, not only delete
+    # msgData.uuid on waiter objects.
+    on_lost = src.split("const _onLost")[1].split("};", 1)[0]
+    assert "_rejectAllPending" in on_lost
+    assert "delete self.pendingMessages[msgData.uuid]" not in on_lost
 
 
 def test_js_listener_examples_allow_any_origin_for_browser_demos():
@@ -50,7 +50,11 @@ def test_js_listener_examples_allow_any_origin_for_browser_demos():
         if "TCPTransport(" not in text:
             continue
         # Workers are native Clients — only listening nodes need origins.
-        if re.search(r"\bClient\s*\(", text) and "Service(" not in text and "Router(" not in text:
+        if (
+            re.search(r"\bClient\s*\(", text)
+            and "Service(" not in text
+            and "Router(" not in text
+        ):
             continue
         listeners.append(path)
 

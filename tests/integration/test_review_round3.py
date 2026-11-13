@@ -90,7 +90,9 @@ def _proc_slow_service(runtime: str, port: int) -> None:
     from daffi import Service, TCPTransport
 
     _register_callbacks()
-    svc = Service(app_name=SLOW, workers=16, transport=TCPTransport(HOST, port), runtime=runtime)
+    svc = Service(
+        app_name=SLOW, workers=16, transport=TCPTransport(HOST, port), runtime=runtime
+    )
     svc.start()
     svc.join()
 
@@ -100,7 +102,9 @@ def _proc_slow_worker(runtime: str, port: int) -> None:
     from daffi import Client, TCPTransport
 
     _register_callbacks()
-    client = Client(app_name=SLOW, workers=16, transport=TCPTransport(HOST, port), runtime=runtime)
+    client = Client(
+        app_name=SLOW, workers=16, transport=TCPTransport(HOST, port), runtime=runtime
+    )
     client.connect()
     client.join()
 
@@ -155,8 +159,16 @@ class RawPeer:
         self.sock.sendall(header + body)
 
     def handshake(self, methods=(), uuid: int = 1) -> None:
-        body = {"meta": {"type": "client"}, "members": [{"name": self.name, "methods": list(methods) or None}]}
-        self.send(uuid=uuid, flag=FLAG_HANDSHAKE, data=json.dumps(body).encode(), return_result=True)
+        body = {
+            "meta": {"type": "client"},
+            "members": [{"name": self.name, "methods": list(methods) or None}],
+        }
+        self.send(
+            uuid=uuid,
+            flag=FLAG_HANDSHAKE,
+            data=json.dumps(body).encode(),
+            return_result=True,
+        )
 
     def _exact(self, n: int) -> bytes:
         buf = b""
@@ -211,7 +223,9 @@ def _start(target, port: int, *members: str) -> mp.Process:
 def _client(port: int, name: str, *members: str):
     from daffi import Client, TCPTransport
 
-    client = Client(app_name=name, transport=TCPTransport(HOST, port), runtime=active_runtime())
+    client = Client(
+        app_name=name, transport=TCPTransport(HOST, port), runtime=active_runtime()
+    )
     conn = client.connect()
     try:
         if members:
@@ -223,7 +237,9 @@ def _client(port: int, name: str, *members: str):
 
 def _start_router(port: int) -> list[mp.Process]:
     router = _start(proc_router, port)
-    worker = mp.Process(target=_proc_slow_worker, args=(active_runtime(), port), daemon=True)
+    worker = mp.Process(
+        target=_proc_slow_worker, args=(active_runtime(), port), daemon=True
+    )
     worker.start()
     wait_for_members(port, {SLOW})
     return [worker, router]
@@ -258,7 +274,14 @@ def test_request_with_uuid_0_is_dropped(node):
     peer = RawPeer(port, "zero-uuid")
     try:
         peer.read_reply(1)
-        peer.send(uuid=0, flag=FLAG_REQUEST, receiver=SLOW, func="add", data=_json(1, 2), return_result=True)
+        peer.send(
+            uuid=0,
+            flag=FLAG_REQUEST,
+            receiver=SLOW,
+            func="add",
+            data=_json(1, 2),
+            return_result=True,
+        )
         time.sleep(0.5)
     finally:
         peer.close()
@@ -277,7 +300,9 @@ def test_router_ignores_a_response_from_a_peer_it_did_not_ask(slow_router):
         forger.read_reply(1)
         with _client(port, "victim", SLOW) as (_, conn):
             result: list = []
-            caller = threading.Thread(target=lambda: result.append(conn.rpc(timeout=10).slow("real", 1.0)))
+            caller = threading.Thread(
+                target=lambda: result.append(conn.rpc(timeout=10).slow("real", 1.0))
+            )
             caller.start()
             time.sleep(0.3)
             # The victim's request uuids are small: it counts from 1.
@@ -402,9 +427,10 @@ def test_stalled_peer_handshaking_again_does_not_freeze_routing(slow_router):
     stalled.name = "stalled"
     stalled.handshake(["sink"])
     try:
-        with _client(port, "flooder", SLOW, "stalled") as (_, flooder), _client(
-            port, "bystander", SLOW
-        ) as (_, bystander):
+        with (
+            _client(port, "flooder", SLOW, "stalled") as (_, flooder),
+            _client(port, "bystander", SLOW) as (_, bystander),
+        ):
             blob = b"x" * (256 * 1024)
 
             def flood():
@@ -420,7 +446,9 @@ def test_stalled_peer_handshaking_again_does_not_freeze_routing(slow_router):
             time.sleep(0.2)
             started = time.monotonic()
             assert bystander.rpc(timeout=10).add(2, 2) == 4
-            assert time.monotonic() - started < 2.5, "routing waited for the stalled peer"
+            assert (
+                time.monotonic() - started < 2.5
+            ), "routing waited for the stalled peer"
     finally:
         stalled.close()
 
@@ -472,7 +500,9 @@ def _upgrade_status(port: int, origin: str | None) -> bytes:
 
 @pytest.fixture
 def origin_router(free_port):
-    proc = mp.Process(target=_proc_origin_router, args=(active_runtime(), free_port), daemon=True)
+    proc = mp.Process(
+        target=_proc_origin_router, args=(active_runtime(), free_port), daemon=True
+    )
     proc.start()
     wait_for_port(free_port)
     yield free_port
@@ -532,7 +562,9 @@ def _proc_star_origin_router(runtime: str, port: int) -> None:
     r.join()
 
 
-def test_star_websocket_allowed_origins_accepts_upgrade_without_origin_header(free_port):
+def test_star_websocket_allowed_origins_accepts_upgrade_without_origin_header(
+    free_port,
+):
     """``websocket_allowed_origins = ['*']`` must accept upgrades that omit Origin
     (raw clients / some local demos), matching the js-client examples."""
     proc = mp.Process(
@@ -575,7 +607,11 @@ def test_stalled_half_sent_message_closes_only_that_connection(free_port, monkey
         metadata = f"stall-peer|{SLOW}|sink".encode()
         body = metadata + b"x" * (1024 * 1024)
         header = pack_header(
-            uuid=5, flag=FLAG_REQUEST, decoder=JSON, msg_len=len(body), metadata_len=len(metadata)
+            uuid=5,
+            flag=FLAG_REQUEST,
+            decoder=JSON,
+            msg_len=len(body),
+            metadata_len=len(metadata),
         )
         staller.sock.sendall(header + body[: 200 * 1024])
 
@@ -584,7 +620,14 @@ def test_stalled_half_sent_message_closes_only_that_connection(free_port, monkey
         assert time.monotonic() - started >= 0.9
 
         time.sleep(2)  # an idle connection with no message in progress is left alone
-        idle.send(uuid=7, flag=FLAG_REQUEST, receiver=SLOW, func="add", data=_json(1, 2), return_result=True)
+        idle.send(
+            uuid=7,
+            flag=FLAG_REQUEST,
+            receiver=SLOW,
+            func="add",
+            data=_json(1, 2),
+            return_result=True,
+        )
         flag, data = idle.read_reply(7)
         assert flag == FLAG_RESPONSE
     finally:
@@ -604,7 +647,9 @@ def _proc_token_service(runtime: str, path: str) -> None:
     from daffi import Service, UnixTransport
 
     _register_callbacks()
-    svc = Service(app_name=SLOW, transport=UnixTransport(path), runtime=runtime, auth_token=TOKEN)
+    svc = Service(
+        app_name=SLOW, transport=UnixTransport(path), runtime=runtime, auth_token=TOKEN
+    )
     svc.start()
     svc.join()
 
@@ -613,7 +658,12 @@ def _proc_token_router(runtime: str, path: str) -> None:
     silence_subprocess(runtime)
     from daffi import Router, UnixTransport
 
-    r = Router(app_name="token-router", transport=UnixTransport(path), runtime=runtime, auth_token=TOKEN)
+    r = Router(
+        app_name="token-router",
+        transport=UnixTransport(path),
+        runtime=runtime,
+        auth_token=TOKEN,
+    )
     r.start()
     r.join()
 
@@ -623,7 +673,9 @@ def _proc_token_worker(runtime: str, path: str) -> None:
     from daffi import Client, UnixTransport
 
     _register_callbacks()
-    client = Client(app_name=SLOW, transport=UnixTransport(path), runtime=runtime, auth_token=TOKEN)
+    client = Client(
+        app_name=SLOW, transport=UnixTransport(path), runtime=runtime, auth_token=TOKEN
+    )
     client.connect()
     client.join()
 
@@ -659,13 +711,25 @@ def token_node(request):
     path = f"/tmp/dftok-{os.getpid()}-{request.param[0]}-{next(_token_seq)}.sock"
     procs = []
     if request.param == "service":
-        procs.append(mp.Process(target=_proc_token_service, args=(active_runtime(), path), daemon=True))
+        procs.append(
+            mp.Process(
+                target=_proc_token_service, args=(active_runtime(), path), daemon=True
+            )
+        )
     else:
-        procs.append(mp.Process(target=_proc_token_router, args=(active_runtime(), path), daemon=True))
+        procs.append(
+            mp.Process(
+                target=_proc_token_router, args=(active_runtime(), path), daemon=True
+            )
+        )
     procs[0].start()
     _wait_unix(path)
     if request.param == "router":
-        procs.append(mp.Process(target=_proc_token_worker, args=(active_runtime(), path), daemon=True))
+        procs.append(
+            mp.Process(
+                target=_proc_token_worker, args=(active_runtime(), path), daemon=True
+            )
+        )
         procs[1].start()
         _wait_unix_members(path, {SLOW})
     yield path
@@ -680,7 +744,12 @@ def token_node(request):
 def _token_client(path: str, name: str, token):
     from daffi import Client, UnixTransport
 
-    return Client(app_name=name, transport=UnixTransport(path), runtime=active_runtime(), auth_token=token)
+    return Client(
+        app_name=name,
+        transport=UnixTransport(path),
+        runtime=active_runtime(),
+        auth_token=token,
+    )
 
 
 def test_client_with_the_token_is_served(token_node):
@@ -728,8 +797,10 @@ def test_async_client_sends_the_token(token_node):
 
     async def main():
         client = AsyncClient(
-            app_name="token-async", transport=UnixTransport(token_node),
-            runtime=active_runtime(), auth_token=TOKEN,
+            app_name="token-async",
+            transport=UnixTransport(token_node),
+            runtime=active_runtime(),
+            auth_token=TOKEN,
         )
         conn = await client.connect()
         try:
@@ -749,7 +820,11 @@ def test_auth_token_is_validated():
 
     for bad in ("", 123, b"bytes", "a\0b"):
         with pytest.raises(InitializationError):
-            Client(app_name="x", transport=UnixTransport("/tmp/daffi-token-check.sock"), auth_token=bad)
+            Client(
+                app_name="x",
+                transport=UnixTransport("/tmp/daffi-token-check.sock"),
+                auth_token=bad,
+            )
 
 
 def test_tcp_auth_token_requires_tls():
@@ -757,9 +832,19 @@ def test_tcp_auth_token_requires_tls():
     from daffi.exceptions import InitializationError
 
     with pytest.raises(InitializationError, match="tls=True"):
-        Service(app_name="x", transport=TCPTransport(HOST, 1), runtime=active_runtime(), auth_token=TOKEN)
+        Service(
+            app_name="x",
+            transport=TCPTransport(HOST, 1),
+            runtime=active_runtime(),
+            auth_token=TOKEN,
+        )
     with pytest.raises(InitializationError, match="tls=True"):
-        Client(app_name="x", transport=TCPTransport(HOST, 1), runtime=active_runtime(), auth_token=TOKEN)
+        Client(
+            app_name="x",
+            transport=TCPTransport(HOST, 1),
+            runtime=active_runtime(),
+            auth_token=TOKEN,
+        )
 
 
 # ── 8. callbacks= offers only the listed callbacks ────────────────────────────
@@ -772,7 +857,12 @@ def _proc_only_add_service(runtime: str, port: int) -> None:
     from daffi import Service, TCPTransport
 
     _register_callbacks()
-    svc = Service(app_name=ONLY_ADD, transport=TCPTransport(HOST, port), runtime=runtime, callbacks=["add"])
+    svc = Service(
+        app_name=ONLY_ADD,
+        transport=TCPTransport(HOST, port),
+        runtime=runtime,
+        callbacks=["add"],
+    )
     svc.start()
     svc.join()
 
@@ -785,7 +875,12 @@ def _proc_only_add_worker(runtime: str, port: int) -> None:
     from daffi.registry._executor_registry import EXECUTOR_REGISTRY
 
     add = EXECUTOR_REGISTRY.get("add").func
-    client = Client(app_name=ONLY_ADD, transport=TCPTransport(HOST, port), runtime=runtime, callbacks=[add])
+    client = Client(
+        app_name=ONLY_ADD,
+        transport=TCPTransport(HOST, port),
+        runtime=runtime,
+        callbacks=[add],
+    )
     client.connect()
     client.join()
 
@@ -795,7 +890,10 @@ def only_add(request, free_port):
     if request.param == "service":
         procs = [_start(_proc_only_add_service, free_port, ONLY_ADD)]
     else:
-        procs = [_start(proc_router, free_port), _start(_proc_only_add_worker, free_port)]
+        procs = [
+            _start(proc_router, free_port),
+            _start(_proc_only_add_worker, free_port),
+        ]
         wait_for_members(free_port, {ONLY_ADD})
     yield free_port
     for proc in procs:
@@ -809,7 +907,14 @@ def test_only_the_listed_callbacks_are_offered(only_add):
     peer = RawPeer(only_add, "only-add-raw")
     try:
         peer.read_reply(1)
-        peer.send(uuid=9, flag=FLAG_REQUEST, receiver=ONLY_ADD, func="slow", data=_json("x", 0), return_result=True)
+        peer.send(
+            uuid=9,
+            flag=FLAG_REQUEST,
+            receiver=ONLY_ADD,
+            func="slow",
+            data=_json("x", 0),
+            return_result=True,
+        )
         flag, data = peer.read_reply(9)
         assert flag == FLAG_ERROR
         # The Service refuses it itself; the Router already knows the worker
@@ -850,7 +955,11 @@ def _proc_named_worker(runtime: str, port: int, name: str) -> None:
 def listed_workers(free_port):
     procs = [_start(proc_router, free_port)]
     for name in LISTED:
-        proc = mp.Process(target=_proc_named_worker, args=(active_runtime(), free_port, name), daemon=True)
+        proc = mp.Process(
+            target=_proc_named_worker,
+            args=(active_runtime(), free_port, name),
+            daemon=True,
+        )
         proc.start()
         procs.append(proc)
     wait_for_members(free_port, set(LISTED))
@@ -884,7 +993,9 @@ def test_missing_members_names_only_the_absent_peers(listed_workers):
     with _client(listed_workers, "member-checker", *LISTED) as (client, _):
         conn_num = client._conn_num
         assert dfcore.missingMembers(conn_num, {"listed-a", "listed-b"}) == []
-        assert dfcore.missingMembers(conn_num, ["listed-a", "listed-gone"]) == ["listed-gone"]
+        assert dfcore.missingMembers(conn_num, ["listed-a", "listed-gone"]) == [
+            "listed-gone"
+        ]
         with pytest.raises(TypeError):
             dfcore.missingMembers(conn_num, [1])
 
@@ -896,7 +1007,11 @@ def test_async_rpc_to_a_list_of_receivers(listed_workers):
     from daffi.aio import AsyncClient
 
     async def main():
-        client = AsyncClient(app_name="list-async", transport=TCPTransport(HOST, listed_workers), runtime=active_runtime())
+        client = AsyncClient(
+            app_name="list-async",
+            transport=TCPTransport(HOST, listed_workers),
+            runtime=active_runtime(),
+        )
         conn = await client.connect()
         try:
             await conn.wait_for_members(*LISTED, timeout=15)
@@ -920,7 +1035,11 @@ def test_connect_refused_by_the_kernel_fails_at_once(runtime):
 
     # TCP to a multicast address is refused by connect() itself; poll() on that
     # socket used to wait out the whole 15 s connect timeout.
-    client = Client(app_name="multicast-caller", transport=TCPTransport("224.0.0.1", 80), runtime=runtime)
+    client = Client(
+        app_name="multicast-caller",
+        transport=TCPTransport("224.0.0.1", 80),
+        runtime=runtime,
+    )
     start = time.monotonic()
     with pytest.raises(InitializationError) as info:
         client.connect()
@@ -938,14 +1057,20 @@ def test_unresolvable_tcp_host_is_not_taken_for_a_socket_path(tmp_path, monkeypa
     host = "no-such-host.invalid"
     (tmp_path / host).write_text("keep me")
 
-    service = Service(app_name="dns-svc", transport=TCPTransport(host, 4999), runtime=active_runtime())
+    service = Service(
+        app_name="dns-svc", transport=TCPTransport(host, 4999), runtime=active_runtime()
+    )
     with pytest.raises(Exception):
         service.start()
     service.stop()
     assert (tmp_path / host).read_text() == "keep me"
 
     (tmp_path / host).unlink()
-    client = Client(app_name="dns-client", transport=TCPTransport(host, 4999), runtime=active_runtime())
+    client = Client(
+        app_name="dns-client",
+        transport=TCPTransport(host, 4999),
+        runtime=active_runtime(),
+    )
     with pytest.raises(Exception):
         client.connect()
     client.stop()

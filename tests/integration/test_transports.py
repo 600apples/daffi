@@ -127,7 +127,9 @@ def _callbacks():
         return seconds
 
 
-def _service_proc(runtime: str, spec, app_name: str, bare: bool, tls: tuple | None) -> None:
+def _service_proc(
+    runtime: str, spec, app_name: str, bare: bool, tls: tuple | None
+) -> None:
     silence_subprocess(runtime)
     os.environ["DAFFI_WHO"] = app_name
     from daffi import Service
@@ -178,7 +180,9 @@ def _async_router_proc(runtime: str, spec, app_name: str) -> None:
     async def main():
         from daffi.aio import AsyncRouter
 
-        router = AsyncRouter(app_name=app_name, transport=_materialize(spec), runtime=runtime)
+        router = AsyncRouter(
+            app_name=app_name, transport=_materialize(spec), runtime=runtime
+        )
         await router.start()
         await router.join()
 
@@ -214,9 +218,7 @@ def _worker_proc(runtime: str, endpoint, app_name: str, tls_ca: str | None) -> N
 
 
 def _spawn(target, args):
-    proc = mp.Process(
-        target=target, args=(active_runtime(), *args), daemon=True
-    )
+    proc = mp.Process(target=target, args=(active_runtime(), *args), daemon=True)
     proc.start()
     return proc
 
@@ -249,7 +251,11 @@ def _caller_proc(runtime: str, endpoint, receiver: str, calling) -> None:
     silence_subprocess(runtime)
     from daffi import Client
 
-    client = Client(app_name="doomed-caller", transport=_materialize([endpoint], bare=True), runtime=runtime)
+    client = Client(
+        app_name="doomed-caller",
+        transport=_materialize([endpoint], bare=True),
+        runtime=runtime,
+    )
     conn = client.connect()
     conn.wait_for_members(receiver, timeout=20)
     calling.set()
@@ -314,7 +320,9 @@ def _worker_threads(timeout: float = 5.0) -> list[str]:
 
     deadline = time.monotonic() + timeout
     while True:
-        names = [t.name for t in threading.enumerate() if t.name.startswith("daffi-worker")]
+        names = [
+            t.name for t in threading.enumerate() if t.name.startswith("daffi-worker")
+        ]
         if not names or time.monotonic() > deadline:
             return names
         time.sleep(0.01)
@@ -337,7 +345,11 @@ def _wait_gone(conn, name: str, timeout: float = 20.0) -> None:
 def _connect(endpoint, app_name: str):
     from daffi import Client
 
-    client = Client(app_name=app_name, transport=_materialize([endpoint], bare=True), runtime=active_runtime())
+    client = Client(
+        app_name=app_name,
+        transport=_materialize([endpoint], bare=True),
+        runtime=active_runtime(),
+    )
     return client, client.connect()
 
 
@@ -348,7 +360,9 @@ def _isolated(target, *args, timeout: float = 90.0):
     nodes are never started inside the pytest process itself.
     """
     queue = mp.Queue()
-    proc = mp.Process(target=_run_isolated, args=(active_runtime(), queue, target, args), daemon=True)
+    proc = mp.Process(
+        target=_run_isolated, args=(active_runtime(), queue, target, args), daemon=True
+    )
     proc.start()
     try:
         ok, value = queue.get(timeout=timeout)
@@ -458,7 +472,11 @@ def _start_failing_after_peers_connected(spec, node: str, sync: bool = True) -> 
 
     def connect_everyone_then_fail(*_):
         for i, endpoint in enumerate(spec):
-            client = Client(app_name=f"peer-{i}", transport=_materialize([endpoint], bare=True), runtime=active_runtime())
+            client = Client(
+                app_name=f"peer-{i}",
+                transport=_materialize([endpoint], bare=True),
+                runtime=active_runtime(),
+            )
             client.connect()
             peers.append(client)
         raise RuntimeError("late start failure")
@@ -537,7 +555,12 @@ def _failed_service_start_threads(spec) -> dict:
     from daffi.exceptions import InitializationError as InitError
 
     blocker = _occupy(spec[-1])
-    svc = Service(app_name="iso-threads", transport=_materialize(spec), workers=3, runtime=active_runtime())
+    svc = Service(
+        app_name="iso-threads",
+        transport=_materialize(spec),
+        workers=3,
+        runtime=active_runtime(),
+    )
     try:
         svc.start()
     except InitError as exc:
@@ -559,7 +582,11 @@ def _restart_cycles(spec, rounds: int) -> list[list[bool]]:
 
     seen = []
     for i in range(rounds):
-        router = Router(app_name=f"iso-cycle-{i}", transport=_materialize(spec), runtime=active_runtime())
+        router = Router(
+            app_name=f"iso-cycle-{i}",
+            transport=_materialize(spec),
+            runtime=active_runtime(),
+        )
         router.start()
         seen.append([_accepts(endpoint) for endpoint in spec])
         router.stop()
@@ -589,7 +616,11 @@ def _async_start_with_one_bad_listener(spec, bad: int) -> dict:
     blocker = _occupy(spec[bad])
 
     async def main():
-        router = AsyncRouter(app_name="iso-async-bad", transport=_materialize(spec), runtime=active_runtime())
+        router = AsyncRouter(
+            app_name="iso-async-bad",
+            transport=_materialize(spec),
+            runtime=active_runtime(),
+        )
         try:
             await router.start()
         except InitError as exc:
@@ -642,13 +673,18 @@ class TestConstruction:
         from daffi import Router, TCPTransport
 
         with pytest.raises(InitializationError):
-            Router(transport=[TCPTransport(HOST, 1), object()], runtime=active_runtime())
+            Router(
+                transport=[TCPTransport(HOST, 1), object()], runtime=active_runtime()
+            )
 
     def test_duplicate_tcp_transport_is_rejected(self):
         from daffi import Router, TCPTransport
 
         with pytest.raises(InitializationError, match="duplicate transport tcp://"):
-            Router(transport=[TCPTransport(HOST, 7001), TCPTransport(HOST, 7001)], runtime=active_runtime())
+            Router(
+                transport=[TCPTransport(HOST, 7001), TCPTransport(HOST, 7001)],
+                runtime=active_runtime(),
+            )
 
     def test_duplicate_unix_transport_is_rejected(self):
         from daffi import Service, UnixTransport
@@ -656,13 +692,22 @@ class TestConstruction:
         path = "/tmp/daffi-dup.sock"
         relative = os.path.relpath(path)
         with pytest.raises(InitializationError, match="duplicate transport unix://"):
-            Service(transport=[UnixTransport(path), UnixTransport(relative)], runtime=active_runtime())
+            Service(
+                transport=[UnixTransport(path), UnixTransport(relative)],
+                runtime=active_runtime(),
+            )
 
     def test_same_port_on_different_hosts_or_ephemeral_ports_are_distinct(self):
         from daffi import Router, TCPTransport
 
-        Router(transport=[TCPTransport(HOST, 7002), TCPTransport("localhost", 7002)], runtime=active_runtime())
-        Router(transport=[TCPTransport(HOST, 0), TCPTransport(HOST, 0)], runtime=active_runtime())
+        Router(
+            transport=[TCPTransport(HOST, 7002), TCPTransport("localhost", 7002)],
+            runtime=active_runtime(),
+        )
+        Router(
+            transport=[TCPTransport(HOST, 0), TCPTransport(HOST, 0)],
+            runtime=active_runtime(),
+        )
 
     def test_client_takes_one_transport(self):
         from daffi import Client, Router, TCPTransport, UnixTransport
@@ -674,7 +719,10 @@ class TestConstruction:
         with pytest.raises(TypeError):
             Client(app_name="named-wrong", transports=tcp, runtime=active_runtime())
         with pytest.raises(InitializationError):
-            Client(transport=[tcp, UnixTransport("/tmp/daffi-client.sock")], runtime=active_runtime())
+            Client(
+                transport=[tcp, UnixTransport("/tmp/daffi-client.sock")],
+                runtime=active_runtime(),
+            )
         with pytest.raises(TypeError):
             Router(transports=tcp, runtime=active_runtime())
 
@@ -943,7 +991,9 @@ class TestNativeStart:
         assert info.value.args == ("port must be in range 0-65535", 1)
 
     def test_duplicate_listener_names_its_index(self):
-        result = _isolated(_native_start, [(HOST, 7003), (HOST, 7004), (HOST, 7003)], None)
+        result = _isolated(
+            _native_start, [(HOST, 7003), (HOST, 7004), (HOST, 7003)], None
+        )
         assert result["args"] == ("DuplicateListener", 2)
 
     def test_bind_failure_names_the_failing_listener(self):
@@ -1049,7 +1099,9 @@ class TestOneListenerLosesItsPeers:
             client, conn = _connect(_tcp(b), "watcher-b")
             try:
                 conn.wait_for_members("worker-on-a", "worker-on-unix", timeout=20)
-                assert conn.rpc(timeout=TIMEOUT, receiver="worker-on-unix").add(1, 1) == 2
+                assert (
+                    conn.rpc(timeout=TIMEOUT, receiver="worker-on-unix").add(1, 1) == 2
+                )
 
                 on_unix.kill()
                 on_unix.join(5)
@@ -1058,7 +1110,16 @@ class TestOneListenerLosesItsPeers:
                 assert "worker-on-a" in _members(conn)
                 assert conn.rpc(timeout=TIMEOUT, receiver="worker-on-a").add(2, 2) == 4
                 # The listener whose only peer died keeps accepting.
-                assert _rpc(_unix(path), "worker-on-a", "echo", "still", app_name="late-unix") == "still"
+                assert (
+                    _rpc(
+                        _unix(path),
+                        "worker-on-a",
+                        "echo",
+                        "still",
+                        app_name="late-unix",
+                    )
+                    == "still"
+                )
             finally:
                 client.stop()
                 quiet_kill(on_a)
@@ -1109,8 +1170,13 @@ class TestOneListenerLosesItsPeers:
                 doomed.join(5)
             finally:
                 quiet_kill(doomed)
-            assert _rpc(_tcp(port), "svc-doomed", "add", 5, 5, app_name="survivor") == 10
-            assert _rpc(_unix(path), "svc-doomed", "echo", "again", app_name="next-unix") == "again"
+            assert (
+                _rpc(_tcp(port), "svc-doomed", "add", 5, 5, app_name="survivor") == 10
+            )
+            assert (
+                _rpc(_unix(path), "svc-doomed", "echo", "again", app_name="next-unix")
+                == "again"
+            )
         finally:
             quiet_kill(proc)
 
@@ -1148,7 +1214,10 @@ class TestOneListenerLosesItsPeers:
                     with socket.create_connection((HOST, a), timeout=5) as sock:
                         sock.sendall(os.urandom(4096))
                 assert _rpc(_tcp(b), "worker-junk", "echo", "clean") == "clean"
-                assert _rpc(_tcp(a), "worker-junk", "add", 6, 6, app_name="after-junk") == 12
+                assert (
+                    _rpc(_tcp(a), "worker-junk", "add", 6, 6, app_name="after-junk")
+                    == 12
+                )
             finally:
                 quiet_kill(worker)
         finally:
@@ -1171,11 +1240,23 @@ class TestOneListenerLosesItsPeers:
                     os.unlink(path)
                     # The worker's established connection is unaffected while
                     # the path is gone, and the listener binds the path again.
-                    assert conn.rpc(timeout=TIMEOUT, receiver="worker-unlinked").add(7, 8) == 15
-                    assert _rpc(_tcp(port), "worker-unlinked", "who", app_name="new-tcp") == "worker-unlinked"
+                    assert (
+                        conn.rpc(timeout=TIMEOUT, receiver="worker-unlinked").add(7, 8)
+                        == 15
+                    )
+                    assert (
+                        _rpc(_tcp(port), "worker-unlinked", "who", app_name="new-tcp")
+                        == "worker-unlinked"
+                    )
                     _wait_accepts(_unix(path))
                     assert (
-                        _rpc(_unix(path), "worker-unlinked", "echo", "back", app_name="new-unix")
+                        _rpc(
+                            _unix(path),
+                            "worker-unlinked",
+                            "echo",
+                            "back",
+                            app_name="new-unix",
+                        )
                         == "back"
                     )
                 finally:
@@ -1227,13 +1308,22 @@ class TestOneListenerLosesItsPeers:
                     taken, _ = holder.accept()
                     taken.close()
                 # The server kept its other listener and did not steal the path.
-                assert _rpc(_tcp(port), "worker-held", "add", 1, 2, app_name="held-tcp") == 3
+                assert (
+                    _rpc(_tcp(port), "worker-held", "add", 1, 2, app_name="held-tcp")
+                    == 3
+                )
                 holder.close()
                 holder = None
                 os.unlink(path)
                 _wait_accepts(_unix(path))
                 assert (
-                    _rpc(_unix(path), "worker-held", "echo", "restored", app_name="held-unix")
+                    _rpc(
+                        _unix(path),
+                        "worker-held",
+                        "echo",
+                        "restored",
+                        app_name="held-unix",
+                    )
                     == "restored"
                 )
             finally:
@@ -1330,7 +1420,8 @@ class TestAsync:
                 from daffi.aio import AsyncClient
 
                 client = AsyncClient(
-                    app_name="aio-svc", transport=TCPTransport(HOST, b),
+                    app_name="aio-svc",
+                    transport=TCPTransport(HOST, b),
                     runtime=active_runtime(),
                 )
                 conn = await client.connect()

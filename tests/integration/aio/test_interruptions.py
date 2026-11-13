@@ -39,7 +39,9 @@ def _proc_service(runtime: str, port: int) -> None:
         async def echo(payload):
             return payload
 
-        svc = AsyncService(app_name="intr-aio-svc", transport=TCPTransport(HOST, port), runtime=runtime)
+        svc = AsyncService(
+            app_name="intr-aio-svc", transport=TCPTransport(HOST, port), runtime=runtime
+        )
         await svc.start()
         await svc.join()
 
@@ -53,7 +55,11 @@ def _proc_router(runtime: str, port: int) -> None:
         from daffi.aio import AsyncRouter
         from daffi import TCPTransport
 
-        r = AsyncRouter(app_name="intr-aio-router", transport=TCPTransport(HOST, port), runtime=runtime)
+        r = AsyncRouter(
+            app_name="intr-aio-router",
+            transport=TCPTransport(HOST, port),
+            runtime=runtime,
+        )
         await r.start()
         await r.join()
 
@@ -71,7 +77,9 @@ def _proc_worker(runtime: str, port: int, name: str = "intr-aio-worker") -> None
         async def echo(payload):
             return payload
 
-        client = AsyncClient(app_name=name, transport=TCPTransport(HOST, port), runtime=runtime)
+        client = AsyncClient(
+            app_name=name, transport=TCPTransport(HOST, port), runtime=runtime
+        )
         await client.connect()
         await client.join()
 
@@ -83,7 +91,14 @@ def _proc_worker(runtime: str, port: int, name: str = "intr-aio-worker") -> None
 
 @pytest.fixture
 def live_service(free_port):
-    proc = mp.Process(target=_proc_service, args=(active_runtime(), free_port,), daemon=True)
+    proc = mp.Process(
+        target=_proc_service,
+        args=(
+            active_runtime(),
+            free_port,
+        ),
+        daemon=True,
+    )
     proc.start()
     wait_for_port(free_port)
     time.sleep(0.15)
@@ -93,11 +108,25 @@ def live_service(free_port):
 
 @pytest.fixture
 def router_with_one_worker(free_port):
-    rproc = mp.Process(target=_proc_router, args=(active_runtime(), free_port,), daemon=True)
+    rproc = mp.Process(
+        target=_proc_router,
+        args=(
+            active_runtime(),
+            free_port,
+        ),
+        daemon=True,
+    )
     rproc.start()
     wait_for_port(free_port)
 
-    wproc = mp.Process(target=_proc_worker, args=(active_runtime(), free_port,), daemon=True)
+    wproc = mp.Process(
+        target=_proc_worker,
+        args=(
+            active_runtime(),
+            free_port,
+        ),
+        daemon=True,
+    )
     wproc.start()
     wait_for_members(free_port, {"intr-aio-worker"})
     yield free_port, rproc, wproc
@@ -117,7 +146,11 @@ class TestServiceKilledAsync:
         from daffi import TCPTransport
 
         port, svc_proc = live_service
-        client = AsyncClient(app_name="intr-killed", transport=TCPTransport(HOST, port), runtime=active_runtime())
+        client = AsyncClient(
+            app_name="intr-killed",
+            transport=TCPTransport(HOST, port),
+            runtime=active_runtime(),
+        )
         conn = await client.connect()
 
         # Give one good call to confirm the connection is live.
@@ -142,7 +175,8 @@ class TestServiceKilledAsync:
         from daffi import TCPTransport
 
         client = AsyncClient(
-            app_name="intr-dead-connect", transport=TCPTransport(HOST, free_port),
+            app_name="intr-dead-connect",
+            transport=TCPTransport(HOST, free_port),
             runtime=active_runtime(),
         )
         with pytest.raises(InitializationError):
@@ -154,7 +188,11 @@ class TestServiceKilledAsync:
         from daffi import TCPTransport
 
         port, svc_proc = live_service
-        client = AsyncClient(app_name="intr-frozen", transport=TCPTransport(HOST, port), runtime=active_runtime())
+        client = AsyncClient(
+            app_name="intr-frozen",
+            transport=TCPTransport(HOST, port),
+            runtime=active_runtime(),
+        )
         conn = await client.connect()
 
         os.kill(svc_proc.pid, signal.SIGSTOP)
@@ -172,7 +210,8 @@ class TestServiceKilledAsync:
 
         port, svc_proc = live_service
         client = AsyncClient(
-            app_name="intr-resumed", transport=TCPTransport(HOST, port),
+            app_name="intr-resumed",
+            transport=TCPTransport(HOST, port),
             runtime=active_runtime(),
         )
         conn = await client.connect()
@@ -202,13 +241,16 @@ class TestWorkerKilledAsync:
 
         # Add a second worker so there's one surviving after we kill the first.
         proc2 = mp.Process(
-            target=_proc_worker, args=(active_runtime(), port, "intr-aio-worker2"), daemon=True
+            target=_proc_worker,
+            args=(active_runtime(), port, "intr-aio-worker2"),
+            daemon=True,
         )
         proc2.start()
         wait_for_members(port, {"intr-aio-worker2"})
 
         client = AsyncClient(
-            app_name="intr-cast-caller", transport=TCPTransport(HOST, port),
+            app_name="intr-cast-caller",
+            transport=TCPTransport(HOST, port),
             runtime=active_runtime(),
         )
         conn = await client.connect()

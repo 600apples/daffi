@@ -450,23 +450,36 @@ pub fn missingMembers(_: [*c]PyObject, args: [*c]PyObject) callconv(.c) [*c]PyOb
     if (py.PyArg_ParseTuple(args, "kO", &conn_num, &names) == 0) return null;
     const iter = py.PyObject_GetIter(names) orelse return null;
     defer py.Py_DECREF(iter);
-    const missing = py.PyList_New(0) orelse return null;
+    // The UTF-8 views stay valid without the GIL while `held` keeps their
+    // str objects alive.
+    var held: std.ArrayList(*PyObject) = .empty;
+    defer {
+        for (held.items) |name| py.Py_DECREF(name);
+        held.deinit(allocator);
+    }
+    var views: std.ArrayList([]const u8) = .empty;
+    defer views.deinit(allocator);
     while (py.PyIter_Next(iter)) |name| {
-        defer py.Py_DECREF(name);
-        var size: py.Py_ssize_t = undefined;
-        const utf8 = py.PyUnicode_AsUTF8AndSize(name, &size) orelse {
-            py.Py_DECREF(missing);
-            return null;
+        held.append(allocator, name) catch {
+            py.Py_DECREF(name);
+            return py.PyErr_NoMemory();
         };
-        const present = Client.hasMember(conn_num, utf8[0..@intCast(size)]) catch false;
-        if (!present and py.PyList_Append(missing, name) != 0) {
+        var size: py.Py_ssize_t = undefined;
+        const utf8 = py.PyUnicode_AsUTF8AndSize(name, &size) orelse return null;
+        views.append(allocator, utf8[0..@intCast(size)]) catch return py.PyErr_NoMemory();
+    }
+    if (py.PyErr_Occurred() != null) return null;
+    const present = allocator.alloc(bool, views.items.len) catch return py.PyErr_NoMemory();
+    defer allocator.free(present);
+    const py_state = py.PyEval_SaveThread();
+    Client.hasMembers(conn_num, views.items, present) catch @memset(present, false);
+    py.PyEval_RestoreThread(py_state);
+    const missing = py.PyList_New(0) orelse return null;
+    for (held.items, present) |name, is_present| {
+        if (!is_present and py.PyList_Append(missing, name) != 0) {
             py.Py_DECREF(missing);
             return null;
         }
-    }
-    if (py.PyErr_Occurred() != null) {
-        py.Py_DECREF(missing);
-        return null;
     }
     return missing;
 }
@@ -477,7 +490,11 @@ pub fn getAvailableMembers(_: [*c]PyObject, args: [*c]PyObject) callconv(.c) [*c
     if (py.PyArg_ParseTuple(args, "k", &conn_num) == 0) return null;
     // getAvailableMembers returns allocator-owned memory (always).  We must
     // free it after Py_BuildValue has copied it into a Python string object.
-    const members = Client.getAvailableMembers(allocator, conn_num) catch return Py_BuildValue("");
+    // The member list is built under the client's lock: not with the GIL held.
+    const py_state = py.PyEval_SaveThread();
+    const result = Client.getAvailableMembers(allocator, conn_num);
+    py.PyEval_RestoreThread(py_state);
+    const members = result catch return Py_BuildValue("");
     defer allocator.free(members);
     return Py_BuildValue("s#", cPtr(members), @as(py.Py_ssize_t, @intCast(members.len)));
 }

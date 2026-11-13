@@ -29,7 +29,22 @@ pub const Source = struct {
     fd: c_int,
     onReadable: *const fn (source: *Source, scratch: []u8) Action,
     onRemoved: *const fn (source: *Source) void,
+    /// Watched for writability instead of readability (see `readNeedsWrite`).
+    awaiting_write: bool = false,
 };
+
+/// Descriptor whose read on this loop thread cannot go on until it is
+/// writable.  Reset before each callback.
+threadlocal var read_needs_write: c_int = -1;
+
+/// For a read on a loop thread that cannot go on until `fd` is writable (a
+/// TLS session that must send first): until the callback that made it
+/// returns and the socket takes data, the loop watches `fd` for writability
+/// only, so a socket that stays readable does not spin it.  `onReadable`
+/// runs when it becomes writable.
+pub fn readNeedsWrite(fd: c_int) void {
+    if (current != null) read_needs_write = fd;
+}
 
 const Command = struct {
     func: *const fn (ctx: *anyopaque) void,
@@ -84,6 +99,7 @@ pub fn start(allocator: std.mem.Allocator) !*EventLoop {
 
 /// Start watching `source.fd`.  Thread-safe.
 pub fn register(self: *EventLoop, source: *Source) !void {
+    source.awaiting_write = false;
     try self.poller.add(source.fd, @intFromPtr(source));
 }
 
@@ -92,6 +108,7 @@ pub fn register(self: *EventLoop, source: *Source) !void {
 pub fn disarm(self: *EventLoop, source: *Source) void {
     std.debug.assert(self.isLoopThread());
     self.poller.remove(source.fd);
+    source.awaiting_write = false;
 }
 
 /// Start watching every source in `sources` as one step, on the loop thread:
@@ -194,9 +211,19 @@ fn run(self: *EventLoop, ready: *misc.Event) void {
                 continue;
             }
             const source: *Source = @ptrFromInt(udata);
+            read_needs_write = -1;
             if (source.onReadable(source, &self.scratch) == .remove) {
                 self.poller.remove(source.fd);
                 source.onRemoved(source);
+                continue;
+            }
+            const wants_write = read_needs_write == source.fd;
+            if (wants_write != source.awaiting_write) {
+                self.poller.watch(source.fd, udata, if (wants_write) .write else .read) catch |err| {
+                    log.warn("cannot change what descriptor {d} is watched for: {}", .{ source.fd, err });
+                    continue;
+                };
+                source.awaiting_write = wants_write;
             }
         }
         self.runCommands();
@@ -244,6 +271,61 @@ test "EventLoop delivers readability and runs commands" {
     probe.removed.wait();
     try std.testing.expect(probe.hits.load(.acquire) >= 1);
     _ = c.close(fds[0]);
+}
+
+test "a read that needs to write waits for writability without spinning" {
+    const loop = try start(std.heap.c_allocator);
+    const pc = @import("posix_c");
+
+    const Probe = struct {
+        source: Source,
+        hits: std.atomic.Value(u32) = .init(0),
+        /// While set, each call reports that the read must write first.
+        blocked: std.atomic.Value(bool) = .init(true),
+
+        fn onReadable(s: *Source, _: []u8) Action {
+            const self: *@This() = @fieldParentPtr("source", s);
+            _ = self.hits.fetchAdd(1, .acq_rel);
+            if (self.blocked.load(.acquire)) readNeedsWrite(s.fd);
+            return .keep;
+        }
+        fn onRemoved(_: *Source) void {}
+    };
+    const Noop = struct {
+        fn run(_: *anyopaque) void {}
+    };
+    var token: u8 = 0;
+
+    var fds: [2]c_int = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), pc.socketpair(pc.AF_UNIX, pc.SOCK_STREAM, 0, &fds));
+    defer for (fds) |fd| {
+        _ = c.close(fd);
+    };
+    // fds[0]: send buffer full (not writable), and data waiting (readable).
+    var filler: [4096]u8 = @splat(1);
+    while (c.send(fds[0], &filler, filler.len, c.MSG.DONTWAIT) > 0) {}
+    _ = c.write(fds[1], "x", 1);
+
+    var probe = Probe{ .source = .{ .fd = fds[0], .onReadable = Probe.onReadable, .onRemoved = Probe.onRemoved } };
+    try loop.register(&probe.source);
+    var rounds: usize = 0;
+    while (probe.hits.load(.acquire) == 0) : (rounds += 1) {
+        try std.testing.expect(rounds < 1000);
+        loop.call(Noop.run, &token);
+    }
+    for (0..50) |_| loop.call(Noop.run, &token);
+    try std.testing.expectEqual(@as(u32, 1), probe.hits.load(.acquire));
+
+    // Writable again: the source runs, then goes back to readability.
+    probe.blocked.store(false, .release);
+    var drain: [64 * 1024]u8 = undefined;
+    while (c.recv(fds[1], &drain, drain.len, c.MSG.DONTWAIT) > 0) {}
+    rounds = 0;
+    while (probe.hits.load(.acquire) < 3) : (rounds += 1) {
+        try std.testing.expect(rounds < 10_000);
+        loop.call(Noop.run, &token);
+    }
+    loop.detach(&.{&probe.source});
 }
 
 test "EventLoop.registerAll watches every source or none" {

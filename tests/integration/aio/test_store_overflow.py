@@ -50,7 +50,7 @@ def _proc_service_overflow(runtime: str, port: int) -> None:
     silence_subprocess(runtime)
 
     async def _main():
-        from daffi import callback, TCPTransport
+        from daffi import callback, SerdeFormat, TCPTransport
         from daffi.aio import AsyncService
 
         _barrier = _AsyncBarrier2()
@@ -66,8 +66,11 @@ def _proc_service_overflow(runtime: str, port: int) -> None:
             return payload
 
         svc = AsyncService(
-            app_name="overflow-aio-svc", workers=4, transport=TCPTransport(HOST, port),
+            app_name="overflow-aio-svc",
+            workers=4,
+            transport=TCPTransport(HOST, port),
             runtime=runtime,
+            serdes=SerdeFormat.ALL,
         )
         await svc.start()
         await svc.join()
@@ -77,7 +80,14 @@ def _proc_service_overflow(runtime: str, port: int) -> None:
 
 @pytest.fixture
 def overflow_service(free_port):
-    proc = mp.Process(target=_proc_service_overflow, args=(active_runtime(), free_port,), daemon=True)
+    proc = mp.Process(
+        target=_proc_service_overflow,
+        args=(
+            active_runtime(),
+            free_port,
+        ),
+        daemon=True,
+    )
     proc.start()
     wait_for_port(free_port, proc=proc)
     time.sleep(0.2)

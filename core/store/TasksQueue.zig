@@ -12,10 +12,17 @@ pub const max_pending: usize = 65_536;
 /// The same for the bytes the waiting requests hold: a few peers sending
 /// large messages faster than Python takes them must not exhaust memory.
 pub const max_pending_bytes: usize = 256 * 1024 * 1024;
+/// Lifecycle events waiting beyond this many are dropped: a peer looping
+/// handshake/disconnect must not grow the queue while Python is not taking
+/// from it.
+pub const max_pending_events: usize = 65_536;
 
 queue: std.DoublyLinkedList = .{},
 len: usize = 0,
 bytes: usize = 0,
+/// How many of `len` are EVENTS messages.
+events: usize = 0,
+event_limit: usize = max_pending_events,
 byte_limit: usize = max_pending_bytes,
 mutex: Mutex = .{},
 /// Guards both descriptors.  Python sets one to -1 before closing it, so a
@@ -44,6 +51,7 @@ pub fn deinit(self: *TasksQueue) void {
     }
     self.len = 0;
     self.bytes = 0;
+    self.events = 0;
 }
 
 /// Tell Python the queue has work, unless an earlier wakeup is still
@@ -105,14 +113,18 @@ pub fn getMessageFromQueue(self: *TasksQueue) ?*Message {
     self.len -= 1;
     const msg: *Message = @alignCast(@fieldParentPtr("queue_node", node));
     self.bytes -= msg.data.len;
+    if (msg.getFlag() == .EVENTS) self.events -= 1;
     return msg;
 }
 
-/// Queue a message whatever the backlog (events, lifecycle notices).
-pub fn pushMessageToQueue(self: *TasksQueue, message: *Message) void {
+/// Queue an event whatever the request backlog, unless `event_limit` events
+/// are already waiting.  The caller keeps a refused message.
+pub fn tryPushEvent(self: *TasksQueue, message: *Message) bool {
     self.mutex.lock();
     defer self.mutex.unlock();
+    if (self.events >= self.event_limit) return false;
     self.append(message);
+    return true;
 }
 
 /// Queue a request unless `max_pending` requests or `byte_limit` bytes are
@@ -131,6 +143,7 @@ fn append(self: *TasksQueue, message: *Message) void {
     self.queue.append(&message.queue_node);
     self.len += 1;
     self.bytes += message.data.len;
+    if (message.getFlag() == .EVENTS) self.events += 1;
 }
 
 pub fn pending(self: *TasksQueue) usize {
@@ -160,4 +173,22 @@ test "TasksQueue refuses requests past its byte limit" {
     try std.testing.expectEqual(@as(usize, 0), q.bytes);
     try std.testing.expect(q.tryPushRequest(small));
     try std.testing.expect(q.bytes > 0);
+}
+
+test "TasksQueue drops events past its event limit" {
+    var q = TasksQueue{ .event_limit = 2 };
+    defer q.deinit();
+
+    for (0..2) |_| try std.testing.expect(q.tryPushEvent(try serde.createEventMessage(std.testing.allocator, 0, "peer", "connected")));
+    const extra = try serde.createEventMessage(std.testing.allocator, 0, "peer", "disconnected");
+    defer extra.deinit();
+    try std.testing.expect(!q.tryPushEvent(extra));
+    // Requests are counted apart.
+    try std.testing.expect(q.tryPushRequest(try testRequest("1")));
+    try std.testing.expectEqual(@as(usize, 3), q.pending());
+
+    q.getMessageFromQueue().?.deinit();
+    try std.testing.expectEqual(@as(usize, 1), q.events);
+    const again = try serde.createEventMessage(std.testing.allocator, 0, "peer", "connected");
+    try std.testing.expect(q.tryPushEvent(again));
 }

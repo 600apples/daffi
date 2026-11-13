@@ -20,6 +20,7 @@ pub const op_table = OperationTable{
     .writeParts = writeParts,
     .writeNonBlocking = writeNonBlocking,
     .writeNonBlockingParts = writeNonBlockingParts,
+    .writeVec = writeVec,
     .accept = accept,
     .handle = handle,
     .hasPendingInput = hasPendingInput,
@@ -125,6 +126,10 @@ pub fn writeNonBlocking(_: *anyopaque, _: []const u8) !usize {
 }
 
 pub fn writeNonBlockingParts(_: *anyopaque, _: []const u8, _: []const u8) !usize {
+    @panic("server connection does not support write");
+}
+
+pub fn writeVec(_: *anyopaque, _: []const []const u8) !bool {
     @panic("server connection does not support write");
 }
 

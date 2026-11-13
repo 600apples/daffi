@@ -76,8 +76,10 @@ def _silence(runtime: str) -> None:
     logging.disable(logging.CRITICAL)
 
     import tests.conftest as _runtime_state
+
     _runtime_state.SELECTED_RUNTIME = runtime
     from daffi import dfcore
+
     dfcore.setRuntime(runtime)
 
 
@@ -101,7 +103,9 @@ def _proc_service(runtime: str, port: int) -> None:
     def echo(payload):
         return payload
 
-    svc = Service(app_name="bench-service", transport=TCPTransport(HOST, port), runtime=runtime)
+    svc = Service(
+        app_name="bench-service", transport=TCPTransport(HOST, port), runtime=runtime
+    )
     svc.start()
     svc.join()
 
@@ -110,7 +114,9 @@ def _proc_router(runtime: str, port: int) -> None:
     _silence(runtime)
     from daffi import Router, TCPTransport
 
-    router = Router(app_name="bench-router", transport=TCPTransport(HOST, port), runtime=runtime)
+    router = Router(
+        app_name="bench-router", transport=TCPTransport(HOST, port), runtime=runtime
+    )
     router.start()
     router.join()
 
@@ -123,7 +129,9 @@ def _proc_worker(runtime: str, port: int) -> None:
     def echo(payload):
         return payload
 
-    client = Client(app_name="bench-worker", transport=TCPTransport(HOST, port), runtime=runtime)
+    client = Client(
+        app_name="bench-worker", transport=TCPTransport(HOST, port), runtime=runtime
+    )
     client.connect()
     while True:
         time.sleep(1)
@@ -159,11 +167,22 @@ def bench_direct(calls: int) -> dict:
     from daffi import Client, TCPTransport
 
     port = _free_port()
-    svc = mp.Process(target=_proc_service, args=(active_runtime(), port,), daemon=True)
+    svc = mp.Process(
+        target=_proc_service,
+        args=(
+            active_runtime(),
+            port,
+        ),
+        daemon=True,
+    )
     svc.start()
     try:
         _wait_for_port(port)
-        client = Client(app_name="bench-direct", transport=TCPTransport(HOST, port), runtime=active_runtime())
+        client = Client(
+            app_name="bench-direct",
+            transport=TCPTransport(HOST, port),
+            runtime=active_runtime(),
+        )
         conn = client.connect()
         conn.wait_for_members("bench-service", timeout=10)
         result = _sequential(conn, calls)
@@ -177,13 +196,31 @@ def bench_router(calls: int) -> dict:
     from daffi import Client, TCPTransport
 
     port = _free_port()
-    router = mp.Process(target=_proc_router, args=(active_runtime(), port,), daemon=True)
+    router = mp.Process(
+        target=_proc_router,
+        args=(
+            active_runtime(),
+            port,
+        ),
+        daemon=True,
+    )
     router.start()
-    worker = mp.Process(target=_proc_worker, args=(active_runtime(), port,), daemon=True)
+    worker = mp.Process(
+        target=_proc_worker,
+        args=(
+            active_runtime(),
+            port,
+        ),
+        daemon=True,
+    )
     try:
         _wait_for_port(port)
         worker.start()
-        client = Client(app_name="bench-caller", transport=TCPTransport(HOST, port), runtime=active_runtime())
+        client = Client(
+            app_name="bench-caller",
+            transport=TCPTransport(HOST, port),
+            runtime=active_runtime(),
+        )
         conn = client.connect()
         conn.wait_for_members("bench-worker", timeout=10)
         result = _sequential(conn, calls)
@@ -197,7 +234,14 @@ def bench_concurrent(n_clients: int, seconds: float) -> dict:
     from daffi import Client, TCPTransport
 
     port = _free_port()
-    svc = mp.Process(target=_proc_service, args=(active_runtime(), port,), daemon=True)
+    svc = mp.Process(
+        target=_proc_service,
+        args=(
+            active_runtime(),
+            port,
+        ),
+        daemon=True,
+    )
     svc.start()
     try:
         _wait_for_port(port)
@@ -208,9 +252,13 @@ def bench_concurrent(n_clients: int, seconds: float) -> dict:
         clients, conns = [], []
         connect_started = time.perf_counter()
         for i in range(n_clients):
-            client = Client(app_name=f"bench-c{i}", transport=TCPTransport(HOST, port), runtime=active_runtime())
+            client = Client(
+                app_name=f"bench-c{i}",
+                transport=TCPTransport(HOST, port),
+                runtime=active_runtime(),
+            )
             conn = client.connect()
-            conn.wait_for_members("bench-service", timeout=10, interval=0.05)
+            conn.wait_for_members("bench-service", timeout=10)
             clients.append(client)
             conns.append(conn)
             if (i + 1) % 200 == 0 or i + 1 == n_clients:
@@ -247,7 +295,9 @@ def bench_concurrent(n_clients: int, seconds: float) -> dict:
             for started, t in enumerate(threads, start=1):
                 t.start()
                 if started % 200 == 0 or started == n_clients:
-                    print(f"concurrent: callers started {started}/{n_clients}", flush=True)
+                    print(
+                        f"concurrent: callers started {started}/{n_clients}", flush=True
+                    )
             deadline[0] = time.perf_counter() + seconds
             start.set()
             print(f"concurrent: load for {seconds:.0f}s", flush=True)
@@ -470,9 +520,7 @@ def main() -> None:
             print(line, end="", flush=True)
         proc.wait()
         text = "".join(captured)
-        line = next(
-            (l for l in text.splitlines() if l.startswith("RESULT ")), None
-        )
+        line = next((l for l in text.splitlines() if l.startswith("RESULT ")), None)
         if line is None:
             print(f"{model} run failed (exit {proc.returncode})", flush=True)
             results[model] = None

@@ -164,18 +164,17 @@ const Runtime = struct {
         // `live` under this same lock, so a connection either gets registered
         // before the walk (and is closed by it) or is refused here.
         if (self.stopping) return error.ServerStopping;
+        conn.live_index = self.live.items.len;
         try self.live.append(self.allocator, conn);
     }
 
     fn unregisterLive(self: *Runtime, conn: *ServerHandler.ConnectionT) void {
         self.live_mutex.lock();
         defer self.live_mutex.unlock();
-        for (self.live.items, 0..) |c, i| {
-            if (c == conn) {
-                _ = self.live.swapRemove(i);
-                return;
-            }
-        }
+        const i = conn.live_index;
+        if (i >= self.live.items.len or self.live.items[i] != conn) return;
+        _ = self.live.swapRemove(i);
+        if (i < self.live.items.len) self.live.items[i].live_index = i;
     }
 
     fn interruptAllLive(self: *Runtime) void {
@@ -253,16 +252,16 @@ const Runtime = struct {
         }
     }
 
-    /// Close every native connection whose unfinished frame has received
-    /// nothing for `frame_stall_ms`: a peer must not hold its share of the
-    /// partial-frame budget, or a reader thread, forever.
+    /// Close every connection (native or WebSocket) whose unfinished frame
+    /// has received nothing for `frame_stall_ms`: a peer must not hold its
+    /// share of the partial-frame budget, or a reader thread, forever.
     fn closeStalledFrames(self: *Runtime) void {
         const now = misc.monotonicMs();
         const frame_stall_ms = frame_stall_setting.load(.monotonic);
         self.live_mutex.lock();
         defer self.live_mutex.unlock();
         for (self.live.items) |c| {
-            if (c.is_websocket or !c.frameStalled(now, frame_stall_ms)) continue;
+            if (!c.frameStalled(now, frame_stall_ms)) continue;
             c.frame_progress_ms.store(0, .monotonic);
             if (c.peer_addr) |addr| {
                 log.warn("closing connection from {f}: a message stalled half-received for {d} ms", .{ fmtNetAddr(addr), frame_stall_ms });
@@ -956,7 +955,7 @@ fn onListenerRemoved(_: *EventLoop.Source) void {}
 
 /// Process-wide cap on accepted connections (threads and evented).
 /// Override with `DAFFI_MAX_CONNECTIONS`.
-const default_max_connections: usize = 4096;
+const default_max_connections: usize = 20_000;
 var max_connections: std.atomic.Value(usize) = .init(default_max_connections);
 
 fn readMaxConnections() void {

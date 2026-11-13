@@ -32,7 +32,7 @@ python examples/service/01_rpc/2_client.py
 
 | Format | Types supported | Cross-language | Requires extra |
 |--------|----------------|----------------|----------------|
-| `PICKLE` | Any Python object | No | — |
+| `PICKLE` | Any Python object (refuse with `serdes=SerdeFormat.SAFE`) | No | — |
 | `JSON` | dict, list, str, int, float, bool, None | Yes | — |
 | `OPAQUE` | `bytes` or `str` (pass-through) | Yes | — |
 | `MSGPACK` | Same as JSON (binary) | Yes | included |

@@ -100,6 +100,8 @@ pub const RecvFreelist = struct {
     /// first `filled` bytes.  May return `old` when it already fits.
     pub fn reallocBuf(self: *RecvFreelist, old: []u8, filled: usize, new_len: usize) ![]u8 {
         if (old.len >= new_len) return old;
+        // Unpooled: the allocator may grow it in place (mremap) instead of copying.
+        if (old.len > class_sizes[class_sizes.len - 1]) return try self.allocator.realloc(old, new_len);
         const fresh = try self.allocBuf(new_len);
         @memcpy(fresh[0..filled], old[0..filled]);
         self.freeBuf(old);

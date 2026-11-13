@@ -19,7 +19,9 @@ async def _rpc(port: int, name: str, method: str, *args, serde, **kwargs):
     from daffi.aio import AsyncClient
     from daffi import TCPTransport
 
-    client = AsyncClient(app_name=name, transport=TCPTransport(HOST, port), runtime=active_runtime())
+    client = AsyncClient(
+        app_name=name, transport=TCPTransport(HOST, port), runtime=active_runtime()
+    )
     conn = await client.connect()
     try:
         proxy = conn.rpc(timeout=TIMEOUT, serde=serde)
@@ -100,7 +102,8 @@ class TestPickleAsync:
         from daffi import SerdeFormat, TCPTransport
 
         client = AsyncClient(
-            app_name="pk-multi", transport=TCPTransport(HOST, direct_service),
+            app_name="pk-multi",
+            transport=TCPTransport(HOST, direct_service),
             runtime=active_runtime(),
         )
         conn = await client.connect()
@@ -171,7 +174,8 @@ class TestJsonAsync:
         from daffi import SerdeFormat, TCPTransport
 
         client = AsyncClient(
-            app_name="js-multi", transport=TCPTransport(HOST, direct_service),
+            app_name="js-multi",
+            transport=TCPTransport(HOST, direct_service),
             runtime=active_runtime(),
         )
         conn = await client.connect()
@@ -185,7 +189,8 @@ class TestJsonAsync:
         from daffi import SerdeFormat, TCPTransport
 
         client = AsyncClient(
-            app_name="js-kwargs", transport=TCPTransport(HOST, direct_service),
+            app_name="js-kwargs",
+            transport=TCPTransport(HOST, direct_service),
             runtime=active_runtime(),
         )
         conn = await client.connect()
@@ -261,7 +266,9 @@ class TestOpaqueAsync:
         assert not isinstance(result, bytearray)
 
     async def test_bytearray_empty(self, direct_service):
-        result = await self._rpc_opaque(direct_service, "op-bytearray-empty", bytearray())
+        result = await self._rpc_opaque(
+            direct_service, "op-bytearray-empty", bytearray()
+        )
         assert result == b""
         assert isinstance(result, bytes)
 
@@ -300,7 +307,8 @@ class TestOpaqueAsync:
         from daffi import SerdeFormat, TCPTransport
 
         client = AsyncClient(
-            app_name="op-multi-err", transport=TCPTransport(HOST, direct_service),
+            app_name="op-multi-err",
+            transport=TCPTransport(HOST, direct_service),
             runtime=active_runtime(),
         )
         conn = await client.connect()
@@ -316,7 +324,8 @@ class TestOpaqueAsync:
         from daffi import SerdeFormat, TCPTransport
 
         client = AsyncClient(
-            app_name="op-kwarg", transport=TCPTransport(HOST, direct_service),
+            app_name="op-kwarg",
+            transport=TCPTransport(HOST, direct_service),
             runtime=active_runtime(),
         )
         conn = await client.connect()
@@ -405,7 +414,8 @@ class TestMsgpackAsync:
         from daffi import SerdeFormat, TCPTransport
 
         client = AsyncClient(
-            app_name="mp-multi", transport=TCPTransport(HOST, direct_service),
+            app_name="mp-multi",
+            transport=TCPTransport(HOST, direct_service),
             runtime=active_runtime(),
         )
         conn = await client.connect()
@@ -419,7 +429,8 @@ class TestMsgpackAsync:
         from daffi import SerdeFormat, TCPTransport
 
         client = AsyncClient(
-            app_name="mp-router", transport=TCPTransport(HOST, router_with_worker),
+            app_name="mp-router",
+            transport=TCPTransport(HOST, router_with_worker),
             runtime=active_runtime(),
         )
         conn = await client.connect()

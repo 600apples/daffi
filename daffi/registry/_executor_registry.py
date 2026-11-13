@@ -79,7 +79,11 @@ class ExecutorRegistry:
             subscriber(executor)
 
     def rename(self, old: str, new: str) -> None:
-        """Move the executor registered as *old* to *new*."""
+        """Move the executor registered as *old* to *new*.
+
+        One step for readers: a lookup finds the callback under one of the
+        two names throughout, and a failed rename leaves it under *old*.
+        """
         if old == new:
             return
         with self._lock:
@@ -91,8 +95,12 @@ class ExecutorRegistry:
                     f"Callback {existing!r} is already registered. "
                     "Please use another name or set a custom alias."
                 )
+            renamed = Executor(executor.func, new, executor.cls)
+            self.registry[new] = renamed
             del self.registry[old]
-        self.register(new, executor.func, executor.cls)
+            subscribers = list(self.subscribers)
+        for subscriber in subscribers:
+            subscriber(renamed)
 
     def unregister(self, name: str) -> None:
         """Remove the executor registered under *name*.  No-op if absent."""
@@ -101,8 +109,7 @@ class ExecutorRegistry:
 
     def get(self, name: str) -> Optional[Executor]:
         """Look up an executor by *name*, returning ``None`` if not found."""
-        with self._lock:
-            return self.registry.get(name)
+        return self.registry.get(name)
 
 
 EXECUTOR_REGISTRY = ExecutorRegistry()

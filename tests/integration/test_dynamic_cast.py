@@ -46,7 +46,8 @@ def _process_worker(runtime: str, port: int, worker_id: int) -> None:
         return {"result": data, "worker": worker_id}
 
     client = Client(
-        app_name=f"dyn-worker-{worker_id}", transport=TCPTransport(HOST, port),
+        app_name=f"dyn-worker-{worker_id}",
+        transport=TCPTransport(HOST, port),
         runtime=runtime,
     )
     client.connect()
@@ -65,7 +66,14 @@ def _process_worker(runtime: str, port: int, worker_id: int) -> None:
 @pytest.fixture
 def router_only(free_port):
     """Start only the Router; workers are spawned inside the test body."""
-    rproc = mp.Process(target=proc_router, args=(active_runtime(), free_port,), daemon=True)
+    rproc = mp.Process(
+        target=proc_router,
+        args=(
+            active_runtime(),
+            free_port,
+        ),
+        daemon=True,
+    )
     rproc.start()
     wait_for_port(free_port)
     yield free_port
@@ -76,7 +84,9 @@ def router_only(free_port):
 
 
 def _spawn_worker(port: int, worker_id: int) -> mp.Process:
-    p = mp.Process(target=_process_worker, args=(active_runtime(), port, worker_id), daemon=True)
+    p = mp.Process(
+        target=_process_worker, args=(active_runtime(), port, worker_id), daemon=True
+    )
     p.start()
     return p
 
@@ -97,7 +107,8 @@ class TestDynamicCast:
         from daffi import Client, TCPTransport
 
         client = Client(
-            app_name="dyn-caller", transport=TCPTransport(HOST, router_only),
+            app_name="dyn-caller",
+            transport=TCPTransport(HOST, router_only),
             runtime=active_runtime(),
         )
         conn = client.connect()
@@ -147,7 +158,8 @@ class TestDynamicCast:
         from daffi import Client, TCPTransport
 
         client = Client(
-            app_name="dyn-caller-vals", transport=TCPTransport(HOST, router_only),
+            app_name="dyn-caller-vals",
+            transport=TCPTransport(HOST, router_only),
             runtime=active_runtime(),
         )
         conn = client.connect()

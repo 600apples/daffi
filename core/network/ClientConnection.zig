@@ -19,6 +19,7 @@ pub const op_table = OperationTable{
     .writeParts = writeParts,
     .writeNonBlocking = writeNonBlocking,
     .writeNonBlockingParts = writeNonBlockingParts,
+    .writeVec = writeVec,
     .accept = accept,
     .handle = handle,
     .hasPendingInput = hasPendingInput,
@@ -150,33 +151,34 @@ pub fn write(ctx: *anyopaque, data: []const u8) !void {
     return try self.stream.writeAll(data);
 }
 
+/// For TLS, short of everything the record that starts at the returned
+/// offset is in flight: the caller's write side must pass to whoever sends
+/// the rest (see `tls.sslWriteSome`).
 pub fn writeNonBlocking(ctx: *anyopaque, data: []const u8) !usize {
     const self: *ClientConnection = @ptrCast(@alignCast(ctx));
-    // A TLS record cannot be half-written and resumed by another thread.
-    if (self.ssl != null) return 0;
+    if (self.ssl) |ssl| return tls_impl.sslWriteSome(ssl, &.{data});
     return self.stream.writeNonBlocking(data);
 }
 
 pub fn writeNonBlockingParts(ctx: *anyopaque, head: []const u8, body: []const u8) !usize {
     const self: *ClientConnection = @ptrCast(@alignCast(ctx));
-    if (self.ssl != null) return 0;
+    if (self.ssl) |ssl| return tls_impl.sslWriteSome(ssl, &.{ head, body });
     return self.stream.writeNonBlockingParts(head, body);
 }
 
 pub fn writeParts(ctx: *anyopaque, head: []const u8, body: []const u8) !void {
     const self: *ClientConnection = @ptrCast(@alignCast(ctx));
-    if (self.ssl) |ssl| {
-        const total = head.len + body.len;
-        if (total <= 16 * 1024) {
-            var tmp: [16 * 1024]u8 = undefined;
-            @memcpy(tmp[0..head.len], head);
-            @memcpy(tmp[head.len..][0..body.len], body);
-            return tls_impl.sslWrite(ssl, tmp[0..total]);
-        }
-        try tls_impl.sslWrite(ssl, head);
-        return tls_impl.sslWrite(ssl, body);
-    }
+    if (self.ssl) |ssl| return tls_impl.sslWriteParts(ssl, &.{ head, body });
     return self.stream.writeAllParts(head, body);
+}
+
+/// Plain TCP only: records cut across queued writes would not line up with
+/// a TLS write that is still in flight.
+pub fn writeVec(ctx: *anyopaque, parts: []const []const u8) !bool {
+    const self: *ClientConnection = @ptrCast(@alignCast(ctx));
+    if (self.ssl != null) return false;
+    try self.stream.writeAllVec(parts);
+    return true;
 }
 
 pub fn accept(_: *anyopaque, _: c_int) anyerror!AcceptedConnection {

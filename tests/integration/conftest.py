@@ -80,7 +80,11 @@ def wait_for_members(
 
     # children don't pull daffi in during fixture
     # import.
-    client = Client(app_name=probe_name, transport=TCPTransport(HOST, port), runtime=active_runtime())
+    client = Client(
+        app_name=probe_name,
+        transport=TCPTransport(HOST, port),
+        runtime=active_runtime(),
+    )
     conn = client.connect()
     try:
         conn.wait_for_members(*expected, timeout=timeout)
@@ -105,8 +109,10 @@ def silence_subprocess(runtime: str) -> None:
     logging.disable(logging.CRITICAL)
 
     import tests.conftest as _runtime_state
+
     _runtime_state.SELECTED_RUNTIME = runtime
     from daffi import dfcore
+
     dfcore.setRuntime(runtime)
 
     from daffi.registry._executor_registry import EXECUTOR_REGISTRY  # noqa: PLC0415
@@ -135,7 +141,9 @@ def quiet_kill(proc: mp.Process, timeout: float = 5.0) -> None:
 # ── common subprocess entry points ─────────────────────────────────────────────
 
 
-def proc_service(runtime: str, port: int, app_name: str = "integ-service", workers: int = 4) -> None:
+def proc_service(
+    runtime: str, port: int, app_name: str = "integ-service", workers: int = 4
+) -> None:
     """Service subprocess: registers echo + add callbacks, then joins."""
     silence_subprocess(runtime)
     from daffi import Service, callback, SerdeFormat, TCPTransport
@@ -151,9 +159,11 @@ def proc_service(runtime: str, port: int, app_name: str = "integ-service", worke
     transport = TCPTransport(HOST, port)
     transport.websocket_allowed_origins = ["http://localhost"]
     svc = Service(
-        app_name=app_name, workers=workers,
+        app_name=app_name,
+        workers=workers,
         transport=transport,
-        runtime=runtime, serdes=SerdeFormat.ALL,
+        runtime=runtime,
+        serdes=SerdeFormat.ALL,
     )
     svc.start()
     svc.join()
@@ -190,8 +200,11 @@ def proc_worker(runtime: str, port: int, app_name: str, workers: int = 4) -> Non
         return a + b
 
     client = Client(
-        app_name=app_name, workers=workers, transport=TCPTransport(HOST, port),
-        runtime=runtime, serdes=SerdeFormat.ALL,
+        app_name=app_name,
+        workers=workers,
+        transport=TCPTransport(HOST, port),
+        runtime=runtime,
+        serdes=SerdeFormat.ALL,
     )
     client.connect()
     try:
@@ -218,7 +231,14 @@ def free_port() -> int:
 @pytest.fixture
 def direct_service(free_port):
     """Start a Service subprocess; yield its port; terminate on teardown."""
-    proc = mp.Process(target=proc_service, args=(active_runtime(), free_port,), daemon=True)
+    proc = mp.Process(
+        target=proc_service,
+        args=(
+            active_runtime(),
+            free_port,
+        ),
+        daemon=True,
+    )
     proc.start()
     wait_for_port(free_port)
     wait_for_members(free_port, {"integ-service"})
@@ -229,12 +249,21 @@ def direct_service(free_port):
 @pytest.fixture
 def router_with_worker(free_port):
     """Start Router + one Worker subprocess; yield the router port."""
-    rproc = mp.Process(target=proc_router, args=(active_runtime(), free_port,), daemon=True)
+    rproc = mp.Process(
+        target=proc_router,
+        args=(
+            active_runtime(),
+            free_port,
+        ),
+        daemon=True,
+    )
     rproc.start()
     wait_for_port(free_port)
 
     wproc = mp.Process(
-        target=proc_worker, args=(active_runtime(), free_port, "integ-worker"), daemon=True
+        target=proc_worker,
+        args=(active_runtime(), free_port, "integ-worker"),
+        daemon=True,
     )
     wproc.start()
     wait_for_members(free_port, {"integ-worker"})

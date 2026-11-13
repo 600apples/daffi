@@ -40,7 +40,9 @@ def _service(runtime: str, path: str) -> None:
     def add(a: int, b: int) -> int:
         return a + b
 
-    svc = Service(app_name="ux-service", workers=2, transport=UnixTransport(path), runtime=runtime)
+    svc = Service(
+        app_name="ux-service", workers=2, transport=UnixTransport(path), runtime=runtime
+    )
     svc.start()
     svc.join()
 
@@ -66,7 +68,9 @@ def _worker(runtime: str, path: str) -> None:
     def add(a: int, b: int) -> int:
         return a + b
 
-    c = Client(app_name="ux-service", workers=2, transport=UnixTransport(path), runtime=runtime)
+    c = Client(
+        app_name="ux-service", workers=2, transport=UnixTransport(path), runtime=runtime
+    )
     c.connect()
     while True:
         time.sleep(1)
@@ -109,7 +113,14 @@ def _sock_path(tmp_path, *, long: bool = False) -> str:
 @pytest.fixture
 def unix_service(tmp_path, request):
     path = _sock_path(tmp_path, long=getattr(request, "param", False))
-    proc = mp.Process(target=_service, args=(active_runtime(), path,), daemon=True)
+    proc = mp.Process(
+        target=_service,
+        args=(
+            active_runtime(),
+            path,
+        ),
+        daemon=True,
+    )
     proc.start()
     _wait_for_socket(path)
     yield path
@@ -123,7 +134,11 @@ def test_rpc_over_unix_socket(unix_service):
     from daffi import Client, UnixTransport, TCPTransport
 
     assert unix_service.count("/") >= 2
-    client = Client(app_name="ux-client", transport=UnixTransport(unix_service), runtime=active_runtime())
+    client = Client(
+        app_name="ux-client",
+        transport=UnixTransport(unix_service),
+        runtime=active_runtime(),
+    )
     conn = client.connect()
     try:
         conn.wait_for_members("ux-service", timeout=15)
@@ -139,13 +154,31 @@ def test_router_over_unix_socket(tmp_path):
     from daffi import Client, UnixTransport, TCPTransport
 
     path = _sock_path(tmp_path, long=True)
-    rproc = mp.Process(target=_router, args=(active_runtime(), path,), daemon=True)
+    rproc = mp.Process(
+        target=_router,
+        args=(
+            active_runtime(),
+            path,
+        ),
+        daemon=True,
+    )
     rproc.start()
     _wait_for_socket(path)
-    wproc = mp.Process(target=_worker, args=(active_runtime(), path,), daemon=True)
+    wproc = mp.Process(
+        target=_worker,
+        args=(
+            active_runtime(),
+            path,
+        ),
+        daemon=True,
+    )
     wproc.start()
     try:
-        client = Client(app_name="ux-client", transport=UnixTransport(path), runtime=active_runtime())
+        client = Client(
+            app_name="ux-client",
+            transport=UnixTransport(path),
+            runtime=active_runtime(),
+        )
         conn = client.connect()
         try:
             conn.wait_for_members("ux-service", timeout=20)
@@ -163,7 +196,8 @@ def test_async_client_over_unix_socket(unix_service):
 
     async def main():
         client = AsyncClient(
-            app_name="ux-aclient", transport=UnixTransport(unix_service),
+            app_name="ux-aclient",
+            transport=UnixTransport(unix_service),
             runtime=active_runtime(),
         )
         conn = await client.connect()
@@ -184,11 +218,22 @@ def test_stale_socket_file_is_replaced(tmp_path):
     leftover = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     leftover.bind(path)
     leftover.close()
-    proc = mp.Process(target=_service, args=(active_runtime(), path,), daemon=True)
+    proc = mp.Process(
+        target=_service,
+        args=(
+            active_runtime(),
+            path,
+        ),
+        daemon=True,
+    )
     proc.start()
     try:
         _wait_for_listener(path)
-        client = Client(app_name="ux-client", transport=UnixTransport(path), runtime=active_runtime())
+        client = Client(
+            app_name="ux-client",
+            transport=UnixTransport(path),
+            runtime=active_runtime(),
+        )
         conn = client.connect()
         try:
             conn.wait_for_members("ux-service", timeout=15)
@@ -202,7 +247,14 @@ def test_regular_file_at_the_socket_path_is_not_deleted(tmp_path):
     path = _sock_path(tmp_path)
     with open(path, "w") as f:
         f.write("not a socket")
-    proc = mp.Process(target=_service, args=(active_runtime(), path,), daemon=True)
+    proc = mp.Process(
+        target=_service,
+        args=(
+            active_runtime(),
+            path,
+        ),
+        daemon=True,
+    )
     proc.start()
     try:
         proc.join(timeout=20)
@@ -217,17 +269,38 @@ def test_second_server_does_not_take_over_a_live_socket(tmp_path):
     from daffi import Client, UnixTransport
 
     path = _sock_path(tmp_path)
-    first = mp.Process(target=_service, args=(active_runtime(), path,), daemon=True)
+    first = mp.Process(
+        target=_service,
+        args=(
+            active_runtime(),
+            path,
+        ),
+        daemon=True,
+    )
     first.start()
     second = None
     try:
         _wait_for_listener(path)
-        second = mp.Process(target=_router, args=(active_runtime(), path,), daemon=True)
+        second = mp.Process(
+            target=_router,
+            args=(
+                active_runtime(),
+                path,
+            ),
+            daemon=True,
+        )
         second.start()
         second.join(timeout=20)
-        assert second.exitcode not in (None, 0), "the second server started on a live socket"
+        assert second.exitcode not in (
+            None,
+            0,
+        ), "the second server started on a live socket"
 
-        client = Client(app_name="ux-client", transport=UnixTransport(path), runtime=active_runtime())
+        client = Client(
+            app_name="ux-client",
+            transport=UnixTransport(path),
+            runtime=active_runtime(),
+        )
         conn = client.connect()
         try:
             conn.wait_for_members("ux-service", timeout=15)

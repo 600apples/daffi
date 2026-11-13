@@ -24,6 +24,20 @@ const log = std.log.scoped(.connection);
 /// Writes queued for a peer that is not reading, past which it is dropped.
 pub const max_outbox_bytes: usize = 64 * 1024 * 1024;
 
+/// A drain that sends less than `drain_min_bytes` in `drain_window_ms`
+/// drops the connection: the stall timeout only bounds each wait, and a
+/// peer reading a trickle must not keep a worker forever.
+pub const drain_window_ms: i64 = 30_000;
+pub const drain_min_bytes: usize = 64 * 1024;
+
+/// Connections drained at once, process-wide.  The rest wait for one of
+/// those workers, so slow readers cannot take the blocking pool from
+/// handshakes and WebSocket sessions.
+pub const max_drains: usize = runtime.BlockingPool.max_workers / 8;
+
+/// Queued entries a drain gathers into one send (two slices each).
+const drain_batch = 16;
+
 /// Write side of a connection: one writer at a time.  Unlike a pthread
 /// mutex it may be released by another thread than the one that took it,
 /// so a frame an event loop only partly sent can be finished elsewhere
@@ -134,13 +148,18 @@ pub const OperationTable = struct {
     readNoBuffer: *const fn (ctx: *anyopaque) anyerror!?[]const u8,
     write: *const fn (ctx: *anyopaque, data: []const u8) anyerror!void,
     /// Send what the socket takes without blocking and return how much that
-    /// was; 0 when the transport cannot (TLS, WebSocket).
+    /// was; 0 when the transport cannot (WebSocket).  Short of everything,
+    /// the rest must be the next write on the connection (TLS: a record may
+    /// be in flight).
     writeNonBlocking: *const fn (ctx: *anyopaque, data: []const u8) anyerror!usize,
-    /// `writeNonBlocking` of `head` then `body` (writev).  0 when the
-    /// transport cannot (TLS, WebSocket).
+    /// `writeNonBlocking` of `head` then `body` (one gathered send).  0 when
+    /// the transport cannot (WebSocket).
     writeNonBlockingParts: *const fn (ctx: *anyopaque, head: []const u8, body: []const u8) anyerror!usize,
     /// Write `head` then `body` as one message (one WebSocket frame).
     writeParts: *const fn (ctx: *anyopaque, head: []const u8, body: []const u8) anyerror!void,
+    /// `write` of several queued messages in one gathered send; false (and
+    /// nothing written) when the transport frames or encrypts each one.
+    writeVec: *const fn (ctx: *anyopaque, parts: []const []const u8) anyerror!bool,
     /// Wait up to `timeout_ms` for an inbound connection; `error.Timeout`
     /// means none arrived.
     accept: *const fn (ctx: *anyopaque, timeout_ms: c_int) anyerror!AcceptedConnection,
@@ -197,8 +216,16 @@ pub fn Connection(comptime contype: ConnectionType) type {
         outbox_head: usize = 0,
         outbox_len: usize = 0,
         outbox_bytes: usize = 0,
-        /// A worker owns the write side and is sending the outbox.
+        /// A worker owns the write side and is sending the outbox (or is
+        /// queued to).
         outbox_draining: bool = false,
+        /// The drain inherits the write side from `post`: part of a frame
+        /// is already out.
+        drain_holds_gate: bool = false,
+        /// Next connection waiting for a drain worker (see `drains`).
+        drain_next: ?*Self = null,
+        /// Position in the server's list of live connections.
+        live_index: usize = 0,
         /// True once the connection has been interrupted/closed.  Atomic: it is
         /// written by whichever thread tears the connection down and polled by
         /// reader/accept loops.
@@ -219,6 +246,21 @@ pub fn Connection(comptime contype: ConnectionType) type {
 
         pub const Self = @This();
         pub const Config = T.Config;
+
+        /// Connections waiting for a drain worker, and how many workers
+        /// (at most `max_drains`) are draining.
+        const DrainQueue = struct {
+            mutex: Mutex = .{},
+            head: ?*Self = null,
+            tail: ?*Self = null,
+            running: usize = 0,
+        };
+        var drains: DrainQueue = .{};
+
+        /// The child of a fork has none of the parent's drain workers.
+        pub fn resetDrainsAfterFork() void {
+            drains = .{};
+        }
 
         pub fn noteFrameProgress(self: *Self, partial: bool) void {
             if (comptime is_wasm) return;
@@ -287,24 +329,18 @@ pub fn Connection(comptime contype: ConnectionType) type {
                 try self.enqueue(parts, 0);
                 return self.startDrain(false);
             }
-            var sent: usize = 0;
-            if (parts.len == 2) {
-                sent = self.op_table.writeNonBlockingParts(self.ctx, parts[0], parts[1]) catch |err| {
-                    self.wlock.unlock();
-                    self.close();
-                    return err;
-                };
-            } else {
-                for (parts) |part| {
-                    const got = self.op_table.writeNonBlocking(self.ctx, part) catch |err| {
-                        self.wlock.unlock();
-                        self.close();
-                        return err;
-                    };
-                    sent += got;
-                    if (got < part.len) break;
-                }
-            }
+            // One call: a TLS record left in flight must be the first thing
+            // the drain sends, so the rest is queued exactly from there.
+            assert(parts.len == 1 or parts.len == 2);
+            const attempt = if (parts.len == 2)
+                self.op_table.writeNonBlockingParts(self.ctx, parts[0], parts[1])
+            else
+                self.op_table.writeNonBlocking(self.ctx, parts[0]);
+            const sent = attempt catch |err| {
+                self.wlock.unlock();
+                self.close();
+                return err;
+            };
             var total: usize = 0;
             for (parts) |p| total += p.len;
             if (sent >= total) {
@@ -397,30 +433,68 @@ pub fn Connection(comptime contype: ConnectionType) type {
             return e;
         }
 
-        /// Start the worker that sends the outbox.  Call with `outbox_mutex`
+        /// Start the worker that sends the outbox, or queue the connection
+        /// for one when `max_drains` are busy.  Call with `outbox_mutex`
         /// held; with `holds_gate` the caller's write side passes to it.
         fn startDrain(self: *Self, holds_gate: bool) !void {
             self.retain();
-            runtime.spawnBlocking(drainOutbox, .{ self, holds_gate }) catch |err| {
+            self.drain_holds_gate = holds_gate;
+            self.outbox_draining = true;
+            {
+                drains.mutex.lock();
+                defer drains.mutex.unlock();
+                if (drains.running >= max_drains) {
+                    if (drains.tail) |t| t.drain_next = self else drains.head = self;
+                    drains.tail = self;
+                    return;
+                }
+                drains.running += 1;
+            }
+            runtime.spawnBlocking(drainWorker, .{self}) catch |err| {
+                drains.mutex.lock();
+                drains.running -= 1;
+                drains.mutex.unlock();
+                self.outbox_draining = false;
                 self.release();
                 if (holds_gate) self.wlock.unlock();
                 self.dropOutbox();
                 self.close();
                 return err;
             };
-            self.outbox_draining = true;
         }
 
-        fn drainOutbox(self: *Self, holds_gate: bool) void {
+        /// Drain `first`, then every connection queued for a worker.
+        fn drainWorker(first: *Self) void {
+            var next: ?*Self = first;
+            while (next) |conn| {
+                conn.drainOutbox();
+                next = takeQueuedDrain();
+            }
+        }
+
+        /// The next connection waiting for a drain; null gives the
+        /// worker's slot back.
+        fn takeQueuedDrain() ?*Self {
+            drains.mutex.lock();
+            defer drains.mutex.unlock();
+            const conn = drains.head orelse {
+                drains.running -= 1;
+                return null;
+            };
+            drains.head = conn.drain_next;
+            if (drains.head == null) drains.tail = null;
+            conn.drain_next = null;
+            return conn;
+        }
+
+        fn drainOutbox(self: *Self) void {
             defer self.release();
-            if (!holds_gate) self.wlock.lock();
-            // Evented sockets stay non-blocking for `post()`.  The drain
-            // worker uses blocking write (SO_SNDTIMEO); flip only here.
             const posix_net = @import("posix_net.zig");
-            const fd = self.op_table.handle(self.ctx);
-            const was_nb = posix_net.isNonBlocking(fd);
-            if (was_nb) posix_net.setBlocking(fd);
-            defer if (was_nb) posix_net.setNonBlocking(fd);
+            if (!self.drain_holds_gate) self.wlock.lock();
+            var progress = posix_net.WriteProgress.init(drain_window_ms, drain_min_bytes);
+            posix_net.write_progress = &progress;
+            defer posix_net.write_progress = null;
+            var batch: [drain_batch]OutboxEntry = undefined;
             while (true) {
                 self.outbox_mutex.lock();
                 if (self.outbox_len == 0) {
@@ -429,15 +503,17 @@ pub fn Connection(comptime contype: ConnectionType) type {
                     self.outbox_mutex.unlock();
                     return;
                 }
-                const entry = self.popOutbox().?;
-                self.outbox_bytes -= entry.bytes();
+                var n: usize = 0;
+                while (n < batch.len) : (n += 1) {
+                    const entry = self.popOutbox() orelse break;
+                    self.outbox_bytes -= entry.bytes();
+                    batch[n] = entry;
+                }
                 self.outbox_mutex.unlock();
-                defer entry.deinit(self.allocator);
-                const write_err = if (entry.n >= 2)
-                    self.writeHeldParts(entry.parts[0], entry.parts[1])
-                else
-                    self.writeHeld(entry.parts[0]);
-                write_err catch {
+                defer for (batch[0..n]) |entry| entry.deinit(self.allocator);
+                self.writeBatch(batch[0..n]) catch {
+                    if (posix_net.writeWaitBudget() == null)
+                        log.warn("closing a connection whose peer sent less than {d} bytes in {d} ms", .{ drain_min_bytes, drain_window_ms });
                     self.outbox_mutex.lock();
                     self.dropOutbox();
                     self.outbox_draining = false;
@@ -445,6 +521,34 @@ pub fn Connection(comptime contype: ConnectionType) type {
                     self.outbox_mutex.unlock();
                     return;
                 };
+            }
+        }
+
+        /// Send queued entries in order, gathered into one send where the
+        /// transport allows it.
+        fn writeBatch(self: *Self, batch: []const OutboxEntry) !void {
+            comptime assert(2 * drain_batch <= @import("posix_net.zig").max_vec);
+            if (batch.len > 1) {
+                var parts: [2 * drain_batch][]const u8 = undefined;
+                var n: usize = 0;
+                for (batch) |entry| {
+                    for (entry.parts[0..entry.n]) |part| {
+                        parts[n] = part;
+                        n += 1;
+                    }
+                }
+                const gathered = self.op_table.writeVec(self.ctx, parts[0..n]) catch |err| {
+                    self.close();
+                    return err;
+                };
+                if (gathered) return;
+            }
+            for (batch) |entry| {
+                if (entry.n >= 2) {
+                    try self.writeHeldParts(entry.parts[0], entry.parts[1]);
+                } else {
+                    try self.writeHeld(entry.parts[0]);
+                }
             }
         }
 
@@ -562,8 +666,7 @@ pub fn Connection(comptime contype: ConnectionType) type {
             stream.setIoTimeout(tls_impl.HANDSHAKE_TIMEOUT_MS);
             const deadline = @import("../misc.zig").monotonicMs() + tls_impl.HANDSHAKE_TIMEOUT_MS;
 
-            var sync_parser = SynParser.init(self.allocator, deadline, conn.websocket_allowed_origins);
-            defer sync_parser.deinit();
+            var sync_parser = SynParser.init(deadline, conn.websocket_allowed_origins);
             const pnet_addr = posix_net.Address{};
 
             var ctx: *anyopaque = undefined;
@@ -613,6 +716,10 @@ pub fn Connection(comptime contype: ConnectionType) type {
                 return err;
             };
             new_self.* = .{ .ctx = ctx, .op_table = table, .allocator = self.allocator, .is_websocket = is_websocket, .peer_addr = addr };
+            if (is_websocket) {
+                const web: *WebConnection = @ptrCast(@alignCast(ctx));
+                web.startSession(&new_self.frame_progress_ms);
+            }
             if (comptime @import("builtin").mode == .debug)
                 std.debug.print("accepted {s} connection from {f}\n", .{ if (is_websocket) "web" else "native", fmtNetAddr(addr) });
             return new_self;
@@ -815,6 +922,115 @@ test "post does not wait for a slow peer and keeps the order of writes" {
     const reader = try std.Thread.spawn(.{}, Reader.run, .{ peer.fd, &in_order });
     reader.join();
     try std.testing.expect(in_order);
+    try peer.close();
+}
+
+test "the drain writes a non-blocking socket without making it blocking" {
+    if (comptime is_wasm) return;
+    const posix_net = @import("posix_net.zig");
+    const peer = try TestPeer.open();
+    posix_net.setNonBlocking(peer.conn.handle());
+    const chunk = 256 * 1024;
+    const count = 16;
+    var buf: [chunk]u8 = undefined;
+    for (0..count) |i| {
+        @memset(&buf, @truncate(i));
+        try peer.conn.post(&.{ buf[0..16], buf[16..] });
+    }
+    try std.testing.expect(peer.draining());
+
+    const Reader = struct {
+        fn run(fd: c_int, out: *bool) void {
+            var got: [chunk]u8 = undefined;
+            for (0..count) |i| {
+                var at: usize = 0;
+                while (at < chunk) {
+                    // Slow enough that the drainer waits on a full buffer.
+                    if (at == 0) {
+                        const pause = std.c.timespec{ .sec = 0, .nsec = 2 * std.time.ns_per_ms };
+                        _ = std.c.nanosleep(&pause, null);
+                    }
+                    const n = TestPeer.c.read(fd, got[at..].ptr, chunk - at);
+                    if (n <= 0) return;
+                    at += @intCast(n);
+                }
+                for (got) |b| if (b != @as(u8, @truncate(i))) return;
+            }
+            out.* = true;
+        }
+    };
+    var in_order = false;
+    const reader = try std.Thread.spawn(.{}, Reader.run, .{ peer.fd, &in_order });
+    while (peer.draining()) {
+        try std.testing.expect(posix_net.isNonBlocking(peer.conn.handle()));
+        std.Thread.yield() catch {};
+    }
+    reader.join();
+    try std.testing.expect(in_order);
+    try std.testing.expect(posix_net.isNonBlocking(peer.conn.handle()));
+    try peer.close();
+}
+
+test "the drain gathers many queued entries and keeps their order" {
+    if (comptime is_wasm) return;
+    const peer = try TestPeer.open();
+    const count = 3 * drain_batch + 5;
+    peer.conn.outbox_mutex.lock();
+    for (0..count) |i| {
+        const byte = [_]u8{@truncate(i)};
+        try peer.conn.enqueue(&.{ "<", &byte }, 0);
+    }
+    try peer.conn.startDrain(false);
+    peer.conn.outbox_mutex.unlock();
+    try peer.waitDrained();
+
+    var got: [2 * count]u8 = undefined;
+    var at: usize = 0;
+    while (at < got.len) {
+        const n = TestPeer.c.read(peer.fd, got[at..].ptr, got.len - at);
+        try std.testing.expect(n > 0);
+        at += @intCast(n);
+    }
+    for (0..count) |i| {
+        try std.testing.expectEqual(@as(u8, '<'), got[2 * i]);
+        try std.testing.expectEqual(@as(u8, @truncate(i)), got[2 * i + 1]);
+    }
+    try peer.close();
+}
+
+test "a drain past max_drains waits for a worker instead of taking one" {
+    if (comptime is_wasm) return;
+    const Conn = TestPeer.Conn;
+    const peer = try TestPeer.open();
+    Conn.drains.mutex.lock();
+    const saved = Conn.drains.running;
+    Conn.drains.running = max_drains;
+    Conn.drains.mutex.unlock();
+    defer {
+        Conn.drains.mutex.lock();
+        Conn.drains.running = saved;
+        Conn.drains.mutex.unlock();
+    }
+
+    peer.conn.outbox_mutex.lock();
+    try peer.conn.enqueue(&.{"queued"}, 0);
+    try peer.conn.startDrain(false);
+    peer.conn.outbox_mutex.unlock();
+    try std.testing.expect(peer.draining());
+    try std.testing.expectEqual(@as(?*Conn, peer.conn), Conn.drains.head);
+
+    // A busy worker finishing its connection takes this one next.
+    const next = Conn.takeQueuedDrain() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(peer.conn, next);
+    try std.testing.expectEqual(@as(?*Conn, null), Conn.drains.head);
+    next.drainOutbox();
+    try std.testing.expect(!peer.draining());
+    try std.testing.expectEqual(@as(?*Conn, null), Conn.takeQueuedDrain());
+    try std.testing.expectEqual(max_drains - 1, Conn.drains.running);
+
+    var got: [6]u8 = undefined;
+    try std.testing.expectEqual(@as(isize, 6), TestPeer.c.read(peer.fd, &got, got.len));
+    try std.testing.expectEqualSlices(u8, "queued", &got);
     try peer.close();
 }
 

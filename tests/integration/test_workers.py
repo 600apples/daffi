@@ -46,7 +46,7 @@ CALLS_PER_THREAD = 10  # sequential calls per thread inside concurrent tests
 
 def _svc_thread_workers(runtime: str, port: int) -> None:
     silence_subprocess(runtime)
-    from daffi import Service, callback, TCPTransport
+    from daffi import SerdeFormat, Service, callback, TCPTransport
 
     @callback
     def echo(payload):
@@ -66,7 +66,13 @@ def _svc_thread_workers(runtime: str, port: int) -> None:
             raise ValueError(f"negative: {x}")
         return x
 
-    svc = Service(app_name="svc-thread", workers=4, transport=TCPTransport(HOST, port), runtime=runtime)
+    svc = Service(
+        app_name="svc-thread",
+        workers=4,
+        transport=TCPTransport(HOST, port),
+        runtime=runtime,
+        serdes=SerdeFormat.ALL,
+    )
     svc.start()
     svc.join()
 
@@ -94,7 +100,9 @@ def _router_worker_thread(runtime: str, port: int, name: str) -> None:
             raise ValueError(f"negative: {x}")
         return x
 
-    client = Client(app_name=name, workers=4, transport=TCPTransport(HOST, port), runtime=runtime)
+    client = Client(
+        app_name=name, workers=4, transport=TCPTransport(HOST, port), runtime=runtime
+    )
     client.connect()
     try:
         while True:
@@ -116,7 +124,9 @@ def _ping_worker(runtime: str, port: int, name: str) -> None:
     def ping():
         return name
 
-    c = Client(app_name=name, workers=4, transport=TCPTransport(HOST, port), runtime=runtime)
+    c = Client(
+        app_name=name, workers=4, transport=TCPTransport(HOST, port), runtime=runtime
+    )
     c.connect()
     try:
         while True:
@@ -133,7 +143,14 @@ def _ping_worker(runtime: str, port: int, name: str) -> None:
 @pytest.fixture
 def svc_thread(free_port):
     """Service with 4 thread workers."""
-    proc = mp.Process(target=_svc_thread_workers, args=(active_runtime(), free_port,), daemon=True)
+    proc = mp.Process(
+        target=_svc_thread_workers,
+        args=(
+            active_runtime(),
+            free_port,
+        ),
+        daemon=True,
+    )
     proc.start()
     wait_for_port(free_port)
     time.sleep(0.2)
@@ -144,7 +161,14 @@ def svc_thread(free_port):
 @pytest.fixture
 def router_thread(free_port):
     """Router + one Client worker with 4 thread workers."""
-    rproc = mp.Process(target=proc_router, args=(active_runtime(), free_port,), daemon=True)
+    rproc = mp.Process(
+        target=proc_router,
+        args=(
+            active_runtime(),
+            free_port,
+        ),
+        daemon=True,
+    )
     rproc.start()
     wait_for_port(free_port)
     wproc = mp.Process(
@@ -153,7 +177,9 @@ def router_thread(free_port):
         daemon=True,
     )
     wproc.start()
-    wait_for_members(free_port, {"worker-thread"}, timeout=15.0, probe_name="tw-router-probe")
+    wait_for_members(
+        free_port, {"worker-thread"}, timeout=15.0, probe_name="tw-router-probe"
+    )
     yield free_port
     quiet_kill(wproc)
     quiet_kill(rproc)
@@ -166,7 +192,9 @@ def _connect(port: int, name: str):
     """Create a Client, connect, and return (client, conn)."""
     from daffi import Client, TCPTransport
 
-    client = Client(app_name=name, transport=TCPTransport(HOST, port), runtime=active_runtime())
+    client = Client(
+        app_name=name, transport=TCPTransport(HOST, port), runtime=active_runtime()
+    )
     return client, client.connect()
 
 
@@ -269,7 +297,14 @@ class TestDirectThreadWorkers:
 
     def test_workers_count_inline_baseline(self, free_port):
         """workers=1 (inline) still processes requests correctly."""
-        proc = mp.Process(target=_svc_thread_workers, args=(active_runtime(), free_port,), daemon=True)
+        proc = mp.Process(
+            target=_svc_thread_workers,
+            args=(
+                active_runtime(),
+                free_port,
+            ),
+            daemon=True,
+        )
         proc.start()
         wait_for_port(free_port)
         time.sleep(0.15)
@@ -325,11 +360,22 @@ class TestRouterThreadWorkers:
         """cast() reaches multiple thread-worker clients via router."""
         N = 3
 
-        rproc = mp.Process(target=proc_router, args=(active_runtime(), free_port,), daemon=True)
+        rproc = mp.Process(
+            target=proc_router,
+            args=(
+                active_runtime(),
+                free_port,
+            ),
+            daemon=True,
+        )
         rproc.start()
         wait_for_port(free_port)
         wprocs = [
-            mp.Process(target=_ping_worker, args=(active_runtime(), free_port, f"tw-{i}"), daemon=True)
+            mp.Process(
+                target=_ping_worker,
+                args=(active_runtime(), free_port, f"tw-{i}"),
+                daemon=True,
+            )
             for i in range(N)
         ]
         for p in wprocs:

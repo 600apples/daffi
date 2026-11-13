@@ -8,7 +8,6 @@ Start 1_router.py first, then this, then 3_caller.py.
 
 import os
 from daffi import Client, callback, TCPTransport
-from daffi import SerdeFormat, TCPTransport
 from models import Task, TaskResult
 
 WORKER_NAME = os.environ.get("WORKER_NAME", "task-worker-1")

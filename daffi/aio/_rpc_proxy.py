@@ -23,12 +23,10 @@ from __future__ import annotations
 
 import asyncio
 import inspect
-import json
 import time
 import logging
 import threading
 from typing import TYPE_CHECKING, Union, List, Optional, Tuple
-from contextlib import contextmanager
 
 if TYPE_CHECKING:
     from daffi.aio.app import AsyncClient
@@ -39,21 +37,17 @@ from daffi.exceptions import (
     Disconnected,
     Evicted,
     TransmissionFailure,
-    InitializationError,
 )
 from daffi.utils.misc import iterable
 from daffi._wakeup import WakeupFd
-from daffi import dfcore
-from daffi.registry._executor_registry import EXECUTOR_REGISTRY
 from daffi._bindings import (
     send_message_from_client,
     get_message_from_client_store,
     drain_parked_responses,
     expire_message,
-    set_service_methods,
-    send_handshake_from_client,
     set_response_fd,
     get_available_members,
+    missing_members,
     MessageFlag,
 )
 from daffi._rpc_proxy import (
@@ -67,10 +61,10 @@ from daffi._rpc_proxy import (
 )
 
 
-async def _offload(fn, *args):
-    """Run a blocking native call off the event loop."""
+async def _offload(client: "AsyncClient", fn, *args):
+    """Run a blocking native send on the client's send executor."""
     loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(None, fn, *args)
+    return await loop.run_in_executor(client._send_executor(), fn, *args)
 
 
 async def _aiter_chunks(gen):
@@ -79,8 +73,15 @@ async def _aiter_chunks(gen):
         async for chunk in gen:
             yield chunk
         return
-    chunks = gen if iterable(gen) else [gen]
-    it = iter(chunks)
+    if not iterable(gen):
+        yield gen
+        return
+    if isinstance(gen, (list, tuple)):
+        # Nothing to compute: no executor hop per chunk.
+        for chunk in gen:
+            yield chunk
+        return
+    it = iter(gen)
 
     def _next():
         try:
@@ -95,6 +96,7 @@ async def _aiter_chunks(gen):
             return
         yield chunk
 
+
 # ---------------------------------------------------------------------------
 # AsyncResponseNotifier
 # ---------------------------------------------------------------------------
@@ -104,7 +106,8 @@ class AsyncResponseNotifier:
     """Per-connection response router for asyncio waiters.
 
     Lives on the event loop: futures are created, resolved and dropped only
-    from the loop thread, so no lock is needed around them.
+    from the loop thread, so no lock is needed around them.  Closing it
+    fails every waiter left, the way the sync wait reports a closed store.
     """
 
     _instances: dict[int, "AsyncResponseNotifier"] = {}
@@ -115,6 +118,7 @@ class AsyncResponseNotifier:
         self._wakeup = WakeupFd()
         self._loop = loop
         self._futures: dict[int, asyncio.Future] = {}
+        self._closed = False
         set_response_fd(conn_num, self._wakeup.write_fd)
         loop.add_reader(self._wakeup.read_fd, self._on_readable)
 
@@ -122,9 +126,7 @@ class AsyncResponseNotifier:
         self._wakeup.drain()
         batch = drain_parked_responses(self._conn_num)
         if batch == "disconnected":
-            for fut in self._futures.values():
-                if not fut.done():
-                    fut.set_result(batch)
+            self._fail_pending(batch)
             return
         for uuid in batch:
             fut = self._futures.get(uuid)
@@ -139,6 +141,9 @@ class AsyncResponseNotifier:
         or lifecycle error) for *uuid*."""
         fut = self._loop.create_future()
         self._futures[uuid] = fut
+        if self._closed:
+            fut.set_result("disconnected")
+            return fut
         # The response may have been parked before this future existed.
         res = get_message_from_client_store(uuid, self._conn_num)
         if res is not None:
@@ -180,18 +185,38 @@ class AsyncResponseNotifier:
         """Fail every pending waiter of *conn_num* with *err*."""
         with cls._instances_lock:
             n = cls._instances.get(conn_num)
-        if n is None:
+        if n is not None:
+            n._fail_pending(err)
+
+    def _fail_pending(self, outcome) -> None:
+        """Resolve every waiter still pending with *outcome* (a reason
+        string or an exception), on the loop thread."""
+
+        def _fail() -> None:
+            for fut in self._futures.values():
+                if not fut.done():
+                    fut.set_result(outcome)
+
+        try:
+            running = asyncio.get_running_loop()
+        except RuntimeError:
+            running = None
+        if running is self._loop:
+            _fail()
             return
-        for fut in n._futures.values():
-            if not fut.done():
-                fut.set_result(err)
+        try:
+            self._loop.call_soon_threadsafe(_fail)
+        except RuntimeError:
+            pass  # the loop is closed: nobody is waiting any more
 
     def _close(self) -> None:
+        self._closed = True
         try:
             self._loop.remove_reader(self._wakeup.read_fd)
         except Exception:
             pass
         self._wakeup.close()
+        self._fail_pending("disconnected")
 
 
 # ---------------------------------------------------------------------------
@@ -241,7 +266,11 @@ class AsyncRpcResult:
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
                         raise CallTimeout(
-                            call=str(self.proxy) if self.proxy else f"(uuid: {self.uuid})",
+                            call=(
+                                str(self.proxy)
+                                if self.proxy
+                                else f"(uuid: {self.uuid})"
+                            ),
                             timeout=self.timeout,
                             elapsed=time.monotonic() - self._started,
                             receivers=self.receivers or None,
@@ -269,7 +298,7 @@ class AsyncRpcResult:
         return unpack_response(res, self.serde)
 
     def _check_receivers(self) -> None:
-        if missing := set(dfcore.missingMembers(self.conn_num, self.receivers)):
+        if missing := set(missing_members(self.conn_num, self.receivers)):
             raise TransmissionFailure(
                 f"The anticipated receivers(s) {missing} unexpectedly"
                 f" disconnected, causing an interruption in the awaiting"
@@ -379,6 +408,7 @@ class AsyncRpcProxy:
             f"Unable to proceed with {label}: {{}}", TransmissionFailure, conn_num
         ):
             uuid, ts, found_receiver = await _offload(
+                self.conn.client,
                 self._to.send,
                 lambda receiver: send_message_from_client(
                     data=data,
@@ -420,6 +450,7 @@ class AsyncRpcProxy:
             f"Unable to proceed with {label}: {{}}", TransmissionFailure, conn_num
         ):
             uuid, ts, found_receiver = await _offload(
+                self.conn.client,
                 self._to.send,
                 lambda receiver: send_message_from_client(
                     data=payload,
@@ -441,7 +472,9 @@ class AsyncRpcProxy:
             raise TransmissionFailure(f"No receivers found for {label}." + members)
 
     @classmethod
-    def _process_client_handshake(cls, conn_num: int, names: "list[str] | None" = None) -> dict:
+    def _process_client_handshake(
+        cls, conn_num: int, names: "list[str] | None" = None
+    ) -> dict:
         """Sync handshake — delegates to the sync ``RpcProxy`` implementation.
 
         Called via ``loop.run_in_executor`` so it does not block the event
@@ -545,38 +578,39 @@ class AsyncBroadcastProxy:
                 + (f"\nAvailable peers: {available}" if available else "")
             )
         pending: dict[str, AsyncRpcResult] = {}
+        sent: list = []
         try:
-            for receiver_name in receivers:
-                with system_exception_handler(
-                    f"Unable to dispatch call_all to {receiver_name!r}: {{}}",
-                    TransmissionFailure,
-                    conn_num,
-                ):
-                    uuid, ts, found = await _offload(
-                        lambda: send_message_from_client(
-                            data=data,
-                            flag=MessageFlag.REQUEST,
-                            serde=self.serde,
-                            receiver=receiver_name,
-                            func_name=func_name,
-                            return_result=True,
+            try:
+                await _offload(
+                    self.conn.client,
+                    lambda: self._send_each(
+                        "call_all",
+                        receivers,
+                        sent,
+                        data,
+                        is_bytes,
+                        func_name,
+                        True,
+                        conn_num,
+                    ),
+                )
+            finally:
+                for receiver_name, uuid, ts, found in sent:
+                    if found:
+                        pending[receiver_name] = AsyncRpcResult(
                             conn_num=conn_num,
-                            is_bytes=is_bytes,
+                            uuid=uuid,
+                            ts=ts,
+                            timeout=self.timeout,
+                            receivers={receiver_name},
+                            serde=self.serde,
                         )
-                    )
-                if found:
-                    pending[receiver_name] = AsyncRpcResult(
-                        conn_num=conn_num,
-                        uuid=uuid,
-                        ts=ts,
-                        timeout=self.timeout,
-                        receivers={receiver_name},
-                        serde=self.serde,
-                    )
-                else:
+            for receiver_name, _, _, found in sent:
+                if not found:
                     self.logger.warning(
                         f"call_all: receiver {receiver_name!r} not reachable, skipping."
                     )
+
             async def _take(name: str, rpc_result: AsyncRpcResult):
                 try:
                     result_data, _, serde_r = await rpc_result.result()
@@ -606,24 +640,46 @@ class AsyncBroadcastProxy:
                 f"No receivers found for cast_all(fn={func_name!r})."
                 + (f"\nAvailable peers: {available}" if available else "")
             )
+        await _offload(
+            self.conn.client,
+            lambda: self._send_each(
+                "cast_all", receivers, [], data, is_bytes, func_name, False, conn_num
+            ),
+        )
+
+    def _send_each(
+        self,
+        label: str,
+        receivers: List[str],
+        sent: list,
+        data,
+        is_bytes: bool,
+        func_name: str,
+        return_result: bool,
+        conn_num: int,
+    ) -> None:
+        """Send one request per receiver, in order, in a single executor hop.
+
+        Appends ``(receiver, uuid, ts, found)`` to *sent* as it goes, so the
+        caller still sees the requests sent before one that failed.
+        """
         for receiver_name in receivers:
             with system_exception_handler(
-                f"Unable to dispatch cast_all to {receiver_name!r}: {{}}",
+                f"Unable to dispatch {label} to {receiver_name!r}: {{}}",
                 TransmissionFailure,
                 conn_num,
             ):
-                await _offload(
-                    lambda: send_message_from_client(
-                        data=data,
-                        flag=MessageFlag.REQUEST,
-                        serde=self.serde,
-                        receiver=receiver_name,
-                        func_name=func_name,
-                        return_result=False,
-                        conn_num=conn_num,
-                        is_bytes=is_bytes,
-                    )
+                uuid, ts, found = send_message_from_client(
+                    data=data,
+                    flag=MessageFlag.REQUEST,
+                    serde=self.serde,
+                    receiver=receiver_name,
+                    func_name=func_name,
+                    return_result=return_result,
+                    conn_num=conn_num,
+                    is_bytes=is_bytes,
                 )
+            sent.append((receiver_name, uuid, ts, found))
 
 
 # ---------------------------------------------------------------------------
@@ -671,6 +727,7 @@ class _AsyncStreamBase:
             f"Unable to stream to {label}: {{}}", TransmissionFailure, conn_num
         ):
             uuid, ts, found_receiver = await _offload(
+                self.conn.client,
                 lambda: send_message_from_client(
                     data=data,
                     flag=MessageFlag.REQUEST,
@@ -680,7 +737,7 @@ class _AsyncStreamBase:
                     return_result=return_result,
                     conn_num=conn_num,
                     is_bytes=is_bytes,
-                )
+                ),
             )
         if not found_receiver:
             members = (
@@ -955,9 +1012,11 @@ class AsyncClientConnection:
         self,
         *members: str,
         timeout: Union[float, None] = None,
-        interval: float = 1.0,
     ) -> None:
         """Async-block until all requested peers appear in the network.
+
+        Returns as soon as every named peer is present, waking on
+        ``on_member_added`` / ``CONNECTED``.
 
         Example::
 
@@ -972,20 +1031,49 @@ class AsyncClientConnection:
                 raise err
             raise Disconnected("Client is not connected.")
         needed = set(members)
-        import time as _time
+        loop = asyncio.get_running_loop()
+        wake = asyncio.Event()
 
-        start = _time.monotonic()
-        while True:
-            if client._disconnected or client._conn_num is None:
-                err = client._connection_error
-                if err is not None:
-                    raise err
-                raise Disconnected("Client disconnected while waiting for members.")
-            current = {m["name"] for m in get_available_members(client._conn_num)}
-            if needed.issubset(current):
-                return
-            if timeout is not None and (_time.monotonic() - start) >= timeout:
-                raise TimeoutError(
-                    f"Timed out after {timeout}s waiting for members: {needed - current}"
+        def _on_join(name: str) -> None:
+            # Sync or executor-run handlers must schedule onto the waiter's loop.
+            if name in needed:
+                loop.call_soon_threadsafe(wake.set)
+
+        handlers = client._on_member_added_handlers
+        handlers.append(_on_join)
+        start = time.monotonic()
+        try:
+            while True:
+                if client._disconnected or client._conn_num is None:
+                    err = client._connection_error
+                    if err is not None:
+                        raise err
+                    raise Disconnected(
+                        "Client disconnected while waiting for members."
+                    )
+                current = {m["name"] for m in get_available_members(client._conn_num)}
+                if needed.issubset(current):
+                    return
+                remaining = (
+                    None
+                    if timeout is None
+                    else timeout - (time.monotonic() - start)
                 )
-            await asyncio.sleep(interval)
+                if remaining is not None and remaining <= 0:
+                    raise TimeoutError(
+                        f"Timed out after {timeout}s waiting for members: "
+                        f"{needed - current}"
+                    )
+                if remaining is None:
+                    await wake.wait()
+                else:
+                    try:
+                        await asyncio.wait_for(wake.wait(), timeout=remaining)
+                    except asyncio.TimeoutError:
+                        pass
+                wake.clear()
+        finally:
+            try:
+                handlers.remove(_on_join)
+            except ValueError:
+                pass

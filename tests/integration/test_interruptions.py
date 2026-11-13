@@ -144,7 +144,9 @@ def _intr_worker(runtime: str, port: int, name: str) -> None:
 
 
 def _start_slow_service(port: int, name: str = "intr-slow-svc") -> mp.Process:
-    p = mp.Process(target=_intr_slow_service, args=(active_runtime(), port, name), daemon=True)
+    p = mp.Process(
+        target=_intr_slow_service, args=(active_runtime(), port, name), daemon=True
+    )
     p.start()
     wait_for_port(port)
     time.sleep(0.3)
@@ -152,7 +154,9 @@ def _start_slow_service(port: int, name: str = "intr-slow-svc") -> mp.Process:
 
 
 def _start_service(port: int, name: str = "intr-svc") -> mp.Process:
-    p = mp.Process(target=_intr_service, args=(active_runtime(), port, name), daemon=True)
+    p = mp.Process(
+        target=_intr_service, args=(active_runtime(), port, name), daemon=True
+    )
     p.start()
     wait_for_port(port)
     # Small grace after the TCP listener opens so the child finishes daffi
@@ -163,14 +167,18 @@ def _start_service(port: int, name: str = "intr-svc") -> mp.Process:
 
 
 def _start_router(port: int, name: str = "intr-router") -> mp.Process:
-    p = mp.Process(target=_intr_router, args=(active_runtime(), port, name), daemon=True)
+    p = mp.Process(
+        target=_intr_router, args=(active_runtime(), port, name), daemon=True
+    )
     p.start()
     wait_for_port(port)
     return p
 
 
 def _start_worker(port: int, name: str) -> mp.Process:
-    p = mp.Process(target=_intr_worker, args=(active_runtime(), port, name), daemon=True)
+    p = mp.Process(
+        target=_intr_worker, args=(active_runtime(), port, name), daemon=True
+    )
     p.start()
     return p
 
@@ -179,7 +187,9 @@ def _connect(port: int, name: str):
     """Return (client, conn) connected to *port*."""
     from daffi import Client, TCPTransport
 
-    client = Client(app_name=name, transport=TCPTransport(HOST, port), runtime=active_runtime())
+    client = Client(
+        app_name=name, transport=TCPTransport(HOST, port), runtime=active_runtime()
+    )
     conn = client.connect()
     return client, conn
 
@@ -216,7 +226,9 @@ def _sigstop(proc: mp.Process) -> None:
         except FileNotFoundError:
             return
         time.sleep(0.01)
-    raise AssertionError(f"process {proc.pid} did not enter stopped state after SIGSTOP")
+    raise AssertionError(
+        f"process {proc.pid} did not enter stopped state after SIGSTOP"
+    )
 
 
 def _sigcont(proc: mp.Process) -> None:
@@ -258,7 +270,8 @@ class TestServiceKilled:
         from daffi import Client, TCPTransport
 
         client = Client(
-            app_name="intr-dead-connect", transport=TCPTransport(HOST, free_port),
+            app_name="intr-dead-connect",
+            transport=TCPTransport(HOST, free_port),
             runtime=active_runtime(),
         )
         with pytest.raises(InitializationError):

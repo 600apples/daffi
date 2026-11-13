@@ -114,7 +114,9 @@ def _start_target(port: int, workers: int = 1, serdes=None) -> mp.Process:
 def _client(port: int, name: str, *members: str):
     from daffi import Client, TCPTransport
 
-    client = Client(app_name=name, transport=TCPTransport(HOST, port), runtime=active_runtime())
+    client = Client(
+        app_name=name, transport=TCPTransport(HOST, port), runtime=active_runtime()
+    )
     conn = client.connect()
     try:
         if members:
@@ -165,32 +167,46 @@ FLAG_REQUEST, FLAG_RESPONSE, FLAG_ERROR = 1, 2, 3
 
 
 def _request(
-    uuid: int, serde: int, func_name: str, data: bytes, is_bytes: bool, return_result: bool = True
+    uuid: int,
+    serde: int,
+    func_name: str,
+    data: bytes,
+    is_bytes: bool,
+    return_result: bool = True,
 ) -> bytes:
     metadata = f"ws-peer||{func_name}".encode()
     body = metadata + data
-    return pack_header(
-        uuid=uuid,
-        flag=FLAG_REQUEST,
-        decoder=serde,
-        is_bytes=int(is_bytes),
-        return_result=int(return_result),
-        msg_len=len(body),
-        metadata_len=len(metadata),
-    ) + body
+    return (
+        pack_header(
+            uuid=uuid,
+            flag=FLAG_REQUEST,
+            decoder=serde,
+            is_bytes=int(is_bytes),
+            return_result=int(return_result),
+            msg_len=len(body),
+            metadata_len=len(metadata),
+        )
+        + body
+    )
 
 
 def _handshake() -> bytes:
-    body = json.dumps({"meta": {"type": "client"}, "members": [{"name": "ws-peer", "methods": None}]}).encode()
+    body = json.dumps(
+        {"meta": {"type": "client"}, "members": [{"name": "ws-peer", "methods": None}]}
+    ).encode()
     metadata = b"ws-peer||"
-    return pack_header(
-        uuid=1,
-        flag=0,
-        decoder=1,
-        return_result=1,
-        msg_len=len(metadata) + len(body),
-        metadata_len=len(metadata),
-    ) + metadata + body
+    return (
+        pack_header(
+            uuid=1,
+            flag=0,
+            decoder=1,
+            return_result=1,
+            msg_len=len(metadata) + len(body),
+            metadata_len=len(metadata),
+        )
+        + metadata
+        + body
+    )
 
 
 def _masked_binary_frame(payload: bytes) -> bytes:
@@ -273,12 +289,25 @@ class TestPickleFromWebSocket:
             sock.sendall(_masked_binary_frame(_handshake()))
             sock.sendall(
                 _masked_binary_frame(
-                    _request(7, SerdeFormat.JSON, "remember", data, is_bytes, return_result=False)
+                    _request(
+                        7,
+                        SerdeFormat.JSON,
+                        "remember",
+                        data,
+                        is_bytes,
+                        return_result=False,
+                    )
                 )
             )
             with _client(target, "ws-witness", TARGET) as (_, conn):
-                _wait_until(lambda: conn.rpc(timeout=10, serde=SerdeFormat.PICKLE).recall(), 10, "the WebSocket request")
-                assert conn.rpc(timeout=10, serde=SerdeFormat.PICKLE).recall() == [(("from-ws",), {})]
+                _wait_until(
+                    lambda: conn.rpc(timeout=10, serde=SerdeFormat.PICKLE).recall(),
+                    10,
+                    "the WebSocket request",
+                )
+                assert conn.rpc(timeout=10, serde=SerdeFormat.PICKLE).recall() == [
+                    (("from-ws",), {})
+                ]
 
     def test_pickle_request_is_refused_and_never_unpickled(self, target, tmp_path):
         from daffi import SerdeFormat
@@ -287,7 +316,11 @@ class TestPickleFromWebSocket:
         marker = tmp_path / "unpickled"
         data, is_bytes = Serializer.serialize(SerdeFormat.PICKLE, _Booby(str(marker)))
         with _websocket(target) as sock:
-            sock.sendall(_masked_binary_frame(_request(9, SerdeFormat.PICKLE, "lookup", data, is_bytes)))
+            sock.sendall(
+                _masked_binary_frame(
+                    _request(9, SerdeFormat.PICKLE, "lookup", data, is_bytes)
+                )
+            )
             uuid, flag, serde, body = _read_message(sock)
         assert (uuid, flag) == (9, FLAG_ERROR)
         assert b"SerdeNotAllowed" in body
@@ -298,21 +331,29 @@ class TestPickleFromWebSocket:
         from daffi import SerdeFormat
         from daffi._serialization import Serializer
 
-        router = mp.Process(target=proc_router, args=(active_runtime(), free_port), daemon=True)
+        router = mp.Process(
+            target=proc_router, args=(active_runtime(), free_port), daemon=True
+        )
         router.start()
         worker = None
         try:
             wait_for_port(free_port)
             worker = mp.Process(
-                target=_proc_target_worker, args=(active_runtime(), free_port), daemon=True
+                target=_proc_target_worker,
+                args=(active_runtime(), free_port),
+                daemon=True,
             )
             worker.start()
             wait_for_members(free_port, {TARGET})
             marker = tmp_path / "unpickled"
-            data, is_bytes = Serializer.serialize(SerdeFormat.PICKLE, _Booby(str(marker)))
+            data, is_bytes = Serializer.serialize(
+                SerdeFormat.PICKLE, _Booby(str(marker))
+            )
             with _websocket(free_port) as sock:
                 sock.sendall(
-                    _masked_binary_frame(_request(11, SerdeFormat.PICKLE, "lookup", data, is_bytes))
+                    _masked_binary_frame(
+                        _request(11, SerdeFormat.PICKLE, "lookup", data, is_bytes)
+                    )
                 )
                 uuid, flag, _, body = _read_message(sock)
             assert (uuid, flag) == (11, FLAG_ERROR)
@@ -333,7 +374,9 @@ def _proc_target_worker(runtime: str, port: int) -> None:
     def lookup(key):
         return key
 
-    client = Client(app_name=TARGET, transport=TCPTransport(HOST, port), runtime=runtime)
+    client = Client(
+        app_name=TARGET, transport=TCPTransport(HOST, port), runtime=runtime
+    )
     client.connect()
     client.join()
 
@@ -349,7 +392,9 @@ class TestSerdesAllowList:
             marker = tmp_path / "unpickled"
             with _client(free_port, "allow-list", TARGET) as (_, conn):
                 with pytest.raises(RemoteCallError, match="PICKLE") as info:
-                    conn.rpc(timeout=10, serde=SerdeFormat.PICKLE).lookup(_Booby(str(marker)))
+                    conn.rpc(timeout=10, serde=SerdeFormat.PICKLE).lookup(
+                        _Booby(str(marker))
+                    )
                 assert type(info.value).__name__ == "SerdeNotAllowed"
                 with pytest.raises(RemoteCallError) as info:
                     conn.rpc(timeout=10, serde=SerdeFormat.OPAQUE).lookup(b"raw")
@@ -366,10 +411,32 @@ class TestSerdesAllowList:
         for bad in ("json", [99], [], 5):
             with pytest.raises(InitializationError):
                 Service(
-                    transport=TCPTransport(HOST, free_port), runtime=active_runtime(), serdes=bad
+                    transport=TCPTransport(HOST, free_port),
+                    runtime=active_runtime(),
+                    serdes=bad,
                 )
         svc = Service(transport=TCPTransport(HOST, free_port), runtime=active_runtime())
         assert svc.serdes == SerdeFormat.ALL
+
+    @pytest.mark.parametrize("workers", [1, 4], ids=["inline", "pool"])
+    def test_pickle_is_refused_when_serdes_is_safe(self, free_port, tmp_path, workers):
+        """A customer who sets serdes=SAFE must not unpickle a PICKLE request."""
+        from daffi import SerdeFormat
+        from daffi.exceptions import RemoteCallError
+
+        proc = _start_target(free_port, workers, serdes=SerdeFormat.SAFE)
+        try:
+            marker = tmp_path / "unpickled"
+            with _client(free_port, "safe-serdes", TARGET) as (_, conn):
+                with pytest.raises(RemoteCallError, match="PICKLE") as info:
+                    conn.rpc(timeout=10, serde=SerdeFormat.PICKLE).lookup(
+                        _Booby(str(marker))
+                    )
+                assert type(info.value).__name__ == "SerdeNotAllowed"
+                assert conn.rpc(timeout=10).add(2, 3) == 5
+            assert not marker.exists(), "a refused PICKLE payload was unpickled"
+        finally:
+            quiet_kill(proc)
 
 
 # ── 2. invalid UTF-8 ──────────────────────────────────────────────────────────
@@ -393,7 +460,10 @@ def test_invalid_utf8_text_does_not_stop_the_service(target):
                 is_bytes=False,
             )
         assert conn.rpc(timeout=10).add(20, 22) == 42
-        assert conn.rpc(timeout=10, serde=SerdeFormat.PICKLE).recall() == [((b"\xff\xfe",), {})] * 3
+        assert (
+            conn.rpc(timeout=10, serde=SerdeFormat.PICKLE).recall()
+            == [((b"\xff\xfe",), {})] * 3
+        )
 
 
 # ── 3. nested calls between clients of one process ────────────────────────────
@@ -474,7 +544,9 @@ def test_server_restarted_after_stop_stops_again(free_port, kind):
 def test_client_reconnected_after_stop_works(free_port):
     from daffi import Client, TCPTransport
 
-    proc = mp.Process(target=proc_service, args=(active_runtime(), free_port), daemon=True)
+    proc = mp.Process(
+        target=proc_service, args=(active_runtime(), free_port), daemon=True
+    )
     proc.start()
     try:
         wait_for_port(free_port)
@@ -492,7 +564,9 @@ def test_client_reconnected_after_stop_works(free_port):
                 joiner = threading.Thread(target=client.join, daemon=True)
                 joiner.start()
                 joiner.join(0.3)
-                assert joiner.is_alive(), f"round {round_}: join() returned while connected"
+                assert (
+                    joiner.is_alive()
+                ), f"round {round_}: join() returned while connected"
             finally:
                 client.stop()
             joiner.join(5)
@@ -511,10 +585,16 @@ def test_rpc_nowait_sends_one_call_with_all_arguments(target):
         conn.rpc_nowait().remember(["a", "b", "c"], tag="x")
         conn.rpc_nowait().remember("plain")
         conn.rpc_nowait().remember(key=[1, 2])
-        _wait_until(lambda: len(conn.rpc(timeout=10, serde=SerdeFormat.PICKLE).recall()) >= 3, 10, "the calls")
+        _wait_until(
+            lambda: len(conn.rpc(timeout=10, serde=SerdeFormat.PICKLE).recall()) >= 3,
+            10,
+            "the calls",
+        )
         time.sleep(0.2)
         # A pool may run them in any order.
-        assert sorted(conn.rpc(timeout=10, serde=SerdeFormat.PICKLE).recall(), key=repr) == sorted(
+        assert sorted(
+            conn.rpc(timeout=10, serde=SerdeFormat.PICKLE).recall(), key=repr
+        ) == sorted(
             [
                 ((["a", "b", "c"],), {"tag": "x"}),
                 (("plain",), {}),

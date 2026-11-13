@@ -70,7 +70,9 @@ def _wait_for_port(port: int, timeout: float = 15.0) -> None:
                 return
         except OSError:
             time.sleep(0.05)
-    raise TimeoutError(f"Server on {HOST}:{port} did not become ready within {timeout}s")
+    raise TimeoutError(
+        f"Server on {HOST}:{port} did not become ready within {timeout}s"
+    )
 
 
 def _wait_for_unix(path: str, timeout: float = 15.0) -> None:
@@ -148,7 +150,9 @@ def _proc_daffi_tcp(runtime: str, port: int) -> None:
     def echo(payload):
         return payload
 
-    svc = Service(app_name="zmq-cmp-svc", transport=TCPTransport(HOST, port), runtime=runtime)
+    svc = Service(
+        app_name="zmq-cmp-svc", transport=TCPTransport(HOST, port), runtime=runtime
+    )
     svc.start()
     svc.join()
 
@@ -161,7 +165,9 @@ def _proc_daffi_uds(runtime: str, path: str) -> None:
     def echo(payload):
         return payload
 
-    svc = Service(app_name="zmq-cmp-svc", transport=UnixTransport(path), runtime=runtime)
+    svc = Service(
+        app_name="zmq-cmp-svc", transport=UnixTransport(path), runtime=runtime
+    )
     svc.start()
     svc.join()
 
@@ -171,7 +177,9 @@ def bench_daffi_tcp(wire: str) -> list[float]:
     from daffi._serialization import SerdeFormat
 
     port = _free_port()
-    proc = mp.Process(target=_proc_daffi_tcp, args=(active_runtime(), port), daemon=True)
+    proc = mp.Process(
+        target=_proc_daffi_tcp, args=(active_runtime(), port), daemon=True
+    )
     proc.start()
     try:
         _wait_for_port(port)
@@ -196,7 +204,9 @@ def bench_daffi_uds(wire: str) -> list[float]:
     from daffi._serialization import SerdeFormat
 
     path = _tmp_ipc_path("daffi")
-    proc = mp.Process(target=_proc_daffi_uds, args=(active_runtime(), path), daemon=True)
+    proc = mp.Process(
+        target=_proc_daffi_uds, args=(active_runtime(), path), daemon=True
+    )
     proc.start()
     try:
         _wait_for_unix(path)
@@ -363,10 +373,10 @@ def main() -> None:
     except ImportError:
         print("  [skip] pynng not installed — nng rows omitted  (pip install pynng)")
 
+    print(f"\ndaffi vs ZeroMQ vs nng  —  {N} sequential echo round-trips")
     print(
-        f"\ndaffi vs ZeroMQ vs nng  —  {N} sequential echo round-trips"
+        f"host: {HOST}   warmup: {WARMUP}   payload: {_DATA_FILE.name} ({payload_bytes} bytes JSON)"
     )
-    print(f"host: {HOST}   warmup: {WARMUP}   payload: {_DATA_FILE.name} ({payload_bytes} bytes JSON)")
     print("wire: raw JSON bytes; daffi uses SerdeFormat.OPAQUE (no pickle/msgpack)\n")
 
     results: list[tuple[str, str, float]] = []

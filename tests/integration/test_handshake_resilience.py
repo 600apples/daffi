@@ -49,7 +49,9 @@ def _echo_worker(runtime: str, port: int, name: str = "hs-echo-worker") -> None:
     def echo(payload):
         return payload
 
-    client = Client(app_name=name, workers=1, transport=TCPTransport(HOST, port), runtime=runtime)
+    client = Client(
+        app_name=name, workers=1, transport=TCPTransport(HOST, port), runtime=runtime
+    )
     client.connect()
     try:
         client.join()
@@ -62,7 +64,14 @@ def _echo_worker(runtime: str, port: int, name: str = "hs-echo-worker") -> None:
 
 @pytest.fixture
 def router_port(free_port):
-    proc = mp.Process(target=proc_router, args=(active_runtime(), free_port,), daemon=True)
+    proc = mp.Process(
+        target=proc_router,
+        args=(
+            active_runtime(),
+            free_port,
+        ),
+        daemon=True,
+    )
     proc.start()
     wait_for_port(free_port)
     yield free_port
@@ -72,7 +81,9 @@ def router_port(free_port):
 @pytest.fixture
 def router_with_echo(router_port):
     wproc = mp.Process(
-        target=_echo_worker, args=(active_runtime(), router_port, "hs-echo-worker"), daemon=True
+        target=_echo_worker,
+        args=(active_runtime(), router_port, "hs-echo-worker"),
+        daemon=True,
     )
     wproc.start()
     wait_for_members(router_port, {"hs-echo-worker"})
@@ -93,7 +104,9 @@ class TestMalformedHandshake:
 
         port = router_with_echo
         attacker = Client(
-            app_name="hs-attacker", workers=1, transport=TCPTransport(HOST, port),
+            app_name="hs-attacker",
+            workers=1,
+            transport=TCPTransport(HOST, port),
             runtime=active_runtime(),
         )
         conn = attacker.connect()
@@ -118,7 +131,9 @@ class TestMalformedHandshake:
 
         # If the router mutex were still held, this connect / rpc would hang.
         survivor = Client(
-            app_name="hs-survivor", workers=1, transport=TCPTransport(HOST, port),
+            app_name="hs-survivor",
+            workers=1,
+            transport=TCPTransport(HOST, port),
             runtime=active_runtime(),
         )
         conn = survivor.connect()
@@ -134,7 +149,9 @@ class TestMalformedHandshake:
 
         port = router_with_echo
         client = Client(
-            app_name="hs-rpc-client", workers=1, transport=TCPTransport(HOST, port),
+            app_name="hs-rpc-client",
+            workers=1,
+            transport=TCPTransport(HOST, port),
             runtime=active_runtime(),
         )
         conn = client.connect()

@@ -97,8 +97,10 @@ def _silence(runtime: str) -> None:
     logging.disable(logging.CRITICAL)
 
     import tests.conftest as _runtime_state
+
     _runtime_state.SELECTED_RUNTIME = runtime
     from daffi import dfcore
+
     dfcore.setRuntime(runtime)
     from daffi.registry._executor_registry import EXECUTOR_REGISTRY
 
@@ -137,7 +139,9 @@ def _proc_service(runtime: str, port: int, workers: int) -> None:
         return sum(i * i for i in range(n))
 
     svc = Service(
-        app_name="bench-svc", workers=workers, transport=TCPTransport(HOST, port),
+        app_name="bench-svc",
+        workers=workers,
+        transport=TCPTransport(HOST, port),
         runtime=runtime,
     )
     svc.start()
@@ -148,7 +152,9 @@ def _proc_router(runtime: str, port: int) -> None:
     _silence(runtime)
     from daffi import Router, TCPTransport
 
-    r = Router(app_name="bench-router", transport=TCPTransport(HOST, port), runtime=runtime)
+    r = Router(
+        app_name="bench-router", transport=TCPTransport(HOST, port), runtime=runtime
+    )
     r.start()
     r.join()
 
@@ -167,7 +173,9 @@ def _proc_worker(runtime: str, port: int, workers: int) -> None:
         return sum(i * i for i in range(n))
 
     client = Client(
-        app_name="bench-worker", workers=workers, transport=TCPTransport(HOST, port),
+        app_name="bench-worker",
+        workers=workers,
+        transport=TCPTransport(HOST, port),
         runtime=runtime,
     )
     client.connect()
@@ -204,7 +212,8 @@ def _bench(
     arg = wire if cb_name == "echo" else cpu_arg
 
     client = Client(
-        app_name=f"bench-caller-{label}", transport=TCPTransport(HOST, port),
+        app_name=f"bench-caller-{label}",
+        transport=TCPTransport(HOST, port),
         runtime=active_runtime(),
     )
     conn = client.connect()
@@ -292,7 +301,14 @@ def run_router(
     cb_name: str,
 ) -> BenchResult:
     port = _free_port()
-    rproc = mp.Process(target=_proc_router, args=(active_runtime(), port,), daemon=True)
+    rproc = mp.Process(
+        target=_proc_router,
+        args=(
+            active_runtime(),
+            port,
+        ),
+        daemon=True,
+    )
     rproc.start()
     wproc = mp.Process(
         target=_proc_worker,

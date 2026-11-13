@@ -49,7 +49,8 @@ def _worker(runtime: str, port: int, worker_id: int) -> None:
             return value
 
         client = AsyncClient(
-            app_name=f"cast-worker-{worker_id:02d}", transport=TCPTransport(HOST, port),
+            app_name=f"cast-worker-{worker_id:02d}",
+            transport=TCPTransport(HOST, port),
             runtime=runtime,
         )
         await client.connect()
@@ -64,13 +65,22 @@ def _worker(runtime: str, port: int, worker_id: int) -> None:
 @pytest.fixture
 def cast_setup(free_port):
     """Start AsyncRouter + N_WORKERS AsyncWorker subprocesses; yield the router port."""
-    rproc = mp.Process(target=proc_router, args=(active_runtime(), free_port,), daemon=True)
+    rproc = mp.Process(
+        target=proc_router,
+        args=(
+            active_runtime(),
+            free_port,
+        ),
+        daemon=True,
+    )
     rproc.start()
     wait_for_port(free_port)
 
     worker_procs = []
     for i in range(N_WORKERS):
-        p = mp.Process(target=_worker, args=(active_runtime(), free_port, i), daemon=True)
+        p = mp.Process(
+            target=_worker, args=(active_runtime(), free_port, i), daemon=True
+        )
         p.start()
         worker_procs.append(p)
 
@@ -97,7 +107,9 @@ class TestCastBroadcastAsync:
         from daffi.aio import AsyncClient
         from daffi import TCPTransport
 
-        client = AsyncClient(app_name=name, transport=TCPTransport(HOST, port), runtime=active_runtime())
+        client = AsyncClient(
+            app_name=name, transport=TCPTransport(HOST, port), runtime=active_runtime()
+        )
         conn = await client.connect()
         return client, conn
 

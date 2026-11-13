@@ -1,32 +1,62 @@
-#  Daffi
+# Daffi
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+### High-performance RPC for Python.
+
+[![Performance](https://img.shields.io/badge/Performance-Native%20Core-blue)](#)
+[![Transports](https://img.shields.io/badge/Transports-TCP%20%7C%20Unix-green)](#)
+[![Python](https://img.shields.io/badge/Python-3.10%2B-blue)](https://www.python.org/)
+[![License](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+
+A lightweight inter-process communication framework powered by a compiled native core.
+Connect Python applications, distribute workloads, and exchange data with minimal overhead.
 
 **📖 Full documentation: [https://600apples.github.io/daffi/](https://600apples.github.io/daffi/)**
 
 ---
 
-Daffi is a lightweight inter-process RPC framework with a compiled core.
-It lets Python processes (and browser JavaScript clients) call each other's
-functions over TCP, Unix sockets, or WebSocket — with no serialisation
-boilerplate, no extra broker process required for direct connections, and
-throughput up to **~1.2 GiB/s** for large binary payloads.
+## Why Daffi?
+
+- **No external broker required** — Establish direct connections without additional infrastructure.
+- **Simple remote calls** — Invoke remote functions through familiar Python interfaces.
+- **Multiple communication patterns** — Support RPC, broadcast, and streaming.
+- **Native runtime** — Choose between threaded and event-driven connection handling.
+- **Efficient data transfer** — Exchange large binary payloads with minimal overhead.
 
 ---
 
-## Three building blocks
+## Architecture
 
-| Class | Role |
-|---|---|
-| `Service` | Listens on a TCP port. Exposes `@callback` functions; Clients call them. |
-| `Router` | Pure message forwarder. Needed for the multi-worker layout. Has no callbacks of its own. |
-| `Client` | Connects to a `Router` or `Service`. Can issue calls **and/or** expose its own `@callback` functions. |
+Daffi supports two primary communication topologies: direct communication between a Client and a Service,
+and distributed communication through a Router.
 
-> **Both `Service` and `Client` can expose `@callback` functions.**
-> The topology determines the role:
-> - **Client → Service**: only the `Service` exposes callbacks; Clients are pure callers.
-> - **Client → Router → Worker**: any `Client` can expose callbacks (acting as a worker),
->   issue calls (acting as a caller), or do both at the same time — all through the Router.
+#### Core components
+
+| Component | Description                                                                               |
+|-----------|-------------------------------------------------------------------------------------------|
+| `Service` | Listens for incoming connections and exposes remotely callable _@callback_ functions.     |
+| `Router`  | orwards messages between connected nodes. It does not execute callbacks itself.           |
+| `Client`  | Connects to a Service or Router. It can issue remote calls, expose callbacks, or do both. |
+
+#### Direct communication
+
+In a direct connection, a Client communicates with a Service.
+
+![Direct communication](docs/images/direct_communication.png)
+
+- The Service exposes callbacks.
+- The Client invokes those callbacks remotely.
+
+#### Distributed communication
+
+A Router enables multiple Clients to participate in a shared communication network.
+
+![Distributed communication](docs/images/distributed_worker_arch.png)
+
+- Workers expose callbacks through their Client connections.
+- Callers invoke remote functions through the Router.
+- The Router forwards calls to matching workers.
+- Multiple workers can provide the same callback.
+
 
 ---
 
@@ -38,7 +68,9 @@ pip install daffi
 
 Requires Python 3.10 or newer.
 
-## Quick start — direct layout (Client → Service)
+## Quick start — direct communication
+
+1. Create a `Service` instance.
 
 `service.py`:
 ```python
@@ -57,6 +89,8 @@ svc.start()
 svc.join()          # block until svc.stop() is called
 ```
 
+2. Connect a `Client` to the Service.
+
 `client.py`:
 ```python
 from daffi import Client, TCPTransport
@@ -64,20 +98,28 @@ from daffi import Client, TCPTransport
 client = Client(app_name="my-client", transport=TCPTransport("127.0.0.1", 5000))
 conn = client.connect()
 
-result = conn.rpc(timeout=5).add(1, 2)     # → 3.0
-greeting = conn.rpc(timeout=5).greet("Alice")  # → "Hello, Alice!"
+result = conn.rpc().add(1, 2)     # → 3.0
+greeting = conn.rpc().greet("Alice")  # → "Hello, Alice!"
 
 client.stop()
 ```
 
-Run `service.py` first, then `client.py` in a second terminal.
+3. Run the example.
 
----
+Start the Service first:
 
-## Router layout (Client → Router → Worker)
+```bash
+python service.py
+```
+Then, in another terminal:
 
-Use a `Router` when you need many workers behind a single address, or want
-load-balanced / broadcast calls.
+```bash
+python client.py
+```
+
+##  Distributed architecture — Router and Workers
+
+1. Start a `Router` instance.
 
 `router.py`:
 ```python
@@ -87,6 +129,8 @@ router = Router(transport=TCPTransport("127.0.0.1", 6000))
 router.start()
 router.join()
 ```
+
+2. Register a `Worker`
 
 `worker.py`:
 ```python
@@ -101,6 +145,8 @@ client.connect()
 client.join()   # block until Ctrl+C / SIGTERM
 ```
 
+3. Create a `Client`.
+
 `caller.py`:
 ```python
 from daffi import Client, TCPTransport
@@ -108,290 +154,457 @@ from daffi import Client, TCPTransport
 client = Client(app_name="caller", transport=TCPTransport("127.0.0.1", 6000))
 conn = client.connect()
 
-# RPC — routed to one worker (round-robin)
-result = conn.rpc(timeout=5).process("job-42")
+# RPC — routed to one worker (round-robin if many workers expose the same function)
+result = conn.rpc().process("job-42")
 
-# Cast — sent to *all* workers, returns {worker_name: result}
-all_results = conn.cast(timeout=5).process("broadcast-job")
+# Cast — sent to *all* workers, returns {worker_name: result} (in this case, only one worker)
+all_results = conn.cast().process("broadcast-job")
 
 client.stop()
 ```
-
 ---
 
-## Call styles
+## Communication patterns
 
-All styles are accessed through the connection handle returned by
-`client.connect()`.  Every call method returns a proxy; call the desired
-remote function by attribute access.
+Daffi provides several communication patterns through the connection handle returned by `client.connect()`.
 
 ```python
 conn = client.connect()
 ```
 
-### `rpc` — blocking, one worker (round-robin)
+Each method returns a proxy that allows remote functions to be invoked through attribute access.
 
-When multiple workers expose the same function, `rpc()` picks one using a
-**round-robin** strategy — each call goes to the next worker in rotation, spreading
-load evenly.  Pin to a specific worker with `receiver=` when you need affinity.
+### RPC — `rpc()`
 
-> **Round-robin only applies in the Router topology** (many workers behind one Router).
-> In the Client → Service topology there is always exactly one receiver — the Service
-> itself — so omitting `receiver=` is the norm and specifying it is redundant.
+Execute a remote function and wait for its result.
+
+In a Router topology, calls are distributed across matching workers using round-robin selection.
 
 ```python
-result = conn.rpc(timeout=5).echo("hello")
-result = conn.rpc(timeout=5, serde=SerdeFormat.JSON).add(1, 2)
+result = conn.rpc().echo("hello")
 
-# Router topology only: pin to a specific worker by name (bypasses round-robin)
-result = conn.rpc(timeout=5, receiver="worker-1").process("task")
+# Or 
+
+result = conn.rpc(
+    timeout=5,
+    serde=SerdeFormat.JSON,
+).add(1, 2)
 ```
 
-### `rpc_nowait` — fire-and-forget
+To target a specific worker, use `receiver`:
+
+```python
+result = conn.rpc(
+    timeout=5,
+    receiver="worker-1",
+).process("task")
+```
+
+`receiver` is only relevant when connecting through a Router with multiple workers.
+
+### Fire-and-forget — `rpc_nowait()`
+
+Invoke a remote function without waiting for its result.
 
 ```python
 conn.rpc_nowait().notify("event happened")
 ```
 
-### `cast` — broadcast to all workers, collect results
+### Broadcast — `cast()`
 
-Most useful in the **Router topology** where multiple workers expose the same
-function.  The call fans out to every matching worker simultaneously and returns
-a `{worker_name: result}` dict once all have responded.
+Execute a remote function on all matching workers and collect their results.
+
+The returned dictionary maps worker names to their respective results.
 
 ```python
-# Returns {worker_name: result, ...}
 results = conn.cast(timeout=5).echo("ping")
-# e.g. {"worker-01": "ping", "worker-02": "ping", ...}
+
+# Example:
+# {
+#     "worker-01": "ping",
+#     "worker-02": "ping",
+# }
 ```
 
-### `cast_nowait` — broadcast, fire-and-forget
+### Broadcast without waiting — `cast_nowait()`
+
+Broadcast a function call without collecting results.
 
 ```python
 conn.cast_nowait().notify("broadcast event")
 ```
 
-### `stream` — chunked send with backpressure
+### Streaming — `stream()`
+
+Send data in chunks.
+
+The sender waits for acknowledgement before sending the next chunk.
 
 ```python
 @callback
-def receive_chunk(data: bytes) -> None: ...
+def process_stream(data: bytes) -> None:
+    ...
 
-# Sends each chunk and waits for acknowledgement before sending the next
-await_result = conn.stream(serde=SerdeFormat.OPAQUE)
-for chunk in my_large_object_chunks:
-    await_result.receive_chunk(chunk)
+
+# Split a large payload into fixed-size chunks (e.g. 64 KiB)
+payload = open("large.bin", "rb").read()
+chunks = [payload[i:i + 65536] for i in range(0, len(payload), 65536)]
+
+sender = conn.stream(serde=SerdeFormat.OPAQUE)
+
+for chunk in chunks:
+    sender.process_stream(chunk)
 ```
 
-### `stream_nowait` — chunked send, fire-and-forget
+Or pass an iterator / generator directly — `stream()` consumes it and sends each yielded value:
 
 ```python
-conn.stream_nowait(serde=SerdeFormat.OPAQUE).receive_chunk(chunk)
+def chunk_source(path: str, size: int = 65536):
+    with open(path, "rb") as f:
+        while chunk := f.read(size):
+            yield chunk
+
+
+conn.stream(serde=SerdeFormat.OPAQUE).process_stream(
+    chunk_source("large.bin"),
+)
 ```
+
+### Streaming without waiting — `stream_nowait()`
+
+Send streaming data without waiting for acknowledgements.
+
+```python
+conn.stream_nowait(serde=SerdeFormat.OPAQUE).process_stream(
+    chunk_source("large.bin"),
+)
+```
+
+See the communication patterns guide for additional examples and configuration options.
 
 ---
 
-## Serialisation formats
+## Serialization
 
-Pass `serde=SerdeFormat.X` to any call method.
+Daffi supports multiple serialization formats, allowing applications to choose between 
+interoperability, readability, flexibility, and performance.
 
-| Format | Import | Notes                                                                    |
-|---|---|--------------------------------------------------------------------------|
-| `MSGPACK` | `from daffi import SerdeFormat` | Default. Compact binary; language-agnostic.                              |
-| `JSON` | same | Human-readable; requires JSON-serialisable values.                       |
-| `OPAQUE` | same | Raw `bytes` or `string` — zero-copy, fastest for binary and string data. |
-| `PICKLE` | same | Any Python object. Pass `serde=SerdeFormat.PICKLE` on the call.          |
+Specify the desired format using `serde=SerdeFormat.X` on a communication method.
+
+| Format    | Description                                            | Typical use case                |
+|-----------|--------------------------------------------------------|---------------------------------|
+| `MSGPACK` | Compact binary serialization. Default format.          | General-purpose communication   |
+| `JSON`    | Human-readable, JSON-compatible data.                  | Interoperability and debugging  |
+| `OPAQUE`  | Raw bytes or strings without structured serialization. | High-throughput data transfer   |
+| `PICKLE`  | Python object serialization.                           | Python-specific object exchange |
+
+### Examples
 
 ```python
 from daffi import Client, SerdeFormat
 
 conn = client.connect()
-result = conn.rpc(serde=SerdeFormat.JSON, timeout=5).add(1, 2)
+
+# MessagePack (default)
+result = conn.rpc().add(1, 2)
+
+# JSON
+result = conn.rpc(
+    serde=SerdeFormat.JSON,
+).add(1, 2)
+
+# Opaque binary data
+result = conn.rpc(
+    serde=SerdeFormat.OPAQUE,
+).receive_data(binary_payload)
 ```
+
+### Pickle serialization
+
+Pickle supports Python-specific objects but requires special care.
+
+Deserializing untrusted pickle data can execute arbitrary code. 
+Only use it when the sender and transmitted data are trusted.
+
+Daffi also provides a receiver-side deserialization policy:
+
+```python
+serde=SerdeFormat.PICKLE
+```
+
+The receiver can use:
+
+```python
+serdes=SerdeFormat.SAFE
+```
+
+to refuse pickle deserialization.
+
 
 ---
 
-## `@callback` decorator
+## Callbacks and concurrency
 
-Decorate any top-level function or bound method to make it callable remotely.
-Registration is global and happens at import time.
+Callbacks are Python functions or bound methods that can be invoked remotely by other nodes.
+
+### Defining callbacks
+
+Use the `@callback` decorator to register a remotely callable function.
 
 ```python
 from daffi import callback
+
 
 @callback
 def echo(payload):
     return payload
 
+
 @callback
 def compute(x: int, y: int) -> int:
     return x * y
 ```
----
 
-## Concurrent callback execution (`workers`)
+Callback registration happens at import time.
 
-By default every node processes incoming callbacks **inline on a single thread**
-(`workers=1`).  Callbacks are executed one at a time — a slow callback blocks
-the next one.
+Both `Service` and `Client` instances can expose callbacks.
 
-Pass `workers=N` (N ≥ 2) to spin up a thread pool so that up to N callbacks
-run in parallel:
+### Concurrent callback execution
+
+By default, each node executes incoming callbacks sequentially using a single execution thread:
+
+```python
+workers=1
+```
+
+To execute multiple callbacks concurrently, configure the `workers` parameter.
 
 ```python
 import time
+
 from daffi import Service, callback, TCPTransport
+
 
 @callback
 def slow_task(n: int) -> int:
-    time.sleep(1)        # simulates I/O-bound work
+    time.sleep(1)
     return n * n
 
-# workers=1 (default) — three concurrent callers would each wait ~1 s
-svc = Service( workers=1,transport=TCPTransport("127.0.0.1", 5000))
 
-# workers=4 — three concurrent callers all finish in ~1 s
-svc = Service( workers=4,transport=TCPTransport("127.0.0.1", 5000))
+svc = Service(
+    workers=4,
+    transport=TCPTransport("127.0.0.1", 5000),
+)
 
 svc.start()
 svc.join()
 ```
 
-The same parameter works on a `Client` acting as a worker in the Router topology:
+With `workers=4`, up to four callbacks can execute concurrently.
+
+The same parameter is available on a `Client` acting as a worker:
 
 ```python
-from daffi import Client, callback, TCPTransport
-
-@callback
-def process(task: str) -> str:
-    time.sleep(0.5)
-    return f"done: {task}"
-
-# This single Client instance can now handle up to 8 concurrent incoming calls
-client = Client(app_name="worker-1", workers=8, transport=TCPTransport("127.0.0.1", 6000))
-client.connect()
-client.join()
+client = Client(
+    app_name="worker-1",
+    workers=8,
+    transport=TCPTransport("127.0.0.1", 6000),
+)
 ```
 
-> **When to increase `workers`:**
-> - Callbacks do **I/O** (network calls, file reads, database queries).
-> - Callbacks are **fast and pure** — keep `workers=1` (no threading overhead).
->
-> For **CPU-bound** callbacks, Python's GIL limits true parallelism within one
-> process.  Run multiple worker nodes behind a Router instead of increasing
-> `workers` on a single node.
 
----
+## Native runtime
 
-## Native runtime (`threads` vs `evented`)
+Daffi's compiled core supports two connection-handling models, configurable through the `runtime` argument.
 
-The native core can serve connections in two ways, chosen per process with
-the `runtime` argument:
+### Runtime modes
 
-- `threads` (default): one OS thread per connection.
-- `evented`: all connections are multiplexed over a few event-loop threads
-  (kqueue on macOS, epoll on Linux).
+| Runtime   | Description                                                              |
+|-----------|--------------------------------------------------------------------------|
+| `threads` | Creates an operating-system thread for each connection. Default runtime. |
+| `evented` | Multiplexes connections across a small number of event-loop threads.     |
 
-The same split — blocking **threaded** I/O vs multiplexed **evented** I/O —
-is described in Zig’s own documentation as `Io.Threaded` and `Io.Evented`;
-see [I/O as an Interface](https://ziglang.org/download/0.16.0/release-notes.html#IO-as-an-Interface)
-in the [Zig 0.16.0 release notes](https://ziglang.org/download/0.16.0/release-notes.html).
-(daffi’s native core follows that idea with its own epoll/kqueue loops; it does
-not use `std.Io.Evented` yet.)
+### Selecting a runtime
 
 ```python
 from daffi import Runtime, Router, TCPTransport
 
-# threads is the default; pass runtime= only to force evented
 router = Router(
     transport=TCPTransport("127.0.0.1", 6000),
     runtime=Runtime.EVENTED,
 )
 ```
 
-Omit `runtime` and that node selects `threads`. One process cannot mix the
-two models: a later constructor that disagrees raises `InitializationError`.
+Omitting `runtime` selects the default `threads` implementation.
 
-`DAFFI_EVENT_LOOPS` sets the number of loop threads (default: one per CPU,
-capped at 64). Nothing else in your code changes. This is independent of
-`daffi.aio`, which is the Python asyncio API and works with both models.
+The runtime is selected per process. 
+A process cannot mix the two runtime models; conflicting initialization raises `InitializationError`.
 
-Measured with daffi's benchmark suite (release build, localhost):
+### Event-loop configuration
 
-| | threads | evented |
-|---|---|---|
-| Sequential calls/s, Client → Service | 12,097 | 12,148 |
-| 200 concurrent clients → Service, calls/s | 14,559 | 15,272 |
-| Native threads with 64 clients connected | 67 | 7 |
+Use the `DAFFI_EVENT_LOOPS` environment variable to configure the number of event-loop threads.
 
-`threads` is faster for one caller and for many clients calling one Service
-together. With `threads` the Service uses about one native thread per client
-(2003 threads for 2000 clients). With `evented` the Service stays at a handful
-(7 in that run).
+The default is one loop per CPU, capped at 64.
 
-> **`threads` (default) fits when:**
-> - You want the faster path, for one caller or for many clients at once.
-> - Peers that may be **slow to read** large messages or streams. In the evented
->   model a stalled peer can briefly hold up other connections on the same loop.
-> - Mostly **WebSocket (browser)** clients. They keep a thread each in both
->   models.
->
-> **Prefer `evented` when:**
-> - A Router or Service holds **many connections** and one thread per connection
->   does not fit, for example a container with a low thread limit.
-> - Most connections are idle, such as workers waiting for tasks.
+```bash
+DAFFI_EVENT_LOOPS=4 python router.py
+```
 
-Compare both on your machine with `python tests/perf/runtime_benchmark.py`.
-The `concurrent` rows are the many-clients → one Service case.
+> The runtime selection is independent of `daffi.aio`, which provides Daffi's Python asyncio API
+and works with both native runtime models.
 
-See the [runtime guide](https://600apples.github.io/daffi/usage/runtime/)
-for details and full measurements, and the Zig docs linked above for the
-`Io.Threaded` / `Io.Evented` background.
+### Choosing a runtime
+
+Use `threads` when:
+
+- Connections may be slow to read large messages or streams.
+- Your application primarily uses connections that benefit from independent thread handling.
+
+Use `evented` when:
+
+- A Router or Service needs to maintain many simultaneous connections.
+- Native thread count is a limiting resource.
+- Most connections are idle, such as workers waiting for tasks.
+
+See the [runtime guide](https://600apples.github.io/daffi/usage/runtime/) for implementation details.
+
+---
+
+## Transports
+
+Daffi supports multiple transport mechanisms for communication between processes.
+
+`Client` accepts a single transport. 
+`Router` and `Service` accept one transport or a sequence of them — every listener shares that node's membership, 
+and `start()` brings all of them up together.
+
+### TCP
+
+Use `TCPTransport` to communicate between processes over a network or localhost.
+
+```python
+from daffi import Service, Client, TCPTransport
+
+svc = Service(
+    transport=TCPTransport("127.0.0.1", 5000),
+)
+svc.start()
+
+client = Client(
+    transport=TCPTransport("127.0.0.1", 5000),
+)
+conn = client.connect()
+```
+
+### Unix domain sockets
+
+Use `UnixTransport` for inter-process communication on the same machine, without binding a TCP port.
+
+```python
+from daffi import Service, Client, UnixTransport
+
+svc = Service(
+    transport=UnixTransport("/tmp/daffi.sock"),
+)
+svc.start()
+
+client = Client(
+    transport=UnixTransport("/tmp/daffi.sock"),
+)
+conn = client.connect()
+```
+
+### Multiple transports
+
+A common pattern is to expose both TCP (for remote clients or workers) and a Unix socket (for processes on the same host):
+
+```python
+from daffi import Router, Client, TCPTransport, UnixTransport
+
+tcp = TCPTransport("0.0.0.0", 6000)
+unix = UnixTransport("/tmp/daffi.sock")
+
+router = Router(
+    transport=[tcp, unix],
+)
+router.start()
+
+# Remote worker connects over TCP
+remote = Client(
+    app_name="worker-remote",
+    transport=TCPTransport("127.0.0.1", 6000),
+)
+remote.connect()
+
+# Co-located client connects over the Unix socket
+local = Client(
+    app_name="worker-local",
+    transport=UnixTransport("/tmp/daffi.sock"),
+)
+local.connect()
+```
+
+Choose the transport according to your deployment environment:
+
+- **TCP:** Communication between processes on the same or different machines.
+- **Unix sockets:** Local inter-process communication.
+- **Both:** TCP for remote peers, Unix for co-located clients or workers.
 
 ---
 
 ## Event handlers
 
-Receive `connected` / `disconnected` notifications for nodes joining or
-leaving the network.
+Daffi provides event handlers for monitoring changes in network membership.
+
+Register handlers with `on_member_added` and `on_member_removed`. Each handler receives the peer's `app_name` as a string.
 
 ```python
 from daffi import Service, TCPTransport
-def on_event(event: dict):
-    # event["type"]   → "connected" or "disconnected"
-    # event["member"] → app_name of the node that changed state
-    print(f"[{event['type']}] {event['member']}")
 
-svc = Service(transport=TCPTransport("127.0.0.1", 5000))
-svc.add_event_handler(on_event)
+
+svc = Service(
+    transport=TCPTransport("127.0.0.1", 5000),
+)
+
+
+@svc.on_member_added
+def on_join(member: str) -> None:
+    print(f"connected: {member}")
+
+
+@svc.on_member_removed
+def on_leave(member: str) -> None:
+    print(f"disconnected: {member}")
+
+
 svc.start()
+svc.join()
 ```
 
-Both `Service` and `Client` support `add_event_handler`.
+| Method | Description |
+|---|---|
+| `on_member_added` | Called when a node joins the network. |
+| `on_member_removed` | Called when a node leaves the network. |
+
+Both `Service` and `Client` support these methods.
+
+Event handlers are useful for monitoring network membership, tracking worker availability, and implementing application-level lifecycle logic.
 
 ---
 
-## Unix sockets
+## Security
 
-Use a `UnixTransport` for inter-process communication on the same machine.
+Daffi supports TLS encryption for TCP connections.
 
-```python
-from daffi import Service, Client, UnixTransport
-svc = Service(transport=UnixTransport("/tmp/daffi.sock"))
-svc.start()
+TLS allows clients to verify the server's identity and protects communication against network interception.
 
-client = Client(transport=UnixTransport("/tmp/daffi.sock"))
-conn = client.connect()
-```
+### TLS configuration
 
----
-
-## TLS
+Configure TLS on the server-side transport:
 
 ```python
-from daffi import Router, Client, TCPTransport
-# Server (Router or Service) — TLS is configured on the transport.
-# cert/key/ca accept a filesystem path or PEM material.
+from daffi import Router, TCPTransport
+
 router = Router(
     transport=TCPTransport(
         "127.0.0.1",
@@ -401,10 +614,15 @@ router = Router(
         key="/path/to/server.key",
     ),
 )
-router.start()
 
-# Client — supply ca to verify the server certificate,
-# or leave it empty to skip verification
+router.start()
+```
+
+Configure the Client with the trusted CA certificate:
+
+```python
+from daffi import Client, TCPTransport
+
 client = Client(
     transport=TCPTransport(
         "127.0.0.1",
@@ -413,5 +631,16 @@ client = Client(
         ca="/path/to/ca.crt",
     ),
 )
+
 conn = client.connect()
 ```
+
+### Certificate configuration
+
+The transport accepts certificate, private key, and CA material through filesystem paths or PEM data.
+
+- `cert` — Server certificate.
+- `key` — Server private key.
+- `ca` — Certificate authority used by the Client to verify the server.
+
+**Security recommendation:** Configure certificate verification in production. Disabling server certificate verification exposes connections to man-in-the-middle attacks.

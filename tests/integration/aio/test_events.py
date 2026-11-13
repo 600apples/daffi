@@ -38,7 +38,9 @@ def _worker_proc(runtime: str, port: int, name: str) -> None:
         async def ping():
             return "pong"
 
-        client = AsyncClient(app_name=name, transport=TCPTransport(HOST, port), runtime=runtime)
+        client = AsyncClient(
+            app_name=name, transport=TCPTransport(HOST, port), runtime=runtime
+        )
         await client.connect()
         await client.join()
 
@@ -50,7 +52,14 @@ def _worker_proc(runtime: str, port: int, name: str) -> None:
 
 @pytest.fixture
 def router_port(free_port):
-    proc = mp.Process(target=proc_router, args=(active_runtime(), free_port,), daemon=True)
+    proc = mp.Process(
+        target=proc_router,
+        args=(
+            active_runtime(),
+            free_port,
+        ),
+        daemon=True,
+    )
     proc.start()
     wait_for_port(free_port)
     yield free_port
@@ -68,11 +77,13 @@ class TestMemberAddedEventAsync:
         from daffi.aio import AsyncClient
         from daffi import TCPTransport
 
+        loop = asyncio.get_running_loop()  # sync handlers run on a thread
         received: list[str] = []
         event = asyncio.Event()
 
         client = AsyncClient(
-            app_name="evt-watcher-added", transport=TCPTransport(HOST, router_port),
+            app_name="evt-watcher-added",
+            transport=TCPTransport(HOST, router_port),
             runtime=active_runtime(),
         )
         conn = await client.connect()
@@ -80,10 +91,12 @@ class TestMemberAddedEventAsync:
         @conn.on_member_added
         def _on_added(name: str):
             received.append(name)
-            event.set()
+            loop.call_soon_threadsafe(event.set)
 
         proc = mp.Process(
-            target=_worker_proc, args=(active_runtime(), router_port, "evt-joiner"), daemon=True
+            target=_worker_proc,
+            args=(active_runtime(), router_port, "evt-joiner"),
+            daemon=True,
         )
         proc.start()
         try:
@@ -97,11 +110,13 @@ class TestMemberAddedEventAsync:
         from daffi.aio import AsyncClient
         from daffi import TCPTransport
 
+        loop = asyncio.get_running_loop()  # sync handlers run on a thread
         received: list[str] = []
         event = asyncio.Event()
 
         client = AsyncClient(
-            app_name="evt-watcher-self", transport=TCPTransport(HOST, router_port),
+            app_name="evt-watcher-self",
+            transport=TCPTransport(HOST, router_port),
             runtime=active_runtime(),
         )
         conn = await client.connect()
@@ -109,10 +124,12 @@ class TestMemberAddedEventAsync:
         @conn.on_member_added
         def _on_added(name: str):
             received.append(name)
-            event.set()
+            loop.call_soon_threadsafe(event.set)
 
         proc = mp.Process(
-            target=_worker_proc, args=(active_runtime(), router_port, "evt-other-self"), daemon=True
+            target=_worker_proc,
+            args=(active_runtime(), router_port, "evt-other-self"),
+            daemon=True,
         )
         proc.start()
         try:
@@ -126,11 +143,13 @@ class TestMemberAddedEventAsync:
         from daffi.aio import AsyncClient
         from daffi import TCPTransport
 
+        loop = asyncio.get_running_loop()  # sync handlers run on a thread
         received: list[str] = []
         event = asyncio.Event()
 
         client = AsyncClient(
-            app_name="evt-watcher-name", transport=TCPTransport(HOST, router_port),
+            app_name="evt-watcher-name",
+            transport=TCPTransport(HOST, router_port),
             runtime=active_runtime(),
         )
         conn = await client.connect()
@@ -138,11 +157,13 @@ class TestMemberAddedEventAsync:
         @conn.on_member_added
         def _on_added(name: str):
             received.append(name)
-            event.set()
+            loop.call_soon_threadsafe(event.set)
 
         expected_name = "evt-named-worker"
         proc = mp.Process(
-            target=_worker_proc, args=(active_runtime(), router_port, expected_name), daemon=True
+            target=_worker_proc,
+            args=(active_runtime(), router_port, expected_name),
+            daemon=True,
         )
         proc.start()
         try:
@@ -156,13 +177,15 @@ class TestMemberAddedEventAsync:
         from daffi.aio import AsyncClient
         from daffi import TCPTransport
 
+        loop = asyncio.get_running_loop()  # sync handlers run on a thread
         received_a: list[str] = []
         received_b: list[str] = []
         event_a = asyncio.Event()
         event_b = asyncio.Event()
 
         client = AsyncClient(
-            app_name="evt-multi-added", transport=TCPTransport(HOST, router_port),
+            app_name="evt-multi-added",
+            transport=TCPTransport(HOST, router_port),
             runtime=active_runtime(),
         )
         conn = await client.connect()
@@ -170,15 +193,17 @@ class TestMemberAddedEventAsync:
         @conn.on_member_added
         def _handler_a(name: str):
             received_a.append(name)
-            event_a.set()
+            loop.call_soon_threadsafe(event_a.set)
 
         @conn.on_member_added
         def _handler_b(name: str):
             received_b.append(name)
-            event_b.set()
+            loop.call_soon_threadsafe(event_b.set)
 
         proc = mp.Process(
-            target=_worker_proc, args=(active_runtime(), router_port, "evt-multi-w"), daemon=True
+            target=_worker_proc,
+            args=(active_runtime(), router_port, "evt-multi-w"),
+            daemon=True,
         )
         proc.start()
         try:
@@ -201,12 +226,14 @@ class TestMemberRemovedEventAsync:
         from daffi.aio import AsyncClient
         from daffi import TCPTransport
 
+        loop = asyncio.get_running_loop()  # sync handlers run on a thread
         removed: list[str] = []
         joined = asyncio.Event()
         event = asyncio.Event()
 
         client = AsyncClient(
-            app_name="evt-watcher-removed", transport=TCPTransport(HOST, router_port),
+            app_name="evt-watcher-removed",
+            transport=TCPTransport(HOST, router_port),
             runtime=active_runtime(),
         )
         conn = await client.connect()
@@ -214,16 +241,18 @@ class TestMemberRemovedEventAsync:
         @conn.on_member_added
         def _on_added(name: str):
             if name == "evt-leaver":
-                joined.set()
+                loop.call_soon_threadsafe(joined.set)
 
         @conn.on_member_removed
         def _on_removed(name: str):
             if name == "evt-leaver":
                 removed.append(name)
-                event.set()
+                loop.call_soon_threadsafe(event.set)
 
         proc = mp.Process(
-            target=_worker_proc, args=(active_runtime(), router_port, "evt-leaver"), daemon=True
+            target=_worker_proc,
+            args=(active_runtime(), router_port, "evt-leaver"),
+            daemon=True,
         )
         proc.start()
         try:
@@ -239,12 +268,14 @@ class TestMemberRemovedEventAsync:
         from daffi.aio import AsyncClient
         from daffi import TCPTransport
 
+        loop = asyncio.get_running_loop()  # sync handlers run on a thread
         added: list[str] = []
         joined = asyncio.Event()
         removed_event = asyncio.Event()
 
         client = AsyncClient(
-            app_name="evt-no-add-on-rm", transport=TCPTransport(HOST, router_port),
+            app_name="evt-no-add-on-rm",
+            transport=TCPTransport(HOST, router_port),
             runtime=active_runtime(),
         )
         conn = await client.connect()
@@ -253,15 +284,17 @@ class TestMemberRemovedEventAsync:
         def _on_added(name: str):
             if name == "evt-rm-only":
                 added.append(name)
-                joined.set()
+                loop.call_soon_threadsafe(joined.set)
 
         @conn.on_member_removed
         def _on_removed(name: str):
             if name == "evt-rm-only":
-                removed_event.set()
+                loop.call_soon_threadsafe(removed_event.set)
 
         proc = mp.Process(
-            target=_worker_proc, args=(active_runtime(), router_port, "evt-rm-only"), daemon=True
+            target=_worker_proc,
+            args=(active_runtime(), router_port, "evt-rm-only"),
+            daemon=True,
         )
         proc.start()
         try:

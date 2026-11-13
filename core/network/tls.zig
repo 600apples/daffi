@@ -16,6 +16,7 @@
 const std = @import("std");
 const net = @import("posix_net.zig");
 const misc = @import("../misc.zig");
+const EventLoop = @import("../runtime/EventLoop.zig");
 const Mutex = misc.Mutex;
 
 const c = @import("openssl_c");
@@ -42,6 +43,9 @@ const Session = struct {
     /// Monotonic ms after which a read waiting for the peer gives up.  Set
     /// while an accepted connection is still being upgraded; 0 afterwards.
     deadline: i64 = 0,
+    /// Longest `sslRead` waits for the peer once the upgrade is done
+    /// (-1: forever).
+    read_timeout_ms: c_int = -1,
 
     /// How long a WANT_READ/WANT_WRITE wait may block, or null when the
     /// deadline has passed.
@@ -70,7 +74,85 @@ fn configureCtx(ctx: *c.SSL_CTX) void {
     // Writers retry SSL_write after WANT_WRITE with the same data, but the
     // buffer address is not guaranteed to be identical on every call.
     _ = c.SSL_CTX_ctrl(ctx, c.SSL_CTRL_MODE, c.SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER, null);
+    // A renegotiation makes SSL_read write, which an event loop cannot wait for.
+    const SSL_OP_NO_RENEGOTIATION: u64 = 1 << 30; // the header macro does not translate
+    _ = c.SSL_CTX_set_options(ctx, SSL_OP_NO_RENEGOTIATION);
 }
+
+/// Socket BIO used instead of OpenSSL's, whose write() raises SIGPIPE when
+/// the peer is gone.  Retry and EOF reporting match BIO_s_socket.
+const SocketBio = struct {
+    var method: ?*c.BIO_METHOD = null;
+    var method_mutex: Mutex = .{};
+
+    fn new(fd: c_int) !*c.BIO {
+        const bio = c.BIO_new(try getMethod()) orelse return error.TlsInitFailed;
+        // +1: descriptor 0 must not read back as a null pointer.
+        c.BIO_set_data(bio, @ptrFromInt(@as(usize, @intCast(fd)) + 1));
+        c.BIO_set_init(bio, 1);
+        return bio;
+    }
+
+    fn getMethod() !*c.BIO_METHOD {
+        method_mutex.lock();
+        defer method_mutex.unlock();
+        if (method) |m| return m;
+        const m = c.BIO_meth_new(c.BIO_get_new_index() | c.BIO_TYPE_SOURCE_SINK | c.BIO_TYPE_DESCRIPTOR, "daffi socket") orelse
+            return error.TlsInitFailed;
+        if (c.BIO_meth_set_write(m, write) != 1 or c.BIO_meth_set_read(m, read) != 1 or c.BIO_meth_set_ctrl(m, ctrl) != 1) {
+            c.BIO_meth_free(m);
+            return error.TlsInitFailed;
+        }
+        method = m;
+        return m;
+    }
+
+    fn fdOf(bio: ?*c.BIO) c_int {
+        return @intCast(@intFromPtr(c.BIO_get_data(bio)) - 1);
+    }
+
+    /// BIO_sock_should_retry: errors after which the call is worth repeating.
+    fn shouldRetry(result: isize) bool {
+        if (result >= 0) return false;
+        const err: std.c.E = @fromBackingInt(@intCast(std.c._errno().*));
+        return switch (err) {
+            .INTR, .AGAIN, .INPROGRESS, .ALREADY, .NOTCONN, .PROTO => true,
+            else => false,
+        };
+    }
+
+    fn write(bio: ?*c.BIO, buf: [*c]const u8, len: c_int) callconv(.c) c_int {
+        const n = std.c.send(fdOf(bio), buf, @intCast(len), net.no_sigpipe);
+        c.BIO_clear_flags(bio, c.BIO_FLAGS_RWS | c.BIO_FLAGS_SHOULD_RETRY);
+        if (shouldRetry(n)) c.BIO_set_flags(bio, c.BIO_FLAGS_WRITE | c.BIO_FLAGS_SHOULD_RETRY);
+        return @intCast(n);
+    }
+
+    fn read(bio: ?*c.BIO, buf: [*c]u8, len: c_int) callconv(.c) c_int {
+        if (buf == null) return 0;
+        const n = std.c.recv(fdOf(bio), buf, @intCast(len), 0);
+        c.BIO_clear_flags(bio, c.BIO_FLAGS_RWS | c.BIO_FLAGS_SHOULD_RETRY);
+        if (shouldRetry(n)) {
+            c.BIO_set_flags(bio, c.BIO_FLAGS_READ | c.BIO_FLAGS_SHOULD_RETRY);
+        } else if (n == 0) {
+            c.BIO_set_flags(bio, c.BIO_FLAGS_IN_EOF);
+        }
+        return @intCast(n);
+    }
+
+    fn ctrl(bio: ?*c.BIO, cmd: c_int, _: c_long, ptr: ?*anyopaque) callconv(.c) c_long {
+        return switch (cmd) {
+            c.BIO_C_GET_FD => blk: {
+                const fd = fdOf(bio);
+                if (ptr) |p| @as(*c_int, @ptrCast(@alignCast(p))).* = fd;
+                break :blk fd;
+            },
+            c.BIO_CTRL_FLUSH, c.BIO_CTRL_DUP => 1,
+            c.BIO_CTRL_EOF => @intFromBool(c.BIO_test_flags(bio, c.BIO_FLAGS_IN_EOF) != 0),
+            else => 0,
+        };
+    }
+};
 
 /// True when `blob` looks like PEM material rather than a filesystem path.
 /// Paths never start with the PEM armour; inline certs/keys/CAs always do.
@@ -229,7 +311,9 @@ fn newSession(ctx: *SslCtx, fd: c_int) !*Session {
     const real_ctx: *c.SSL_CTX = @ptrCast(@alignCast(ctx));
     const ssl = c.SSL_new(real_ctx) orelse return error.TlsInitFailed;
     errdefer c.SSL_free(ssl);
-    if (c.SSL_set_fd(ssl, fd) == 0) return error.TlsSetFdFailed;
+    const bio = SocketBio.new(fd) catch return error.TlsSetFdFailed;
+    // The session owns the BIO (one reference for both directions).
+    c.SSL_set_bio(ssl, bio, bio);
     const s = try allocator.create(Session);
     s.* = .{ .ssl = ssl, .fd = fd };
     return s;
@@ -348,10 +432,10 @@ pub fn sslRead(conn: *SslConn, buf: []u8) !usize {
         if (n > 0) return @intCast(n);
         switch (err) {
             c.SSL_ERROR_ZERO_RETURN => return 0,
-            // Without a deadline this waits for the peer's next message;
-            // shutting the socket down (close) wakes it.
+            // Without a deadline or read timeout this waits for the peer's
+            // next message; shutting the socket down (close) wakes it.
             c.SSL_ERROR_WANT_READ => {
-                const budget = s.waitBudget(-1) orelse return error.Timeout;
+                const budget = s.waitBudget(s.read_timeout_ms) orelse return error.Timeout;
                 if (!net.waitFd(s.fd, net.WAIT_READ, budget)) return error.Timeout;
             },
             c.SSL_ERROR_WANT_WRITE => {
@@ -380,11 +464,22 @@ pub fn sslReadSome(conn: *SslConn, buf: []u8) !usize {
     const n = c.SSL_read(s.ssl, buf.ptr, len);
     if (n > 0) return @intCast(n);
     return switch (c.SSL_get_error(s.ssl, n)) {
-        // WANT_WRITE (renegotiation) is resolved by the next blocking write.
-        c.SSL_ERROR_WANT_READ, c.SSL_ERROR_WANT_WRITE => error.WouldBlock,
+        c.SSL_ERROR_WANT_READ => error.WouldBlock,
+        // The session must send first (a key update answer) and the socket
+        // is full.  Retrying on readability would spin while the peer keeps
+        // sending, so the loop waits for writability instead.
+        c.SSL_ERROR_WANT_WRITE => {
+            EventLoop.readNeedsWrite(s.fd);
+            return error.WouldBlock;
+        },
         c.SSL_ERROR_ZERO_RETURN, c.SSL_ERROR_SYSCALL => 0,
         else => error.TlsReadError,
     };
+}
+
+/// Bound every later `sslRead` wait for the peer to `ms` (`error.Timeout`).
+pub fn setReadTimeout(conn: *SslConn, ms: u32) void {
+    session(conn).read_timeout_ms = @intCast(@min(ms, std.math.maxInt(c_int)));
 }
 
 /// Whether the session holds decrypted bytes not yet read.
@@ -395,32 +490,129 @@ pub fn sslPending(conn: *SslConn) bool {
     return c.SSL_pending(s.ssl) > 0;
 }
 
-/// Write all bytes in data to a TLS connection (blocking).
-pub fn sslWrite(conn: *SslConn, data: []const u8) !void {
-    const s = session(conn);
-    var sent: usize = 0;
-    while (sent < data.len) {
-        const chunk = data[sent..];
-        const len: c_int = @intCast(@min(chunk.len, std.math.maxInt(c_int)));
-        s.mutex.lock();
-        c.ERR_clear_error();
-        const n = c.SSL_write(s.ssl, chunk.ptr, len);
-        const err = if (n > 0) c.SSL_ERROR_NONE else c.SSL_get_error(s.ssl, n);
-        s.mutex.unlock();
-        if (n > 0) {
-            sent += @intCast(n);
-            continue;
+/// Plaintext per SSL_write: one full TLS record.  An SSL_write that returned
+/// WANT_WRITE/WANT_READ must be repeated with the same bytes, possibly by
+/// another thread, so every writer cuts the stream at the same offsets: a
+/// write resumed at a piece boundary repeats exactly the piece in flight.
+pub const piece_len = 16 * 1024;
+
+/// The consecutive `piece_len` windows of `parts` laid end to end.
+const Pieces = struct {
+    parts: []const []const u8,
+    part: usize = 0,
+    offset: usize = 0,
+    scratch: [piece_len]u8 = undefined,
+
+    /// A piece inside one part is that part's memory; one that spans parts
+    /// is gathered into `scratch`, so a small header shares its record.
+    fn next(self: *Pieces) ?[]const u8 {
+        while (self.part < self.parts.len and self.offset == self.parts[self.part].len) {
+            self.part += 1;
+            self.offset = 0;
         }
-        switch (err) {
-            c.SSL_ERROR_WANT_WRITE => {
-                if (!net.waitFd(s.fd, net.WAIT_WRITE, WRITE_STALL_TIMEOUT_MS)) return error.TlsWriteTimeout;
-            },
-            c.SSL_ERROR_WANT_READ => {
-                if (!net.waitFd(s.fd, net.WAIT_READ, WRITE_STALL_TIMEOUT_MS)) return error.TlsWriteTimeout;
-            },
-            else => return error.TlsWriteError,
+        if (self.part == self.parts.len) return null;
+        const current = self.parts[self.part][self.offset..];
+        if (current.len >= piece_len or self.part + 1 == self.parts.len) {
+            const n = @min(current.len, piece_len);
+            self.offset += n;
+            return current[0..n];
         }
+        var filled: usize = 0;
+        while (filled < piece_len and self.part < self.parts.len) {
+            const rest = self.parts[self.part][self.offset..];
+            const n = @min(rest.len, piece_len - filled);
+            @memcpy(self.scratch[filled..][0..n], rest[0..n]);
+            filled += n;
+            self.offset += n;
+            if (self.offset == self.parts[self.part].len) {
+                self.part += 1;
+                self.offset = 0;
+            }
+        }
+        return self.scratch[0..filled];
     }
+};
+
+const PieceResult = enum { done, want_read, want_write };
+
+fn writePiece(s: *Session, piece: []const u8) !PieceResult {
+    s.mutex.lock();
+    c.ERR_clear_error();
+    const n = c.SSL_write(s.ssl, piece.ptr, @intCast(piece.len));
+    const err = if (n > 0) c.SSL_ERROR_NONE else c.SSL_get_error(s.ssl, n);
+    s.mutex.unlock();
+    // Without SSL_MODE_ENABLE_PARTIAL_WRITE a success is the whole piece.
+    if (n > 0) return .done;
+    return switch (err) {
+        c.SSL_ERROR_WANT_WRITE => .want_write,
+        c.SSL_ERROR_WANT_READ => .want_read,
+        else => error.TlsWriteError,
+    };
+}
+
+/// Write all bytes in data to a TLS connection, waiting for the socket.
+pub fn sslWrite(conn: *SslConn, data: []const u8) !void {
+    return sslWriteParts(conn, &.{data});
+}
+
+/// `sslWrite` of `parts` laid end to end, in full records.
+pub fn sslWriteParts(conn: *SslConn, parts: []const []const u8) !void {
+    const s = session(conn);
+    var pieces = Pieces{ .parts = parts };
+    while (pieces.next()) |piece| {
+        while (true) {
+            const events = switch (try writePiece(s, piece)) {
+                .done => break,
+                .want_write => net.WAIT_WRITE,
+                .want_read => net.WAIT_READ,
+            };
+            const budget = net.writeWaitBudget() orelse return error.TlsWriteTimeout;
+            if (!net.waitFd(s.fd, events, budget)) return error.TlsWriteTimeout;
+        }
+        net.noteWritten(piece.len);
+    }
+}
+
+/// Write what the socket takes now, without waiting, and return how many
+/// bytes of `parts` are fully sent.  Short of all of them, the piece that
+/// starts there is in flight: the next write on this session must be
+/// `sslWriteParts` of the rest, so the caller keeps the write side for it.
+pub fn sslWriteSome(conn: *SslConn, parts: []const []const u8) !usize {
+    const s = session(conn);
+    var pieces = Pieces{ .parts = parts };
+    var sent: usize = 0;
+    while (pieces.next()) |piece| {
+        if (try writePiece(s, piece) != .done) return sent;
+        sent += piece.len;
+    }
+    return sent;
+}
+
+test "a write resumed at a piece boundary repeats the same pieces" {
+    var body: [2 * piece_len + 100]u8 = undefined;
+    for (&body, 0..) |*b, i| b.* = @truncate(i *% 7);
+    const head = "head";
+    var whole: [head.len + body.len]u8 = undefined;
+    @memcpy(whole[0..head.len], head);
+    @memcpy(whole[head.len..], &body);
+
+    var pieces = Pieces{ .parts = &.{ head, &body } };
+    var offset: usize = 0;
+    var count: usize = 0;
+    while (pieces.next()) |piece| : (count += 1) {
+        try std.testing.expectEqualSlices(u8, whole[offset..][0..@min(piece_len, whole.len - offset)], piece);
+        // What a drain resuming here (the queued rest of the parts) sends first.
+        if (offset > 0) {
+            var resumed = Pieces{ .parts = &.{body[offset - head.len ..]} };
+            try std.testing.expectEqualSlices(u8, piece, resumed.next().?);
+        }
+        offset += piece.len;
+    }
+    try std.testing.expectEqual(whole.len, offset);
+    try std.testing.expectEqual(@as(usize, 3), count);
+
+    var empty = Pieces{ .parts = &.{ "", "" } };
+    try std.testing.expectEqual(@as(?[]const u8, null), empty.next());
 }
 
 /// Free the per-connection TLS session.

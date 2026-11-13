@@ -13,7 +13,7 @@ pub const Event = struct {
     member: []const u8,
 
     pub fn fromJson(allocator: Allocator, data: []const u8) !json.Parsed(Event) {
-        return try json.parseFromSlice(Event, allocator, data, .{});
+        return try json.parseFromSlice(Event, allocator, data, .{ .ignore_unknown_fields = true });
     }
 
     pub fn toJson(self: *Event, allocator: Allocator) ![]const u8 {
@@ -32,11 +32,15 @@ pub const Handshake = struct {
     const Member = struct {
         name: []const u8,
         methods: ?[][]const u8,
+        /// The registration a router gave this name (see `ChannelsMapper`);
+        /// absent (0) from peers that predate it.
+        generation: u16 = 0,
     };
 
     pub const MemberData = struct {
         name: []const u8,
         methods: []const u8, // comma separated list of methods
+        generation: u16 = 0,
     };
 
     const Meta = struct {
@@ -56,21 +60,43 @@ pub const Handshake = struct {
     pub const max_methods: usize = 1024;
     pub const max_name_len: usize = 64;
 
+    pub const Limits = struct {
+        max_members: usize,
+        max_methods: usize,
+        max_name_len: usize,
+    };
+
+    /// For a handshake a server receives from a connecting peer.
+    pub const peer_limits: Limits = .{ .max_members = max_members, .max_methods = max_methods, .max_name_len = max_name_len };
+    /// For the reply a client gets from its server: a router lists every
+    /// member of the cluster, so the per-peer caps do not apply.
+    pub const reply_limits: Limits = .{ .max_members = std.math.maxInt(usize), .max_methods = std.math.maxInt(usize), .max_name_len = std.math.maxInt(usize) };
+
+    /// Parse a handshake from an untrusted peer.
     pub fn fromJson(allocator: Allocator, data: []const u8) !json.Parsed(Handshake) {
+        return fromJsonLimited(allocator, data, peer_limits);
+    }
+
+    /// Parse a server's handshake reply or member broadcast.
+    pub fn fromJsonReply(allocator: Allocator, data: []const u8) !json.Parsed(Handshake) {
+        return fromJsonLimited(allocator, data, reply_limits);
+    }
+
+    pub fn fromJsonLimited(allocator: Allocator, data: []const u8, limits: Limits) !json.Parsed(Handshake) {
         const parsed = try json.parseFromSlice(Handshake, allocator, data, .{ .ignore_unknown_fields = true });
         errdefer parsed.deinit();
-        try parsed.value.validate();
+        try parsed.value.validate(limits);
         return parsed;
     }
 
-    pub fn validate(self: Handshake) !void {
-        if (self.members.len > max_members) return error.TooManyMembers;
+    pub fn validate(self: Handshake, limits: Limits) !void {
+        if (self.members.len > limits.max_members) return error.TooManyMembers;
         for (self.members) |mb| {
-            if (mb.name.len == 0 or mb.name.len > max_name_len) return error.InvalidMemberName;
+            if (mb.name.len == 0 or mb.name.len > limits.max_name_len) return error.InvalidMemberName;
             if (mb.methods) |methods| {
-                if (methods.len > max_methods) return error.TooManyMethods;
+                if (methods.len > limits.max_methods) return error.TooManyMethods;
                 for (methods) |m| {
-                    if (m.len == 0 or m.len > max_name_len) return error.InvalidMethodName;
+                    if (m.len == 0 or m.len > limits.max_name_len) return error.InvalidMethodName;
                 }
             }
         }
@@ -105,7 +131,7 @@ pub const Handshake = struct {
                 var mt_idx: usize = 0;
                 while (methods_iterator.next()) |mt| : (mt_idx += 1) methods.?[mt_idx] = mem.trim(u8, mt, " ");
             }
-            members[mem_idx] = .{ .name = md.name, .methods = methods };
+            members[mem_idx] = .{ .name = md.name, .methods = methods, .generation = md.generation };
         }
         return .{ .meta = .{ .type = connection_type orelse PLACEHOLDER }, .members = members };
     }
@@ -154,4 +180,29 @@ test "handshake rejects oversized membership" {
     }
     try body.appendSlice(std.testing.allocator, "]}");
     try std.testing.expectError(error.TooManyMembers, Handshake.fromJson(std.testing.allocator, body.items));
+    // A router's reply lists the whole cluster.
+    const reply = try Handshake.fromJsonReply(std.testing.allocator, body.items);
+    defer reply.deinit();
+    try std.testing.expectEqual(Handshake.max_members + 1, reply.value.members.len);
+}
+
+test "handshake member generation is optional on the wire" {
+    const old = try Handshake.fromJsonReply(std.testing.allocator,
+        \\{"meta":{"type":"router"},"members":[{"name":"a","methods":["f"]}]}
+    );
+    defer old.deinit();
+    try std.testing.expectEqual(@as(u16, 0), old.value.members[0].generation);
+
+    var arena = ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var hs = try Handshake.create(arena.allocator(), &.{.{ .name = "a", .methods = "f", .generation = 9 }}, "router");
+    const parsed = try Handshake.fromJsonReply(std.testing.allocator, try hs.toJson(arena.allocator()));
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(u16, 9), parsed.value.members[0].generation);
+
+    const event = try Event.fromJson(std.testing.allocator,
+        \\{"type":"connected","member":"a","future":1}
+    );
+    defer event.deinit();
+    try std.testing.expectEqualStrings("a", event.value.member);
 }

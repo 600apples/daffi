@@ -30,7 +30,9 @@ def _router_only(runtime: str, port: int, name: str = "dup-aio-router") -> None:
         from daffi.aio import AsyncRouter
         from daffi import TCPTransport
 
-        r = AsyncRouter(app_name=name, transport=TCPTransport(HOST, port), runtime=runtime)
+        r = AsyncRouter(
+            app_name=name, transport=TCPTransport(HOST, port), runtime=runtime
+        )
         await r.start()
         await r.join()
 
@@ -44,7 +46,12 @@ def _service_only(runtime: str, port: int, name: str = "dup-aio-service") -> Non
         from daffi.aio import AsyncService
         from daffi import TCPTransport
 
-        s = AsyncService(app_name=name, workers=2, transport=TCPTransport(HOST, port), runtime=runtime)
+        s = AsyncService(
+            app_name=name,
+            workers=2,
+            transport=TCPTransport(HOST, port),
+            runtime=runtime,
+        )
         await s.start()
         await s.join()
 
@@ -62,7 +69,9 @@ def _client_only(runtime: str, port: int, name: str) -> None:
         async def ping():
             return "pong"
 
-        client = AsyncClient(app_name=name, transport=TCPTransport(HOST, port), runtime=runtime)
+        client = AsyncClient(
+            app_name=name, transport=TCPTransport(HOST, port), runtime=runtime
+        )
         await client.connect()
         await client.join()
 
@@ -71,7 +80,14 @@ def _client_only(runtime: str, port: int, name: str) -> None:
 
 @pytest.fixture
 def router_fixture(free_port):
-    proc = mp.Process(target=_router_only, args=(active_runtime(), free_port,), daemon=True)
+    proc = mp.Process(
+        target=_router_only,
+        args=(
+            active_runtime(),
+            free_port,
+        ),
+        daemon=True,
+    )
     proc.start()
     wait_for_port(free_port)
     yield free_port
@@ -80,7 +96,14 @@ def router_fixture(free_port):
 
 @pytest.fixture
 def service_fixture(free_port):
-    proc = mp.Process(target=_service_only, args=(active_runtime(), free_port,), daemon=True)
+    proc = mp.Process(
+        target=_service_only,
+        args=(
+            active_runtime(),
+            free_port,
+        ),
+        daemon=True,
+    )
     proc.start()
     wait_for_port(free_port)
     time.sleep(0.15)
@@ -97,13 +120,15 @@ class TestDuplicateNameRouterAsync:
         from daffi import TCPTransport
 
         client1 = AsyncClient(
-            app_name="dup-aio-client", transport=TCPTransport(HOST, router_fixture),
+            app_name="dup-aio-client",
+            transport=TCPTransport(HOST, router_fixture),
             runtime=active_runtime(),
         )
         await client1.connect()
 
         client2 = AsyncClient(
-            app_name="dup-aio-client", transport=TCPTransport(HOST, router_fixture),
+            app_name="dup-aio-client",
+            transport=TCPTransport(HOST, router_fixture),
             runtime=active_runtime(),
         )
         conn2 = await client2.connect()
@@ -124,7 +149,8 @@ class TestDuplicateNameRouterAsync:
 
         name = "dup-aio-reconnect"
         client1 = AsyncClient(
-            app_name=name, transport=TCPTransport(HOST, router_fixture),
+            app_name=name,
+            transport=TCPTransport(HOST, router_fixture),
             runtime=active_runtime(),
         )
         await client1.connect()
@@ -132,7 +158,8 @@ class TestDuplicateNameRouterAsync:
         await asyncio.sleep(0.1)
 
         client2 = AsyncClient(
-            app_name=name, transport=TCPTransport(HOST, router_fixture),
+            app_name=name,
+            transport=TCPTransport(HOST, router_fixture),
             runtime=active_runtime(),
         )
         await client2.connect()
@@ -150,13 +177,15 @@ class TestDuplicateNameServiceAsync:
         from daffi import TCPTransport
 
         client1 = AsyncClient(
-            app_name="dup-aio-svc-c", transport=TCPTransport(HOST, service_fixture),
+            app_name="dup-aio-svc-c",
+            transport=TCPTransport(HOST, service_fixture),
             runtime=active_runtime(),
         )
         await client1.connect()
 
         client2 = AsyncClient(
-            app_name="dup-aio-svc-c", transport=TCPTransport(HOST, service_fixture),
+            app_name="dup-aio-svc-c",
+            transport=TCPTransport(HOST, service_fixture),
             runtime=active_runtime(),
         )
         await client2.connect()

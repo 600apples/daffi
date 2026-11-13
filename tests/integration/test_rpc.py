@@ -19,7 +19,6 @@ import pytest
 
 from .conftest import HOST, TIMEOUT
 
-
 # ── helpers ───────────────────────────────────────────────────────────────────
 
 
@@ -28,7 +27,9 @@ def _rpc(port: int, name: str, *args, serde=None, **kwargs):
     from daffi import Client, SerdeFormat, TCPTransport
 
     serde = serde if serde is not None else SerdeFormat.DEFAULT
-    client = Client(app_name=name, transport=TCPTransport(HOST, port), runtime=active_runtime())
+    client = Client(
+        app_name=name, transport=TCPTransport(HOST, port), runtime=active_runtime()
+    )
     conn = client.connect()
     try:
         proxy = conn.rpc(timeout=TIMEOUT, serde=serde)
@@ -133,7 +134,8 @@ class TestDirectRpc:
         from daffi import Client, TCPTransport
 
         client = Client(
-            app_name="t-repeated", transport=TCPTransport(HOST, direct_service),
+            app_name="t-repeated",
+            transport=TCPTransport(HOST, direct_service),
             runtime=active_runtime(),
         )
         conn = client.connect()
@@ -198,7 +200,8 @@ class TestRouterRpc:
         from daffi import Client, TCPTransport
 
         client = Client(
-            app_name="r-repeated", transport=TCPTransport(HOST, router_with_worker),
+            app_name="r-repeated",
+            transport=TCPTransport(HOST, router_with_worker),
             runtime=active_runtime(),
         )
         conn = client.connect()

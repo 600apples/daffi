@@ -68,7 +68,9 @@ class TestSyncTaskDispatcherWorkers:
             dispatcher._start_connection_workers(second)
             assert len(dispatcher._pools[1].threads) == 2
             assert len(dispatcher._pools[2].threads) == 3
-            assert set(dispatcher._pools[1].threads).isdisjoint(dispatcher._pools[2].threads)
+            assert set(dispatcher._pools[1].threads).isdisjoint(
+                dispatcher._pools[2].threads
+            )
         finally:
             _stop_pools(dispatcher)
 
@@ -103,7 +105,10 @@ class TestSyncTaskDispatcherWorkers:
             return None, MessageFlag.RESPONSE, serde
 
         monkeypatch.setattr(_task_dispatcher, "_invoke_callback", slow_callback)
-        native = [(i + 1, i, MessageFlag.REQUEST, 1, "caller", "me", "f", False) for i in range(total)]
+        native = [
+            (i + 1, i, MessageFlag.REQUEST, 1, "caller", "me", "f", False)
+            for i in range(total)
+        ]
 
         class Wakeup:
             signals = 0
@@ -205,7 +210,9 @@ class TestAsyncTaskDispatcherWorkers:
         from daffi._task_dispatcher import TaskDispatcher
         from daffi.aio._task_dispatcher import AsyncTaskDispatcher
 
-        assert AsyncTaskDispatcher.DEFAULT_WORKERS == TaskDispatcher.DEFAULT_WORKERS == 1
+        assert (
+            AsyncTaskDispatcher.DEFAULT_WORKERS == TaskDispatcher.DEFAULT_WORKERS == 1
+        )
         assert AsyncTaskDispatcher().workers == 1
 
     async def test_runs_up_to_workers_at_once(self):

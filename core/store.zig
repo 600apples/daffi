@@ -1,5 +1,6 @@
 pub const ClientMessageStore = @import("store/ClientMessageStore.zig");
 pub const ChannelsMapper = @import("store/ChannelsMapper.zig").ChannelsMapper;
+pub const generationOlder = @import("store/ChannelsMapper.zig").generationOlder;
 pub const TasksQueue = @import("store/TasksQueue.zig");
 pub const ReplyRoutes = @import("store/ReplyRoutes.zig").ReplyRoutes;
 

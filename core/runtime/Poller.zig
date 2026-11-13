@@ -1,6 +1,7 @@
 //! Readiness notification for the event loop: kqueue on macOS/BSD, epoll on
-//! Linux.  Only read interest is needed — writes stay blocking in both
-//! runtimes.  Level-triggered: a descriptor keeps being reported
+//! Linux.  Descriptors are watched for readability; writes never wait on a
+//! loop, except that a TLS read which must send first waits for writability
+//! (`watch`).  Level-triggered: a descriptor keeps being reported
 //! while it has unread data (or a pending EOF), so a callback may consume
 //! input in bounded chunks.
 
@@ -83,19 +84,49 @@ pub fn add(self: *Poller, fd: c_int, udata: usize) !void {
 /// Stop watching `fd`.  Must happen before the descriptor is closed.
 pub fn remove(self: *Poller, fd: c_int) void {
     if (use_kqueue) {
-        const change = c.Kevent{
-            .ident = @intCast(fd),
-            .filter = c.EVFILT.READ,
-            .flags = c.EV.DELETE,
-            .fflags = 0,
-            .data = 0,
-            .udata = 0,
-        };
-        var none: c.Kevent = undefined;
-        _ = c.kevent(self.fd, @ptrCast(&change), 1, @ptrCast(&none), 0, null);
+        // Whichever filter is active; deleting the other one fails harmlessly.
+        _ = self.kqueueChange(fd, c.EVFILT.READ, c.EV.DELETE, 0);
+        _ = self.kqueueChange(fd, c.EVFILT.WRITE, c.EV.DELETE, 0);
     } else {
         _ = c.epoll_ctl(self.fd, std.os.linux.EPOLL.CTL_DEL, fd, null);
     }
+}
+
+pub const Interest = enum { read, write };
+
+/// Switch a watched `fd` to readability or to writability only (hang-ups
+/// and errors are reported either way).
+pub fn watch(self: *Poller, fd: c_int, udata: usize, interest: Interest) !void {
+    if (use_kqueue) {
+        const on: i16 = if (interest == .write) c.EVFILT.WRITE else c.EVFILT.READ;
+        const off: i16 = if (interest == .write) c.EVFILT.READ else c.EVFILT.WRITE;
+        if (!self.kqueueChange(fd, on, c.EV.ADD | c.EV.ENABLE, udata)) {
+            net.noteOsFailure("kevent");
+            return error.PollerAddFailed;
+        }
+        _ = self.kqueueChange(fd, off, c.EV.DELETE, 0);
+    } else {
+        const EPOLL = std.os.linux.EPOLL;
+        const events: u32 = if (interest == .write) EPOLL.OUT else EPOLL.IN | EPOLL.RDHUP;
+        var ev = c.epoll_event{ .events = events, .data = .{ .ptr = udata } };
+        if (c.epoll_ctl(self.fd, EPOLL.CTL_MOD, fd, &ev) != 0) {
+            net.noteOsFailure("epoll_ctl");
+            return error.PollerAddFailed;
+        }
+    }
+}
+
+fn kqueueChange(self: *Poller, fd: c_int, filter: i16, flags: u16, udata: usize) bool {
+    const change = c.Kevent{
+        .ident = @intCast(fd),
+        .filter = filter,
+        .flags = flags,
+        .fflags = 0,
+        .data = 0,
+        .udata = udata,
+    };
+    var none: c.Kevent = undefined;
+    return c.kevent(self.fd, @ptrCast(&change), 1, @ptrCast(&none), 0, null) >= 0;
 }
 
 /// Pause after a failed wait other than EINTR (ENOMEM, ...), so a failure

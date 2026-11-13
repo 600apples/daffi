@@ -65,7 +65,14 @@ def _worker_proc(runtime: str, port: int, name: str) -> None:
 @pytest.fixture
 def router_port(free_port):
     """Bare Router; no workers pre-spawned."""
-    proc = mp.Process(target=proc_router, args=(active_runtime(), free_port,), daemon=True)
+    proc = mp.Process(
+        target=proc_router,
+        args=(
+            active_runtime(),
+            free_port,
+        ),
+        daemon=True,
+    )
     proc.start()
     wait_for_port(free_port)
     yield free_port
@@ -86,7 +93,8 @@ class TestRouterMemberAdded:
         arrived = threading.Event()
 
         watcher = Client(
-            app_name="ev-watcher-add", transport=TCPTransport(HOST, router_port),
+            app_name="ev-watcher-add",
+            transport=TCPTransport(HOST, router_port),
             runtime=active_runtime(),
         )
 
@@ -97,7 +105,9 @@ class TestRouterMemberAdded:
 
         watcher.connect()
         wproc = mp.Process(
-            target=_worker_proc, args=(active_runtime(), router_port, "ev-joiner"), daemon=True
+            target=_worker_proc,
+            args=(active_runtime(), router_port, "ev-joiner"),
+            daemon=True,
         )
         wproc.start()
         try:
@@ -116,7 +126,8 @@ class TestRouterMemberAdded:
         both_done = threading.Event()
 
         watcher = Client(
-            app_name="ev-watcher-deco", transport=TCPTransport(HOST, router_port),
+            app_name="ev-watcher-deco",
+            transport=TCPTransport(HOST, router_port),
             runtime=active_runtime(),
         )
 
@@ -132,7 +143,9 @@ class TestRouterMemberAdded:
 
         watcher.connect()
         wproc = mp.Process(
-            target=_worker_proc, args=(active_runtime(), router_port, "ev-deco-worker"), daemon=True
+            target=_worker_proc,
+            args=(active_runtime(), router_port, "ev-deco-worker"),
+            daemon=True,
         )
         wproc.start()
         try:
@@ -151,7 +164,8 @@ class TestRouterMemberAdded:
         done = threading.Event()
 
         watcher = Client(
-            app_name="ev-multi-add", transport=TCPTransport(HOST, router_port),
+            app_name="ev-multi-add",
+            transport=TCPTransport(HOST, router_port),
             runtime=active_runtime(),
         )
         watcher.on_member_added(lambda m: order.append(1))
@@ -160,7 +174,9 @@ class TestRouterMemberAdded:
 
         watcher.connect()
         wproc = mp.Process(
-            target=_worker_proc, args=(active_runtime(), router_port, "ev-multi-w"), daemon=True
+            target=_worker_proc,
+            args=(active_runtime(), router_port, "ev-multi-w"),
+            daemon=True,
         )
         wproc.start()
         try:
@@ -180,14 +196,17 @@ class TestRouterMemberAdded:
         arrived = threading.Event()
 
         watcher = Client(
-            app_name="ev-self-check", transport=TCPTransport(HOST, router_port),
+            app_name="ev-self-check",
+            transport=TCPTransport(HOST, router_port),
             runtime=active_runtime(),
         )
         watcher.on_member_added(lambda m: (added.append(m), arrived.set()))
         watcher.connect()
 
         wproc = mp.Process(
-            target=_worker_proc, args=(active_runtime(), router_port, "ev-other-peer"), daemon=True
+            target=_worker_proc,
+            args=(active_runtime(), router_port, "ev-other-peer"),
+            daemon=True,
         )
         wproc.start()
         try:
@@ -208,7 +227,8 @@ class TestRouterMemberAdded:
         added_event = threading.Event()
 
         watcher = Client(
-            app_name="ev-no-rem", transport=TCPTransport(HOST, router_port),
+            app_name="ev-no-rem",
+            transport=TCPTransport(HOST, router_port),
             runtime=active_runtime(),
         )
         watcher.on_member_added(lambda m: added_event.set())
@@ -216,7 +236,9 @@ class TestRouterMemberAdded:
         watcher.connect()
 
         wproc = mp.Process(
-            target=_worker_proc, args=(active_runtime(), router_port, "ev-joiner-only"), daemon=True
+            target=_worker_proc,
+            args=(active_runtime(), router_port, "ev-joiner-only"),
+            daemon=True,
         )
         wproc.start()
         try:
@@ -243,7 +265,8 @@ class TestRouterMemberRemoved:
         joined = threading.Event()
 
         watcher = Client(
-            app_name="ev-watcher-rem", transport=TCPTransport(HOST, router_port),
+            app_name="ev-watcher-rem",
+            transport=TCPTransport(HOST, router_port),
             runtime=active_runtime(),
         )
         watcher.on_member_added(lambda m: joined.set() if m == "ev-leaver" else None)
@@ -253,7 +276,9 @@ class TestRouterMemberRemoved:
         watcher.connect()
 
         wproc = mp.Process(
-            target=_worker_proc, args=(active_runtime(), router_port, "ev-leaver"), daemon=True
+            target=_worker_proc,
+            args=(active_runtime(), router_port, "ev-leaver"),
+            daemon=True,
         )
         wproc.start()
         assert joined.wait(timeout=_EVENT_TIMEOUT), "ev-leaver never joined"
@@ -276,7 +301,8 @@ class TestRouterMemberRemoved:
         removed_event = threading.Event()
 
         watcher = Client(
-            app_name="ev-no-add-on-rem", transport=TCPTransport(HOST, router_port),
+            app_name="ev-no-add-on-rem",
+            transport=TCPTransport(HOST, router_port),
             runtime=active_runtime(),
         )
         watcher.on_member_added(
@@ -288,7 +314,9 @@ class TestRouterMemberRemoved:
         watcher.connect()
 
         wproc = mp.Process(
-            target=_worker_proc, args=(active_runtime(), router_port, "ev-gone"), daemon=True
+            target=_worker_proc,
+            args=(active_runtime(), router_port, "ev-gone"),
+            daemon=True,
         )
         wproc.start()
         assert joined.wait(timeout=_EVENT_TIMEOUT), "ev-gone never joined"
@@ -312,7 +340,8 @@ class TestRouterMemberRemoved:
         removed_ev = threading.Event()
 
         watcher = Client(
-            app_name="ev-lifecycle", transport=TCPTransport(HOST, router_port),
+            app_name="ev-lifecycle",
+            transport=TCPTransport(HOST, router_port),
             runtime=active_runtime(),
         )
         watcher.on_member_added(lambda m: (added.append(m), added_ev.set()))
@@ -320,7 +349,9 @@ class TestRouterMemberRemoved:
         watcher.connect()
 
         wproc = mp.Process(
-            target=_worker_proc, args=(active_runtime(), router_port, "ev-cycle-peer"), daemon=True
+            target=_worker_proc,
+            args=(active_runtime(), router_port, "ev-cycle-peer"),
+            daemon=True,
         )
         wproc.start()
 

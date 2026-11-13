@@ -62,7 +62,9 @@ def _wait_for_port(port: int, timeout: float = 15.0) -> None:
                 return
         except OSError:
             time.sleep(0.05)
-    raise TimeoutError(f"Server on {HOST}:{port} did not become ready within {timeout}s")
+    raise TimeoutError(
+        f"Server on {HOST}:{port} did not become ready within {timeout}s"
+    )
 
 
 def _silence() -> None:
@@ -199,7 +201,9 @@ def _proc_daffi(runtime: str, port: int) -> None:
     def echo(payload):
         return payload
 
-    svc = Service(app_name="grpc-cmp-svc", transport=TCPTransport(HOST, port), runtime=runtime)
+    svc = Service(
+        app_name="grpc-cmp-svc", transport=TCPTransport(HOST, port), runtime=runtime
+    )
     svc.start()
     svc.join()
 
@@ -234,7 +238,10 @@ def main() -> None:
     try:
         import grpc
     except ImportError:
-        print("grpcio not installed — pip install grpcio grpcio-tools protobuf", file=sys.stderr)
+        print(
+            "grpcio not installed — pip install grpcio grpcio-tools protobuf",
+            file=sys.stderr,
+        )
         sys.exit(1)
 
     _ensure_grpc_stubs()
@@ -244,7 +251,9 @@ def main() -> None:
     payload_bytes = len(wire_bytes)
 
     print(f"\ngRPC {grpc.__version__} vs daffi  —  {N} sequential unary rpc calls")
-    print(f"host: {HOST}   warmup: {WARMUP}   payload: {_DATA_FILE.name} ({payload_bytes} bytes JSON)")
+    print(
+        f"host: {HOST}   warmup: {WARMUP}   payload: {_DATA_FILE.name} ({payload_bytes} bytes JSON)"
+    )
     print("wire: JSON bytes in protobuf `bytes` field; daffi serde=MSGPACK\n")
 
     print("── gRPC ─────────────────────────────────────────────────")

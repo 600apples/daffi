@@ -48,7 +48,9 @@ def _proc_service(runtime: str, port: int) -> None:
         return a + b
 
     svc = Service(
-        app_name="conc-service", workers=16, transport=TCPTransport(HOST, port),
+        app_name="conc-service",
+        workers=16,
+        transport=TCPTransport(HOST, port),
         runtime=runtime,
     )
     svc.start()
@@ -59,7 +61,9 @@ def _proc_router(runtime: str, port: int) -> None:
     silence_subprocess(runtime)
     from daffi import Router, TCPTransport
 
-    r = Router(app_name="conc-router", transport=TCPTransport(HOST, port), runtime=runtime)
+    r = Router(
+        app_name="conc-router", transport=TCPTransport(HOST, port), runtime=runtime
+    )
     r.start()
     r.join()
 
@@ -78,7 +82,9 @@ def _proc_worker(runtime: str, port: int) -> None:
         return a + b
 
     client = Client(
-        app_name="conc-worker", workers=16, transport=TCPTransport(HOST, port),
+        app_name="conc-worker",
+        workers=16,
+        transport=TCPTransport(HOST, port),
         runtime=runtime,
     )
     client.connect()
@@ -96,7 +102,14 @@ def _proc_worker(runtime: str, port: int) -> None:
 
 @pytest.fixture
 def conc_service(free_port):
-    proc = mp.Process(target=_proc_service, args=(active_runtime(), free_port,), daemon=True)
+    proc = mp.Process(
+        target=_proc_service,
+        args=(
+            active_runtime(),
+            free_port,
+        ),
+        daemon=True,
+    )
     proc.start()
     wait_for_port(free_port)
     # Deterministic — replaces a fixed sleep that occasionally raced
@@ -108,10 +121,24 @@ def conc_service(free_port):
 
 @pytest.fixture
 def conc_router(free_port):
-    rproc = mp.Process(target=_proc_router, args=(active_runtime(), free_port,), daemon=True)
+    rproc = mp.Process(
+        target=_proc_router,
+        args=(
+            active_runtime(),
+            free_port,
+        ),
+        daemon=True,
+    )
     rproc.start()
     wait_for_port(free_port)
-    wproc = mp.Process(target=_proc_worker, args=(active_runtime(), free_port,), daemon=True)
+    wproc = mp.Process(
+        target=_proc_worker,
+        args=(
+            active_runtime(),
+            free_port,
+        ),
+        daemon=True,
+    )
     wproc.start()
     # Block until the router actually has the worker registered — without this
     # the test occasionally fires its first echo() before conc-worker has
@@ -131,7 +158,11 @@ class TestSharedConnectionConcurrency:
     def _shared_echo_threads(self, port: int, prefix: str) -> list[Exception]:
         from daffi import Client, TCPTransport
 
-        client = Client(app_name=f"{prefix}-shared", transport=TCPTransport(HOST, port), runtime=active_runtime())
+        client = Client(
+            app_name=f"{prefix}-shared",
+            transport=TCPTransport(HOST, port),
+            runtime=active_runtime(),
+        )
         conn = client.connect()
         proxy = conn.rpc(timeout=TIMEOUT)
 
@@ -151,7 +182,14 @@ class TestSharedConnectionConcurrency:
                     errors.append(exc)
 
         threads = [
-            threading.Thread(target=_task, args=(active_runtime(), i,), daemon=True)
+            threading.Thread(
+                target=_task,
+                args=(
+                    active_runtime(),
+                    i,
+                ),
+                daemon=True,
+            )
             for i in range(N_THREADS)
         ]
         for t in threads:
@@ -185,7 +223,8 @@ class TestIndependentConnectionsConcurrency:
             from daffi import Client, TCPTransport
 
             client = Client(
-                app_name=f"{prefix}-ind-{tid:03d}", transport=TCPTransport(HOST, port),
+                app_name=f"{prefix}-ind-{tid:03d}",
+                transport=TCPTransport(HOST, port),
                 runtime=runtime,
             )
             conn = client.connect()
@@ -203,7 +242,14 @@ class TestIndependentConnectionsConcurrency:
                 client.stop()
 
         threads = [
-            threading.Thread(target=_task, args=(active_runtime(), i,), daemon=True)
+            threading.Thread(
+                target=_task,
+                args=(
+                    active_runtime(),
+                    i,
+                ),
+                daemon=True,
+            )
             for i in range(N_THREADS)
         ]
         for t in threads:
@@ -231,7 +277,8 @@ class TestConcurrentArithmetic:
         from daffi import Client, TCPTransport
 
         client = Client(
-            app_name="conc-add-dir", transport=TCPTransport(HOST, conc_service),
+            app_name="conc-add-dir",
+            transport=TCPTransport(HOST, conc_service),
             runtime=active_runtime(),
         )
         conn = client.connect()
@@ -251,7 +298,14 @@ class TestConcurrentArithmetic:
                     errors.append(exc)
 
         threads = [
-            threading.Thread(target=_task, args=(active_runtime(), i,), daemon=True)
+            threading.Thread(
+                target=_task,
+                args=(
+                    active_runtime(),
+                    i,
+                ),
+                daemon=True,
+            )
             for i in range(N_THREADS)
         ]
         for t in threads:
@@ -269,7 +323,8 @@ class TestConcurrentArithmetic:
         from daffi import Client, TCPTransport
 
         client = Client(
-            app_name="conc-add-rtr", transport=TCPTransport(HOST, conc_router),
+            app_name="conc-add-rtr",
+            transport=TCPTransport(HOST, conc_router),
             runtime=active_runtime(),
         )
         conn = client.connect()
@@ -289,7 +344,14 @@ class TestConcurrentArithmetic:
                     errors.append(exc)
 
         threads = [
-            threading.Thread(target=_task, args=(active_runtime(), i,), daemon=True)
+            threading.Thread(
+                target=_task,
+                args=(
+                    active_runtime(),
+                    i,
+                ),
+                daemon=True,
+            )
             for i in range(N_THREADS)
         ]
         for t in threads:

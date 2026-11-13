@@ -79,8 +79,10 @@ def _silence(runtime: str) -> None:
     logging.disable(logging.CRITICAL)
 
     import tests.conftest as _runtime_state
+
     _runtime_state.SELECTED_RUNTIME = runtime
     from daffi import dfcore
+
     dfcore.setRuntime(runtime)
 
 
@@ -88,7 +90,9 @@ def _proc_router(runtime: str, port: int) -> None:
     _silence(runtime)
     from daffi import Router, TCPTransport
 
-    r = Router(app_name="soak-router", transport=TCPTransport(HOST, port), runtime=runtime)
+    r = Router(
+        app_name="soak-router", transport=TCPTransport(HOST, port), runtime=runtime
+    )
     r.start()
     r.join()
 
@@ -102,7 +106,9 @@ def _proc_worker(runtime: str, port: int, workers: int) -> None:
         return payload
 
     client = Client(
-        app_name="soak-worker", workers=workers, transport=TCPTransport(HOST, port),
+        app_name="soak-worker",
+        workers=workers,
+        transport=TCPTransport(HOST, port),
         runtime=runtime,
     )
     client.connect()
@@ -113,7 +119,8 @@ def _proc_worker(runtime: str, port: int, workers: int) -> None:
         client.stop()
 
 
-def _proc_loader(runtime: str, 
+def _proc_loader(
+    runtime: str,
     port: int,
     n_clients: int,
     duration_s: float,
@@ -128,7 +135,8 @@ def _proc_loader(runtime: str,
     for i in range(n_clients):
         try:
             client = Client(
-                app_name=f"soak-c{i:04d}", transport=TCPTransport(HOST, port),
+                app_name=f"soak-c{i:04d}",
+                transport=TCPTransport(HOST, port),
                 runtime=runtime,
             )
             conn = client.connect()
@@ -228,7 +236,14 @@ def run_soak(
     # Spawned children do not inherit an in-process lock. Pass the model in.
     port = _free_port()
     ctx = mp.get_context("spawn")
-    router = ctx.Process(target=_proc_router, args=(model, port,), daemon=True)
+    router = ctx.Process(
+        target=_proc_router,
+        args=(
+            model,
+            port,
+        ),
+        daemon=True,
+    )
     worker = ctx.Process(target=_proc_worker, args=(model, port, workers), daemon=True)
     q: mp.Queue = ctx.Queue()
     loader = ctx.Process(

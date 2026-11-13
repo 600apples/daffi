@@ -103,8 +103,10 @@ def _silence(runtime: str) -> None:
     logging.disable(logging.CRITICAL)
 
     import tests.conftest as _runtime_state
+
     _runtime_state.SELECTED_RUNTIME = runtime
     from daffi import dfcore
+
     dfcore.setRuntime(runtime)
     try:
         from daffi.registry._executor_registry import EXECUTOR_REGISTRY
@@ -154,7 +156,9 @@ def _proc_router(runtime: str, port: int) -> None:
     _silence(runtime)
     from daffi import Router, TCPTransport
 
-    r = Router(app_name="chaos-router", transport=TCPTransport(HOST, port), runtime=runtime)
+    r = Router(
+        app_name="chaos-router", transport=TCPTransport(HOST, port), runtime=runtime
+    )
     r.start()
     r.join()
 
@@ -327,7 +331,8 @@ def _do_cast_nowait(conn, rng: random.Random) -> None:
 # ─── caller thread loops ──────────────────────────────────────────────────────
 
 
-def _router_caller_loop(runtime: str, 
+def _router_caller_loop(
+    runtime: str,
     caller_id: int,
     router_port: int,
     worker_names: list[str],
@@ -428,7 +433,8 @@ def _router_caller_loop(runtime: str,
             pass
 
 
-def _service_caller_loop(runtime: str, 
+def _service_caller_loop(
+    runtime: str,
     caller_id: int,
     service_port: int,
     service_name: str,
@@ -599,7 +605,14 @@ def _run() -> None:
 
     try:
         # ── router ────────────────────────────────────────────────────────────
-        rproc = mp.Process(target=_proc_router, args=(active_runtime(), router_port,), daemon=True)
+        rproc = mp.Process(
+            target=_proc_router,
+            args=(
+                active_runtime(),
+                router_port,
+            ),
+            daemon=True,
+        )
         rproc.start()
         procs.append(rproc)
         _wait_for_port(router_port)
@@ -607,7 +620,11 @@ def _run() -> None:
 
         # ── workers ───────────────────────────────────────────────────────────
         for i in range(N_WORKERS):
-            p = mp.Process(target=_proc_worker, args=(active_runtime(), router_port, i), daemon=True)
+            p = mp.Process(
+                target=_proc_worker,
+                args=(active_runtime(), router_port, i),
+                daemon=True,
+            )
             p.start()
             procs.append(p)
 
@@ -618,7 +635,9 @@ def _run() -> None:
         # ── services ──────────────────────────────────────────────────────────
         for i in range(N_SERVICES):
             p = mp.Process(
-                target=_proc_service, args=(active_runtime(), service_ports[i], i), daemon=True
+                target=_proc_service,
+                args=(active_runtime(), service_ports[i], i),
+                daemon=True,
             )
             p.start()
             procs.append(p)
@@ -640,7 +659,12 @@ def _run() -> None:
             svc_idx = i % N_SERVICES
             t = threading.Thread(
                 target=_service_caller_loop,
-                args=(active_runtime(), i, service_ports[svc_idx], service_names[svc_idx]),
+                args=(
+                    active_runtime(),
+                    i,
+                    service_ports[svc_idx],
+                    service_names[svc_idx],
+                ),
                 name=f"ServiceCaller-{i}",
                 daemon=True,
             )

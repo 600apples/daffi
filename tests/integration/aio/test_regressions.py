@@ -48,7 +48,9 @@ FRAGILE = "aio-fragile"
 # ── subprocess targets ────────────────────────────────────────────────────────
 
 
-def _proc_fragile_service(runtime: str, port: int, workers: int, explode_on_join: bool) -> None:
+def _proc_fragile_service(
+    runtime: str, port: int, workers: int, explode_on_join: bool
+) -> None:
     silence_subprocess(runtime)
 
     async def _main():
@@ -84,7 +86,9 @@ def _proc_fragile_service(runtime: str, port: int, workers: int, explode_on_join
             return a + b
 
         svc = AsyncService(
-            app_name=FRAGILE, workers=workers, transport=TCPTransport(HOST, port),
+            app_name=FRAGILE,
+            workers=workers,
+            transport=TCPTransport(HOST, port),
             runtime=runtime,
         )
 
@@ -131,7 +135,9 @@ def _proc_pickle_injector(runtime: str, port: int, marker: str, flag_name: str) 
         async def lookup(key):
             return key
 
-        svc = AsyncService(app_name="aio-injector", transport=TCPTransport(HOST, port), runtime=runtime)
+        svc = AsyncService(
+            app_name="aio-injector", transport=TCPTransport(HOST, port), runtime=runtime
+        )
         await svc.start()
         await svc.join()
 
@@ -152,7 +158,9 @@ def _proc_self_stopping_worker(runtime: str, port: int, workers: int, q) -> None
             await holder["client"].stop()
 
         client = AsyncClient(
-            app_name="aio-self-stopper", workers=workers, transport=TCPTransport(HOST, port),
+            app_name="aio-self-stopper",
+            workers=workers,
+            transport=TCPTransport(HOST, port),
             runtime=runtime,
         )
         holder["client"] = client
@@ -169,7 +177,9 @@ def _proc_self_stopping_worker(runtime: str, port: int, workers: int, q) -> None
 # ── helpers ───────────────────────────────────────────────────────────────────
 
 
-def _start_fragile(port: int, workers: int, explode_on_join: bool = False) -> mp.Process:
+def _start_fragile(
+    port: int, workers: int, explode_on_join: bool = False
+) -> mp.Process:
     proc = mp.Process(
         target=_proc_fragile_service,
         args=(active_runtime(), port, workers, explode_on_join),
@@ -186,7 +196,9 @@ async def _client(port: int, name: str, *members: str):
     from daffi import TCPTransport
     from daffi.aio import AsyncClient
 
-    client = AsyncClient(app_name=name, transport=TCPTransport(HOST, port), runtime=active_runtime())
+    client = AsyncClient(
+        app_name=name, transport=TCPTransport(HOST, port), runtime=active_runtime()
+    )
     conn = await client.connect()
     try:
         if members:
@@ -244,7 +256,9 @@ def pool_service(free_port):
 
 @pytest.fixture
 def router_port(free_port):
-    proc = mp.Process(target=proc_router, args=(active_runtime(), free_port), daemon=True)
+    proc = mp.Process(
+        target=proc_router, args=(active_runtime(), free_port), daemon=True
+    )
     proc.start()
     wait_for_port(free_port, proc=proc)
     yield free_port
@@ -351,7 +365,9 @@ async def test_cancelled_call_reply_never_reaches_a_later_call(pool_service):
         # Request ids are 16 bit: this walks every one of them.
         batch = 400
         for start in range(0, 65_600, batch):
-            results = await asyncio.gather(*(proxy.echo(i) for i in range(start, start + batch)))
+            results = await asyncio.gather(
+                *(proxy.echo(i) for i in range(start, start + batch))
+            )
             for i, result in zip(range(start, start + batch), results):
                 if result != i:
                     pytest.fail(f"call {i} got {result!r}")
@@ -371,7 +387,9 @@ async def test_reply_in_wrong_format_is_never_unpickled(free_port, tmp_path):
         proc.start()
         try:
             wait_for_port(free_port, proc=proc)
-            async with _client(free_port, f"aio-victim-{flag_name}", "aio-injector") as conn:
+            async with _client(
+                free_port, f"aio-victim-{flag_name}", "aio-injector"
+            ) as conn:
                 with pytest.raises(RemoteCallError, match="does not match"):
                     await conn.rpc(timeout=10, serde=SerdeFormat.JSON).lookup("k")
             assert not marker.exists(), f"{flag_name} reply was unpickled"
@@ -386,13 +404,19 @@ async def test_evicted_client_does_not_take_its_name_back(router_port):
     from daffi.exceptions import Evicted
 
     worker = mp.Process(
-        target=proc_worker, args=(active_runtime(), router_port, "aio-evict-worker"), daemon=True
+        target=proc_worker,
+        args=(active_runtime(), router_port, "aio-evict-worker"),
+        daemon=True,
     )
     worker.start()
     try:
         wait_for_members(router_port, {"aio-evict-worker"})
-        async with _client(router_port, "aio-contested", "aio-evict-worker") as old_conn:
-            async with _client(router_port, "aio-contested", "aio-evict-worker") as new_conn:
+        async with _client(
+            router_port, "aio-contested", "aio-evict-worker"
+        ) as old_conn:
+            async with _client(
+                router_port, "aio-contested", "aio-evict-worker"
+            ) as new_conn:
 
                 async def _old_was_told() -> bool:
                     try:
@@ -401,7 +425,9 @@ async def test_evicted_client_does_not_take_its_name_back(router_port):
                         return True
                     return False
 
-                await _wait_until(_old_was_told, 10, "the evicted client to raise Evicted")
+                await _wait_until(
+                    _old_was_told, 10, "the evicted client to raise Evicted"
+                )
                 with pytest.raises(Evicted):
                     await old_conn.rpc(timeout=5).add(1, 1)
 
@@ -425,7 +451,9 @@ async def test_callback_can_stop_its_own_client(router_port, workers):
     proc.start()
     try:
         wait_for_members(router_port, {"aio-self-stopper"})
-        async with _client(router_port, "aio-stop-requester", "aio-self-stopper") as conn:
+        async with _client(
+            router_port, "aio-stop-requester", "aio-self-stopper"
+        ) as conn:
             try:
                 await conn.rpc(timeout=5).shutdown()
             except DaffiError:

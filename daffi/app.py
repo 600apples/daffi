@@ -21,9 +21,11 @@ from daffi.utils.misc import string_uuid
 from daffi._rpc_proxy import (
     RpcProxy,
     ClientConnection,
+    hand_off_polling,
     system_exception_handler,
 )
-from daffi._signals import SIGNAL_POLL_S, set_signal_handler
+from daffi._bindings import invalidate_members
+from daffi._signals import SIGNAL_POLL_S, release_signal_handler, set_signal_handler
 from daffi._task_dispatcher import TaskDispatcher, shared_dispatcher
 from daffi.registry._executor_registry import EXECUTOR_REGISTRY
 from daffi.transports import (
@@ -55,8 +57,7 @@ def _coerce_runtime(value: "Runtime | str") -> Runtime:
         return Runtime(value)
     except ValueError:
         raise InitializationError(
-            "runtime must be 'threads' or 'evented', "
-            f"got {value!r}"
+            "runtime must be 'threads' or 'evented', " f"got {value!r}"
         ) from None
 
 
@@ -106,9 +107,13 @@ def _coerce_auth_token(value: "str | None") -> "str | None":
     if value is None:
         return None
     if not isinstance(value, str):
-        raise InitializationError(f"auth_token must be a str, got {type(value).__name__}")
+        raise InitializationError(
+            f"auth_token must be a str, got {type(value).__name__}"
+        )
     if not value or "\0" in value:
-        raise InitializationError("auth_token must be a non-empty string without NUL characters")
+        raise InitializationError(
+            "auth_token must be a non-empty string without NUL characters"
+        )
     return value
 
 
@@ -126,6 +131,10 @@ class EventsMixin:
 
     * :meth:`on_member_added`   — fires when a peer joins (``"connected"``).
     * :meth:`on_member_removed` — fires when a peer leaves (``"disconnected"``).
+
+    On :class:`Service` and :class:`Client`, handlers run on daffi's event
+    thread (one per process), one event at a time in arrival order; a slow
+    handler delays later events, not calls.
 
     Both can be used as plain method calls **or** as decorators::
 
@@ -296,11 +305,12 @@ class Application(EventsMixin, ABC):
                            in incoming ``@callback`` requests; a request in
                            any other format is answered with a
                            ``SerdeNotAllowed`` error and never decoded.
-                           ``None`` (default) accepts every format
-                           (:attr:`SerdeFormat.ALL`).  Pass
-                           :attr:`SerdeFormat.SAFE` to refuse PICKLE.
-                           PICKLE from a WebSocket peer is always refused.
-                           Ignored by :class:`Router`.
+                           ``None`` (default) is :attr:`SerdeFormat.ALL`
+                           (including PICKLE).  Pass
+                           :attr:`SerdeFormat.SAFE` (or any set without
+                           PICKLE) to refuse PICKLE when peers are not
+                           all trusted.  PICKLE from a WebSocket peer is
+                           always refused.  Ignored by :class:`Router`.
             auth_token:    Shared secret.  A :class:`Router` or
                            :class:`Service` given one refuses every peer
                            whose handshake does not carry the same token; a
@@ -355,9 +365,8 @@ class Application(EventsMixin, ABC):
         # re-raise ``_connection_error``) or whether it must be raised
         # directly from the watcher thread to avoid being silently swallowed.
         self._joining: bool = False
-        # Set by :meth:`stop`; cleared by :meth:`connect` / :meth:`start`.
-        # Reconnect must not resurrect a client the user shut down.
-        self._intentionally_stopped: bool = False
+        # Backs :attr:`_intentionally_stopped`; the handler is registered below.
+        self._stopped_on_purpose: bool = False
         self.__init_events__()
         self._executors_subscribed: bool = False
 
@@ -398,6 +407,25 @@ class Application(EventsMixin, ABC):
                     "Unix sockets may use auth_token without TLS."
                 )
 
+    @property
+    def _intentionally_stopped(self) -> bool:
+        """Set by :meth:`stop`; cleared by :meth:`connect` / :meth:`start`.
+
+        Reconnect must not resurrect a client the user shut down.  A node
+        stopped this way also stops taking SIGINT / SIGTERM, so Ctrl+C
+        behaves as without daffi once every node is stopped; starting it
+        again takes them back.
+        """
+        return self._stopped_on_purpose
+
+    @_intentionally_stopped.setter
+    def _intentionally_stopped(self, value: bool) -> None:
+        self._stopped_on_purpose = value
+        if value:
+            release_signal_handler(self._signal_stop)
+        else:
+            set_signal_handler(self._signal_stop)
+
     def _signal_stop(self) -> None:
         """Stop on SIGINT / SIGTERM / interpreter exit."""
         self.stop()
@@ -412,9 +440,11 @@ class Application(EventsMixin, ABC):
         """
         allow_any_ws = self.auth_token is not None
         listeners = [
-            t.native_listener(allow_any_origin=allow_any_ws)
-            if isinstance(t, TCPTransport)
-            else t.native_listener()
+            (
+                t.native_listener(allow_any_origin=allow_any_ws)
+                if isinstance(t, TCPTransport)
+                else t.native_listener()
+            )
             for t in self._transports
         ]
         try:
@@ -436,7 +466,11 @@ class Application(EventsMixin, ABC):
 
     def _exposed_names(self) -> "list[str]":
         """The registered callbacks this node offers (see ``callbacks=``)."""
-        return [name for name, _ in EXECUTOR_REGISTRY if self.callbacks is None or name in self.callbacks]
+        return [
+            name
+            for name, _ in EXECUTOR_REGISTRY
+            if self.callbacks is None or name in self.callbacks
+        ]
 
     def _register_executors(self):
         """Log all currently registered callbacks and subscribe for future ones.
@@ -460,9 +494,13 @@ class Application(EventsMixin, ABC):
                     return
                 try:
                     if self.server_mode is None:
-                        RpcProxy._process_client_handshake(self._conn_num, self._exposed_names())
+                        RpcProxy._process_client_handshake(
+                            self._conn_num, self._exposed_names()
+                        )
                     elif self.server_mode == ServerMode.SERVICE:
-                        RpcProxy._process_service_handshake(self._conn_num, self._exposed_names())
+                        RpcProxy._process_service_handshake(
+                            self._conn_num, self._exposed_names()
+                        )
                     else:
                         return
                 except Exception as exc:
@@ -497,6 +535,7 @@ class Application(EventsMixin, ABC):
         self._executors_subscribed = False
 
     def _wait_stopped(self) -> None:
+        hand_off_polling()
         while not self._stop_event.wait(SIGNAL_POLL_S):
             if self._disconnected:
                 return
@@ -592,11 +631,15 @@ class ServerMixin:
                 self._task_dispatcher.start_for_connection(self)
                 # Before any socket accepts, so the first handshake already
                 # carries the callback list.
-                RpcProxy._advertise_service_methods(self._conn_num, self._exposed_names())
+                RpcProxy._advertise_service_methods(
+                    self._conn_num, self._exposed_names()
+                )
             dfcore.startServer(self._conn_num)
             self._register_executors()
             if self.server_mode == ServerMode.SERVICE:
-                RpcProxy._process_service_handshake(self._conn_num, self._exposed_names())
+                RpcProxy._process_service_handshake(
+                    self._conn_num, self._exposed_names()
+                )
         except BaseException:
             self._abort_start()
             raise
@@ -769,7 +812,9 @@ class Client(Application[SingleTransportMixin]):
                 f"Failed to connect to the server. connection info: {self.info}"
             )
         try:
-            handshake = RpcProxy._process_client_handshake(self._conn_num, self._exposed_names())
+            handshake = RpcProxy._process_client_handshake(
+                self._conn_num, self._exposed_names()
+            )
         except Exception as exc:
             # Tear the native slot down so the caller can retry connect()
             # without hitting the "already connected" guard.  Remap to
@@ -788,8 +833,24 @@ class Client(Application[SingleTransportMixin]):
         self.logger.debug(
             f"has been connected successfully. connection info: {self.info}"
         )
-        self._task_dispatcher.start_for_connection(self)
-        self._register_executors()
+        try:
+            self._task_dispatcher.start_for_connection(self)
+            self._register_executors()
+        except BaseException:
+            # Out of fds or threads: undo it all, so connect() can be retried
+            # instead of reporting "already connected" on a dead handle.
+            conn_num = self._conn_num
+            try:
+                self._task_dispatcher.stop_for_connection(self)
+            except Exception:
+                self.logger.exception("Could not detach a half-started connection")
+            try:
+                dfcore.stopClient(conn_num)
+            except Exception:
+                pass
+            invalidate_members(conn_num)
+            self._conn_num = None
+            raise
 
     def _try_reconnect(self) -> bool:
         """Attempt one reconnection after a background disconnect.
@@ -908,8 +969,11 @@ class Client(Application[SingleTransportMixin]):
         if self._task_dispatcher:
             self._task_dispatcher.stop_for_connection(self)
         if self._conn_num is not None:
-            from daffi._bindings import invalidate_members
-
-            invalidate_members(self._conn_num)
-            dfcore.stopClient(self._conn_num)
+            conn_num = self._conn_num
+            invalidate_members(conn_num)
+            try:
+                dfcore.stopClient(conn_num)
+            finally:
+                # Also drops what a reader stored while the handle was closing.
+                invalidate_members(conn_num)
             self._conn_num = None

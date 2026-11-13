@@ -80,6 +80,7 @@ fn isPickleFromWeb(conn: anytype, message: *Message) bool {
 const PICKLE_FROM_WEB = "PICKLE is not accepted from WebSocket peers";
 
 const UNKNOWN_SENDER = "a request must come from the peer that handshook under its sender name";
+const NO_RECEIVER = "no connected peer with that name exposes the requested callback";
 const UNAUTHORIZED = "Unauthorized: wrong or missing auth_token";
 
 /// uuid 0 is never issued, and a reply carries its request's uuid, so a
@@ -267,6 +268,8 @@ pub fn ServerHandler(comptime HandlerConnectionT: ConnectionType) type {
                     log_service.warn("evicting stale slot for '{s}' — new connection takes over", .{connection_name});
                     evict_event = try serde.createEventMessage(self.allocator, 0, connection_name, "evicted");
                 }
+                // A handshake re-sent on the same connection is no new peer.
+                const rejoined = self.chan_mapper.connOf(connection_name) == conn;
                 _ = try self.chan_mapper.getOrCreateChannel(conn, connection_name);
                 const methods = self.methods orelse serde.PLACEHOLDER;
 
@@ -275,9 +278,9 @@ pub fn ServerHandler(comptime HandlerConnectionT: ConnectionType) type {
                 try message.setData(data);
 
                 // Event message for the service itself.
-                const event_message = try serde.createEventMessage(self.allocator, 0, connection_name, "connected");
+                const event_message: ?*Message = if (rejoined) null else try serde.createEventMessage(self.allocator, 0, connection_name, "connected");
                 var event_pushed = false;
-                defer if (!event_pushed) event_message.deinit();
+                defer if (!event_pushed) if (event_message) |ev| ev.deinit();
 
                 self.mutex.unlock();
                 locked = false;
@@ -292,11 +295,17 @@ pub fn ServerHandler(comptime HandlerConnectionT: ConnectionType) type {
                     // Python may dequeue and free it at any moment.
                     try self.sendToConnection(Message, sc, evict_event.?);
                     sc.close();
-                    self.tasks_queue.pushMessageToQueue(evict_event.?);
-                    evict_event = null;
+                    if (self.pushEvent(evict_event.?, connection_name)) evict_event = null;
                 }
-                self.tasks_queue.pushMessageToQueue(event_message);
-                event_pushed = true;
+                if (event_message) |ev| event_pushed = self.pushEvent(ev, connection_name);
+            }
+
+            /// Queue a lifecycle event for Python; false (the caller keeps
+            /// it) when too many are already waiting.
+            fn pushEvent(self: *Self, event: *Message, member: []const u8) bool {
+                if (self.tasks_queue.tryPushEvent(event)) return true;
+                log_service.warn("event queue full ({d} pending), dropping an event for '{s}'", .{ TasksQueue.max_pending_events, member });
+                return false;
             }
 
             fn onRequest(self: *Self, conn: *ParentConnT, message: *Message, consumed: *bool) !void {
@@ -342,18 +351,11 @@ pub fn ServerHandler(comptime HandlerConnectionT: ConnectionType) type {
                 defer self.mutex.unlock();
                 // Destroy first so an OOM building the event cannot leave a
                 // retain() on a connection that is about to be freed.
-                while (self.chan_mapper.getChannelByConnection(conn)) |chan| {
-                    const name = self.allocator.dupe(u8, chan.connection_name) catch {
-                        self.chan_mapper.destroyChannel(chan);
-                        continue;
-                    };
-                    self.chan_mapper.destroyChannel(chan);
-                    const event_message = serde.createEventMessage(self.allocator, 0, name, "disconnected") catch {
-                        self.allocator.free(name);
-                        continue;
-                    };
-                    self.allocator.free(name);
-                    self.tasks_queue.pushMessageToQueue(event_message);
+                while (self.chan_mapper.removeOneByConnection(conn, self.allocator)) |removed| {
+                    const name = removed.name orelse continue;
+                    defer self.allocator.free(name);
+                    const event_message = serde.createEventMessage(self.allocator, 0, name, "disconnected") catch continue;
+                    if (!self.pushEvent(event_message, name)) event_message.deinit();
                 }
             }
 
@@ -381,11 +383,20 @@ pub fn ServerHandler(comptime HandlerConnectionT: ConnectionType) type {
             auth_token: ?[]const u8 = null,
             allocator: Allocator,
             mutex: Mutex = .{},
+            /// Last generation handed out (see `ChannelsMapper.Channel`);
+            /// guarded by `mutex`.
+            generation: u16 = 0,
 
             const Self = @This();
             pub const ParentConnT = ConnectionT;
             const MessageHandlerT = MessageHandler(Self);
             fn wakeupFn(_: *Self) void {}
+
+            fn nextGeneration(self: *Self) u16 {
+                self.generation +%= 1;
+                if (self.generation == 0) self.generation = 1;
+                return self.generation;
+            }
 
             pub fn handler(self: *const Self) MessageHandlerT {
                 return .{
@@ -404,9 +415,10 @@ pub fn ServerHandler(comptime HandlerConnectionT: ConnectionType) type {
                 sender_known: bool,
             };
 
-            /// Where a request goes, in one pass under `self.mutex`.  The
-            /// router changes its channels only under that mutex, so they are
-            /// read here without the mapper's own lock.
+            /// Where a request goes, in one pass under the mapper's lock
+            /// only: channels and their method sets change under it too
+            /// (`ChannelsMapper.upsert` swaps a set in whole), so routing does
+            /// not wait for `self.mutex`.
             fn lookupRoute(self: *Self, conn: *ParentConnT, message: *Message) Route {
                 self.chan_mapper.mutex.lock();
                 defer self.chan_mapper.mutex.unlock();
@@ -482,18 +494,19 @@ pub fn ServerHandler(comptime HandlerConnectionT: ConnectionType) type {
                         };
                     }
                 }
+                // A peer re-sending its handshake on the connection it
+                // registered on (to advertise callbacks added since) keeps its
+                // generation, and nobody is told it connected again.
+                const rejoined = self.chan_mapper.connOf(connection_name) == conn;
                 for (client_hs.value.members) |mb| {
                     if (!std.mem.eql(u8, mb.name, connection_name)) continue;
-                    var chan = try self.chan_mapper.getOrCreateChannel(conn, mb.name);
-                    chan.clear();
-                    if (mb.methods) |methods| {
-                        for (methods) |mt| try chan.addMethod(mt);
-                    }
+                    const generation: ?u16 = if (self.chan_mapper.connOf(mb.name) == conn) null else self.nextGeneration();
+                    _ = try self.chan_mapper.upsert(conn, mb.name, mb.methods, generation);
                 }
                 const all_chans = self.chan_mapper.allChannels();
                 var memberdata = try alloc.alloc(Handshake.MemberData, all_chans.len);
                 for (all_chans, 0..) |*c, idx| {
-                    memberdata[idx] = .{ .name = c.connection_name, .methods = try c.joinedMethods(alloc, serde.UNIT_SEPARATOR) };
+                    memberdata[idx] = .{ .name = c.connection_name, .methods = try c.joinedMethods(alloc, serde.UNIT_SEPARATOR), .generation = c.generation };
                 }
                 var router_hs = try Handshake.create(alloc, memberdata, "router");
                 const hs_data = try router_hs.toJson(alloc);
@@ -506,16 +519,19 @@ pub fn ServerHandler(comptime HandlerConnectionT: ConnectionType) type {
                 // channels are registered under the names in the JSON body; a peer
                 // is free to make those differ, so the lookup can legitimately miss.
                 const new_chan = self.chan_mapper.channels.getPtr(connection_name);
+                const new_generation: u16 = if (new_chan) |c| c.generation else 0;
                 if (new_chan != null and new_chan.?.methods.hash_map.count() > 0) {
                     const new_member_methods = try new_chan.?.joinedMethods(alloc, serde.UNIT_SEPARATOR);
                     var mini_memberdata = try alloc.alloc(Handshake.MemberData, 1);
-                    mini_memberdata[0] = .{ .name = connection_name, .methods = new_member_methods };
+                    mini_memberdata[0] = .{ .name = connection_name, .methods = new_member_methods, .generation = new_generation };
                     mini_broadcast = try serde.createHandshakeMessage(self.allocator, mini_memberdata, 0, "router");
                 }
                 defer if (mini_broadcast) |mb| mb.deinit();
 
-                var connected_event = try serde.createEventMessage(self.allocator, 0, connection_name, "connected");
-                defer connected_event.deinit();
+                // An event's uuid carries the generation of the registration
+                // it is about (0: unknown); older clients ignore it.
+                const connected_event: ?*Message = if (rejoined) null else try serde.createEventMessage(self.allocator, new_generation, connection_name, "connected");
+                defer if (connected_event) |ev| ev.deinit();
 
                 // Collect broadcast targets with retain() so their connections
                 // stay alive after we release self.mutex.  Size grows with the
@@ -575,8 +591,10 @@ pub fn ServerHandler(comptime HandlerConnectionT: ConnectionType) type {
                         self.sendToConnection(Message, c, mb) catch {};
                 }
                 // 2. "connected" EVENT drives @on_event("connected") handlers.
-                for (bcast_conns.items) |c|
-                    self.sendToConnection(Message, c, connected_event) catch {};
+                if (connected_event) |ev| {
+                    for (bcast_conns.items) |c|
+                        self.sendToConnection(Message, c, ev) catch {};
+                }
             }
 
             fn onRequest(self: *Self, conn: *ParentConnT, message: *Message, _: *bool) !void {
@@ -590,7 +608,7 @@ pub fn ServerHandler(comptime HandlerConnectionT: ConnectionType) type {
                 const route = self.lookupRoute(conn, message);
                 const target = route.target orelse {
                     log_router.debug("no route for request to: {s}", .{message.getReceiver()});
-                    if (message.getReturnResult()) replyError(log_router, self.allocator, conn, message, "ReceiverNotFound", "no connected peer with that name exposes the requested callback");
+                    if (message.getReturnResult()) replyError(log_router, self.allocator, conn, message, "ReceiverNotFound", NO_RECEIVER);
                     return;
                 };
                 defer target.release();
@@ -603,8 +621,12 @@ pub fn ServerHandler(comptime HandlerConnectionT: ConnectionType) type {
                     if (wants_reply) replyError(log_router, self.allocator, conn, message, "UnknownSender", UNKNOWN_SENDER);
                     return;
                 }
-                const id = if (wants_reply) self.routes.add(conn, uuid, target) catch {
-                    replyError(log_router, self.allocator, conn, message, "RouterOverloaded", "the router has too many requests in flight");
+                const id = if (wants_reply) self.routes.add(conn, uuid, target) catch |err| {
+                    switch (err) {
+                        // It disconnected after the lookup.
+                        error.ResponderGone => replyError(log_router, self.allocator, conn, message, "ReceiverNotFound", NO_RECEIVER),
+                        else => replyError(log_router, self.allocator, conn, message, "RouterOverloaded", "the router has too many requests in flight"),
+                    }
                     return;
                 } else uuid;
                 message.setUuid(id);
@@ -638,23 +660,24 @@ pub fn ServerHandler(comptime HandlerConnectionT: ConnectionType) type {
 
             // --------------------- ROUTER CONNECTION LIFECYCLE ----------------------
             fn diconnectionHandler(self: *Self, conn: *ParentConnT) !void {
+                // From here on `routes.add` refuses `conn` as a responder, so
+                // a request routed to it concurrently gets an error reply
+                // instead of a route that outlives the drop below.
+                conn.suspended.store(true, .release);
                 self.routes.dropConnection(conn);
                 self.mutex.lock();
                 var locked = true;
                 defer if (locked) self.mutex.unlock();
                 var arena = ArenaAllocator.init(self.allocator);
                 defer arena.deinit();
-                var allocator = arena.allocator();
+                const allocator = arena.allocator();
 
                 // A client registers one channel per member it announced.
-                var departed: std.ArrayList([]const u8) = .empty;
-                while (self.chan_mapper.getChannelByConnection(conn)) |chan| {
-                    const name = allocator.dupe(u8, chan.connection_name) catch {
-                        self.chan_mapper.destroyChannel(chan);
-                        continue;
-                    };
-                    self.chan_mapper.destroyChannel(chan);
-                    departed.append(allocator, name) catch continue;
+                const Departed = struct { name: []const u8, generation: u16 };
+                var departed: std.ArrayList(Departed) = .empty;
+                while (self.chan_mapper.removeOneByConnection(conn, allocator)) |removed| {
+                    const name = removed.name orelse continue;
+                    departed.append(allocator, .{ .name = name, .generation = removed.generation }) catch continue;
                 }
                 if (departed.items.len == 0) return;
 
@@ -670,6 +693,9 @@ pub fn ServerHandler(comptime HandlerConnectionT: ConnectionType) type {
                 //
                 // Targets are snapshotted with references and written to after the
                 // mutex is released, so one slow peer cannot stall the router.
+                // The departed name may meanwhile register again and its
+                // "connected" overtake this event; the event's generation lets
+                // clients tell it is about the older registration.
                 var targets: std.ArrayList(*ParentConnT) = .empty;
                 defer {
                     for (targets.items) |t| t.release();
@@ -682,8 +708,8 @@ pub fn ServerHandler(comptime HandlerConnectionT: ConnectionType) type {
                 }
                 self.mutex.unlock();
                 locked = false;
-                for (departed.items) |name| {
-                    var event_message = serde.createEventMessage(self.allocator, 0, name, "disconnected") catch continue;
+                for (departed.items) |d| {
+                    var event_message = serde.createEventMessage(self.allocator, d.generation, d.name, "disconnected") catch continue;
                     defer event_message.deinit();
                     for (targets.items) |t| self.sendToConnection(Message, t, event_message) catch {};
                 }
@@ -728,6 +754,10 @@ pub const ClientHandler = struct {
     response_parked: bool = false,
     /// The server announced that a newer connection took this client's name.
     evicted: std.atomic.Value(bool) = .init(false),
+    /// Newest generation seen per member name, also for members without a
+    /// channel (a peer without callbacks joins with no member broadcast).
+    /// Guarded by `mutex`.
+    member_generations: std.StringHashMapUnmanaged(u16) = .empty,
 
     const Self = @This();
     pub const ParentConnT = Connection(.ClientConnectionType);
@@ -749,6 +779,8 @@ pub const ClientHandler = struct {
     pub fn deinit(self: *ClientHandler) void {
         self.tasks_queue.deinit();
         self.chan_mapper.deinit();
+        self.forgetMemberGenerations();
+        self.member_generations.deinit(self.allocator);
         self.msg_store.deinit();
         if (self.methods) |m| self.allocator.free(m);
         if (self.auth_token) |t| self.allocator.free(t);
@@ -812,28 +844,16 @@ pub const ClientHandler = struct {
     /// surfaced as a random ``UnicodeDecodeError`` out of ``s#`` (or a
     /// ``TransmissionFailure`` wrapping it) in ``test_concurrent_mixed_callbacks``.
     ///
-    /// Duplication happens while the appropriate mutex is still held:
-    ///   * explicit receiver: ``chan_mapper.findReceiverDupe`` locks the
-    ///     ``ChannelsMapper`` mutex across lookup + dupe.
-    ///   * round-robin: ``self.mutex`` is held across the ``allChannels()``
-    ///     walk *and* the dupe of the selected entry.
+    /// Both lookups hold the ``ChannelsMapper`` mutex across lookup + dupe
+    /// (``findReceiverDupe`` / ``findRoundRobinDupe``); method sets are only
+    /// swapped under that mutex, so reading them there is safe.
     ///
     /// Caller must free the returned slice with ``self.allocator`` — see the
     /// ``defer`` in ``core/cffi/client.zig:sendMessageFromClient``.
     pub fn findReceiverForMethod(self: *Self, method: []const u8, receiver: ?[]const u8) ![]const u8 {
-        // Always hold client_handler.mutex for the entire lookup.
-        //
-        // Rationale: chan_mapper.allChannels() returns a raw slice into the
-        // HashMap backing array.  onHandshake calls chan.clear() and
-        // chan.addMethod() *after* releasing chan_mapper.mutex but still holding
-        // client_handler.mutex.  Without client_handler.mutex here, the explicit-
-        // receiver path (which previously relied on chan_mapper.mutex only) could
-        // race with chan.clear() / chan.addMethod() — reading a BufSet that is
-        // being concurrently freed/rebuilt, causing SIGSEGV.
-        //
-        // Lock ordering:  client_handler.mutex  →  chan_mapper.mutex  (inside
-        // findReceiverDupe / getOrCreateChannel).  onEvent follows the same
-        // order, so no deadlock is possible.
+        // ``self.mutex`` makes the own-handshake rebuild (clear + refill)
+        // look atomic to callers, and guards the round-robin cursor.
+        // Lock ordering:  client_handler.mutex  →  chan_mapper.mutex.
         self.mutex.lock();
         defer self.mutex.unlock();
         if (receiver) |rec| {
@@ -846,33 +866,10 @@ pub const ClientHandler = struct {
                 else => return err,
             };
         }
-        // #9: round-robin across method-matching channels WITHOUT allocating an
-        // intermediate list.  Two O(N) passes over allChannels() avoid the
-        // heap allocation entirely; N is the number of connected peers which is
-        // small in practice.
-        //
-        // Pass 1: count matching channels so we can wrap the position modulo that count.
-        // Pass 2: pick the channel at the round-robin index.
-        const all = self.chan_mapper.allChannels();
-        var match_count: usize = 0;
-        for (all) |*c| {
-            if (mem.eql(u8, c.connection_name, self.app_name)) continue;
-            if (c.containsMethod(method)) match_count += 1;
-        }
-        if (match_count == 0) return error.ReceiverNotFound;
-
-        // Advance the position by 1 so successive calls rotate to the next peer.
-        const pos = self.chan_iterator.position % match_count;
-        self.chan_iterator.position = (pos + 1) % match_count;
-
-        var idx: usize = 0;
-        for (all) |*c| {
-            if (mem.eql(u8, c.connection_name, self.app_name)) continue;
-            if (!c.containsMethod(method)) continue;
-            if (idx == pos) return try self.allocator.dupe(u8, c.connection_name);
-            idx += 1;
-        }
-        return error.ReceiverNotFound;
+        return self.chan_mapper.findRoundRobinDupe(self.allocator, method, self.app_name, &self.chan_iterator.position) catch |err| switch (err) {
+            error.ChannelNotFound => error.ReceiverNotFound,
+            else => err,
+        };
     }
 
     pub fn setClientMethods(self: *Self, methods: []const u8) !void {
@@ -919,40 +916,98 @@ pub const ClientHandler = struct {
         const is_own = std.mem.eql(u8, message.getTransmitter(), self.app_name);
         if (is_own) {
             // Full rebuild: clear then reconstruct from the authoritative list.
-            // Use the persistent allocator directly so the channel data outlives
-            // this stack frame.
-            var client_hs = Handshake.fromJson(self.allocator, message.getData()) catch |err| {
-                log_client.err("failed to parse own handshake: {s}", .{@errorName(err)});
+            // The member list is the whole cluster: no per-peer caps.
+            var client_hs = Handshake.fromJsonReply(self.allocator, message.getData()) catch |err| {
+                log_client.warn("failed to parse own handshake: {s}", .{@errorName(err)});
+                self.storeHandshakeFailure(message, err);
                 return;
             };
             defer client_hs.deinit();
             self.chan_mapper.clearAllChannels();
+            self.forgetMemberGenerations();
             for (client_hs.value.members) |mb| {
-                var chan = try self.chan_mapper.getOrCreateChannel(conn, mb.name);
-                if (mb.methods) |methods| {
-                    for (methods) |mt| try chan.addMethod(mt);
-                }
+                self.noteMemberGeneration(mb.name, mb.generation);
+                _ = try self.chan_mapper.upsert(conn, mb.name, mb.methods, knownGeneration(mb.generation));
             }
             self.storeResponse(message, consumed);
         } else {
-            // Add-only broadcast update: parse with an arena to avoid permanent
-            // allocations for member strings we will not keep.
-            var arena = ArenaAllocator.init(self.allocator);
-            defer arena.deinit();
-            const client_hs = Handshake.fromJson(arena.allocator(), message.getData()) catch |err| {
-                log_client.err("failed to parse broadcast handshake: {s}", .{@errorName(err)});
+            try self.mergeMembers(conn, message);
+        }
+    }
+
+    fn knownGeneration(generation: u16) ?u16 {
+        return if (generation == 0) null else generation;
+    }
+
+    /// Caller holds `self.mutex`.
+    fn noteMemberGeneration(self: *Self, name: []const u8, generation: u16) void {
+        if (generation == 0) return;
+        const gop = self.member_generations.getOrPut(self.allocator, name) catch return;
+        if (gop.found_existing) {
+            if (!store.generationOlder(gop.value_ptr.*, generation)) return;
+        } else {
+            gop.key_ptr.* = self.allocator.dupe(u8, name) catch {
+                _ = self.member_generations.remove(name);
                 return;
             };
-            for (client_hs.value.members) |mb| {
-                const method_count = if (mb.methods) |m| m.len else 0;
-                log_client.debug("[{s}] broadcast handshake: member={s} methods={d}", .{ self.app_name, mb.name, method_count });
-                var chan = try self.chan_mapper.getOrCreateChannel(conn, mb.name);
-                chan.clear();
-                if (mb.methods) |methods| {
-                    for (methods) |mt| try chan.addMethod(mt);
-                }
-            }
         }
+        gop.value_ptr.* = generation;
+    }
+
+    /// Whether `generation` of `name` was since replaced by a newer
+    /// registration.  If not, `name` is forgotten.  Caller holds `self.mutex`.
+    fn departedIsStale(self: *Self, name: []const u8, generation: u16) bool {
+        const known = self.member_generations.get(name) orelse return false;
+        if (store.generationOlder(generation, known)) return true;
+        const kv = self.member_generations.fetchRemove(name).?;
+        self.allocator.free(kv.key);
+        return false;
+    }
+
+    fn forgetMemberGenerations(self: *Self) void {
+        var it = self.member_generations.keyIterator();
+        while (it.next()) |key| self.allocator.free(key.*);
+        self.member_generations.clearRetainingCapacity();
+    }
+
+    /// Add-only update from a broadcast: listed members are added or have
+    /// their methods replaced, unless the entry is older than what we know.
+    /// Caller holds `self.mutex`.
+    fn mergeMembers(self: *Self, conn: *ParentConnT, message: *Message) !void {
+        // Parse with an arena to avoid permanent allocations for member
+        // strings we will not keep.
+        var arena = ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const client_hs = Handshake.fromJsonReply(arena.allocator(), message.getData()) catch |err| {
+            log_client.err("failed to parse broadcast handshake: {s}", .{@errorName(err)});
+            return;
+        };
+        for (client_hs.value.members) |mb| {
+            const method_count = if (mb.methods) |m| m.len else 0;
+            log_client.debug("[{s}] broadcast handshake: member={s} methods={d}", .{ self.app_name, mb.name, method_count });
+            if (self.member_generations.get(mb.name)) |known| {
+                if (store.generationOlder(mb.generation, known)) continue;
+            }
+            self.noteMemberGeneration(mb.name, mb.generation);
+            _ = try self.chan_mapper.upsert(conn, mb.name, mb.methods, knownGeneration(mb.generation));
+        }
+    }
+
+    /// An own handshake reply that cannot be used still answers the caller
+    /// waiting on it, with an ERROR, instead of leaving it to time out.
+    /// (wasm hands the raw reply to JS itself.)
+    fn storeHandshakeFailure(self: *Self, reply: *Message, err: anyerror) void {
+        if (comptime misc.is_wasm) return;
+        var buf: [128]u8 = undefined;
+        const text = std.fmt.bufPrint(&buf, "failed to parse handshake reply: {s}", .{@errorName(err)}) catch "failed to parse handshake reply";
+        var raw = serde.createErrorReply(self.allocator, reply, "DaffiError", text) catch return;
+        const failure = Message.fromRawMessage(self.allocator, &raw) catch {
+            self.allocator.free(raw.data);
+            return;
+        };
+        var stored = false;
+        self.storeResponse(failure, &stored);
+        if (!stored) failure.deinit();
     }
 
     /// Add-only update of the chan_mapper from a broadcast HANDSHAKE message.
@@ -961,20 +1016,7 @@ pub const ClientHandler = struct {
     pub fn addMembersFromHandshake(self: *Self, conn: *ParentConnT, message: *Message) !void {
         self.mutex.lock();
         defer self.mutex.unlock();
-        var arena = ArenaAllocator.init(self.allocator);
-        defer arena.deinit();
-        const alloc = arena.allocator();
-        const client_hs = Handshake.fromJson(alloc, message.getData()) catch |err| {
-            log_client.err("failed to parse broadcast handshake: {s}", .{@errorName(err)});
-            return;
-        };
-        for (client_hs.value.members) |mb| {
-            var chan = try self.chan_mapper.getOrCreateChannel(conn, mb.name);
-            chan.clear();
-            if (mb.methods) |methods| {
-                for (methods) |mt| try chan.addMethod(mt);
-            }
-        }
+        try self.mergeMembers(conn, message);
     }
 
     /// Handle an EVENTS message received from the router.
@@ -987,27 +1029,48 @@ pub const ClientHandler = struct {
     /// **"disconnected"**: removes the departed member from the Zig chan_mapper
     ///   immediately (so routing stops hitting the dead peer) and then pushes
     ///   the event to the task queue so Python ``on_member_removed`` handlers
-    ///   are notified.
+    ///   are notified.  An event about an older registration than the one we
+    ///   know (the peer reconnected and its "connected" overtook this event)
+    ///   is dropped.
+    ///
+    /// The event's uuid is the generation of the registration it is about;
+    /// 0 from routers that predate generations.
     pub fn onEvent(self: *Self, _: *ParentConnT, message: *Message, consumed: *bool) !void {
         var arena = ArenaAllocator.init(self.allocator);
         defer arena.deinit();
         const event = Event.fromJson(arena.allocator(), message.getData()) catch return;
+        const generation = message.getUuid();
 
-        log_client.debug("[{s}] event: type={s} member={s}", .{ self.app_name, event.value.type, event.value.member });
+        log_client.debug("[{s}] event: type={s} member={s} generation={d}", .{ self.app_name, event.value.type, event.value.member, generation });
 
         if (std.mem.eql(u8, event.value.type, "disconnected")) {
             // Must hold client_handler.mutex while mutating chan_mapper so we
             // don't race with findReceiverForMethod / getAvailableMembersClientEntry
             // which iterate allChannels() under the same lock.
             self.mutex.lock();
-            self.chan_mapper.destroyChannelByName(event.value.member);
+            const removal: ChannelsMapperT.Removal = if (self.departedIsStale(event.value.member, generation))
+                .stale
+            else
+                self.chan_mapper.destroyChannelByName(event.value.member, generation);
+            self.mutex.unlock();
+            if (removal == .stale) {
+                log_client.debug("[{s}] ignoring 'disconnected' for an older registration of {s}", .{ self.app_name, event.value.member });
+                return;
+            }
+        } else if (std.mem.eql(u8, event.value.type, "connected")) {
+            self.mutex.lock();
+            self.noteMemberGeneration(event.value.member, generation);
+            self.chan_mapper.noteGeneration(event.value.member, generation);
             self.mutex.unlock();
         } else if (std.mem.eql(u8, event.value.type, "evicted") and std.mem.eql(u8, event.value.member, self.app_name)) {
             self.evicted.store(true, .release);
             self.tasks_queue.triggerEviction();
         }
 
-        self.tasks_queue.pushMessageToQueue(message);
+        if (!self.tasks_queue.tryPushEvent(message)) {
+            log_client.warn("[{s}] event queue full ({d} pending), dropping '{s}' event for {s}", .{ self.app_name, TasksQueue.max_pending_events, event.value.type, event.value.member });
+            return;
+        }
         consumed.* = true;
         self.task_pushed = true;
     }
@@ -1110,4 +1173,152 @@ test "ClientHandler frees its method list and token" {
     try handler.setClientMethods("a,b");
     try handler.setClientMethods("a,b,c");
     handler.deinit();
+}
+
+fn testConnection(comptime ConnT: type, alloc: Allocator, fd: c_int) !*ConnT {
+    const ClientConnection = network.ClientConnection;
+    const conn = try alloc.create(ConnT);
+    conn.* = .{ .ctx = try ClientConnection.initFromAccepted(alloc, fd), .op_table = ClientConnection.op_table, .allocator = alloc };
+    // Stream.close() releases a descriptor this socketpair never counted.
+    @import("../nofile.zig").acquire(1);
+    return conn;
+}
+
+fn testMessage(alloc: Allocator, data: []const u8, uuid: u16, flag: MessageFlag, transmitter: []const u8) !*Message {
+    var raw = try RawMessage.create(alloc, data, uuid, flag, .JSON, false, true, transmitter, serde.PLACEHOLDER, serde.PLACEHOLDER);
+    return Message.fromRawMessage(alloc, &raw);
+}
+
+const TestFrame = struct { flag: MessageFlag, uuid: u16, body: []const u8 };
+
+fn readTestFrame(fd: c_int, buf: []u8) !TestFrame {
+    const c = @import("posix_c");
+    var got: usize = 0;
+    while (got < serde.HEADER_SIZE) {
+        const n = c.read(fd, buf[got..].ptr, serde.HEADER_SIZE - got);
+        if (n <= 0) return error.EOF;
+        got += @intCast(n);
+    }
+    const header = try serde.Header.parse(buf[0..serde.HEADER_SIZE]);
+    got = 0;
+    while (got < header.msg_len) {
+        const n = c.read(fd, buf[got..].ptr, header.msg_len - got);
+        if (n <= 0) return error.EOF;
+        got += @intCast(n);
+    }
+    return .{ .flag = header.flag, .uuid = header.uuid, .body = buf[header.metadata_len..header.msg_len] };
+}
+
+test "a router re-handshake is no new 'connected', and events carry the generation" {
+    const c = @import("posix_c");
+    const alloc = std.testing.allocator;
+    const Handlers = ServerHandler(.ClientConnectionType);
+    const handler = try Handlers.init(.Router, alloc, "router", null);
+    defer handler.deinit();
+    const router = &handler.Router;
+
+    var a_fds: [2]c_int = undefined;
+    var b_fds: [2]c_int = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), c.socketpair(c.AF_UNIX, c.SOCK_STREAM, 0, &a_fds));
+    defer _ = c.close(a_fds[1]);
+    try std.testing.expectEqual(@as(c_int, 0), c.socketpair(c.AF_UNIX, c.SOCK_STREAM, 0, &b_fds));
+    defer _ = c.close(b_fds[1]);
+    const a = try testConnection(Handlers.ConnectionT, alloc, a_fds[0]);
+    defer a.release();
+    const b = try testConnection(Handlers.ConnectionT, alloc, b_fds[0]);
+    defer b.release();
+
+    var arena = ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const Peer = struct {
+        fn handshake(r: *Handlers.RouterHandler, conn: *Handlers.ConnectionT, ar: Allocator, name: []const u8, methods: []const u8) !void {
+            var hs = try Handshake.create(ar, &.{.{ .name = name, .methods = methods }}, "client");
+            const message = try testMessage(std.testing.allocator, try hs.toJson(ar), 1, .HANDSHAKE, name);
+            defer message.deinit();
+            var keep = true;
+            try r.onHandshake(conn, message, &keep);
+        }
+    };
+
+    var buf: [4096]u8 = undefined;
+    try Peer.handshake(router, a, arena.allocator(), "a", serde.PLACEHOLDER);
+    try std.testing.expectEqual(MessageFlag.HANDSHAKE, (try readTestFrame(a_fds[1], &buf)).flag);
+
+    try Peer.handshake(router, b, arena.allocator(), "b", "f");
+    const generation = router.chan_mapper.channels.getPtr("b").?.generation;
+    try std.testing.expect(generation != 0);
+    const joined = try readTestFrame(a_fds[1], &buf);
+    try std.testing.expectEqual(MessageFlag.HANDSHAKE, joined.flag);
+    const members = try Handshake.fromJsonReply(alloc, joined.body);
+    defer members.deinit();
+    try std.testing.expectEqual(generation, members.value.members[0].generation);
+    const connected = try readTestFrame(a_fds[1], &buf);
+    try std.testing.expectEqual(MessageFlag.EVENTS, connected.flag);
+    try std.testing.expectEqual(generation, connected.uuid);
+
+    // New callbacks on the same connection: the member list again, no event.
+    try Peer.handshake(router, b, arena.allocator(), "b", "f" ++ [_]u8{serde.UNIT_SEPARATOR} ++ "g");
+    try std.testing.expectEqual(generation, router.chan_mapper.channels.getPtr("b").?.generation);
+    try std.testing.expectEqual(MessageFlag.HANDSHAKE, (try readTestFrame(a_fds[1], &buf)).flag);
+
+    try router.diconnectionHandler(b);
+    const gone = try readTestFrame(a_fds[1], &buf);
+    try std.testing.expectEqual(MessageFlag.EVENTS, gone.flag);
+    try std.testing.expectEqual(generation, gone.uuid);
+    const event = try Event.fromJson(alloc, gone.body);
+    defer event.deinit();
+    try std.testing.expectEqualStrings("disconnected", event.value.type);
+    // A request that looked b up before it left gets no route to it.
+    try std.testing.expectError(error.ResponderGone, router.routes.add(a, 1, b));
+}
+
+test "a client ignores a 'disconnected' about an older registration" {
+    const c = @import("posix_c");
+    const alloc = std.testing.allocator;
+    const handler = try ClientHandler.init(alloc, "c", null);
+    defer handler.deinit();
+    var fds: [2]c_int = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), c.socketpair(c.AF_UNIX, c.SOCK_STREAM, 0, &fds));
+    defer _ = c.close(fds[1]);
+    const conn = try testConnection(ClientHandler.ParentConnT, alloc, fds[0]);
+    defer conn.release();
+
+    const Deliver = struct {
+        fn run(h: *ClientHandler, cn: *ClientHandler.ParentConnT, data: []const u8, uuid: u16, flag: MessageFlag, transmitter: []const u8) !bool {
+            const message = try testMessage(std.testing.allocator, data, uuid, flag, transmitter);
+            var consumed = false;
+            defer if (!consumed) message.deinit();
+            switch (flag) {
+                .HANDSHAKE => try h.onHandshake(cn, message, &consumed),
+                else => try h.onEvent(cn, message, &consumed),
+            }
+            return consumed;
+        }
+    };
+    const run = Deliver.run;
+
+    // "w" reconnected (generation 2) before its old connection's event arrived.
+    _ = try run(handler, conn, "{\"meta\":{\"type\":\"router\"},\"members\":[{\"name\":\"w\",\"methods\":[\"f\"],\"generation\":2}]}", 0, .HANDSHAKE, "router");
+    try std.testing.expect(!try run(handler, conn, "{\"type\":\"disconnected\",\"member\":\"w\"}", 1, .EVENTS, "router"));
+    try std.testing.expect(handler.chan_mapper.hasChannel("w"));
+
+    // Same for a peer without callbacks, known only from its events.
+    try std.testing.expect(try run(handler, conn, "{\"type\":\"connected\",\"member\":\"m\"}", 5, .EVENTS, "router"));
+    try std.testing.expect(!try run(handler, conn, "{\"type\":\"disconnected\",\"member\":\"m\"}", 4, .EVENTS, "router"));
+    try std.testing.expect(try run(handler, conn, "{\"type\":\"disconnected\",\"member\":\"m\"}", 5, .EVENTS, "router"));
+
+    try std.testing.expect(try run(handler, conn, "{\"type\":\"disconnected\",\"member\":\"w\"}", 2, .EVENTS, "router"));
+    try std.testing.expect(!handler.chan_mapper.hasChannel("w"));
+    // Routers without generations: every event counts.
+    _ = try run(handler, conn, "{\"meta\":{\"type\":\"router\"},\"members\":[{\"name\":\"v\",\"methods\":[\"f\"]}]}", 0, .HANDSHAKE, "router");
+    try std.testing.expect(try run(handler, conn, "{\"type\":\"disconnected\",\"member\":\"v\"}", 0, .EVENTS, "router"));
+    try std.testing.expect(!handler.chan_mapper.hasChannel("v"));
+    try std.testing.expectEqual(@as(usize, 0), handler.member_generations.count());
+
+    // An unusable own handshake reply answers the waiting caller at once.
+    try std.testing.expect(try handler.msg_store.claim(9, false));
+    try std.testing.expect(!try run(handler, conn, "not json", 9, .HANDSHAKE, "c"));
+    const failure = handler.msg_store.fetch(9).?;
+    defer failure.deinit();
+    try std.testing.expectEqual(MessageFlag.ERROR, failure.getFlag());
 }

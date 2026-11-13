@@ -37,13 +37,10 @@ const darwinNonblock = struct {
     }
 };
 
-/// Keeps a write to a closed peer an error instead of a SIGPIPE (Linux; on
-/// macOS the process ignores SIGPIPE, as Python does).
-const no_sigpipe: c_int = if (@import("builtin").target.os.tag == .linux) std.c.MSG.NOSIGNAL else 0;
-
-/// `struct iovec` for writev (same layout on every POSIX target).
-const IoVec = extern struct { base: [*]const u8, len: usize };
-extern "c" fn writev(fd: c_int, iov: [*]const IoVec, iovcnt: c_int) isize;
+/// Keeps a write to a closed peer an error instead of a SIGPIPE.  Linux takes
+/// it per call; Darwin has no such flag, so sockets get SO_NOSIGPIPE instead
+/// (see `setNoSigpipe`).
+pub const no_sigpipe: c_int = if (@import("builtin").target.os.tag == .linux) std.c.MSG.NOSIGNAL else 0;
 
 const F_SETFD: c_int = 2;
 const FD_CLOEXEC: c_int = 1;
@@ -53,6 +50,15 @@ const FD_CLOEXEC: c_int = 1;
 /// after we close ours).
 fn setCloexec(fd: c_int) void {
     _ = fcntl(fd, F_SETFD, FD_CLOEXEC);
+}
+
+/// Darwin counterpart of `no_sigpipe`: a write to a closed peer fails with
+/// EPIPE instead of killing a host that does not ignore SIGPIPE.
+fn setNoSigpipe(fd: c_int) void {
+    if (comptime !@import("builtin").target.os.tag.isDarwin()) return;
+    const SO_NOSIGPIPE: c_int = 0x1022;
+    const on: c_int = 1;
+    _ = c.setsockopt(fd, c.SOL_SOCKET, SO_NOSIGPIPE, &on, @sizeOf(c_int));
 }
 
 // ── TCP keepalive + user timeout — declared manually ─────────────────────────
@@ -166,6 +172,48 @@ const std = @import("std");
 const nofile = @import("../nofile.zig");
 const misc = @import("../misc.zig");
 
+/// Progress a writer must keep up over a long stretch of writes.  The stall
+/// timeout only bounds each wait, so a peer that reads a few bytes every few
+/// seconds would otherwise hold the writing thread for as long as it likes.
+pub const WriteProgress = struct {
+    window_ms: i64,
+    min_bytes: usize,
+    /// Monotonic ms by which `min_bytes` more must have been sent.
+    deadline: i64,
+    credit: usize = 0,
+
+    pub fn init(window_ms: i64, min_bytes: usize) WriteProgress {
+        return .{ .window_ms = window_ms, .min_bytes = min_bytes, .deadline = misc.monotonicMs() + window_ms };
+    }
+
+    fn note(self: *WriteProgress, n: usize) void {
+        self.credit += n;
+        if (self.credit < self.min_bytes) return;
+        self.credit = 0;
+        self.deadline = misc.monotonicMs() + self.window_ms;
+    }
+};
+
+/// Set by a thread for the duration of a backlog drain: every `Stream` and
+/// TLS write it makes then counts towards it and fails with a timeout once
+/// the deadline passes.
+pub threadlocal var write_progress: ?*WriteProgress = null;
+
+pub fn noteWritten(n: usize) void {
+    if (write_progress) |p| p.note(n);
+}
+
+/// How long a writer may wait for the socket to drain: the stall timeout,
+/// cut short by the calling thread's `write_progress`; null once that has
+/// run out.
+pub fn writeWaitBudget() ?c_int {
+    const cap: c_int = @intCast(SEND_STALL_TIMEOUT_MS);
+    const p = write_progress orelse return cap;
+    const left = p.deadline - misc.monotonicMs();
+    if (left <= 0) return null;
+    return @intCast(@min(left, cap));
+}
+
 /// Last connect/listen/accept failure on this thread. `Client.init` fails
 /// with a coarse Zig error (`ConnectionRefused`, `SocketCreateFailed`); the
 /// OS reason (EMFILE, ECONNREFUSED, timeout) lives here so Python can put it
@@ -278,6 +326,51 @@ comptime {
     std.debug.assert(@sizeOf(c.sockaddr_in6) <= @sizeOf(@FieldType(Address, "bytes")));
 }
 
+/// Most slices one gathered write takes.
+pub const max_vec = 32;
+
+/// The unsent rest of a gathered write.
+const IoVecs = struct {
+    iov: [max_vec]c.struct_iovec = undefined,
+    first: usize = 0,
+    len: usize = 0,
+
+    fn init(parts: []const []const u8) !IoVecs {
+        var self = IoVecs{};
+        for (parts) |part| {
+            if (part.len == 0) continue;
+            if (self.len == max_vec) return error.TooManyParts;
+            self.iov[self.len] = .{ .iov_base = @constCast(part.ptr), .iov_len = part.len };
+            self.len += 1;
+        }
+        return self;
+    }
+
+    fn done(self: *const IoVecs) bool {
+        return self.first == self.len;
+    }
+
+    fn send(self: *IoVecs, fd: c_int, flags: c_int) isize {
+        var msg = std.mem.zeroes(c.struct_msghdr);
+        msg.msg_iov = &self.iov[self.first];
+        msg.msg_iovlen = @intCast(self.len - self.first);
+        return c.sendmsg(fd, &msg, flags);
+    }
+
+    fn advance(self: *IoVecs, sent: usize) void {
+        var n = sent;
+        while (self.first < self.len and n >= self.iov[self.first].iov_len) {
+            n -= self.iov[self.first].iov_len;
+            self.first += 1;
+        }
+        if (self.first < self.len) {
+            const v = &self.iov[self.first];
+            v.iov_base = @as([*]u8, @ptrCast(v.iov_base.?)) + n;
+            v.iov_len -= n;
+        }
+    }
+};
+
 pub const Stream = struct {
     handle: posix.socket_t,
 
@@ -324,19 +417,25 @@ pub const Stream = struct {
         return total;
     }
 
-    /// Evented sockets stay non-blocking.  `write` / `writeAllParts` from a
+    /// Evented sockets stay non-blocking.  `write` / `writeAllVec` from a
     /// worker then see EAGAIN when the kernel buffer is full — wait, do not
     /// treat that as SO_SNDTIMEO (which only applies to blocking sockets).
     fn waitWritable(self: Stream) !void {
         if (!isNonBlocking(self.handle)) return error.WriteTimeout;
-        if (!waitFd(self.handle, WAIT_WRITE, @intCast(SEND_STALL_TIMEOUT_MS)))
-            return error.WriteTimeout;
+        const budget = writeWaitBudget() orelse return error.WriteTimeout;
+        if (!waitFd(self.handle, WAIT_WRITE, budget)) return error.WriteTimeout;
     }
 
     pub fn write(self: Stream, data: []const u8) !usize {
         while (true) {
-            const result = c.write(self.handle, data.ptr, data.len);
-            if (result >= 0) return @intCast(result);
+            // A blocking send returns at SO_SNDTIMEO with what it got out,
+            // so the progress deadline is checked between sends too.
+            if (writeWaitBudget() == null) return error.WriteTimeout;
+            const result = std.c.send(self.handle, data.ptr, data.len, no_sigpipe);
+            if (result >= 0) {
+                noteWritten(@intCast(result));
+                return @intCast(result);
+            }
             switch (lastErrno()) {
                 .INTR => continue,
                 .AGAIN => {
@@ -376,44 +475,44 @@ pub const Stream = struct {
         return sent;
     }
 
-    /// `writeNonBlocking` of `head` then `body` in one writev when the
+    /// `writeNonBlocking` of `head` then `body` in one sendmsg when the
     /// socket takes both.
     pub fn writeNonBlockingParts(self: Stream, head: []const u8, body: []const u8) !usize {
-        if (head.len == 0) return self.writeNonBlocking(body);
-        if (body.len == 0) return self.writeNonBlocking(head);
+        return self.writeNonBlockingVec(&.{ head, body });
+    }
+
+    /// `writeNonBlocking` of `parts` back to back, gathered into as few
+    /// system calls as the socket takes.
+    pub fn writeNonBlockingVec(self: Stream, parts: []const []const u8) !usize {
         const nb = darwinNonblock.enter(self.handle) orelse return 0;
         defer nb.leave();
-        var iov = [2]IoVec{ .{ .base = head.ptr, .len = head.len }, .{ .base = body.ptr, .len = body.len } };
-        var first: usize = 0;
-        var sent_total: usize = 0;
-        while (first < iov.len) {
-            const result = writev(self.handle, iov[first..].ptr, @intCast(iov.len - first));
+        var vec = try IoVecs.init(parts);
+        var sent: usize = 0;
+        while (!vec.done()) {
+            const result = vec.send(self.handle, std.c.MSG.DONTWAIT | no_sigpipe);
             if (result < 0) switch (lastErrno()) {
                 .INTR => continue,
-                .AGAIN => return sent_total,
+                .AGAIN => return sent,
                 else => return error.WriteError,
             };
-            var sent: usize = @intCast(result);
-            sent_total += sent;
-            while (first < iov.len and sent >= iov[first].len) {
-                sent -= iov[first].len;
-                first += 1;
-            }
-            if (first < iov.len) {
-                iov[first].base += sent;
-                iov[first].len -= sent;
-            }
+            sent += @intCast(result);
+            vec.advance(@intCast(result));
         }
-        return sent_total;
+        return sent;
     }
 
     /// `writeAll(head)` then `writeAll(body)` in as few system calls as the
-    /// socket takes (writev).
+    /// socket takes.
     pub fn writeAllParts(self: Stream, head: []const u8, body: []const u8) !void {
-        var iov = [2]IoVec{ .{ .base = head.ptr, .len = head.len }, .{ .base = body.ptr, .len = body.len } };
-        var first: usize = 0;
-        while (first < iov.len) {
-            const result = writev(self.handle, iov[first..].ptr, @intCast(iov.len - first));
+        return self.writeAllVec(&.{ head, body });
+    }
+
+    /// `writeAll` of every slice in `parts` (at most `max_vec`), in order.
+    pub fn writeAllVec(self: Stream, parts: []const []const u8) !void {
+        var vec = try IoVecs.init(parts);
+        while (!vec.done()) {
+            if (writeWaitBudget() == null) return error.WriteTimeout;
+            const result = vec.send(self.handle, no_sigpipe);
             if (result < 0) switch (lastErrno()) {
                 .INTR => continue,
                 .AGAIN => {
@@ -422,15 +521,8 @@ pub const Stream = struct {
                 },
                 else => return error.WriteError,
             };
-            var sent: usize = @intCast(result);
-            while (first < iov.len and sent >= iov[first].len) {
-                sent -= iov[first].len;
-                first += 1;
-            }
-            if (first < iov.len) {
-                iov[first].base += sent;
-                iov[first].len -= sent;
-            }
+            noteWritten(@intCast(result));
+            vec.advance(@intCast(result));
         }
     }
 
@@ -526,6 +618,7 @@ pub fn tcpConnectToHost(_: Allocator, host: []const u8, port: u16) !Stream {
     while (it) |rp| : (it = rp.ai_next) {
         const fd = openSocket(rp.ai_family, rp.ai_socktype, rp.ai_protocol) catch continue;
         setCloexec(fd);
+        setNoSigpipe(fd);
 
         // Switch to non-blocking so connect() returns immediately instead of
         // blocking for the kernel's full retransmission timeout (~75 s).
@@ -648,6 +741,7 @@ pub fn connectUnixSocket(path: []const u8) !Stream {
 
     const fd = openSocket(c.AF_UNIX, c.SOCK_STREAM, 0) catch return error.SocketCreateFailed;
     setCloexec(fd);
+    setNoSigpipe(fd);
 
     if (c.connect(fd, @ptrCast(&sun), @sizeOf(c.sockaddr_un)) != 0) {
         noteErrno("connect");
@@ -692,6 +786,7 @@ pub fn getAddressList(allocator: Allocator, host: []const u8, port: u16) !*Addre
     while (it) |rp| : (it = rp.ai_next) count += 1;
 
     const addrs = try allocator.alloc(Address, count);
+    errdefer allocator.free(addrs);
     const list = try allocator.create(AddressList);
     list.* = .{ .addrs = addrs, .allocator = allocator };
 
@@ -763,6 +858,7 @@ pub const Server = struct {
                 };
             }
             setCloexec(fd);
+            setNoSigpipe(fd);
             applyKeepalive(fd);
 
             var addr = Address{ .family = addr_storage.ss_family };
@@ -930,4 +1026,80 @@ test "writeAllParts waits on EAGAIN when the socket is non-blocking" {
     @memset(&body, 0xCD);
     try writer.writeAllParts(head, &body);
     _ = c.shutdown(fds[0], c.SHUT_WR);
+}
+
+test "writeNonBlockingParts returns at a full buffer of a blocking socket" {
+    var fds: [2]c_int = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), c.socketpair(c.AF_UNIX, c.SOCK_STREAM, 0, &fds));
+    defer for (fds) |fd| {
+        _ = c.close(fd);
+    };
+    const stream = Stream{ .handle = fds[0] };
+    stream.setWriteTimeout(2000);
+    const body = try std.testing.allocator.alloc(u8, 8 << 20);
+    defer std.testing.allocator.free(body);
+    @memset(body, 3);
+    const started = misc.monotonicMs();
+    const sent = try stream.writeNonBlockingParts("HEAD", body);
+    try std.testing.expect(sent > 0 and sent < body.len + 4);
+    try std.testing.expect(misc.monotonicMs() - started < 1000);
+    try std.testing.expect(!isNonBlocking(fds[0]));
+}
+
+test "writeAllVec sends every part in order" {
+    var fds: [2]c_int = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), c.socketpair(c.AF_UNIX, c.SOCK_STREAM, 0, &fds));
+    defer for (fds) |fd| {
+        _ = c.close(fd);
+    };
+    try (Stream{ .handle = fds[0] }).writeAllVec(&.{ "a", "", "bc", "def" });
+    var got: [6]u8 = undefined;
+    try std.testing.expectEqual(@as(isize, 6), c.read(fds[1], &got, got.len));
+    try std.testing.expectEqualSlices(u8, "abcdef", &got);
+    var too_many: [max_vec + 1][]const u8 = @splat("x");
+    try std.testing.expectError(error.TooManyParts, (Stream{ .handle = fds[0] }).writeAllVec(&too_many));
+}
+
+test "a write to a closed peer fails instead of raising SIGPIPE" {
+    const Sig = struct {
+        extern "c" fn signal(sig: c_int, handler: usize) usize;
+    };
+    const previous = Sig.signal(13, 0); // SIGPIPE, SIG_DFL: a regression kills the test run
+    defer _ = Sig.signal(13, previous);
+    var fds: [2]c_int = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), c.socketpair(c.AF_UNIX, c.SOCK_STREAM, 0, &fds));
+    defer _ = c.close(fds[0]);
+    _ = c.close(fds[1]);
+    const stream = Stream{ .handle = fds[0] };
+    try std.testing.expectError(error.WriteError, stream.writeAll("x"));
+    try std.testing.expectError(error.WriteError, stream.writeAllParts("a", "b"));
+    try std.testing.expectError(error.WriteError, stream.writeNonBlockingParts("a", "b"));
+}
+
+test "write_progress fails a write the peer reads too slowly" {
+    var fds: [2]c_int = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), c.socketpair(c.AF_UNIX, c.SOCK_STREAM, 0, &fds));
+    defer for (fds) |fd| {
+        _ = c.close(fd);
+    };
+    setNonBlocking(fds[0]);
+    const data = try std.testing.allocator.alloc(u8, 8 << 20);
+    defer std.testing.allocator.free(data);
+    @memset(data, 9);
+
+    var progress = WriteProgress.init(200, data.len);
+    write_progress = &progress;
+    defer write_progress = null;
+    const started = misc.monotonicMs();
+    try std.testing.expectError(error.WriteTimeout, (Stream{ .handle = fds[0] }).writeAllParts("", data));
+    const took = misc.monotonicMs() - started;
+    try std.testing.expect(took >= 150 and took < 2000);
+}
+
+test "getAddressList frees what it allocated when a later allocation fails" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 1 });
+    try std.testing.expectError(error.OutOfMemory, getAddressList(failing.allocator(), "127.0.0.1", 80));
+    const list = try getAddressList(std.testing.allocator, "127.0.0.1", 80);
+    defer list.deinit();
+    try std.testing.expect(list.addrs.len >= 1);
 }

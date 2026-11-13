@@ -10,7 +10,7 @@
  * same CDN release — you do NOT need to host or specify it yourself.
  *
  *   <!-- Load the JS client (pin to a specific release tag). MessagePack is built in. -->
- *   <script src="https://cdn.jsdelivr.net/gh/600apples/daffi@2.0.0/js-client/daffi.js"></script>
+ *   <script src="https://cdn.jsdelivr.net/gh/600apples/daffi@4.0.0/js-client/daffi.js"></script>
  *
  *   <script>
  *     // wsUrl is REQUIRED — there is no default.
@@ -156,115 +156,128 @@
  *   Note: PICKLE (2) is Python-only and is not supported in the JS client.
  */
 
+const _textEnc = new TextEncoder();
+const _textDec = new TextDecoder();
+
 // Compact MessagePack codec matching Python msgpack 1.0 (use_bin_type,
 // raw=False).  Covers nil/bool/int/float/str/bin/array/map — enough for
 // daffi's [args, kwargs] envelope.
 const _mp = (() => {
-    const textEnc = new TextEncoder();
-    const textDec = new TextDecoder();
+    const textEnc = _textEnc;
+    const textDec = _textDec;
 
+    // Encoding writes into one buffer that doubles when full.
     function encode(value) {
-        const out = [];
-        write(out, value);
-        let total = 0;
-        for (const chunk of out) total += chunk.length;
-        const buf = new Uint8Array(total);
-        let off = 0;
-        for (const chunk of out) { buf.set(chunk, off); off += chunk.length; }
-        return buf;
+        const w = { buf: new Uint8Array(256), view: null, pos: 0 };
+        w.view = new DataView(w.buf.buffer);
+        write(w, value);
+        return w.buf.subarray(0, w.pos);
     }
 
-    function u8(n) { return Uint8Array.of(n); }
-    function putUint(tag, n, bytes) {
-        const a = new Uint8Array(1 + bytes);
-        const view = new DataView(a.buffer);
-        view.setUint8(0, tag);
-        if (bytes === 1) view.setUint8(1, n);
-        else if (bytes === 2) view.setUint16(1, n);
-        else if (bytes === 4) view.setUint32(1, n);
-        else view.setBigUint64(1, BigInt(n));
-        return a;
+    function reserve(w, n) {
+        if (w.pos + n <= w.buf.length) return;
+        let size = w.buf.length * 2;
+        while (size < w.pos + n) size *= 2;
+        const next = new Uint8Array(size);
+        next.set(w.buf.subarray(0, w.pos));
+        w.buf = next;
+        w.view = new DataView(next.buffer);
     }
-    function putInt(tag, n, bytes) {
-        const a = new Uint8Array(1 + bytes);
-        const view = new DataView(a.buffer);
-        view.setUint8(0, tag);
-        if (bytes === 1) view.setInt8(1, n);
-        else if (bytes === 2) view.setInt16(1, n);
-        else if (bytes === 4) view.setInt32(1, n);
-        else view.setBigInt64(1, BigInt(n));
-        return a;
+    function u8(w, n) { reserve(w, 1); w.buf[w.pos++] = n; }
+    function putUint(w, tag, n, bytes) {
+        reserve(w, 1 + bytes);
+        const at = w.pos + 1;
+        w.buf[w.pos] = tag;
+        if (bytes === 1) w.view.setUint8(at, n);
+        else if (bytes === 2) w.view.setUint16(at, n);
+        else if (bytes === 4) w.view.setUint32(at, n);
+        else w.view.setBigUint64(at, BigInt(n));
+        w.pos = at + bytes;
+    }
+    function putInt(w, tag, n, bytes) {
+        reserve(w, 1 + bytes);
+        const at = w.pos + 1;
+        w.buf[w.pos] = tag;
+        if (bytes === 1) w.view.setInt8(at, n);
+        else if (bytes === 2) w.view.setInt16(at, n);
+        else if (bytes === 4) w.view.setInt32(at, n);
+        else w.view.setBigInt64(at, BigInt(n));
+        w.pos = at + bytes;
+    }
+    function putBytes(w, bytes) {
+        reserve(w, bytes.length);
+        w.buf.set(bytes, w.pos);
+        w.pos += bytes.length;
     }
 
-    function write(out, v) {
-        if (v === null || v === undefined) { out.push(u8(0xc0)); return; }
-        if (v === false) { out.push(u8(0xc2)); return; }
-        if (v === true) { out.push(u8(0xc3)); return; }
+    function write(w, v) {
+        if (v === null || v === undefined) { u8(w, 0xc0); return; }
+        if (v === false) { u8(w, 0xc2); return; }
+        if (v === true) { u8(w, 0xc3); return; }
         if (typeof v === 'number') {
             if (Number.isInteger(v) && Number.isSafeInteger(v)) {
                 if (v >= 0) {
-                    if (v <= 0x7f) out.push(u8(v));
-                    else if (v <= 0xff) out.push(putUint(0xcc, v, 1));
-                    else if (v <= 0xffff) out.push(putUint(0xcd, v, 2));
-                    else if (v <= 0xffffffff) out.push(putUint(0xce, v, 4));
-                    else out.push(putUint(0xcf, v, 8));
+                    if (v <= 0x7f) u8(w, v);
+                    else if (v <= 0xff) putUint(w, 0xcc, v, 1);
+                    else if (v <= 0xffff) putUint(w, 0xcd, v, 2);
+                    else if (v <= 0xffffffff) putUint(w, 0xce, v, 4);
+                    else putUint(w, 0xcf, v, 8);
                 } else if (v >= -0x20) {
-                    out.push(u8(v & 0xff));
+                    u8(w, v & 0xff);
                 } else if (v >= -0x80) {
-                    out.push(putInt(0xd0, v, 1));
+                    putInt(w, 0xd0, v, 1);
                 } else if (v >= -0x8000) {
-                    out.push(putInt(0xd1, v, 2));
+                    putInt(w, 0xd1, v, 2);
                 } else if (v >= -0x80000000) {
-                    out.push(putInt(0xd2, v, 4));
+                    putInt(w, 0xd2, v, 4);
                 } else {
-                    out.push(putInt(0xd3, v, 8));
+                    putInt(w, 0xd3, v, 8);
                 }
                 return;
             }
-            const a = new Uint8Array(9);
-            const view = new DataView(a.buffer);
-            view.setUint8(0, 0xcb);
-            view.setFloat64(1, v);
-            out.push(a);
+            reserve(w, 9);
+            w.buf[w.pos] = 0xcb;
+            w.view.setFloat64(w.pos + 1, v);
+            w.pos += 9;
             return;
         }
         if (typeof v === 'string') {
             const bytes = textEnc.encode(v);
-            headerBin(out, bytes.length, 0xa0, 0xd9, 0xda, 0xdb, true);
-            out.push(bytes);
+            headerBin(w, bytes.length, 0xa0, 0xd9, 0xda, 0xdb, true);
+            putBytes(w, bytes);
             return;
         }
         if (v instanceof ArrayBuffer) v = new Uint8Array(v);
         if (ArrayBuffer.isView(v) && !(v instanceof DataView)) {
             const bytes = new Uint8Array(v.buffer, v.byteOffset, v.byteLength);
-            headerBin(out, bytes.length, 0, 0xc4, 0xc5, 0xc6, false);
-            out.push(bytes);
+            headerBin(w, bytes.length, 0, 0xc4, 0xc5, 0xc6, false);
+            putBytes(w, bytes);
             return;
         }
         if (Array.isArray(v)) {
-            headerLen(out, v.length, 0x90, 0xdc, 0xdd, 15);
-            for (const item of v) write(out, item);
+            headerLen(w, v.length, 0x90, 0xdc, 0xdd, 15);
+            for (const item of v) write(w, item);
             return;
         }
         if (typeof v === 'object') {
             const keys = Object.keys(v);
-            headerLen(out, keys.length, 0x80, 0xde, 0xdf, 15);
-            for (const k of keys) { write(out, k); write(out, v[k]); }
+            headerLen(w, keys.length, 0x80, 0xde, 0xdf, 15);
+            for (const k of keys) { write(w, k); write(w, v[k]); }
             return;
         }
         throw new TypeError(`msgpack: cannot encode ${typeof v}`);
     }
 
-    function headerBin(out, n, fix, t8, t16, t32, isStr) {
-        if (isStr && n <= 31) { out.push(u8(fix | n)); return; }
-        if (n <= 0xff) out.push(putUint(t8, n, 1));
-        else if (n <= 0xffff) out.push(putUint(t16, n, 2));
-        else out.push(putUint(t32, n, 4));
+    function headerBin(w, n, fix, t8, t16, t32, isStr) {
+        if (isStr && n <= 31) { u8(w, fix | n); return; }
+        if (n <= 0xff) putUint(w, t8, n, 1);
+        else if (n <= 0xffff) putUint(w, t16, n, 2);
+        else putUint(w, t32, n, 4);
     }
-    function headerLen(out, n, fix, t16, t32, fixMax) {
-        if (n <= fixMax) out.push(u8(fix | n));
-        else if (n <= 0xffff) out.push(putUint(t16, n, 2));
-        else out.push(putUint(t32, n, 4));
+    function headerLen(w, n, fix, t16, t32, fixMax) {
+        if (n <= fixMax) u8(w, fix | n);
+        else if (n <= 0xffff) putUint(w, t16, n, 2);
+        else putUint(w, t32, n, 4);
     }
 
     function decode(bytes) {
@@ -455,6 +468,8 @@ function DaffiClient(name, options) {
     this.autoreconnect  = options.autoreconnect  || false;
     this.reconnectDelay = options.reconnectDelay != null ? options.reconnectDelay : 2000;
     this.authToken      = options.authToken || '';
+    // uuid → waiter of a call still expecting its reply.  A reply with no
+    // waiter (its call timed out, or nobody made it) is dropped, never kept.
     this.pendingMessages = {};
     this.eventHandlers   = [];
     this.closed = true;
@@ -465,19 +480,70 @@ function DaffiClient(name, options) {
     // Single WASM instance shared across reconnects so memory helpers remain valid.
     let _wasmExports    = null;
     let _memory         = null;
-    let _decodeString   = null;
-    let _encodeString   = null;
-    let _encodeBuffer   = null;
-    // Current active WebSocket.
+    // Current active WebSocket.  Handlers of any other socket ignore events.
     let _socket = null;
     // Set to true when stop() is called so reconnect loop does not restart.
     let _intentionalClose = false;
+    // Bumped by connect() and stop(): a reconnect scheduled before either
+    // gives up.
+    let _epoch = 0;
     // Reconnect attempt counter; reset to 0 after a successful connect.
     let _reconnectAttempt = 0;
     // True while a reconnect setTimeout is pending or _connectSocket is running.
-    // Prevents duplicate retry chains when both onclose and the open-timeout
-    // fire for the same failed attempt.
+    // Prevents duplicate retry chains.
     let _reconnecting = false;
+    // Set by _sendToSocket when the socket could not take a frame.
+    let _sendFailed = false;
+    // Parsed member list and the wasm membersVersion() it was read at.
+    let _membersCache = null;
+    let _membersVersion = 0;
+
+    const _decodeString = (ptr, len) =>
+        _textDec.decode(new Uint8Array(_memory.buffer, ptr, len));
+
+    // Buffers cross into wasm as [ptr, len]: payloads may contain NUL
+    // bytes, and wasm frees them by length.
+    const _encodeBuffer = (buf) => {
+        const len = buf.byteLength;
+        const ptr = _wasmExports.allocUint8(len);
+        new Uint8Array(_memory.buffer, ptr, len).set(buf);
+        return [ptr, len];
+    };
+
+    const _encodeString = (str) => _encodeBuffer(_textEnc.encode(str));
+
+    /** The failure an export reported (it returned null, or -1 for numbers). */
+    const _wasmError = () => new Error(
+        _decodeString(_wasmExports.lastErrorPtr(), _wasmExports.lastErrorLen()).trim());
+
+    // An OPAQUE reply is parsed as JSON only if its first byte can start a
+    // JSON value; binary chunks skip the UTF-8 decode and the parse attempt.
+    const _JSON_START = new Set(Array.from('{["-0123456789tfn', c => c.charCodeAt(0)));
+    const _mayBeJson = (bytes) => {
+        let i = 0;
+        if (bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf) i = 3;  // BOM
+        while (i < bytes.length && (bytes[i] === 0x20 || bytes[i] === 0x09 || bytes[i] === 0x0a || bytes[i] === 0x0d)) i++;
+        return i < bytes.length && _JSON_START.has(bytes[i]);
+    };
+
+    // decoder: 0=OPAQUE, 1=JSON, 2=PICKLE(unsupported in JS), 3=MSGPACK.
+    // Decoding is synchronous and copies what it returns, so no view into
+    // wasm memory outlives the call.
+    const _decodePayload = (ptr, len, decoder) => {
+        const bytes = new Uint8Array(_memory.buffer, ptr, len);
+        if (decoder === 3) {
+            const decoded = _mp.decode(bytes);
+            // Python serialises return value as [[result], {}]
+            return Array.isArray(decoded) ? decoded[0][0] : decoded;
+        }
+        if (decoder === 0) {
+            if (_mayBeJson(bytes)) {
+                try { return JSON.parse(_textDec.decode(bytes)); } catch (_) { /* binary */ }
+            }
+            return bytes.slice();
+        }
+        return JSON.parse(_textDec.decode(bytes));
+    };
 
     const _initWasm = async () => {
         if (_wasmExports) return; // already done
@@ -486,56 +552,68 @@ function DaffiClient(name, options) {
 
         // The module defines and exports its own memory.  Always go through
         // `_memory.buffer`: it is replaced whenever the memory grows.
+        // The callbacks below must not throw: an exception would unwind the
+        // wasm frames without their cleanup.
         const { exports } = await WebAssembly.instantiate(_module, {
             env: {
+                // Only reached from a Zig panic, which is not recoverable.
                 _throwError(ptr, len) { throw new Error(_decodeString(ptr, len)); },
                 _consoleLog(ptr, len)  { console.log(_decodeString(ptr, len));   },
             },
             window: {
                 // Always uses _socket so reconnect transparently replaces the socket.
                 _sendToSocket(ptr, len) {
-                    if (_socket && _socket.readyState === WebSocket.OPEN) {
-                        _socket.send(_memory.buffer.slice(ptr, ptr + len));
+                    const ws = _socket;
+                    if (ws && ws.readyState === WebSocket.OPEN) {
+                        try {
+                            // send() copies the bytes before it returns.
+                            ws.send(new Uint8Array(_memory.buffer, ptr, len));
+                            return;
+                        } catch (err) {
+                            console.error('[daffi] send failed:', err);
+                        }
                     }
+                    _sendFailed = true;
                 },
 
-                // decoder: 0=OPAQUE, 1=JSON, 2=PICKLE(unsupported in JS), 3=MSGPACK
                 _storeMessage(ptr, len, uuid, isError, decoder) {
-                    let message;
-                    if (decoder === 3) {
-                        const raw = new Uint8Array(_memory.buffer, ptr, len).slice();
-                        const decoded = _mp.decode(raw);
-                        // Python serialises return value as [[result], {}]
-                        message = Array.isArray(decoded) ? decoded[0][0] : decoded;
-                    } else if (decoder === 0) {
-                        const text = _decodeString(ptr, len);
-                        try { message = JSON.parse(text); } catch { message = new Uint8Array(_memory.buffer, ptr, len).slice(); }
-                    } else {
-                        message = JSON.parse(_decodeString(ptr, len));
-                    }
-
-                    const msgData = self.pendingMessages[uuid];
-                    if (msgData && !Array.isArray(msgData)) {
-                        if (msgData.timeoutId) clearTimeout(msgData.timeoutId);
+                    try {
+                        const waiter = self.pendingMessages[uuid];
+                        if (!waiter) return;
                         delete self.pendingMessages[uuid];
-                        if (isError) {
-                            const errText = (message && message.args)
-                                ? `Remote exception: "${message.args[0][0]}(${message.args[0][2]})"`
-                                : String(message);
-                            msgData.reject(errText);
-                        } else {
-                            msgData.resolve(message);
+                        if (waiter.timeoutId) clearTimeout(waiter.timeoutId);
+                        let message;
+                        try {
+                            message = _decodePayload(ptr, len, decoder);
+                        } catch (err) {
+                            waiter.reject(`Could not decode the reply: ${err.message}`);
+                            return;
                         }
-                    } else {
-                        self.pendingMessages[uuid] = [message, isError];
+                        if (isError) {
+                            const args = message && message.args;
+                            const errText = (Array.isArray(args) && Array.isArray(args[0]))
+                                ? `Remote exception: "${args[0][0]}(${args[0][2]})"`
+                                : String(message);
+                            waiter.reject(errText);
+                        } else {
+                            waiter.resolve(message);
+                        }
+                    } catch (err) {
+                        console.error('[daffi] failed to handle a reply:', err);
                     }
                 },
 
                 _triggerEvent(ptr, len) {
-                    const event = JSON.parse(_decodeString(ptr, len));
+                    let event;
+                    try {
+                        event = JSON.parse(_decodeString(ptr, len));
+                    } catch (err) {
+                        console.error('[daffi] could not decode an event:', err);
+                        return;
+                    }
                     if (event.type === 'disconnected') {
                         for (const [uuid, msgData] of Object.entries(self.pendingMessages)) {
-                            if (!Array.isArray(msgData) && msgData.receiver === event.member) {
+                            if (msgData.receiver === event.member) {
                                 if (msgData.timeoutId) clearTimeout(msgData.timeoutId);
                                 delete self.pendingMessages[uuid];
                                 msgData.reject(`"${event.member}" disconnected`);
@@ -551,59 +629,93 @@ function DaffiClient(name, options) {
                         _rejectAllPending(msg);
                         if (_socket) _socket.close();
                     }
-                    for (const h of self.eventHandlers) h(event);
+                    for (const h of self.eventHandlers) {
+                        try { h(event); } catch (err) { console.error('[daffi] event handler failed:', err); }
+                    }
                 },
             },
         });
 
         _wasmExports = exports;
         _memory = exports.memory;
-        const { allocUint8 } = exports;
-
-        _decodeString = (ptr, len) =>
-            new TextDecoder().decode(new Uint8Array(_memory.buffer, ptr, len));
-
-        // Buffers cross into wasm as [ptr, len]: payloads may contain NUL
-        // bytes, and wasm frees them by length.
-        _encodeBuffer = (buf) => {
-            const len = buf.byteLength;
-            const ptr = allocUint8(len);
-            new Uint8Array(_memory.buffer, ptr, len).set(buf);
-            return [ptr, len];
-        };
-
-        _encodeString = (str) => _encodeBuffer(new TextEncoder().encode(str));
     };
 
-    /** Reject waiters and drop early-arrival entries so u16 uuids cannot
-     *  satisfy a later RPC after reconnect resets the counter. */
+    /** Reject every waiter: initClient resets the u16 uuid counter, so a
+     *  waiter kept across a reconnect could take another call's reply. */
     const _rejectAllPending = (reason) => {
-        for (const msgData of Object.values(self.pendingMessages)) {
-            if (!Array.isArray(msgData)) {
-                if (msgData.timeoutId) clearTimeout(msgData.timeoutId);
-                try { msgData.reject(reason); } catch (_) {}
-            }
-        }
+        const waiters = Object.values(self.pendingMessages);
         self.pendingMessages = {};
+        for (const msgData of waiters) {
+            if (msgData.timeoutId) clearTimeout(msgData.timeoutId);
+            try { msgData.reject(reason); } catch (_) {}
+        }
     };
+
+    /** Wait for the reply to `uuid`.  Registered before control returns to
+     *  the event loop, so the reply cannot arrive first. */
+    const _expect = (uuid, timeout, receiver) => new Promise((resolve, reject) => {
+        const previous = self.pendingMessages[uuid];
+        if (previous) {
+            // The u16 uuid came round while that call was still waiting.
+            if (previous.timeoutId) clearTimeout(previous.timeoutId);
+            previous.reject('Request id reused before its reply arrived');
+        }
+        const waiter = { resolve, reject, timeoutId: null, receiver, uuid };
+        if (timeout) {
+            waiter.timeoutId = setTimeout(() => {
+                if (self.pendingMessages[uuid] !== waiter) return;
+                // Its late reply then finds no waiter and is dropped.
+                delete self.pendingMessages[uuid];
+                reject('Operation timed out');
+            }, timeout);
+        }
+        self.pendingMessages[uuid] = waiter;
+    });
+
+    const _ensureOpen = () => {
+        if (self.closed || !_socket || _socket.readyState !== WebSocket.OPEN) {
+            throw new Error('Connection is closed');
+        }
+    };
+
+    /** Members from the native layer, re-read only when a frame changed them. */
+    const _fetchMembers = () => {
+        const { getAvailableMembers, membersVersion, free } = _wasmExports;
+        const version = membersVersion();
+        if (_membersCache !== null && version === _membersVersion) return _membersCache;
+        const ptr = getAvailableMembers(self.connNum);
+        if (!ptr) throw _wasmError();
+        const len = new Uint8Array(_memory.buffer, ptr).indexOf(0);
+        const json = _decodeString(ptr, len);
+        free(ptr, len + 1);
+        _membersCache = JSON.parse(json).members || [];
+        _membersVersion = version;
+        return _membersCache;
+    };
+
+    const _castTargets = (prop, filter) => _fetchMembers().filter(m => {
+        if (!m.methods) return false;
+        if (m.name === self.name) return false;
+        if (!m.methods.includes(prop)) return false;
+        return filter ? filter.includes(m.name) : true;
+    });
 
     const _scheduleReconnect = () => {
         if (_intentionalClose || !self.autoreconnect) return;
-        // Guard against double-scheduling: both socket.onclose and the open-
-        // timeout promise rejection can fire for the same failed attempt.
         if (_reconnecting) return;
         _reconnecting = true;
         _reconnectAttempt += 1;
+        const epoch = _epoch;
         const delay = Math.min(self.reconnectDelay * Math.pow(2, _reconnectAttempt - 1), 60000);
         console.log(`[daffi] connection lost — reconnecting in ${(delay / 1000).toFixed(1)} s…`);
         setTimeout(() => {
-            if (_intentionalClose) { _reconnecting = false; return; }
+            if (_intentionalClose || epoch !== _epoch) { _reconnecting = false; return; }
             _connectSocket()
                 .then(() => { _reconnecting = false; })
                 .catch((err) => {
                     console.warn(`[daffi] reconnect failed: ${err}`);
                     _reconnecting = false;
-                    _scheduleReconnect();
+                    if (epoch === _epoch) _scheduleReconnect();
                 });
         }, delay);
     };
@@ -618,74 +730,48 @@ function DaffiClient(name, options) {
 
         get connNum() { return self.connNum; }
 
+        /** Send one call.  Throws when it cannot be sent; returns the reply
+         *  promise, or null for a fire-and-forget call. */
+        send(prop, args) {
+            _ensureOpen();
+            const { sendMessage, freeSendResult } = _wasmExports;
+            let bytes;
+            if (this.serde === 1) {
+                bytes = _textEnc.encode(JSON.stringify({ args, kwargs: {} }));
+            } else if (this.serde === 3) {
+                bytes = _mp.encode([args, {}]);
+            } else {
+                // OPAQUE — single buffer or string
+                if (args.length !== 1) throw new Error('OPAQUE serde expects exactly one argument.');
+                bytes = args[0] instanceof Uint8Array ? args[0] : _textEnc.encode(args[0]);
+            }
+
+            // sendMessage takes ownership of all three buffers, also on failure.
+            const payload  = _encodeBuffer(bytes);
+            const receiver = _encodeString(this.receiver);
+            const funcName = _encodeString(prop);
+            _sendFailed = false;
+            const msgPtr = sendMessage(...payload, ...receiver, ...funcName, this.serde, this.returnResult, this.connNum);
+            if (!msgPtr) throw _wasmError();
+
+            const view           = new DataView(_memory.buffer, msgPtr, 16);
+            const uuid           = view.getUint32(0, true);
+            const ptrLen         = view.getUint32(4, true);
+            const ptr            = view.getUint32(8, true);
+            const isJsonFlag     = view.getUint32(12, true);
+            const actualReceiver = _decodeString(ptr, ptrLen);
+            freeSendResult(msgPtr);
+            if (_sendFailed) throw new Error('Connection is closed');
+
+            if (!this.returnResult) return null;
+            const reply = _expect(uuid, this.timeout, actualReceiver);
+            // JSON payload is {args:[result], kwargs:{}} — unwrap args[0]
+            return (isJsonFlag && this.serde === 1) ? reply.then(raw => raw.args[0]) : reply;
+        }
+
         get(target, prop) {
             const handler = this;
-            return async (...args) => {
-                const { sendMessage, freeSendResult } = _wasmExports;
-                let payload;
-                if (handler.serde === 1) {
-                    payload = _encodeString(JSON.stringify({ args, kwargs: {} }));
-                } else if (handler.serde === 3) {
-                    const enc = _mp.encode([args, {}]);
-                    payload = _encodeBuffer(enc instanceof Uint8Array ? enc : new Uint8Array(enc));
-                } else {
-                    // OPAQUE — single buffer or string
-                    if (args.length !== 1) throw new Error('OPAQUE serde expects exactly one argument.');
-                    const buf = args[0] instanceof Uint8Array ? args[0] : new TextEncoder().encode(args[0]);
-                    payload = _encodeBuffer(buf);
-                }
-
-                // sendMessage takes ownership of all three buffers.
-                const receiver = _encodeString(handler.receiver);
-                const funcName = _encodeString(prop);
-                const msgPtr   = sendMessage(...payload, ...receiver, ...funcName, handler.serde, handler.returnResult, handler.connNum);
-
-                const view           = new DataView(_memory.buffer, msgPtr, 16);
-                const uuid           = view.getUint32(0, true);
-                const ptrLen         = view.getUint32(4, true);
-                const ptr            = view.getUint32(8, true);
-                const isJsonFlag     = view.getUint32(12, true);
-                const actualReceiver = _decodeString(ptr, ptrLen);
-                freeSendResult(msgPtr);
-
-                if (!handler.returnResult) return;
-
-                const raw = handler.timeout
-                    ? await handler._waitWithTimeout(uuid, handler.timeout, actualReceiver)
-                    : await handler._wait(uuid, actualReceiver);
-
-                // JSON payload is {args:[result], kwargs:{}} — unwrap args[0]
-                return (isJsonFlag && handler.serde === 1) ? raw.args[0] : raw;
-            };
-        }
-
-        _wait(uuid, receiver) {
-            return new Promise((resolve, reject) => {
-                const existing = self.pendingMessages[uuid];
-                if (existing && Array.isArray(existing)) {
-                    const [msg, isError] = existing;
-                    delete self.pendingMessages[uuid];
-                    return isError ? reject(msg) : resolve(msg);
-                }
-                self.pendingMessages[uuid] = { resolve, reject, timeoutId: null, receiver, uuid };
-            });
-        }
-
-        _waitWithTimeout(uuid, timeout, receiver) {
-            return new Promise((resolve, reject) => {
-                const timeoutId = setTimeout(() => {
-                    delete self.pendingMessages[uuid];
-                    reject('Operation timed out');
-                }, timeout);
-                const existing = self.pendingMessages[uuid];
-                if (existing && Array.isArray(existing)) {
-                    clearTimeout(timeoutId);
-                    const [msg, isError] = existing;
-                    delete self.pendingMessages[uuid];
-                    return isError ? reject(msg) : resolve(msg);
-                }
-                self.pendingMessages[uuid] = { resolve, reject, timeoutId, receiver, uuid };
-            });
+            return async (...args) => handler.send(prop, args);
         }
     }
 
@@ -742,9 +828,9 @@ function DaffiClient(name, options) {
                     return async function(gen) {
                         const chunks = (gen != null && typeof gen[Symbol.iterator] === 'function')
                             ? gen : [gen];
+                        const h = new Handler(receiver, timeout, serde, true);
                         for (const chunk of chunks) {
-                            const h = new Handler(receiver, timeout, serde, true);
-                            await h.get({}, funcName)(chunk);
+                            await h.send(funcName, [chunk]);
                         }
                     };
                 }
@@ -753,7 +839,7 @@ function DaffiClient(name, options) {
 
         /**
          * Fire-and-forget stream — iterate an iterable and send each chunk without
-         * waiting for a reply.  No backpressure.
+         * waiting for a reply.  No backpressure.  Throws if a chunk cannot be sent.
          * Default serde: "raw" (OPAQUE).
          */
         stream_nowait(options) {
@@ -766,9 +852,9 @@ function DaffiClient(name, options) {
                     return function(gen) {
                         const chunks = (gen != null && typeof gen[Symbol.iterator] === 'function')
                             ? gen : [gen];
+                        const h = new Handler(receiver, null, serde, false);
                         for (const chunk of chunks) {
-                            const h = new Handler(receiver, null, serde, false);
-                            h.get({}, funcName)(chunk);
+                            h.send(funcName, [chunk]);
                         }
                     };
                 }
@@ -780,12 +866,7 @@ function DaffiClient(name, options) {
          * Each entry: { name: string, methods: string[] | null }
          */
         _members() {
-            const { getAvailableMembers, free } = _wasmExports;
-            const ptr = getAvailableMembers(self.connNum);
-            const len = new Uint8Array(_memory.buffer, ptr).indexOf(0);
-            const json = _decodeString(ptr, len);
-            free(ptr, len + 1);
-            return JSON.parse(json).members || [];
+            return _fetchMembers();
         }
 
         /**
@@ -802,24 +883,17 @@ function DaffiClient(name, options) {
             const filter  = options.receiver
                 ? (Array.isArray(options.receiver) ? options.receiver : [options.receiver])
                 : null;
-            const conn = this;
 
             return new Proxy({}, {
                 get(_, prop) {
                     return async (...args) => {
-                        const members = conn._members();
-                        const targets = members.filter(m => {
-                            if (!m.methods) return false;
-                            if (m.name === self.name) return false;
-                            if (!m.methods.includes(prop)) return false;
-                            if (filter) return filter.some(f => m.name.startsWith(f));
-                            return true;
-                        });
+                        _ensureOpen();
+                        const targets = _castTargets(prop, filter);
                         if (targets.length === 0) throw new Error(`No connected peer exposes "${prop}"`);
                         const results = await Promise.all(
                             targets.map(async (m) => {
                                 const h = new Handler(m.name, timeout, serde, true);
-                                const result = await h.get({}, prop)(...args);
+                                const result = await h.send(prop, args);
                                 return [m.name, result];
                             })
                         );
@@ -831,7 +905,7 @@ function DaffiClient(name, options) {
 
         /**
          * Fire-and-forget broadcast — send to all peers that expose the method,
-         * do not wait for any results.
+         * do not wait for any results.  Throws if a call cannot be sent.
          */
         cast_nowait(options) {
             if (self.closed) throw new Error('Connection is closed');
@@ -840,21 +914,13 @@ function DaffiClient(name, options) {
             const filter = options.receiver
                 ? (Array.isArray(options.receiver) ? options.receiver : [options.receiver])
                 : null;
-            const conn = this;
 
             return new Proxy({}, {
                 get(_, prop) {
                     return (...args) => {
-                        const members = conn._members();
-                        const targets = members.filter(m => {
-                            if (!m.methods) return false;
-                            if (m.name === self.name) return false;
-                            if (!m.methods.includes(prop)) return false;
-                            if (filter) return filter.some(f => m.name.startsWith(f));
-                            return true;
-                        });
-                        for (const m of targets) {
-                            new Handler(m.name, null, serde, false).get({}, prop)(...args);
+                        _ensureOpen();
+                        for (const m of _castTargets(prop, filter)) {
+                            new Handler(m.name, null, serde, false).send(prop, args);
                         }
                     };
                 },
@@ -895,6 +961,7 @@ function DaffiClient(name, options) {
             const needed   = new Set(members);
 
             while (true) {
+                if (self.closed) throw new Error('Connection is closed');
                 const current = new Set(this._members().map(m => m.name));
                 if ([...needed].every(n => current.has(n))) return;
                 if (deadline !== null && Date.now() >= deadline) {
@@ -908,99 +975,129 @@ function DaffiClient(name, options) {
         }
     }
 
+    /** Stop listening to `ws` and close it.  A socket given up on must not
+     *  feed frames into, or close, the connection that replaced it. */
+    const _discardSocket = (ws) => {
+        ws.onopen = ws.onerror = ws.onclose = ws.onmessage = null;
+        if (ws.readyState === WebSocket.CONNECTING || ws.readyState === WebSocket.OPEN) {
+            try { ws.close(); } catch (_) {}
+        }
+    };
+
+    /** The established connection on `ws` ended. */
+    const _onLost = (ws) => {
+        if (ws !== _socket) return;
+        _socket = null;
+        self.closed = true;
+        _membersCache = null;
+        _rejectAllPending('Connection closed unexpectedly');
+        _scheduleReconnect();
+    };
+
     const _connectSocket = async () => {
         await _initWasm();
 
         const { initClient, sendHandshake } = _wasmExports;
 
-        _socket = new WebSocket(self.wsUrl);
-        _socket.binaryType = 'arraybuffer';
+        if (_socket) _discardSocket(_socket);
+        const ws = new WebSocket(self.wsUrl);
+        ws.binaryType = 'arraybuffer';
+        _socket = ws;
 
-        _socket.onmessage = (event) => {
-            const buf = new Uint8Array(event.data);
-            _wasmExports.parseAndStoreMessage(..._encodeBuffer(buf), self.connNum);
+        ws.onmessage = (event) => {
+            if (ws !== _socket) return;
+            const frame = _encodeBuffer(new Uint8Array(event.data));
+            if (_wasmExports.parseAndStoreMessage(...frame, self.connNum) !== 0) {
+                console.error(`[daffi] dropped a frame: ${_wasmError().message}`);
+            }
         };
 
-        _socket.onclose = () => {
-            // Reject waiters and clear early-arrival entries — initClient
-            // resets the u16 uuid counter, so leftovers would mis-resolve.
-            _rejectAllPending('Connection closed unexpectedly');
-            self.closed = true;
-            _scheduleReconnect();
-        };
+        try {
+            // Wait for the socket to open.  Reject immediately on error or early
+            // close rather than polling so errors surface straight away.
+            await new Promise((resolve, reject) => {
+                const timer = setTimeout(() => {
+                    reject(new Error(
+                        `WebSocket open timeout (8 s) — is the daffi server running at ${self.wsUrl}?`));
+                }, 8000);
 
-        // Wait for the socket to open.  Reject immediately on error or early
-        // close rather than polling so errors surface straight away.
-        // The previously-registered onclose (reconnect logic) is captured and
-        // restored in BOTH the success and failure paths so it is never lost.
-        const _savedOnClose = _socket.onclose;
-        await new Promise((resolve, reject) => {
-            const timer = setTimeout(() => {
-                _socket.onclose = _savedOnClose;
-                reject(new Error(
-                    `WebSocket open timeout (8 s) — is the daffi server running at ${self.wsUrl}?`));
-            }, 8000);
+                ws.onopen = () => {
+                    clearTimeout(timer);
+                    resolve();
+                };
 
-            _socket.onopen = () => {
-                clearTimeout(timer);
-                _socket.onopen  = null;
-                _socket.onerror = null;
-                _socket.onclose = _savedOnClose;  // restore before resolving
-                resolve();
+                ws.onerror = () => {
+                    clearTimeout(timer);
+                    reject(new Error(
+                        `WebSocket connection failed for ${self.wsUrl} — ` +
+                        `verify the daffi server is running and reachable`));
+                };
+
+                ws.onclose = (ev) => {
+                    clearTimeout(timer);
+                    reject(new Error(
+                        `WebSocket closed before open (code ${ev.code}) — ` +
+                        `target: ${self.wsUrl}`));
+                };
+            });
+            ws.onopen = null;
+            ws.onerror = null;
+            // Until the handshake completes, a close only fails this attempt.
+            ws.onclose = () => {
+                if (ws === _socket) _rejectAllPending('Connection closed during the handshake');
             };
 
-            _socket.onerror = () => {
-                clearTimeout(timer);
-                _socket.onopen  = null;
-                _socket.onerror = null;
-                _socket.onclose = _savedOnClose;
-                reject(new Error(
-                    `WebSocket connection failed for ${self.wsUrl} — ` +
-                    `verify the daffi server is running and reachable`));
-            };
-
-            _socket.onclose = (ev) => {
-                clearTimeout(timer);
-                _socket.onopen  = null;
-                _socket.onerror = null;
-                _socket.onclose = _savedOnClose;
-                reject(new Error(
-                    `WebSocket closed before open (code ${ev.code}) — ` +
-                    `target: ${self.wsUrl}`));
-            };
-        });
-
-        self.closed = false;
-        // Drop any leftover pending map before uuid counter resets.
-        _rejectAllPending('Connection reset');
-        // Free any previous WASM slot so it doesn't accumulate across reconnects.
-        if (self.connNum != null) {
-            try { _wasmExports.stopClient(self.connNum); } catch (_) {}
-            self.connNum = null;
+            // Drop any leftover pending map before uuid counter resets.
+            _rejectAllPending('Connection reset');
+            _membersCache = null;
+            // Free any previous WASM slot so it doesn't accumulate across reconnects.
+            if (self.connNum != null) {
+                try { _wasmExports.stopClient(self.connNum); } catch (_) {}
+                self.connNum = null;
+            }
+            const token = self.authToken ? _encodeString(self.authToken) : [0, 0];
+            // Numeric exports return -1 on failure.
+            const connNum = initClient(..._encodeString(self.name), ...token);
+            if (connNum < 0) throw _wasmError();
+            self.connNum  = connNum;
+            const hsUuid  = sendHandshake(connNum);
+            if (hsUuid < 0) throw _wasmError();
+            const hsResult = await _expect(hsUuid, 5000, '');
+            if (ws !== _socket) throw new Error('Connection attempt superseded');
+            ws.onclose = () => _onLost(ws);
+            self.closed = false;
+            console.log(`[daffi] "${self.name}" connected. type: ${hsResult.meta.type}`);
+            _reconnectAttempt = 0; // reset counter on success
+            return new Connection();
+        } catch (err) {
+            if (ws === _socket) {
+                _socket = null;
+                self.closed = true;
+            }
+            _discardSocket(ws);
+            throw err;
         }
-        const token = self.authToken ? _encodeString(self.authToken) : [0, 0];
-        const connNum = initClient(..._encodeString(self.name), ...token);
-        self.connNum  = connNum;
-        const hsUuid  = sendHandshake(connNum);
-        const hsResult = await new Handler('', null, 1, true)
-            ._waitWithTimeout(hsUuid, 5000, '');
-        console.log(`[daffi] "${self.name}" connected. type: ${hsResult.meta.type}`);
-        _reconnectAttempt = 0; // reset counter on success
-        return new Connection();
     };
 
     // ── Public API ────────────────────────────────────────────────────────────
 
     /** Connect to the server and return a Connection. */
     this.connect = async () => {
+        _intentionalClose = false;
+        _epoch += 1;
         return _connectSocket();
     };
 
     /** Gracefully close the connection (will not auto-reconnect). */
     this.stop = () => {
         _intentionalClose = true;
+        _epoch += 1;
         self.closed = true;
-        if (_socket) _socket.close();
+        _membersCache = null;
+        const ws = _socket;
+        _socket = null;
+        if (ws) _discardSocket(ws);
+        _rejectAllPending('Client stopped');
     };
 
     /** Subscribe to server events (connected / disconnected / etc.). */

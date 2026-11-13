@@ -70,6 +70,43 @@ pub fn panic(message: []const u8, _: ?*builtin.StackTrace, _: ?usize) noreturn {
     throwError(message);
 }
 
+// Exports report failures with a sentinel return value and the message in
+// `lastErrorPtr`/`lastErrorLen`; JS raises it.  An exception thrown from an
+// import unwinds the wasm frames without running their defers, leaking
+// every buffer they own.
+var last_error_buf: [1024]u8 = undefined;
+var last_error_len: u32 = 0;
+
+fn setError(comptime fmt: []const u8, args: anytype) void {
+    const text = std.fmt.bufPrint(&last_error_buf, fmt, args) catch blk: {
+        const short = "failed (and the details do not fit)\n";
+        @memcpy(last_error_buf[0..short.len], short);
+        break :blk last_error_buf[0..short.len];
+    };
+    last_error_len = @intCast(text.len);
+}
+
+export fn lastErrorPtr() [*]const u8 {
+    return &last_error_buf;
+}
+
+export fn lastErrorLen() u32 {
+    return last_error_len;
+}
+
+/// Returned by `sendHandshake` on failure (uuids are 16 bit).
+const no_uuid = std.math.maxInt(u32);
+/// Returned by `initClient` on failure.
+const no_conn = std.math.maxInt(usize);
+
+// Bumped whenever a frame may have changed the member list, so JS can cache
+// what `getAvailableMembers` returns.
+var members_version: u32 = 0;
+
+export fn membersVersion() u32 {
+    return members_version;
+}
+
 // Every buffer crosses the boundary with its length: payloads may contain
 // NUL bytes, and the allocator must be given back the size it handed out.
 
@@ -94,47 +131,49 @@ export fn freeSendResult(result: [*]usize) void {
     allocator.free(result[0..send_result_len]);
 }
 
+/// Returns the handshake uuid, or `no_uuid` on failure.
 export fn sendHandshake(conn_num: usize) u32 {
     var arena = ArenaAllocator.init(allocator);
     defer arena.deinit();
     const arena_allocator = arena.allocator();
     const methods = ""; // Empty for now. Maybe in the future we will have some methods to be executed in browser.
-    const ident = Client.createHandshake(arena_allocator, methods, conn_num) catch throwError("failed to create message\n");
+    const ident = Client.createHandshake(arena_allocator, methods, conn_num) catch |err| {
+        setError("failed to create the handshake: {any}\n", .{err});
+        return no_uuid;
+    };
     _sendToSocket(ident.data.ptr, ident.data.len);
     return ident.message.uuid;
 }
 
-/// Takes ownership of the three input buffers.  Returns
-/// `[uuid, receiver_len, receiver_ptr, is_json]`; release it with
-/// `freeSendResult`.
-export fn sendMessage(data: [*]u8, data_len: u32, receiver: [*]u8, receiver_len: u32, func_name: [*]u8, func_name_len: u32, serde: u32, return_result: bool, conn_num: usize) [*]const usize {
+/// Takes ownership of the three input buffers, also on failure.  Returns
+/// `[uuid, receiver_len, receiver_ptr, is_json]`, to be released with
+/// `freeSendResult`, or null on failure.
+export fn sendMessage(data: [*]u8, data_len: u32, receiver: [*]u8, receiver_len: u32, func_name: [*]u8, func_name_len: u32, serde: u32, return_result: bool, conn_num: usize) ?[*]const usize {
     const actual_data = data[0..data_len];
     const actual_receiver = receiver[0..receiver_len];
     const actual_func_name = func_name[0..func_name_len];
-    const decoder = std.enums.fromInt(MessageDecoder, serde) orelse throwError("invalid serde\n");
-    const is_bytes = switch (decoder) {
-        .JSON => false,
-        .OPAQUE, .PICKLE, .MSGPACK => true,
-    };
     defer {
         allocator.free(actual_data);
         allocator.free(actual_receiver);
         allocator.free(actual_func_name);
     }
+    const decoder = std.enums.fromInt(MessageDecoder, serde) orelse {
+        setError("invalid serde\n", .{});
+        return null;
+    };
+    const is_bytes = switch (decoder) {
+        .JSON => false,
+        .OPAQUE, .PICKLE, .MSGPACK => true,
+    };
     const ident = Client.createMessage(allocator, actual_data, 0, .REQUEST, decoder, is_bytes, return_result, actual_receiver, actual_func_name, conn_num) catch |err| {
-        const available_receivers = Client.getAvailableMembers(allocator, conn_num) catch throwError("failed to get available receivers\n");
-        defer allocator.free(available_receivers);
-        var iterator = std.mem.splitSequence(u8, available_receivers, "members");
-        _ = iterator.next();
-        const members = iterator.next() orelse throwError("failed to get members\n");
-        // consoleLog("failed to create message: {any} for method '{s}'.\nAvailable receivers {s}\n", .{ err, actual_func_name, available_receivers });
-        var buf: [1000]u8 = undefined;
-        const text = std.fmt.bufPrint(&buf, "failed to create message: {any} for method '{s}'.\nAvailable receivers {s}\n", .{ err, actual_func_name, std.mem.trim(u8, members, ":}") }) catch
-            "failed to create message (and the details do not fit)\n";
-        throwError(text);
+        setSendError(err, actual_func_name, conn_num);
+        return null;
     };
     defer allocator.free(ident.data);
-    const result = allocator.alloc(usize, send_result_len) catch @panic("failed to allocate memory for result");
+    const result = allocator.alloc(usize, send_result_len) catch {
+        setError("failed to allocate memory for the result\n", .{});
+        return null;
+    };
     _sendToSocket(ident.data.ptr, ident.data.len);
     result[0] = ident.message.uuid;
     result[1] = ident.message.receiver.len;
@@ -143,25 +182,57 @@ export fn sendMessage(data: [*]u8, data_len: u32, receiver: [*]u8, receiver_len:
     return result.ptr;
 }
 
-/// Return a null-terminated JSON string describing all connected members and
-/// their registered methods.  Format: {"meta":{...},"members":[{"name":...,"methods":[...]},...]}
-/// The caller must pass the returned pointer, and its length plus one, to
-/// free() when done.
-export fn getAvailableMembers(conn_num: usize) [*:0]const u8 {
-    const json = Client.getAvailableMembers(allocator, conn_num) catch throwError("failed to get available members\n");
-    defer allocator.free(json);
-    return (allocator.dupeSentinel(u8, json, 0) catch @panic("OOM")).ptr;
+fn setSendError(err: anyerror, func_name: []const u8, conn_num: usize) void {
+    const available_receivers = Client.getAvailableMembers(allocator, conn_num) catch {
+        setError("failed to create message: {any} for method '{s}'.\n", .{ err, func_name });
+        return;
+    };
+    defer allocator.free(available_receivers);
+    var iterator = std.mem.splitSequence(u8, available_receivers, "members");
+    _ = iterator.next();
+    const members = iterator.next() orelse "";
+    setError("failed to create message: {any} for method '{s}'.\nAvailable receivers {s}\n", .{ err, func_name, std.mem.trim(u8, members, ":}") });
 }
 
-/// Takes ownership of `data`.
-export fn parseAndStoreMessage(data: [*]u8, len: u32, conn_num: u32) void {
+/// Return a null-terminated JSON string describing all connected members and
+/// their registered methods, or null on failure.
+/// Format: {"meta":{...},"members":[{"name":...,"methods":[...]},...]}
+/// The caller must pass the returned pointer, and its length plus one, to
+/// free() when done.
+export fn getAvailableMembers(conn_num: usize) ?[*:0]const u8 {
+    const json = Client.getAvailableMembers(allocator, conn_num) catch |err| {
+        setError("failed to get available members: {any}\n", .{err});
+        return null;
+    };
+    defer allocator.free(json);
+    const copy = allocator.dupeSentinel(u8, json, 0) catch {
+        setError("failed to allocate memory for the members\n", .{});
+        return null;
+    };
+    return copy.ptr;
+}
+
+/// Takes ownership of `data`, also on failure.  Returns 0, or 1 on failure.
+export fn parseAndStoreMessage(data: [*]u8, len: u32, conn_num: u32) u32 {
     const actual_data = data[0..len];
     defer allocator.free(actual_data);
-    var entry = Client.acquireClientEntry(conn_num) catch throwError("failed to get client entry\n");
+    handleMessage(actual_data, conn_num) catch return 1;
+    return 0;
+}
+
+/// Sets the error message before returning an error.
+fn handleMessage(actual_data: []u8, conn_num: u32) !void {
+    var entry = Client.acquireClientEntry(conn_num) catch |err| {
+        setError("failed to get client entry: {any}\n", .{err});
+        return err;
+    };
     defer entry.release();
     var client_handler = entry.client_handler;
     const connection = entry.connection;
-    var msg = entry.msgpool.buildWsMessage(actual_data) catch throwError("failed to build framed message\n");
+    var msg = entry.msgpool.buildWsMessage(actual_data) catch |err| {
+        setError("failed to build framed message: {any}\n", .{err});
+        return err;
+    };
     // The handlers below may take ownership of `msg` (they set `consumed`) by
     // parking it in the client's message store / task queue.  Freeing it here as
     // well, as an unconditional `defer msg.deinit()` did, left a dangling
@@ -172,13 +243,14 @@ export fn parseAndStoreMessage(data: [*]u8, len: u32, conn_num: u32) void {
     const payload = msg.getData();
     switch (msg.getFlag()) {
         .HANDSHAKE => {
+            members_version +%= 1;
             const is_own = std.mem.eql(u8, msg.getTransmitter(), client_handler.app_name);
             if (is_own) {
                 // Own handshake response: clear + full rebuild, then resolve the JS promise.
                 var consumed = false;
                 client_handler.onHandshake(connection, msg, &consumed) catch |err| {
-                    consoleLog("failed to handle own handshake: {any}\n", .{err});
-                    throwError("failed to handle own handshake\n");
+                    setError("failed to handle own handshake: {any}\n", .{err});
+                    return err;
                 };
                 _storeMessage(payload.ptr, payload.len, uuid, false, @backingInt(msg.getDecoder()));
                 if (consumed) {
@@ -202,8 +274,12 @@ export fn parseAndStoreMessage(data: [*]u8, len: u32, conn_num: u32) void {
             // correct (already-updated) member list.
             var consumed = false;
             client_handler.onEvent(connection, msg, &consumed) catch {};
+            members_version +%= 1;
+            // Not consumed: unparseable, or about an older registration of a
+            // peer that has reconnected since.
+            if (!consumed) return;
             _triggerEvent(payload.ptr, payload.len);
-            if (consumed) {
+            {
                 // onEvent queued it for Python; nothing consumes that queue in
                 // wasm, so take it back out and free it.
                 owned = false;
@@ -216,13 +292,18 @@ export fn parseAndStoreMessage(data: [*]u8, len: u32, conn_num: u32) void {
 }
 
 /// Takes ownership of the name and token buffers.  A zero `token_len` means
-/// no `auth_token` (the token pointer is then not freed).
+/// no `auth_token` (the token pointer is then not freed).  Returns the
+/// connection number, or `no_conn` on failure.
 export fn initClient(data: [*]u8, len: u32, token: [*]u8, token_len: u32) usize {
     const app_name = data[0..len];
     defer allocator.free(app_name);
     const auth_token: ?[]u8 = if (token_len > 0) token[0..token_len] else null;
     defer if (auth_token) |t| allocator.free(t);
-    return Client.init(allocator, app_name, .{}, auth_token) catch throwError("failed to initialize client\n");
+    members_version +%= 1;
+    return Client.init(allocator, app_name, .{}, auth_token) catch |err| {
+        setError("failed to initialize client: {any}\n", .{err});
+        return no_conn;
+    };
 }
 
 /// Release the client slot allocated by initClient.  Must be called on

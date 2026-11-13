@@ -88,8 +88,10 @@ def _silence_subprocess(runtime: str) -> None:
     logging.disable(logging.CRITICAL)
 
     import tests.conftest as _runtime_state
+
     _runtime_state.SELECTED_RUNTIME = runtime
     from daffi import dfcore
+
     dfcore.setRuntime(runtime)
 
 
@@ -157,7 +159,9 @@ def _proc_router(runtime: str, port: int) -> None:
     _silence_subprocess(runtime)
     from daffi import Router, TCPTransport
 
-    router = Router(app_name="conc-router", transport=TCPTransport(HOST, port), runtime=runtime)
+    router = Router(
+        app_name="conc-router", transport=TCPTransport(HOST, port), runtime=runtime
+    )
     router.start()
     router.join()
 
@@ -171,7 +175,8 @@ def _proc_worker(runtime: str, port: int, worker_id: int) -> None:
         return payload
 
     client = Client(
-        app_name=f"worker-{worker_id:03d}", transport=TCPTransport(HOST, port),
+        app_name=f"worker-{worker_id:03d}",
+        transport=TCPTransport(HOST, port),
         runtime=runtime,
     )
     client.connect()
@@ -194,7 +199,9 @@ def _proc_heavy_worker(runtime: str, port: int, n_threads: int) -> None:
         return payload
 
     client = Client(
-        app_name="heavy-worker", workers=n_threads, transport=TCPTransport(HOST, port),
+        app_name="heavy-worker",
+        workers=n_threads,
+        transport=TCPTransport(HOST, port),
         runtime=runtime,
     )
     client.connect()
@@ -217,7 +224,9 @@ def _proc_heavy_service(runtime: str, port: int, n_threads: int) -> None:
         return payload
 
     svc = Service(
-        app_name="heavy-service", workers=n_threads, transport=TCPTransport(HOST, port),
+        app_name="heavy-service",
+        workers=n_threads,
+        transport=TCPTransport(HOST, port),
         runtime=runtime,
     )
     svc.start()
@@ -257,7 +266,9 @@ def _stats(
 # 256-slot Zig clientEntries table starts fresh for every scenario.
 
 
-def _rpc_load_proc(runtime: str, port: int, n_clients: int, n_calls: int, q: "mp.Queue") -> None:
+def _rpc_load_proc(
+    runtime: str, port: int, n_clients: int, n_calls: int, q: "mp.Queue"
+) -> None:
     """RPC measurement subprocess for scenarios 1 & 2.
 
     Connects all clients sequentially (see _run_rpc_scenario docstring for
@@ -279,7 +290,8 @@ def _rpc_load_proc(runtime: str, port: int, n_clients: int, n_calls: int, q: "mp
         print(f"\r  Connecting clients… {i + 1}/{n_clients}", end="", flush=True)
         try:
             client = Client(
-                app_name=f"caller-{i:03d}", transport=TCPTransport(HOST, port),
+                app_name=f"caller-{i:03d}",
+                transport=TCPTransport(HOST, port),
                 runtime=runtime,
             )
             conn = client.connect()
@@ -363,8 +375,13 @@ def _rpc_load_proc(runtime: str, port: int, n_clients: int, n_calls: int, q: "mp
     )
 
 
-def _cast_load_proc(runtime: str, 
-    port: int, n_callers: int, n_casts: int, n_workers: int, result_file: str
+def _cast_load_proc(
+    runtime: str,
+    port: int,
+    n_callers: int,
+    n_casts: int,
+    n_workers: int,
+    result_file: str,
 ) -> None:
     """Cast broadcast measurement subprocess for scenario 3."""
     import threading, time, os, logging, json
@@ -389,7 +406,11 @@ def _cast_load_proc(runtime: str,
             flush=True,
         )
         try:
-            c = Client(app_name=f"caller-{i:03d}", transport=TCPTransport(HOST, port), runtime=runtime)
+            c = Client(
+                app_name=f"caller-{i:03d}",
+                transport=TCPTransport(HOST, port),
+                runtime=runtime,
+            )
             callers.append((c, c.connect()))
         except Exception as exc:
             connect_errors += 1
@@ -459,7 +480,9 @@ def _run_rpc_scenario(label: str, port: int, n_clients: int, n_calls: int) -> No
     """Launch the RPC load in its own subprocess and print results."""
     q: mp.Queue = mp.Queue()
     p = mp.Process(
-        target=_rpc_load_proc, args=(active_runtime(), port, n_clients, n_calls, q), daemon=True
+        target=_rpc_load_proc,
+        args=(active_runtime(), port, n_clients, n_calls, q),
+        daemon=True,
     )
     p.start()
     p.join()
@@ -483,7 +506,14 @@ def run_scenario_1() -> None:
     print(f"{'='*60}")
 
     port = _free_port()
-    svc_proc = mp.Process(target=_proc_service, args=(active_runtime(), port,), daemon=True)
+    svc_proc = mp.Process(
+        target=_proc_service,
+        args=(
+            active_runtime(),
+            port,
+        ),
+        daemon=True,
+    )
     svc_proc.start()
     try:
         _wait_for_port(port)
@@ -504,8 +534,17 @@ def run_scenario_2() -> None:
     print(f"{'='*60}")
 
     port = _free_port()
-    router_proc = mp.Process(target=_proc_router, args=(active_runtime(), port,), daemon=True)
-    worker_proc = mp.Process(target=_proc_worker, args=(active_runtime(), port, 0), daemon=True)
+    router_proc = mp.Process(
+        target=_proc_router,
+        args=(
+            active_runtime(),
+            port,
+        ),
+        daemon=True,
+    )
+    worker_proc = mp.Process(
+        target=_proc_worker, args=(active_runtime(), port, 0), daemon=True
+    )
     router_proc.start()
     try:
         _wait_for_port(port)
@@ -531,7 +570,14 @@ def run_scenario_3() -> None:
     print(f"{'='*60}")
 
     port = _free_port()
-    router_proc = mp.Process(target=_proc_router, args=(active_runtime(), port,), daemon=True)
+    router_proc = mp.Process(
+        target=_proc_router,
+        args=(
+            active_runtime(),
+            port,
+        ),
+        daemon=True,
+    )
     router_proc.start()
     worker_procs: list[mp.Process] = []
     try:
@@ -539,7 +585,9 @@ def run_scenario_3() -> None:
 
         print(f"  Starting {N_WORKERS} workers…", end="", flush=True)
         for i in range(N_WORKERS):
-            p = mp.Process(target=_proc_worker, args=(active_runtime(), port, i), daemon=True)
+            p = mp.Process(
+                target=_proc_worker, args=(active_runtime(), port, i), daemon=True
+            )
             p.start()
             worker_procs.append(p)
         print(" done")
@@ -555,7 +603,14 @@ def run_scenario_3() -> None:
         _os.close(result_fd)
         cast_proc = mp.Process(
             target=_cast_load_proc,
-            args=(active_runtime(), port, N_CALLERS, CASTS_PER_CALLER, N_WORKERS, result_path),
+            args=(
+                active_runtime(),
+                port,
+                N_CALLERS,
+                CASTS_PER_CALLER,
+                N_WORKERS,
+                result_path,
+            ),
             daemon=True,
         )
         cast_proc.start()
@@ -616,9 +671,18 @@ def run_scenario_4() -> None:
     print(f"{'='*70}")
 
     port = _free_port()
-    router_proc = mp.Process(target=_proc_router, args=(active_runtime(), port,), daemon=True)
+    router_proc = mp.Process(
+        target=_proc_router,
+        args=(
+            active_runtime(),
+            port,
+        ),
+        daemon=True,
+    )
     worker_proc = mp.Process(
-        target=_proc_heavy_worker, args=(active_runtime(), port, HEAVY_WORKERS), daemon=True
+        target=_proc_heavy_worker,
+        args=(active_runtime(), port, HEAVY_WORKERS),
+        daemon=True,
     )
     router_proc.start()
     try:
@@ -648,7 +712,9 @@ def run_scenario_5() -> None:
 
     port = _free_port()
     svc_proc = mp.Process(
-        target=_proc_heavy_service, args=(active_runtime(), port, HEAVY_WORKERS), daemon=True
+        target=_proc_heavy_service,
+        args=(active_runtime(), port, HEAVY_WORKERS),
+        daemon=True,
     )
     svc_proc.start()
     try:
@@ -680,8 +746,8 @@ def _sample_rss_kb(pid: int) -> Optional[int]:
     return None
 
 
-def _proc_leak_loader(runtime: str, 
-    port: int, n_callers: int, duration_s: float, q: "mp.Queue"
+def _proc_leak_loader(
+    runtime: str, port: int, n_callers: int, duration_s: float, q: "mp.Queue"
 ) -> None:
     """Continuous RPC load for the leak/resource scenario (scenario 6).
 
@@ -702,7 +768,8 @@ def _proc_leak_loader(runtime: str,
     for i in range(n_callers):
         try:
             client = Client(
-                app_name=f"leak-{i:03d}", transport=TCPTransport(HOST, port),
+                app_name=f"leak-{i:03d}",
+                transport=TCPTransport(HOST, port),
                 runtime=runtime,
             )
             conn = client.connect()
@@ -807,9 +874,18 @@ def run_scenario_leak(
     print(f"{'='*70}", flush=True)
 
     port = _free_port()
-    router_proc = mp.Process(target=_proc_router, args=(active_runtime(), port,), daemon=True)
+    router_proc = mp.Process(
+        target=_proc_router,
+        args=(
+            active_runtime(),
+            port,
+        ),
+        daemon=True,
+    )
     worker_proc = mp.Process(
-        target=_proc_heavy_worker, args=(active_runtime(), port, LEAK_WORKERS), daemon=True
+        target=_proc_heavy_worker,
+        args=(active_runtime(), port, LEAK_WORKERS),
+        daemon=True,
     )
     router_proc.start()
     try:
@@ -964,7 +1040,11 @@ def _wait_for_workers(port: int, n: int, timeout: float = 60) -> None:
     from daffi import Client, TCPTransport
     from daffi._bindings import get_available_members
 
-    probe = Client(app_name="probe-client", transport=TCPTransport(HOST, port), runtime=active_runtime())
+    probe = Client(
+        app_name="probe-client",
+        transport=TCPTransport(HOST, port),
+        runtime=active_runtime(),
+    )
     conn = probe.connect()  # noqa: F841 — just need the connection open
     conn_num = probe._conn_num
 

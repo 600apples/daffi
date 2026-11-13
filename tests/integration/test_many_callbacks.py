@@ -51,7 +51,9 @@ def _proc_service_many(runtime: str, port: int) -> None:
 
     registered = [callback(_make_cb(i)) for i in range(N_CALLBACKS)]  # noqa: F841
 
-    svc = Service(app_name="many-cb-svc", transport=TCPTransport(HOST, port), runtime=runtime)
+    svc = Service(
+        app_name="many-cb-svc", transport=TCPTransport(HOST, port), runtime=runtime
+    )
     svc.start()
     svc.join()
 
@@ -81,7 +83,9 @@ def _proc_service_args(runtime: str, port: int) -> None:
         return sum(items)
 
     svc = Service(
-        app_name="args-cb-svc", workers=8, transport=TCPTransport(HOST, port),
+        app_name="args-cb-svc",
+        workers=8,
+        transport=TCPTransport(HOST, port),
         runtime=runtime,
     )
     svc.start()
@@ -93,7 +97,14 @@ def _proc_service_args(runtime: str, port: int) -> None:
 
 @pytest.fixture
 def many_cb_service(free_port):
-    proc = mp.Process(target=_proc_service_many, args=(active_runtime(), free_port,), daemon=True)
+    proc = mp.Process(
+        target=_proc_service_many,
+        args=(
+            active_runtime(),
+            free_port,
+        ),
+        daemon=True,
+    )
     proc.start()
     wait_for_port(free_port)
     wait_for_members(free_port, {"many-cb-svc"})
@@ -103,7 +114,14 @@ def many_cb_service(free_port):
 
 @pytest.fixture
 def args_cb_service(free_port):
-    proc = mp.Process(target=_proc_service_args, args=(active_runtime(), free_port,), daemon=True)
+    proc = mp.Process(
+        target=_proc_service_args,
+        args=(
+            active_runtime(),
+            free_port,
+        ),
+        daemon=True,
+    )
     proc.start()
     wait_for_port(free_port)
     wait_for_members(free_port, {"args-cb-svc"})
@@ -120,7 +138,9 @@ class TestManyNamedCallbacks:
     def _connect(self, port: int, name: str):
         from daffi import Client, TCPTransport
 
-        client = Client(app_name=name, transport=TCPTransport(HOST, port), runtime=active_runtime())
+        client = Client(
+            app_name=name, transport=TCPTransport(HOST, port), runtime=active_runtime()
+        )
         conn = client.connect()
         return client, conn
 
@@ -181,7 +201,8 @@ class TestManyNamedCallbacks:
             from daffi import Client, TCPTransport
 
             client = Client(
-                app_name=f"mc-sep-{idx}", transport=TCPTransport(HOST, many_cb_service),
+                app_name=f"mc-sep-{idx}",
+                transport=TCPTransport(HOST, many_cb_service),
                 runtime=runtime,
             )
             conn = client.connect()
@@ -196,7 +217,14 @@ class TestManyNamedCallbacks:
                 client.stop()
 
         threads = [
-            threading.Thread(target=_task, args=(active_runtime(), i,)) for i in range(N_CALLBACKS)
+            threading.Thread(
+                target=_task,
+                args=(
+                    active_runtime(),
+                    i,
+                ),
+            )
+            for i in range(N_CALLBACKS)
         ]
         for t in threads:
             t.start()
@@ -231,7 +259,16 @@ class TestManyNamedCallbacks:
                 client.stop()
 
         n_threads = 8
-        threads = [threading.Thread(target=_task, args=(active_runtime(), j,)) for j in range(n_threads)]
+        threads = [
+            threading.Thread(
+                target=_task,
+                args=(
+                    active_runtime(),
+                    j,
+                ),
+            )
+            for j in range(n_threads)
+        ]
         for t in threads:
             t.start()
         for t in threads:
@@ -249,7 +286,9 @@ class TestCallbacksWithArguments:
     def _proxy(self, port: int, name: str):
         from daffi import Client, TCPTransport
 
-        client = Client(app_name=name, transport=TCPTransport(HOST, port), runtime=active_runtime())
+        client = Client(
+            app_name=name, transport=TCPTransport(HOST, port), runtime=active_runtime()
+        )
         conn = client.connect()
         return client, conn.rpc(timeout=TIMEOUT)
 
@@ -304,7 +343,16 @@ class TestCallbacksWithArguments:
             finally:
                 client.stop()
 
-        threads = [threading.Thread(target=_task, args=(active_runtime(), i,)) for i in range(20)]
+        threads = [
+            threading.Thread(
+                target=_task,
+                args=(
+                    active_runtime(),
+                    i,
+                ),
+            )
+            for i in range(20)
+        ]
         for t in threads:
             t.start()
         for t in threads:

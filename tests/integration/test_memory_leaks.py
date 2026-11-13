@@ -46,14 +46,12 @@ def _run_in_model(
     Spawned grandchildren read ``tests.conftest.SELECTED_RUNTIME``, so the prelude sets
     that before the scenario starts.
     """
-    prelude = textwrap.dedent(
-        f"""
+    prelude = textwrap.dedent(f"""
         import tests.conftest as _runtime_state
         from daffi import dfcore as _dfcore
         _runtime_state.SELECTED_RUNTIME = {model!r}
         _dfcore.setRuntime({model!r})
-        """
-    )
+        """)
     return subprocess.run(
         [sys.executable, "-c", prelude + "\n" + code],
         capture_output=True,

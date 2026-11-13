@@ -9,10 +9,7 @@ All notable changes to this project are documented in this file.
 - **Default wire format is MSGPACK.** `rpc()` / `cast()` (Python and the JS
   client) use MessagePack unless `serde=` is set. Pass
   `serde=SerdeFormat.PICKLE` (or JSON / OPAQUE) to choose another format.
-  `msgpack>=1.0` is a required dependency (`daffi[msgpack]` is gone). The JS
-  client embeds a MessagePack codec; no extra script is needed.
-- **Default `serdes=` accepts every format** (`SerdeFormat.ALL`). Pass
-  `serdes=SerdeFormat.SAFE` to refuse PICKLE on a node.
+  `msgpack>=1.0` is a required dependency (`daffi[msgpack]` is gone).
 - **WebSocket Origin is fail-closed.** An empty
   `TCPTransport.websocket_allowed_origins` refuses every upgrade. Set the
   property after construction to the pages that may connect, or set
@@ -91,17 +88,11 @@ All notable changes to this project are documented in this file.
   listening transport): the web pages that may open a WebSocket to it. Empty
   (the default) refuses every upgrade; `*` (set when `auth_token=` is given)
   allows any origin. Other upgrades are refused with 403.
-- `DAFFI_MAX_CONNECTIONS` (default 4096): a process-wide cap on accepted
-  connections. Further accepts are refused.
 - `callbacks=` on `Service`, `Client` and their async counterparts: the
   callbacks this node offers. Default: every registered callback.
 - `verify=` on `TCPTransport` and `UnixTransport` (see Breaking).
 - `rpc()` and `rpc_nowait()` accept a list of receivers and send to
   whichever of them is connected, taking turns.
-- `dfcore.missingMembers(conn_num, names)`: the names that are not
-  connected, read from the native membership.
-- `DAFFI_FRAME_STALL_MS` (default 30000): a connection whose half-received
-  message gets no further bytes for that long is closed.
 
 ### Changed
 
@@ -167,8 +158,60 @@ All notable changes to this project are documented in this file.
   every pending call on each wakeup.
 - Growing the open-file limit on macOS clamps to `kern.maxfilesperproc`
   when `setrlimit` refuses a value above it.
+- A WebSocket session that receives nothing for 30 s is pinged, and closed
+  with 1001 if the next 30 s bring nothing either. A WebSocket message that
+  stops arriving half-way is dropped like a stalled native frame, and
+  WebSocket messages share a 1 GiB process-wide budget.
+- A connection whose queued writes move less than 64 KiB in 30 s is closed.
+  At most an eighth of the pool threads drain queued writes at a time, so
+  slow readers cannot take the threads accepts and handshakes need.
+- TLS and WebSocket writes from the event loop go out directly instead of
+  through a pool thread; up to 16 queued writes are sent per `writev`.
+- WebSocket close frames carry the RFC 6455 status: 1002 for protocol
+  errors, 1007 for invalid UTF-8, 1009 for a message over the size limit.
+- asyncio: sync `on_member_added` / `on_member_removed` handlers run on a
+  worker thread (in arrival order), no longer on the event loop; use
+  `loop.call_soon_threadsafe` to touch asyncio objects from them. Replies
+  and sends go through a small executor of the node instead of the
+  default one; `cast()` sends to every peer in one executor hop.
+- JS client: a call while disconnected rejects with `Connection is closed`
+  (`cast_nowait()` / `stream_nowait()` throw). Cast receiver names match
+  exactly (`"w1"` no longer matches `"w10"`). `app.wasm` reports errors
+  through return codes, so it must ship with the matching `daffi.js`.
 
 ### Fixed
+
+- Router: a client re-sending its handshake while a request was routed to
+  it could crash the router (its method set was replaced while being
+  read). A re-handshake no longer re-announces the peer as `connected`.
+- A 9-byte header claiming a large message no longer reserves the whole
+  size from the process-wide frame budget; only the memory actually held
+  is charged. A few connections could stall every large message in the
+  process.
+- A late `disconnected` event of a peer's previous connection no longer
+  removes the peer after it has reconnected. Registrations carry a
+  generation; peers without one behave as before.
+- A request routed to a peer that disconnected in the meantime fails with
+  `ReceiverNotFound` instead of waiting out its timeout. Reply routes older
+  than 10 minutes are swept when the table fills up, and a disconnect only
+  touches that connection's routes.
+- A cluster of more than 1024 members no longer makes every new client's
+  handshake fail; a handshake reply that cannot be parsed fails the
+  connect at once instead of after 30 s.
+- Lifecycle events are capped per queue (65536).
+- A drain no longer switches the socket to blocking mode. A stuck TLS peer
+  could freeze the event loop, and a plain TCP write could block it.
+- No write raises SIGPIPE in a host that does not ignore it.
+- A TLS read that has to write first (TLS 1.3 KeyUpdate) waits for the
+  socket to be writable instead of spinning.
+- asyncio: pending calls fail with `Disconnected` when the node stops or
+  reconnects; a call without a timeout used to wait forever. `join()`
+  reconnects as documented.
+- JS client: a reply that arrives after its call timed out is dropped; it
+  could resolve a later call that reused the uuid. A socket that failed to
+  open or to handshake is closed and its handlers detached. Autoreconnect
+  works again after `stop()` and `connect()`. An event handler that throws
+  no longer skips the other handlers or leaks wasm memory.
 
 - One callback, serialization, send or event-handler error no longer stops
   the dispatcher for every connection in the process; the caller gets the
@@ -220,6 +263,33 @@ All notable changes to this project are documented in this file.
 - A client handler's method list and token are no longer leaked.
 - A peer name copied for the channel map is no longer leaked when the map
   cannot grow.
+- `cast()` and `wait_for_members()` called from a `workers=1` callback hand
+  polling to a new thread first, like `rpc()`. A cast to two or more peers
+  of the same process used to freeze every connection in the process, and
+  `wait_for_members()` never saw the peer arrive. `cast()` waits for the
+  replies one after another on the calling thread (each timeout still
+  starts at its send) instead of starting a thread per peer.
+- A `cast()` peer that left between the member lookup and the send is
+  reported in the result dict as a `TransmissionFailure`; the other peers
+  still get the call. It used to abort the whole cast.
+- `Client.join()` reconnects after a disconnect as documented. The
+  disconnect used to stop the client in the background, which ruled the
+  reconnect out (or tore the new connection down).
+- Ctrl+C raises `KeyboardInterrupt` again once every node is stopped, and
+  in a forked child; daffi used to swallow it for the rest of the process.
+  The original signal handlers are put back when the last node stops (on
+  the main thread) and in a forked child.
+- `on_member_added` / `on_member_removed` handlers run in arrival order on
+  one event thread per process. A thread used to be started per event, even
+  with no handler registered, so handlers could run out of order.
+- The member list cache no longer keeps a stale answer when a peer joins
+  or leaves while it is being read, or an entry for a closed connection.
+- `connect()` failing after the native connection was made (for example
+  out of file descriptors) closes it again, so `connect()` can be retried.
+- A new connection no longer waits, holding the dispatcher lock, for a
+  poller that is still running an abandoned callback.
+- `@alias` renames a callback in one step: a request in between no longer
+  finds it under neither name.
 
 
 ## 3.0.1

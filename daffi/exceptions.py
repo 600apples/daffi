@@ -2,7 +2,6 @@
 Application-level exceptions for daffi.
 """
 
-
 __all__ = [
     "DaffiError",
     "InitializationError",

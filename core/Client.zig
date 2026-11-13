@@ -516,6 +516,16 @@ pub fn hasMember(conn_num: usize, name: []const u8) !bool {
     return entry.client_handler.chan_mapper.hasChannel(name);
 }
 
+/// For each of `names`, whether a peer by that name is connected.
+pub fn hasMembers(conn_num: usize, names: []const []const u8, present: []bool) !void {
+    const entry = try ClientEntry.acquire(conn_num, .any);
+    defer entry.release();
+    const mapper = entry.client_handler.chan_mapper;
+    mapper.mutex.lock();
+    defer mapper.mutex.unlock();
+    for (names, present) |name, *p| p.* = mapper.channels.contains(name);
+}
+
 /// Install (or with -1, withdraw) the descriptor signalled when the task
 /// queue gets work.
 pub fn setRequestFd(conn_num: usize, fd: i32) !void {

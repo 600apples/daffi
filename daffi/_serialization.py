@@ -33,9 +33,9 @@ class SerdeFormat(IntEnum):
     PICKLE = 2
     """All positional and keyword arguments are pickled as a ``(args, kwargs)``
     tuple.  Callers pass ``serde=SerdeFormat.PICKLE``.  Accepted by default
-    (see :attr:`ALL`); pass ``serdes=SerdeFormat.SAFE`` to refuse it.
-    Unpickling runs code the sender chooses.  Always refused from WebSocket
-    peers."""
+    on ``serdes=``; unpickling runs code the sender chooses, so pass
+    :attr:`SAFE` (or any set without PICKLE) when peers are not all
+    trusted.  Always refused from WebSocket peers."""
 
     MSGPACK = 3
     """All positional and keyword arguments are msgpack-encoded as an

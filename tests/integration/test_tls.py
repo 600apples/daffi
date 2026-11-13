@@ -110,7 +110,9 @@ def _tls_service_without_cert(runtime: str, port: int, q) -> None:
 
 
 def _start(port, cert, key):
-    proc = mp.Process(target=_tls_service, args=(active_runtime(), port, cert, key), daemon=True)
+    proc = mp.Process(
+        target=_tls_service, args=(active_runtime(), port, cert, key), daemon=True
+    )
     proc.start()
     wait_for_port(port)
     return proc
@@ -160,7 +162,9 @@ def test_tls_without_ca_checks_the_system_trust_store(tls_service):
 
     _, port, _ = tls_service
     client = Client(
-        app_name="tls-no-ca", transport=TCPTransport(HOST, port, tls=True), runtime=active_runtime()
+        app_name="tls-no-ca",
+        transport=TCPTransport(HOST, port, tls=True),
+        runtime=active_runtime(),
     )
     with pytest.raises(InitializationError):
         client.connect()
@@ -320,7 +324,9 @@ def test_peer_silent_after_tls_handshake_is_dropped(tls_service):
 def test_server_tls_without_certificate_is_an_error(free_port):
     q = mp.Queue()
     proc = mp.Process(
-        target=_tls_service_without_cert, args=(active_runtime(), free_port, q), daemon=True
+        target=_tls_service_without_cert,
+        args=(active_runtime(), free_port, q),
+        daemon=True,
     )
     proc.start()
     try:
@@ -384,7 +390,10 @@ def _tls_unix_service(runtime: str, path: str, cert_pem: str, key_pem: str) -> N
         app_name="tls-unix-service",
         workers=2,
         transport=UnixTransport(
-            path, tls=True, cert=cert_pem, key=key_pem,
+            path,
+            tls=True,
+            cert=cert_pem,
+            key=key_pem,
         ),
         runtime=runtime,
     )
@@ -406,7 +415,9 @@ def test_tls_unix_socket_with_pem_material(certs):
     key_pem = open(key_path, encoding="utf-8").read()
     # pytest's tmp_path on a macOS runner is longer than sun_path (104 bytes),
     # so the listener would fail with NameTooLong and never create the file.
-    path = os.path.join("/tmp", f"dftls{os.getpid()}-{time.monotonic_ns() % 10**8}.sock")
+    path = os.path.join(
+        "/tmp", f"dftls{os.getpid()}-{time.monotonic_ns() % 10**8}.sock"
+    )
     assert len(path) < 100
     proc = mp.Process(
         target=_tls_unix_service,
@@ -451,7 +462,12 @@ def _mtls_service(runtime: str, port: int, cert: str, key: str) -> None:
         app_name="mtls-service",
         workers=2,
         transport=TCPTransport(
-            HOST, port, tls=True, cert=cert, key=key, ca=cert,
+            HOST,
+            port,
+            tls=True,
+            cert=cert,
+            key=key,
+            ca=cert,
         ),
         runtime=runtime,
     )
@@ -466,7 +482,9 @@ def test_mtls_requires_client_certificate(free_port, certs):
 
     cert, key = certs["good"]
     proc = mp.Process(
-        target=_mtls_service, args=(active_runtime(), free_port, cert, key), daemon=True,
+        target=_mtls_service,
+        args=(active_runtime(), free_port, cert, key),
+        daemon=True,
     )
     proc.start()
     try:
@@ -482,7 +500,12 @@ def test_mtls_requires_client_certificate(free_port, certs):
         ok = Client(
             app_name="mtls-with-client-cert",
             transport=TCPTransport(
-                HOST, free_port, tls=True, ca=cert, cert=cert, key=key,
+                HOST,
+                free_port,
+                tls=True,
+                ca=cert,
+                cert=cert,
+                key=key,
             ),
             runtime=active_runtime(),
         )

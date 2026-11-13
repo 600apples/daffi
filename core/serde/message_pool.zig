@@ -15,19 +15,21 @@ const print = std.debug.print;
 pub const RecvFreelist = @import("recv_freelist.zig").RecvFreelist;
 
 /// First allocation made for an incoming message body.  Only once the peer
-/// has actually sent that much is the buffer grown to the declared size, so a
-/// bare header cannot make us reserve up to 32 MiB.  A single jump (instead of
-/// doubling) matters: each realloc copies and faults in fresh pages, which
-/// cost ~30% throughput on multi-MiB messages.  Large allocations are backed
-/// lazily by the OS, so resident memory still follows the bytes received.
+/// has actually sent that much is the buffer grown, so a bare header cannot
+/// make us reserve (or charge the budget for) up to 32 MiB.
 const INITIAL_RECV_CHUNK: usize = 64 * 1024;
 
-/// Bytes past `INITIAL_RECV_CHUNK` that unfinished frames hold, summed over
-/// every connection in the process.  A frame that would take the sum past
-/// `max_partial_bytes` fails with `error.FrameBudgetExceeded`, which closes
-/// its connection: many peers that each start a large message and never
-/// finish it must not exhaust memory.  The first chunk of each frame is not
-/// counted, so small messages never touch the shared counter.
+/// Each growth multiplies the frame buffer by this much, up to the declared
+/// size: a peer must send 1/RECV_GROWTH of what it makes us hold.  Steps
+/// this large keep the reallocs (copies) of a multi-MiB message to a few.
+const RECV_GROWTH: usize = 8;
+
+/// Bytes past `INITIAL_RECV_CHUNK` that unfinished frames have allocated,
+/// summed over every connection in the process.  A frame that would take the
+/// sum past `max_partial_bytes` fails with `error.FrameBudgetExceeded`, which
+/// closes its connection: many peers that each start a large message and
+/// never finish it must not exhaust memory.  The first chunk of each frame is
+/// not counted, so small messages never touch the shared counter.
 pub var max_partial_bytes: usize = 1024 * 1024 * 1024;
 var partial_bytes: std.atomic.Value(usize) = .init(0);
 
@@ -189,12 +191,15 @@ pub const FrameDecoder = struct {
         return self.frame.len != 0 or self.header_filled != 0;
     }
 
-    fn chargeBudget(self: *FrameDecoder) !void {
-        try self.chargeBudgetFor(self.filled);
+    /// The frame buffer is full but the frame is not: grow it by one step,
+    /// charging the budget for the new size before allocating it.
+    fn grow(self: *FrameDecoder, total: usize) !void {
+        const new_len = @min(total, @max(self.frame.len, INITIAL_RECV_CHUNK / RECV_GROWTH) * RECV_GROWTH);
+        try self.chargeBudgetFor(new_len);
+        try self.reallocFrame(new_len);
     }
 
-    /// Charge the shared budget from the size we are about to hold
-    /// (allocated or filled), not only from bytes already copied.
+    /// Charge the shared budget for an allocation of `held` bytes.
     fn chargeBudgetFor(self: *FrameDecoder, held: usize) !void {
         if (held <= INITIAL_RECV_CHUNK) return;
         const want = held - INITIAL_RECV_CHUNK;
@@ -227,7 +232,6 @@ pub const FrameDecoder = struct {
 
             self.header = try Header.parse(&self.header_buf);
             const total: usize = @as(usize, serde.HEADER_SIZE) + self.header.msg_len;
-            try self.chargeBudgetFor(total);
             // Prefer a freelist class that already fits `total` so small RPCs
             // skip the INITIAL_RECV_CHUNK → realloc step.
             const want = if (self.freelist != null and RecvFreelist.classFor(total) != null)
@@ -244,16 +248,12 @@ pub const FrameDecoder = struct {
             if (input.len == 0) return null;
             // Grow when the allocation is exhausted but the frame is not done.
             // Freelist class capacity may exceed `total`; never copy past it.
-            if (self.frame.len < total and self.filled >= self.frame.len) {
-                try self.chargeBudgetFor(total);
-                try self.reallocFrame(total);
-            }
+            if (self.frame.len < total and self.filled >= self.frame.len) try self.grow(total);
             const room = @min(self.frame.len, total) - self.filled;
             const n = @min(input.len, room);
             @memcpy(self.frame[self.filled..][0..n], input.*[0..n]);
             self.filled += n;
             input.* = input.*[n..];
-            if (self.filled < total) try self.chargeBudget();
         }
 
         return try self.finish();
@@ -266,10 +266,7 @@ pub const FrameDecoder = struct {
         if (self.frame.len == 0) return null;
         const total: usize = @as(usize, serde.HEADER_SIZE) + self.header.msg_len;
         if (total - self.filled < min) return null;
-        if (self.frame.len < total and self.filled >= self.frame.len) {
-            try self.chargeBudgetFor(total);
-            try self.reallocFrame(total);
-        }
+        if (self.frame.len < total and self.filled >= self.frame.len) try self.grow(total);
         // Cap at both allocation and logical frame end (class capacity may exceed `total`).
         return self.frame[self.filled..@min(self.frame.len, total)];
     }
@@ -278,10 +275,7 @@ pub const FrameDecoder = struct {
     /// once its body is complete.
     pub fn commit(self: *FrameDecoder, n: usize) !?*Message {
         self.filled += n;
-        if (self.filled < @as(usize, serde.HEADER_SIZE) + self.header.msg_len) {
-            try self.chargeBudget();
-            return null;
-        }
+        if (self.filled < @as(usize, serde.HEADER_SIZE) + self.header.msg_len) return null;
         return try self.finish();
     }
 
@@ -411,6 +405,41 @@ test "FrameDecoder budget refuses a large frame and is returned on close" {
     try expect(msg.header.uuid == 3);
     try expect(!third.partial());
     try expect(partialBytes() == before);
+}
+
+test "FrameDecoder charges the budget only for what a frame has allocated" {
+    const allocator = std.testing.allocator;
+    const saved = max_partial_bytes;
+    defer max_partial_bytes = saved;
+    max_partial_bytes = 1024 * 1024;
+    const before = partialBytes();
+
+    // Headers claiming 32 MiB each: none of them costs budget.
+    var header: [serde.HEADER_SIZE]u8 = undefined;
+    (try Header.create(1, .REQUEST, .JSON, false, true, 32 * 1024 * 1024 - 1, 8)).toBytes(&header);
+    var idle: [64]FrameDecoder = undefined;
+    for (&idle) |*d| {
+        d.* = FrameDecoder.init(allocator);
+        var input: []const u8 = &header;
+        try expect((try d.next(&input)) == null);
+    }
+    defer for (&idle) |*d| d.deinit();
+    try expect(partialBytes() == before);
+
+    // Past the first chunk the buffer grows one step, and only that is charged.
+    const body = try allocator.alloc(u8, 2 * 1024 * 1024);
+    defer allocator.free(body);
+    @memset(body, '1');
+    const raw = try RawMessage.create(allocator, body, 3, .REQUEST, .JSON, false, true, "tx", "rx", "fn");
+    defer allocator.free(raw.data);
+    var decoder = FrameDecoder.init(allocator);
+    defer decoder.deinit();
+    var input: []const u8 = raw.data[0 .. INITIAL_RECV_CHUNK + 1];
+    try expect((try decoder.next(&input)) == null);
+    try std.testing.expectEqual(before + INITIAL_RECV_CHUNK * (RECV_GROWTH - 1), partialBytes());
+    // The next step would pass the 1 MiB budget.
+    input = raw.data[INITIAL_RECV_CHUNK + 1 .. INITIAL_RECV_CHUNK * RECV_GROWTH + 1];
+    try std.testing.expectError(error.FrameBudgetExceeded, decoder.next(&input));
 }
 
 test "FrameDecoder reassembles messages split at arbitrary points" {

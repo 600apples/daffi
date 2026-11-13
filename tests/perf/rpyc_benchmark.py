@@ -58,7 +58,9 @@ def _wait_for_port(port: int, timeout: float = 15.0) -> None:
                 return
         except OSError:
             time.sleep(0.05)
-    raise TimeoutError(f"Server on {HOST}:{port} did not become ready within {timeout}s")
+    raise TimeoutError(
+        f"Server on {HOST}:{port} did not become ready within {timeout}s"
+    )
 
 
 def _silence() -> None:
@@ -217,7 +219,9 @@ def _proc_daffi_service(runtime: str, port: int) -> None:
     def echo(payload):
         return payload
 
-    svc = Service(app_name="rpyc-cmp-svc", transport=TCPTransport(HOST, port), runtime=runtime)
+    svc = Service(
+        app_name="rpyc-cmp-svc", transport=TCPTransport(HOST, port), runtime=runtime
+    )
     svc.start()
     svc.join()
 
@@ -226,7 +230,9 @@ def _proc_daffi_router(runtime: str, port: int) -> None:
     _silence_daffi(runtime)
     from daffi import Router, TCPTransport
 
-    router = Router(app_name="rpyc-cmp-router", transport=TCPTransport(HOST, port), runtime=runtime)
+    router = Router(
+        app_name="rpyc-cmp-router", transport=TCPTransport(HOST, port), runtime=runtime
+    )
     router.start()
     router.join()
 
@@ -239,7 +245,9 @@ def _proc_daffi_worker(runtime: str, port: int) -> None:
     def echo(payload):
         return payload
 
-    client = Client(app_name="rpyc-cmp-worker", transport=TCPTransport(HOST, port), runtime=runtime)
+    client = Client(
+        app_name="rpyc-cmp-worker", transport=TCPTransport(HOST, port), runtime=runtime
+    )
     client.connect()
     try:
         while True:
@@ -255,7 +263,9 @@ def bench_daffi_direct(data: dict) -> list[float]:
     from daffi._serialization import SerdeFormat
 
     port = _free_port()
-    proc = mp.Process(target=_proc_daffi_service, args=(active_runtime(), port), daemon=True)
+    proc = mp.Process(
+        target=_proc_daffi_service, args=(active_runtime(), port), daemon=True
+    )
     proc.start()
     try:
         _wait_for_port(port)
@@ -280,8 +290,12 @@ def bench_daffi_via_router(data: dict) -> list[float]:
     from daffi._serialization import SerdeFormat
 
     port = _free_port()
-    router_proc = mp.Process(target=_proc_daffi_router, args=(active_runtime(), port), daemon=True)
-    worker_proc = mp.Process(target=_proc_daffi_worker, args=(active_runtime(), port), daemon=True)
+    router_proc = mp.Process(
+        target=_proc_daffi_router, args=(active_runtime(), port), daemon=True
+    )
+    worker_proc = mp.Process(
+        target=_proc_daffi_worker, args=(active_runtime(), port), daemon=True
+    )
     router_proc.start()
     try:
         _wait_for_port(port)
@@ -316,7 +330,9 @@ def main() -> None:
     payload_bytes = len(json.dumps(data).encode())
 
     print(f"\nRPyC {_rpyc.__version__} vs daffi  —  {N} sequential rpc calls")
-    print(f"host: {HOST}   warmup: {WARMUP}   payload: {_DATA_FILE.name} ({payload_bytes} bytes JSON)")
+    print(
+        f"host: {HOST}   warmup: {WARMUP}   payload: {_DATA_FILE.name} ({payload_bytes} bytes JSON)"
+    )
     print("daffi serde=MSGPACK (object RPC peer)\n")
 
     print("── Direct (Client → Server/Service) ─────────────────────")
@@ -333,7 +349,9 @@ def main() -> None:
 
     print("\n── Summary (calls/s) ───────────────────────────────────")
     print(f"  {'layout':<10}  {'RPyC':>10}  {'daffi':>10}  {'daffi vs RPyC':>14}")
-    print(f"  {'----------':<10}  {'----------':>10}  {'----------':>10}  {'--------------':>14}")
+    print(
+        f"  {'----------':<10}  {'----------':>10}  {'----------':>10}  {'--------------':>14}"
+    )
     print(
         f"  {'Direct':<10}  {rpyc_direct:>10.0f}  {daffi_direct:>10.0f}  "
         f"{daffi_direct / rpyc_direct:>13.2f}×"

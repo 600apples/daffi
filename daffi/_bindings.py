@@ -8,6 +8,7 @@ the rest of the Python code does not call ``dfcore.*`` directly.
 
 from __future__ import annotations
 
+import itertools
 import json
 import threading
 from . import dfcore
@@ -17,6 +18,11 @@ from typing import Union, Tuple
 from daffi._serialization import SerdeFormat
 
 _members_cache: dict[int, list] = {}
+# conn_num -> stamp of the native read in flight on a cache miss.  An
+# invalidation removes it, so a read that raced one is not stored.  Stamps
+# never repeat, and handles are never reused, so nothing outlives a release.
+_members_reads: dict[int, int] = {}
+_members_stamps = itertools.count(1)
 _members_lock = threading.Lock()
 
 
@@ -25,8 +31,10 @@ def invalidate_members(conn_num: int | None = None) -> None:
     with _members_lock:
         if conn_num is None:
             _members_cache.clear()
+            _members_reads.clear()
         else:
             _members_cache.pop(conn_num, None)
+            _members_reads.pop(conn_num, None)
 
 
 class MessageFlag(IntEnum):
@@ -60,7 +68,7 @@ def send_message_from_client(
         data:          Serialised payload.  ``bytes`` and ``str`` are passed
                        to the native layer without a copy.
         flag:          Message type — one of :class:`MessageFlag`.
-        serde:         Serialisation format — one of :class:`~daffi.serialization.SerdeFormat`.
+        serde:         Serialisation format — one of :class:`~daffi._serialization.SerdeFormat`.
         receiver:      Target node name, or an empty string for any node.
         func_name:     Name of the remote callback to invoke.
         return_result: ``True`` if the caller expects a response message.
@@ -103,10 +111,16 @@ def get_available_members(conn_num: int) -> list:
         cached = _members_cache.get(conn_num)
         if cached is not None:
             return cached
+        stamp = _members_reads.setdefault(conn_num, next(_members_stamps))
     members_json = dfcore.getAvailableMembers(conn_num)
     members = json.loads(members_json)["members"] if members_json else []
     with _members_lock:
-        _members_cache[conn_num] = members
+        if _members_reads.get(conn_num) == stamp:
+            if members_json:
+                _members_cache[conn_num] = members
+            else:
+                # No answer: the handle is gone (or failed); keep nothing.
+                del _members_reads[conn_num]
     return members
 
 
@@ -168,6 +182,19 @@ def wait_message_from_client_store(
 def expire_message(uuid: int, conn_num: int) -> None:
     """Stop waiting for *uuid*: a response that arrives later is dropped."""
     dfcore.expireMessage(uuid, conn_num)
+
+
+def missing_members(conn_num: int, names) -> list:
+    """Names in *names* that are not currently connected for *conn_num*.
+
+    Args:
+        conn_num: Native connection handle.
+        names:    Iterable of peer ``app_name`` strings to check.
+
+    Returns:
+        A list of names that are missing (empty when every name is present).
+    """
+    return dfcore.missingMembers(conn_num, names)
 
 
 def set_request_fd(conn_num: int, fd: int, *, server_mode: bool) -> None:

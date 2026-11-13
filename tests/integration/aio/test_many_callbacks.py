@@ -42,7 +42,8 @@ def _proc_service_many(runtime: str, port: int) -> None:
         registered = [callback(_make_cb(i)) for i in range(N_CALLBACKS)]  # noqa: F841
 
         svc = AsyncService(
-            app_name="many-cb-aio-svc", transport=TCPTransport(HOST, port),
+            app_name="many-cb-aio-svc",
+            transport=TCPTransport(HOST, port),
             runtime=runtime,
         )
         await svc.start()
@@ -67,7 +68,8 @@ def _proc_service_args(runtime: str, port: int) -> None:
             return a * b
 
         svc = AsyncService(
-            app_name="many-args-aio-svc", transport=TCPTransport(HOST, port),
+            app_name="many-args-aio-svc",
+            transport=TCPTransport(HOST, port),
             runtime=runtime,
         )
         await svc.start()
@@ -78,7 +80,14 @@ def _proc_service_args(runtime: str, port: int) -> None:
 
 @pytest.fixture
 def many_cb_svc(free_port):
-    proc = mp.Process(target=_proc_service_many, args=(active_runtime(), free_port,), daemon=True)
+    proc = mp.Process(
+        target=_proc_service_many,
+        args=(
+            active_runtime(),
+            free_port,
+        ),
+        daemon=True,
+    )
     proc.start()
     wait_for_port(free_port)
     wait_for_members(free_port, {"many-cb-aio-svc"})
@@ -88,7 +97,14 @@ def many_cb_svc(free_port):
 
 @pytest.fixture
 def args_svc(free_port):
-    proc = mp.Process(target=_proc_service_args, args=(active_runtime(), free_port,), daemon=True)
+    proc = mp.Process(
+        target=_proc_service_args,
+        args=(
+            active_runtime(),
+            free_port,
+        ),
+        daemon=True,
+    )
     proc.start()
     wait_for_port(free_port)
     wait_for_members(free_port, {"many-args-aio-svc"})
@@ -104,7 +120,8 @@ class TestManyCallbacksAsync:
         from daffi import TCPTransport
 
         client = AsyncClient(
-            app_name="mcb-caller", transport=TCPTransport(HOST, many_cb_svc),
+            app_name="mcb-caller",
+            transport=TCPTransport(HOST, many_cb_svc),
             runtime=active_runtime(),
         )
         conn = await client.connect()
@@ -121,7 +138,8 @@ class TestManyCallbacksAsync:
         from daffi import TCPTransport
 
         client = AsyncClient(
-            app_name="mcb-concurrent", transport=TCPTransport(HOST, many_cb_svc),
+            app_name="mcb-concurrent",
+            transport=TCPTransport(HOST, many_cb_svc),
             runtime=active_runtime(),
         )
         conn = await client.connect()
@@ -141,7 +159,8 @@ class TestManyCallbacksAsync:
         from daffi import TCPTransport
 
         client = AsyncClient(
-            app_name="mcb-args", transport=TCPTransport(HOST, args_svc),
+            app_name="mcb-args",
+            transport=TCPTransport(HOST, args_svc),
             runtime=active_runtime(),
         )
         conn = await client.connect()
@@ -157,7 +176,8 @@ class TestManyCallbacksAsync:
         from daffi import TCPTransport
 
         client = AsyncClient(
-            app_name="mcb-mixed", transport=TCPTransport(HOST, args_svc),
+            app_name="mcb-mixed",
+            transport=TCPTransport(HOST, args_svc),
             runtime=active_runtime(),
         )
         conn = await client.connect()

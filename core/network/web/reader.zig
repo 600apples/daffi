@@ -1,8 +1,33 @@
 const std = @import("std");
 const buffer = @import("../web/buffer.zig");
 const framing = @import("../web/framing.zig");
+const misc = @import("../../misc.zig");
 const Fragmented = framing.Fragmented;
 const Allocator = std.mem.Allocator;
+
+/// Bytes that unfinished WebSocket messages hold beyond each session's
+/// static buffer, summed over the process.  A message that would take the
+/// sum past `max_partial_bytes` fails with `error.FrameBudgetExceeded`,
+/// which closes its session: many peers that each start a large message and
+/// never finish it must not exhaust memory.
+pub var max_partial_bytes: usize = 1024 * 1024 * 1024;
+var partial_bytes: std.atomic.Value(usize) = .init(0);
+
+pub fn partialBytes() usize {
+    return partial_bytes.load(.monotonic);
+}
+
+pub fn chargePartial(n: usize) !void {
+    const before = partial_bytes.fetchAdd(n, .monotonic);
+    if (before + n > max_partial_bytes) {
+        _ = partial_bytes.fetchSub(n, .monotonic);
+        return error.FrameBudgetExceeded;
+    }
+}
+
+pub fn releasePartial(n: usize) void {
+    if (n != 0) _ = partial_bytes.fetchSub(n, .monotonic);
+}
 
 pub const MessageType = enum {
     text,
@@ -53,6 +78,13 @@ pub const Reader = struct {
     // fragment), the state of the fragmented message is maintained here.)
     fragment: ?Fragmented,
 
+    // Share of the partial-message budget that `buf` holds.
+    charged: usize = 0,
+
+    // Monotonic ms since which the reader has waited, mid-message, for more
+    // bytes; 0 between messages.  Lets the server close a stalled session.
+    progress: ?*std.atomic.Value(i64) = null,
+
     pub fn init(buffer_size: usize, max_size: usize, bp: *buffer.Provider) !Reader {
         const static = try bp.static(buffer_size);
 
@@ -75,10 +107,21 @@ pub const Reader = struct {
 
         if (self.buf.type != .static) {
             self.bp.free(self.buf);
+            releasePartial(self.charged);
+            self.charged = 0;
         }
 
         // the reader owns static, when it goes, static goes
         self.bp.free(self.static);
+    }
+
+    fn noteProgress(self: *Reader, partial: bool) void {
+        const p = self.progress orelse return;
+        if (partial) {
+            p.store(misc.monotonicMs(), .monotonic);
+        } else if (p.load(.monotonic) != 0) {
+            p.store(0, .monotonic);
+        }
     }
 
     pub fn handled(self: *Reader) void {
@@ -89,6 +132,12 @@ pub const Reader = struct {
     }
 
     pub fn readMessage(self: *Reader, stream: anytype) !Message {
+        // Handling the message is not a stall.
+        defer self.noteProgress(false);
+        return self.readFrames(stream);
+    }
+
+    fn readFrames(self: *Reader, stream: anytype) !Message {
         // Our inner loop reads 1 websocket frame, which may not form a whole message
         // due to the fact that websocket has its own annoying fragmentation thing
         // going on.
@@ -219,6 +268,8 @@ pub const Reader = struct {
     fn prepareForNewMessage(self: *Reader) void {
         if (self.buf.type != .static) {
             self.bp.release(self.buf);
+            releasePartial(self.charged);
+            self.charged = 0;
             self.buf = self.static;
             self.len = 0;
             self.start = 0;
@@ -271,7 +322,10 @@ pub const Reader = struct {
                 self.start = 0;
                 pos = len;
             } else if (to_read <= self.max_size) {
+                try chargePartial(to_read);
+                errdefer releasePartial(to_read);
                 const new_buf = try self.bp.alloc(to_read);
+                self.charged = to_read;
                 if (len > 0) {
                     @memcpy(new_buf.data[0..len], buf[start .. start + len]);
                 }
@@ -298,6 +352,8 @@ pub const Reader = struct {
         // const buf_end = if (buf.len - need_pos > 20) buf.len else need_pos;
 
         while (pos < need_pos) {
+            // Mid-message once any byte of it is in, or a fragment is.
+            self.noteProgress(pos > self.start or self.fragment != null);
             const n = try stream.read(buf[pos..buf_end]);
             if (n == 0) {
                 return false;

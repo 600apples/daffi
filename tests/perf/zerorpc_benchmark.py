@@ -61,7 +61,9 @@ def _wait_for_port(port: int, timeout: float = 15.0) -> None:
                 return
         except OSError:
             time.sleep(0.05)
-    raise TimeoutError(f"Server on {HOST}:{port} did not become ready within {timeout}s")
+    raise TimeoutError(
+        f"Server on {HOST}:{port} did not become ready within {timeout}s"
+    )
 
 
 def _silence() -> None:
@@ -175,7 +177,9 @@ def _proc_daffi(runtime: str, port: int) -> None:
     def echo(payload):
         return payload
 
-    svc = Service(app_name="zrpc-cmp-svc", transport=TCPTransport(HOST, port), runtime=runtime)
+    svc = Service(
+        app_name="zrpc-cmp-svc", transport=TCPTransport(HOST, port), runtime=runtime
+    )
     svc.start()
     svc.join()
 
@@ -218,7 +222,9 @@ def main() -> None:
     ver = getattr(zerorpc, "__version__", "unknown")
 
     print(f"\nZeroRPC {ver} vs daffi  —  {N} sequential rpc calls")
-    print(f"host: {HOST}   warmup: {WARMUP}   payload: {_DATA_FILE.name} ({payload_bytes} bytes JSON)")
+    print(
+        f"host: {HOST}   warmup: {WARMUP}   payload: {_DATA_FILE.name} ({payload_bytes} bytes JSON)"
+    )
     print("layout: Direct; daffi serde=PICKLE (object RPC peer)\n")
 
     print("── ZeroRPC ──────────────────────────────────────────────")

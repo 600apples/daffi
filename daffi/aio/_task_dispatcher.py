@@ -27,6 +27,7 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import functools
+import inspect
 import json
 import os
 import queue
@@ -83,7 +84,9 @@ class _DaemonExecutor(concurrent.futures.Executor):
                 self._threads += spawn
         self._tasks.put((future, fn, args, kwargs))
         if spawn:
-            threading.Thread(target=self._work, name="daffi-aio-callback", daemon=True).start()
+            threading.Thread(
+                target=self._work, name="daffi-aio-callback", daemon=True
+            ).start()
         return future
 
     def _work(self) -> None:
@@ -163,8 +166,11 @@ class AsyncTaskDispatcher:
         )
 
         self._poller: asyncio.Task | None = None
-        # Background stop() calls started by lifecycle signals.
+        # Background tasks (stop() calls, INIT handshakes, event handlers)
+        # started by the poller; held here until done.
         self._stop_tasks: set[asyncio.Task] = set()
+        # Last event-handler task of each connection; the next one waits for it.
+        self._event_tails: dict[int | None, asyncio.Task] = {}
         # Request tasks still running, with the conn_num they answer.
         self._running: dict[asyncio.Task, int] = {}
         # Connections left with queued requests because every slot was taken.
@@ -211,10 +217,24 @@ class AsyncTaskDispatcher:
         exposed: "frozenset | None",
     ) -> None:
         try:
-            outcome = await _invoke_callback_async(func_name, serde, data, accepted, exposed)
+            outcome = await _invoke_callback_async(
+                func_name, serde, data, accepted, exposed
+            )
             # A connection stopped during the callback gets no reply.
-            if return_result and conn_num in self._conns:
-                _send_reply(server_mode, conn_num, uuid, transmitter, func_name, outcome, logger)
+            entry = self._conns.get(conn_num)
+            if return_result and entry is not None:
+                # The native send may block on a full socket buffer.
+                await asyncio.get_running_loop().run_in_executor(
+                    entry.conn._send_executor(),
+                    _send_reply,
+                    server_mode,
+                    conn_num,
+                    uuid,
+                    transmitter,
+                    func_name,
+                    outcome,
+                    logger,
+                )
         except Exception:
             logger.exception("Task execution failed")
 
@@ -408,7 +428,7 @@ class AsyncTaskDispatcher:
         from daffi.aio._rpc_proxy import AsyncResponseNotifier, AsyncRpcProxy
 
         if reason == LifecycleSignal.INIT:
-            asyncio.ensure_future(self._run_init_handshake(conn, conn_num))
+            self._keep(asyncio.ensure_future(self._run_init_handshake(conn, conn_num)))
             return
 
         if reason == LifecycleSignal.NORMAL:
@@ -424,51 +444,80 @@ class AsyncTaskDispatcher:
         conn._connection_error = err
         conn._disconnected = True
 
-        if conn._joining:
-            self._stop_in_background(conn)
-        else:
+        if not conn._joining:
             conn.logger.error(f"Error in connection {conn_num}: {err}")
+        elif evicted:
+            # The name belongs to a newer connection: nothing to reconnect.
+            self._stop_in_background(conn)
+        # Otherwise join() wakes on ``_disconnected`` and reconnects once;
+        # stop() would mark the client as stopped on purpose and prevent it.
 
     async def _run_init_handshake(self, conn: Any, conn_num: int) -> None:
         from daffi.aio._rpc_proxy import AsyncRpcProxy
 
         try:
             await asyncio.get_running_loop().run_in_executor(
-                None, AsyncRpcProxy._process_client_handshake, conn_num, conn._exposed_names()
+                None,
+                AsyncRpcProxy._process_client_handshake,
+                conn_num,
+                conn._exposed_names(),
             )
             conn._register_executors()
         except Exception:
             conn.logger.exception("INIT handshake failed")
 
     def _stop_in_background(self, conn: Any) -> None:
-        task = asyncio.ensure_future(conn.stop())
+        self._keep(asyncio.ensure_future(conn.stop()))
+
+    def _keep(self, task: asyncio.Task) -> None:
+        """Hold a strong reference until *task* is done; the loop keeps
+        only weak ones."""
         self._stop_tasks.add(task)
         task.add_done_callback(self._stop_tasks.discard)
 
-    @staticmethod
-    async def _dispatch_event(conn: Any, payload: dict) -> None:
+    async def _dispatch_event(self, conn: Any, payload: dict) -> None:
         """Route an EVENTS payload to the connection's typed handlers.
 
         Both sync and coroutine handlers are supported; one failing handler
-        does not stop the others.
+        does not stop the others.  Sync handlers run on a thread, like in
+        the sync dispatcher.  Events of one connection are handled in the
+        order they arrived.
         """
         event_type: str = payload["type"]
         member: str = payload["member"]
-        invalidate_members(getattr(conn, "_conn_num", None))
+        conn_num = getattr(conn, "_conn_num", None)
+        invalidate_members(conn_num)
         if event_type == EventType.CONNECTED:
             handlers = conn._on_member_added_handlers
         elif event_type == EventType.DISCONNECTED:
             handlers = conn._on_member_removed_handlers
         else:
             return
+        previous = self._event_tails.get(conn_num)
 
         async def _run():
-            for handler in handlers:
+            if previous is not None:
+                await asyncio.wait((previous,))
+            loop = asyncio.get_running_loop()
+            for handler in list(handlers):
                 try:
-                    result = handler(member)
+                    if inspect.iscoroutinefunction(handler):
+                        await handler(member)
+                        continue
+                    result = await loop.run_in_executor(
+                        _callback_executor, handler, member
+                    )
                     if asyncio.iscoroutine(result):
                         await result
                 except Exception:
                     conn.logger.exception(f"Event handler {handler!r} failed")
 
-        asyncio.ensure_future(_run())
+        task = asyncio.ensure_future(_run())
+        self._event_tails[conn_num] = task
+        self._keep(task)
+
+        def _forget(t: asyncio.Task) -> None:
+            if self._event_tails.get(conn_num) is t:
+                del self._event_tails[conn_num]
+
+        task.add_done_callback(_forget)

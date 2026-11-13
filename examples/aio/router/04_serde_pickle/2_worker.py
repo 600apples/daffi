@@ -5,12 +5,13 @@ Receives Task dataclass instances via PICKLE and returns TaskResult.
 The async callback can await I/O (e.g. a database write) without
 blocking the event loop.
 
+
 Start 1_router.py first, then this, then 3_caller.py.
 """
 
 import asyncio
 import os
-from daffi import callback, SerdeFormat, TCPTransport
+from daffi import callback, TCPTransport
 from daffi.aio import AsyncClient
 from models import Task, TaskResult
 

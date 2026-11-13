@@ -18,7 +18,6 @@ import pytest
 
 from .conftest import HOST, TIMEOUT
 
-
 # ── async helper ──────────────────────────────────────────────────────────────
 
 
@@ -28,7 +27,9 @@ async def _rpc(port: int, name: str, *args, serde=None, **kwargs):
     from daffi import SerdeFormat, TCPTransport
 
     serde = serde if serde is not None else SerdeFormat.DEFAULT
-    client = AsyncClient(app_name=name, transport=TCPTransport(HOST, port), runtime=active_runtime())
+    client = AsyncClient(
+        app_name=name, transport=TCPTransport(HOST, port), runtime=active_runtime()
+    )
     conn = await client.connect()
     try:
         proxy = conn.rpc(timeout=TIMEOUT, serde=serde)
@@ -133,7 +134,8 @@ class TestDirectRpcAsync:
         from daffi import TCPTransport
 
         client = AsyncClient(
-            app_name="t-repeated", transport=TCPTransport(HOST, direct_service),
+            app_name="t-repeated",
+            transport=TCPTransport(HOST, direct_service),
             runtime=active_runtime(),
         )
         conn = await client.connect()
@@ -200,7 +202,8 @@ class TestRouterRpcAsync:
         from daffi import TCPTransport
 
         client = AsyncClient(
-            app_name="r-repeated", transport=TCPTransport(HOST, router_with_worker),
+            app_name="r-repeated",
+            transport=TCPTransport(HOST, router_with_worker),
             runtime=active_runtime(),
         )
         conn = await client.connect()

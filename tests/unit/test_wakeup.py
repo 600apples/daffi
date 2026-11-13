@@ -6,8 +6,7 @@ import textwrap
 
 
 def test_wakeup_doubles_the_soft_nofile_limit():
-    script = textwrap.dedent(
-        """
+    script = textwrap.dedent("""
         import resource
         import sys
 
@@ -27,8 +26,7 @@ def test_wakeup_doubles_the_soft_nofile_limit():
         # so 64 doubles to 128 and then to 256. 80 + 100 fits in 256.
         if raised != 256 and not (hard < 256 and raised == hard):
             sys.exit(f"soft limit became {raised}, expected 256")
-        """
-    )
+        """)
     proc = subprocess.run(
         [sys.executable, "-c", script],
         capture_output=True,

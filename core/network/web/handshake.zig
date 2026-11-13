@@ -1,7 +1,6 @@
 const std = @import("std");
 const mem = std.mem;
 const ascii = std.ascii;
-const Mutex = @import("../../misc.zig").Mutex;
 const Allocator = std.mem.Allocator;
 
 pub const KeyValue = struct {
@@ -216,100 +215,3 @@ fn toLower(str: []u8) []u8 {
     }
     return str;
 }
-
-// This is what we're pooling
-const HandshakeState = struct {
-    // a buffer to read data into
-    buffer: []u8,
-
-    // Headers
-    headers: KeyValue,
-
-    fn init(allocator: Allocator, buffer_size: usize, max_headers: usize) !*HandshakeState {
-        const hs = try allocator.create(HandshakeState);
-        hs.* = .{
-            .buffer = try allocator.alloc(u8, buffer_size),
-            .headers = try KeyValue.init(allocator, max_headers),
-        };
-        return hs;
-    }
-
-    fn deinit(self: *HandshakeState, allocator: Allocator) void {
-        allocator.free(self.buffer);
-        self.headers.deinit(allocator);
-        allocator.destroy(self);
-    }
-
-    fn reset(self: *HandshakeState) void {
-        self.headers.reset();
-    }
-};
-
-pub const Pool = struct {
-    mutex: Mutex,
-    available: usize,
-    allocator: Allocator,
-    buffer_size: usize,
-    max_headers: usize,
-    states: []*HandshakeState,
-
-    pub fn init(allocator: Allocator, count: usize, buffer_size: usize, max_headers: usize) !*Pool {
-        const self = try allocator.create(Pool);
-        errdefer allocator.destroy(self);
-        const states = try allocator.alloc(*HandshakeState, count);
-        errdefer allocator.free(states);
-        for (0..count) |i| {
-            states[i] = try HandshakeState.init(allocator, buffer_size, max_headers);
-        }
-        self.* = .{
-            .mutex = Mutex{},
-            .states = states,
-            .allocator = allocator,
-            .available = count,
-            .max_headers = max_headers,
-            .buffer_size = buffer_size,
-        };
-        return self;
-    }
-
-    pub fn deinit(self: *Pool) void {
-        const allocator = self.allocator;
-        for (self.states) |s| {
-            s.deinit(allocator);
-        }
-        allocator.free(self.states);
-        allocator.destroy(self);
-    }
-
-    pub fn acquire(self: *Pool) !*HandshakeState {
-        const states = self.states;
-        self.mutex.lock();
-        const available = self.available;
-        if (available == 0) {
-            // dont hold the lock over factory
-            self.mutex.unlock();
-            return try HandshakeState.init(self.allocator, self.buffer_size, self.max_headers);
-        }
-        const index = available - 1;
-        const state = states[index];
-        self.available = index;
-        self.mutex.unlock();
-        return state;
-    }
-
-    pub fn release(self: *Pool, state: *HandshakeState) void {
-        state.reset();
-        var states = self.states;
-
-        self.mutex.lock();
-        const available = self.available;
-        if (available == states.len) {
-            self.mutex.unlock();
-            state.deinit(self.allocator);
-            return;
-        }
-        states[available] = state;
-        self.available = available + 1;
-        self.mutex.unlock();
-    }
-};

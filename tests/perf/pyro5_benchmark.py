@@ -58,7 +58,9 @@ def _wait_for_port(port: int, timeout: float = 15.0) -> None:
                 return
         except OSError:
             time.sleep(0.05)
-    raise TimeoutError(f"Server on {HOST}:{port} did not become ready within {timeout}s")
+    raise TimeoutError(
+        f"Server on {HOST}:{port} did not become ready within {timeout}s"
+    )
 
 
 def _silence() -> None:
@@ -151,7 +153,9 @@ def _proc_daffi(runtime: str, port: int) -> None:
     def echo(payload):
         return payload
 
-    svc = Service(app_name="pyro-cmp-svc", transport=TCPTransport(HOST, port), runtime=runtime)
+    svc = Service(
+        app_name="pyro-cmp-svc", transport=TCPTransport(HOST, port), runtime=runtime
+    )
     svc.start()
     svc.join()
 
@@ -193,7 +197,9 @@ def main() -> None:
     payload_bytes = len(json.dumps(data).encode())
 
     print(f"\nPyro5 {Pyro5.__version__} vs daffi  —  {N} sequential rpc calls")
-    print(f"host: {HOST}   warmup: {WARMUP}   payload: {_DATA_FILE.name} ({payload_bytes} bytes JSON)")
+    print(
+        f"host: {HOST}   warmup: {WARMUP}   payload: {_DATA_FILE.name} ({payload_bytes} bytes JSON)"
+    )
     print("layout: Direct (one TCP hop); daffi serde=PICKLE (object RPC peer)\n")
 
     print("── Pyro5 ────────────────────────────────────────────────")

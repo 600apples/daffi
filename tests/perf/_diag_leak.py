@@ -14,6 +14,7 @@ Log files:
     /tmp/dafi_worker.log   — worker process (Zig native log + faulthandler)
     /tmp/dafi_callers.log  — callers process (Zig native log)
 """
+
 import sys
 from pathlib import Path
 
@@ -67,7 +68,9 @@ def proc_router(runtime: str, port):
 
     from daffi import Router, TCPTransport
 
-    r = Router(app_name="diag-router", transport=TCPTransport(HOST, port), runtime=runtime)
+    r = Router(
+        app_name="diag-router", transport=TCPTransport(HOST, port), runtime=runtime
+    )
     r.start()
     r.join()
 
@@ -96,7 +99,9 @@ def proc_worker(runtime: str, port, n_workers):
 
     logging.info(f"worker starting  n_workers={n_workers}")
     c = Client(
-        app_name="diag-worker", workers=n_workers, transport=TCPTransport(HOST, port),
+        app_name="diag-worker",
+        workers=n_workers,
+        transport=TCPTransport(HOST, port),
         runtime=runtime,
     )
     c.connect()
@@ -131,7 +136,11 @@ def proc_callers(runtime: str, port, n_callers, delay_s):
     clients = []
     for i in range(n_callers):
         try:
-            cl = Client(app_name=f"dc-{i:03d}", transport=TCPTransport(HOST, port), runtime=runtime)
+            cl = Client(
+                app_name=f"dc-{i:03d}",
+                transport=TCPTransport(HOST, port),
+                runtime=runtime,
+            )
             clients.append((cl, cl.connect()))
         except Exception as e:
             if i < 5:
@@ -210,8 +219,17 @@ if __name__ == "__main__":
     )
 
     port = _free_port()
-    router = mp.Process(target=proc_router, args=(active_runtime(), port,), daemon=True)
-    worker = mp.Process(target=proc_worker, args=(active_runtime(), port, N_WORKERS), daemon=True)
+    router = mp.Process(
+        target=proc_router,
+        args=(
+            active_runtime(),
+            port,
+        ),
+        daemon=True,
+    )
+    worker = mp.Process(
+        target=proc_worker, args=(active_runtime(), port, N_WORKERS), daemon=True
+    )
 
     router.start()
     time.sleep(0.5)
@@ -219,7 +237,9 @@ if __name__ == "__main__":
     time.sleep(2.5)  # wait for worker to connect + handshake
 
     callers = mp.Process(
-        target=proc_callers, args=(active_runtime(), port, N_CALLERS, DELAY), daemon=True
+        target=proc_callers,
+        args=(active_runtime(), port, N_CALLERS, DELAY),
+        daemon=True,
     )
     callers.start()
 

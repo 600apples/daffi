@@ -92,8 +92,10 @@ def _silence_subprocess(runtime: str) -> None:
     logging.disable(logging.CRITICAL)
 
     import tests.conftest as _runtime_state
+
     _runtime_state.SELECTED_RUNTIME = runtime
     from daffi import dfcore
+
     dfcore.setRuntime(runtime)
 
 
@@ -168,7 +170,8 @@ def _proc_router(runtime: str, port: int) -> None:
         from daffi import TCPTransport
 
         router = AsyncRouter(
-            app_name="conc-router-aio", transport=TCPTransport(HOST, port),
+            app_name="conc-router-aio",
+            transport=TCPTransport(HOST, port),
             runtime=runtime,
         )
         await router.start()
@@ -189,7 +192,8 @@ def _proc_worker(runtime: str, port: int, worker_id: int) -> None:
             return payload
 
         client = AsyncClient(
-            app_name=f"worker-{worker_id:03d}", transport=TCPTransport(HOST, port),
+            app_name=f"worker-{worker_id:03d}",
+            transport=TCPTransport(HOST, port),
             runtime=runtime,
         )
         await client.connect()
@@ -276,10 +280,14 @@ def _stats(
 # Uses asyncio.gather so all N_CLIENTS callers run in a single event loop.
 
 
-def _rpc_load_proc(runtime: str, port: int, n_clients: int, n_calls: int, q: "mp.Queue") -> None:
+def _rpc_load_proc(
+    runtime: str, port: int, n_clients: int, n_calls: int, q: "mp.Queue"
+) -> None:
     """RPC measurement subprocess: all callers as asyncio Tasks."""
 
-    async def _run(runtime: str, ) -> dict:
+    async def _run(
+        runtime: str,
+    ) -> dict:
         import os as _os, logging as _log
 
         devnull = _os.open(_os.devnull, _os.O_WRONLY)
@@ -297,7 +305,8 @@ def _rpc_load_proc(runtime: str, port: int, n_clients: int, n_calls: int, q: "mp
             print(f"\r  Connecting clients… {i + 1}/{n_clients}", end="", flush=True)
             try:
                 client = AsyncClient(
-                    app_name=f"caller-{i:03d}", transport=TCPTransport(HOST, port),
+                    app_name=f"caller-{i:03d}",
+                    transport=TCPTransport(HOST, port),
                     runtime=runtime,
                 )
                 conn = await client.connect()
@@ -364,14 +373,20 @@ def _rpc_load_proc(runtime: str, port: int, n_clients: int, n_calls: int, q: "mp
             "n_errors": len(errors),
         }
 
-    result = asyncio.run(_run(runtime, ))
+    result = asyncio.run(
+        _run(
+            runtime,
+        )
+    )
     q.put(result)
 
 
 def _run_rpc_scenario(label: str, port: int, n_clients: int, n_calls: int) -> None:
     q: mp.Queue = mp.Queue()
     p = mp.Process(
-        target=_rpc_load_proc, args=(active_runtime(), port, n_clients, n_calls, q), daemon=True
+        target=_rpc_load_proc,
+        args=(active_runtime(), port, n_clients, n_calls, q),
+        daemon=True,
     )
     p.start()
     p.join()
@@ -387,12 +402,19 @@ def _run_rpc_scenario(label: str, port: int, n_clients: int, n_calls: int) -> No
 # ── cast load subprocess ───────────────────────────────────────────────────────
 
 
-def _cast_load_proc(runtime: str, 
-    port: int, n_callers: int, n_casts: int, n_workers: int, result_file: str
+def _cast_load_proc(
+    runtime: str,
+    port: int,
+    n_callers: int,
+    n_casts: int,
+    n_workers: int,
+    result_file: str,
 ) -> None:
     """Cast broadcast subprocess: all callers as asyncio Tasks."""
 
-    async def _run(runtime: str, ) -> dict:
+    async def _run(
+        runtime: str,
+    ) -> dict:
         import os as _os, logging as _log, json as _json
 
         devnull = _os.open(_os.devnull, _os.O_WRONLY)
@@ -412,7 +434,8 @@ def _cast_load_proc(runtime: str,
             )
             try:
                 c = AsyncClient(
-                    app_name=f"caller-{i:03d}", transport=TCPTransport(HOST, port),
+                    app_name=f"caller-{i:03d}",
+                    transport=TCPTransport(HOST, port),
                     runtime=runtime,
                 )
                 callers.append((c, await c.connect()))
@@ -461,7 +484,11 @@ def _cast_load_proc(runtime: str,
 
     import json
 
-    r = asyncio.run(_run(runtime, ))
+    r = asyncio.run(
+        _run(
+            runtime,
+        )
+    )
     with open(result_file, "w") as f:
         json.dump(r, f)
 
@@ -474,7 +501,11 @@ async def _wait_for_workers_async(port: int, n: int, timeout: float = 60) -> Non
     from daffi import TCPTransport
     from daffi._bindings import get_available_members
 
-    probe = AsyncClient(app_name="probe-aio", transport=TCPTransport(HOST, port), runtime=active_runtime())
+    probe = AsyncClient(
+        app_name="probe-aio",
+        transport=TCPTransport(HOST, port),
+        runtime=active_runtime(),
+    )
     await probe.connect()
     conn_num = probe._conn_num
 
@@ -502,7 +533,11 @@ def _wait_for_workers(port: int, n: int, timeout: float = 60) -> None:
     from daffi import Client, TCPTransport
     from daffi._bindings import get_available_members
 
-    probe = Client(app_name="probe-sync", transport=TCPTransport(HOST, port), runtime=active_runtime())
+    probe = Client(
+        app_name="probe-sync",
+        transport=TCPTransport(HOST, port),
+        runtime=active_runtime(),
+    )
     probe.connect()
     conn_num = probe._conn_num
     ready = 0
@@ -543,7 +578,14 @@ def run_scenario_1() -> None:
     print(f"{'='*70}")
 
     port = _free_port()
-    svc_proc = mp.Process(target=_proc_service, args=(active_runtime(), port,), daemon=True)
+    svc_proc = mp.Process(
+        target=_proc_service,
+        args=(
+            active_runtime(),
+            port,
+        ),
+        daemon=True,
+    )
     svc_proc.start()
     try:
         _wait_for_port(port)
@@ -564,8 +606,17 @@ def run_scenario_2() -> None:
     print(f"{'='*70}")
 
     port = _free_port()
-    router_proc = mp.Process(target=_proc_router, args=(active_runtime(), port,), daemon=True)
-    worker_proc = mp.Process(target=_proc_worker, args=(active_runtime(), port, 0), daemon=True)
+    router_proc = mp.Process(
+        target=_proc_router,
+        args=(
+            active_runtime(),
+            port,
+        ),
+        daemon=True,
+    )
+    worker_proc = mp.Process(
+        target=_proc_worker, args=(active_runtime(), port, 0), daemon=True
+    )
     router_proc.start()
     try:
         _wait_for_port(port)
@@ -594,7 +645,14 @@ def run_scenario_3() -> None:
     print(f"{'='*70}")
 
     port = _free_port()
-    router_proc = mp.Process(target=_proc_router, args=(active_runtime(), port,), daemon=True)
+    router_proc = mp.Process(
+        target=_proc_router,
+        args=(
+            active_runtime(),
+            port,
+        ),
+        daemon=True,
+    )
     router_proc.start()
     worker_procs: list[mp.Process] = []
     try:
@@ -602,7 +660,9 @@ def run_scenario_3() -> None:
 
         print(f"  Starting {N_WORKERS} async workers…", end="", flush=True)
         for i in range(N_WORKERS):
-            p = mp.Process(target=_proc_worker, args=(active_runtime(), port, i), daemon=True)
+            p = mp.Process(
+                target=_proc_worker, args=(active_runtime(), port, i), daemon=True
+            )
             p.start()
             worker_procs.append(p)
         print(" done")
@@ -617,7 +677,14 @@ def run_scenario_3() -> None:
         _os.close(result_fd)
         cast_proc = mp.Process(
             target=_cast_load_proc,
-            args=(active_runtime(), port, N_CALLERS, CASTS_PER_CALLER, N_WORKERS, result_path),
+            args=(
+                active_runtime(),
+                port,
+                N_CALLERS,
+                CASTS_PER_CALLER,
+                N_WORKERS,
+                result_path,
+            ),
             daemon=True,
         )
         cast_proc.start()
@@ -679,9 +746,18 @@ def run_scenario_4() -> None:
     print(f"{'='*70}")
 
     port = _free_port()
-    router_proc = mp.Process(target=_proc_router, args=(active_runtime(), port,), daemon=True)
+    router_proc = mp.Process(
+        target=_proc_router,
+        args=(
+            active_runtime(),
+            port,
+        ),
+        daemon=True,
+    )
     worker_proc = mp.Process(
-        target=_proc_heavy_worker, args=(active_runtime(), port, HEAVY_WORKERS), daemon=True
+        target=_proc_heavy_worker,
+        args=(active_runtime(), port, HEAVY_WORKERS),
+        daemon=True,
     )
     router_proc.start()
     try:
@@ -711,7 +787,9 @@ def run_scenario_5() -> None:
 
     port = _free_port()
     svc_proc = mp.Process(
-        target=_proc_heavy_service, args=(active_runtime(), port, HEAVY_WORKERS), daemon=True
+        target=_proc_heavy_service,
+        args=(active_runtime(), port, HEAVY_WORKERS),
+        daemon=True,
     )
     svc_proc.start()
     try:

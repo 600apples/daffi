@@ -38,7 +38,7 @@ def _proc_service_overflow(runtime: str, port: int) -> None:
     * ``fast_echo`` — returns immediately; used for no-wait calls.
     """
     silence_subprocess(runtime)
-    from daffi import Service, callback, TCPTransport
+    from daffi import SerdeFormat, Service, callback, TCPTransport
 
     _barrier = threading.Barrier(2)
 
@@ -52,8 +52,11 @@ def _proc_service_overflow(runtime: str, port: int) -> None:
         return payload
 
     svc = Service(
-        app_name="overflow-svc", workers=40, transport=TCPTransport(HOST, port),
+        app_name="overflow-svc",
+        workers=40,
+        transport=TCPTransport(HOST, port),
         runtime=runtime,
+        serdes=SerdeFormat.ALL,
     )
     svc.start()
     svc.join()
@@ -64,7 +67,14 @@ def _proc_service_overflow(runtime: str, port: int) -> None:
 
 @pytest.fixture
 def overflow_service(free_port):
-    proc = mp.Process(target=_proc_service_overflow, args=(active_runtime(), free_port,), daemon=True)
+    proc = mp.Process(
+        target=_proc_service_overflow,
+        args=(
+            active_runtime(),
+            free_port,
+        ),
+        daemon=True,
+    )
     proc.start()
     wait_for_port(free_port)
     time.sleep(0.2)
@@ -92,7 +102,8 @@ class TestStoreOverflow:
         from daffi._serialization import Serializer, SerdeFormat
 
         client = Client(
-            app_name="overflow-cli", transport=TCPTransport(HOST, overflow_service),
+            app_name="overflow-cli",
+            transport=TCPTransport(HOST, overflow_service),
             runtime=active_runtime(),
         )
         conn = client.connect()

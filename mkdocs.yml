@@ -1,4 +1,4 @@
-site_name: daffi
+site_name: Daffi
 site_url: https://600apples.github.io/daffi/
 site_dir: mkdocs_files
 extra_css:
@@ -34,17 +34,17 @@ nav:
   - Overview: index.md
   - Architecture: architecture.md
   - Getting Started: getting-started.md
-  - Python API:
-    - Client → Service: usage/service.md
-    - Client → Router → Worker: usage/router.md
-    - Call Styles — rpc vs cast: usage/call-styles.md
-    - Serialization: usage/serialization.md
-    - Events: usage/events.md
-    - Unix Sockets: usage/unix-sockets.md
-    - TLS: usage/tls.md
-    - Async Interface (daffi.aio): usage/aio.md
-    - Runtime (threads vs evented): usage/runtime.md
-  - JavaScript Client: js-client.md
+  - Documentation:
+      - Direct topology (Service): usage/service.md
+      - Router and workers: usage/router.md
+      - Communication patterns: usage/call-styles.md
+      - Serialization: usage/serialization.md
+      - Callbacks and concurrency: usage/callbacks.md
+      - Native runtime: usage/runtime.md
+      - Transports: usage/transports.md
+      - Event handlers: usage/events.md
+      - Security: usage/tls.md
+      - Async interface: usage/aio.md
 
 plugins:
   - search

@@ -73,8 +73,10 @@ def _silence(runtime: str) -> None:
     logging.disable(logging.CRITICAL)
 
     import tests.conftest as _runtime_state
+
     _runtime_state.SELECTED_RUNTIME = runtime
     from daffi import dfcore
+
     dfcore.setRuntime(runtime)
 
 
@@ -125,7 +127,9 @@ def _proc_service(runtime: str, port: int) -> None:
     def echo(payload: bytes) -> bytes:
         return payload
 
-    svc = Service(app_name="lat-service", transport=TCPTransport(HOST, port), runtime=runtime)
+    svc = Service(
+        app_name="lat-service", transport=TCPTransport(HOST, port), runtime=runtime
+    )
     svc.start()
     svc.join()
 
@@ -134,7 +138,9 @@ def _proc_router(runtime: str, port: int) -> None:
     _silence(runtime)
     from daffi import Router, TCPTransport
 
-    r = Router(app_name="lat-router", transport=TCPTransport(HOST, port), runtime=runtime)
+    r = Router(
+        app_name="lat-router", transport=TCPTransport(HOST, port), runtime=runtime
+    )
     r.start()
     r.join()
 
@@ -148,7 +154,9 @@ def _proc_worker(runtime: str, port: int) -> None:
     def echo(payload: bytes) -> bytes:
         return payload
 
-    c = Client(app_name="lat-worker", transport=TCPTransport(HOST, port), runtime=runtime)
+    c = Client(
+        app_name="lat-worker", transport=TCPTransport(HOST, port), runtime=runtime
+    )
     c.connect()
     try:
         while True:
@@ -203,14 +211,22 @@ def run_direct() -> dict[str, dict]:
     from daffi import Client, TCPTransport
 
     port = _free_port()
-    proc = mp.Process(target=_proc_service, args=(active_runtime(), port,), daemon=True)
+    proc = mp.Process(
+        target=_proc_service,
+        args=(
+            active_runtime(),
+            port,
+        ),
+        daemon=True,
+    )
     proc.start()
     results = {}
     try:
         _wait(port)
         time.sleep(0.15)
         client = Client(
-            app_name="lat-direct-caller", transport=TCPTransport(HOST, port),
+            app_name="lat-direct-caller",
+            transport=TCPTransport(HOST, port),
             runtime=active_runtime(),
         )
         conn = client.connect()
@@ -231,8 +247,22 @@ def run_router() -> dict[str, dict]:
     from daffi import Client, TCPTransport
 
     rport = _free_port()
-    rproc = mp.Process(target=_proc_router, args=(active_runtime(), rport,), daemon=True)
-    wproc = mp.Process(target=_proc_worker, args=(active_runtime(), rport,), daemon=True)
+    rproc = mp.Process(
+        target=_proc_router,
+        args=(
+            active_runtime(),
+            rport,
+        ),
+        daemon=True,
+    )
+    wproc = mp.Process(
+        target=_proc_worker,
+        args=(
+            active_runtime(),
+            rport,
+        ),
+        daemon=True,
+    )
     rproc.start()
     results = {}
     try:
@@ -240,7 +270,8 @@ def run_router() -> dict[str, dict]:
         wproc.start()
         time.sleep(0.5)
         client = Client(
-            app_name="lat-router-caller", transport=TCPTransport(HOST, rport),
+            app_name="lat-router-caller",
+            transport=TCPTransport(HOST, rport),
             runtime=active_runtime(),
         )
         conn = client.connect()

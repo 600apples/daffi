@@ -57,7 +57,9 @@ FRAGILE = "fragile"
 # ── subprocess targets ────────────────────────────────────────────────────────
 
 
-def _proc_fragile_service(runtime: str, port: int, workers: int, explode_on_join: bool) -> None:
+def _proc_fragile_service(
+    runtime: str, port: int, workers: int, explode_on_join: bool
+) -> None:
     """A Service whose callbacks (and, with *explode_on_join*, event handler)
     fail in every way the dispatcher used to die on."""
     silence_subprocess(runtime)
@@ -155,7 +157,9 @@ def _proc_pickle_injector(runtime: str, port: int, marker: str, flag_name: str) 
     def lookup(key):
         return key
 
-    svc = Service(app_name="injector", transport=TCPTransport(HOST, port), runtime=runtime)
+    svc = Service(
+        app_name="injector", transport=TCPTransport(HOST, port), runtime=runtime
+    )
     svc.start()
     svc.join()
 
@@ -172,7 +176,9 @@ def _proc_self_stopping_worker(runtime: str, port: int, workers: int, q) -> None
         holder["client"].stop()
 
     client = Client(
-        app_name="self-stopper", workers=workers, transport=TCPTransport(HOST, port),
+        app_name="self-stopper",
+        workers=workers,
+        transport=TCPTransport(HOST, port),
         runtime=runtime,
     )
     holder["client"] = client
@@ -189,7 +195,9 @@ def _proc_stalled_reader(runtime: str, port: int, calls: int, size: int, ready) 
     silence_subprocess(runtime)
     from daffi import Client, TCPTransport
 
-    client = Client(app_name="stalled-reader", transport=TCPTransport(HOST, port), runtime=runtime)
+    client = Client(
+        app_name="stalled-reader", transport=TCPTransport(HOST, port), runtime=runtime
+    )
     conn = client.connect()
     conn.wait_for_members(FRAGILE, timeout=10)
 
@@ -232,10 +240,18 @@ def _proc_high_descriptors(runtime: str, port: int, q) -> None:
         def add(a: int, b: int) -> int:
             return a + b
 
-        svc = Service(app_name="high-fd-service", transport=TCPTransport(HOST, port), runtime=runtime)
+        svc = Service(
+            app_name="high-fd-service",
+            transport=TCPTransport(HOST, port),
+            runtime=runtime,
+        )
         svc.start()
         try:
-            client = Client(app_name="high-fd-client", transport=TCPTransport(HOST, port), runtime=runtime)
+            client = Client(
+                app_name="high-fd-client",
+                transport=TCPTransport(HOST, port),
+                runtime=runtime,
+            )
             conn = client.connect()
             try:
                 conn.wait_for_members("high-fd-service", timeout=10)
@@ -246,7 +262,9 @@ def _proc_high_descriptors(runtime: str, port: int, q) -> None:
 
             async def _aio():
                 aclient = AsyncClient(
-                    app_name="high-fd-aio", transport=TCPTransport(HOST, port), runtime=runtime
+                    app_name="high-fd-aio",
+                    transport=TCPTransport(HOST, port),
+                    runtime=runtime,
                 )
                 aconn = await aclient.connect()
                 try:
@@ -278,7 +296,9 @@ def _proc_stop_while_sending(runtime: str, port: int, q) -> None:
     try:
         for round_ in range(5):
             client = Client(
-                app_name=f"stop-race-{round_}", transport=TCPTransport(HOST, port), runtime=runtime
+                app_name=f"stop-race-{round_}",
+                transport=TCPTransport(HOST, port),
+                runtime=runtime,
             )
             conn = client.connect()
             conn.wait_for_members(FRAGILE, timeout=10)
@@ -322,7 +342,9 @@ def _proc_stop_while_sending(runtime: str, port: int, q) -> None:
 # ── helpers ───────────────────────────────────────────────────────────────────
 
 
-def _start_fragile(port: int, workers: int, explode_on_join: bool = False) -> mp.Process:
+def _start_fragile(
+    port: int, workers: int, explode_on_join: bool = False
+) -> mp.Process:
     proc = mp.Process(
         target=_proc_fragile_service,
         args=(active_runtime(), port, workers, explode_on_join),
@@ -338,7 +360,9 @@ def _start_fragile(port: int, workers: int, explode_on_join: bool = False) -> mp
 def _client(port: int, name: str, *members: str):
     from daffi import Client, TCPTransport
 
-    client = Client(app_name=name, transport=TCPTransport(HOST, port), runtime=active_runtime())
+    client = Client(
+        app_name=name, transport=TCPTransport(HOST, port), runtime=active_runtime()
+    )
     conn = client.connect()
     try:
         if members:
@@ -404,7 +428,9 @@ def inline_service(free_port):
 
 @pytest.fixture
 def router_port(free_port):
-    proc = mp.Process(target=proc_router, args=(active_runtime(), free_port), daemon=True)
+    proc = mp.Process(
+        target=proc_router, args=(active_runtime(), free_port), daemon=True
+    )
     proc.start()
     wait_for_port(free_port)
     yield free_port
@@ -482,7 +508,11 @@ class TestDispatcherSurvivesFailures:
         from daffi import Client, TCPTransport
 
         port, _ = fragile_service
-        gone = Client(app_name="disp-gone", transport=TCPTransport(HOST, port), runtime=active_runtime())
+        gone = Client(
+            app_name="disp-gone",
+            transport=TCPTransport(HOST, port),
+            runtime=active_runtime(),
+        )
         gone_conn = gone.connect()
         gone_conn.wait_for_members(FRAGILE, timeout=10)
 
@@ -629,7 +659,11 @@ def test_concurrent_callers_are_woken_promptly(inline_service):
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX descriptors")
 def test_descriptors_above_1024(free_port):
     q = mp.Queue()
-    proc = mp.Process(target=_proc_high_descriptors, args=(active_runtime(), free_port, q), daemon=True)
+    proc = mp.Process(
+        target=_proc_high_descriptors,
+        args=(active_runtime(), free_port, q),
+        daemon=True,
+    )
     proc.start()
     try:
         result = q.get(timeout=120)
@@ -642,7 +676,11 @@ def test_reconnects_do_not_leak_descriptors(free_port):
     proc = _start_fragile(free_port, 1)
     from daffi import Client, TCPTransport
 
-    client = Client(app_name="reconnector", transport=TCPTransport(HOST, free_port), runtime=active_runtime())
+    client = Client(
+        app_name="reconnector",
+        transport=TCPTransport(HOST, free_port),
+        runtime=active_runtime(),
+    )
     conn = client.connect()
     try:
         conn.wait_for_members(FRAGILE, timeout=10)
@@ -650,7 +688,9 @@ def test_reconnects_do_not_leak_descriptors(free_port):
         for round_ in range(6):
             quiet_kill(proc)
             proc.close()
-            _wait_until(lambda: client._disconnected, 10, "the client to notice the disconnect")
+            _wait_until(
+                lambda: client._disconnected, 10, "the client to notice the disconnect"
+            )
             proc = _start_fragile(free_port, 1)
             assert conn.rpc(timeout=10).add(round_, 1) == round_ + 1
             if baseline is None:
@@ -668,11 +708,15 @@ def test_callback_registration_with_a_dead_client(inline_service):
     from daffi.registry._executor_registry import EXECUTOR_REGISTRY
 
     port, proc = inline_service
-    client = Client(app_name="orphan", transport=TCPTransport(HOST, port), runtime=active_runtime())
+    client = Client(
+        app_name="orphan", transport=TCPTransport(HOST, port), runtime=active_runtime()
+    )
     client.connect().wait_for_members(FRAGILE, timeout=10)
     try:
         quiet_kill(proc)
-        _wait_until(lambda: client._disconnected, 10, "the client to notice the disconnect")
+        _wait_until(
+            lambda: client._disconnected, 10, "the client to notice the disconnect"
+        )
 
         @callback
         def registered_after_server_died():
@@ -689,7 +733,9 @@ def test_callback_registration_with_a_dead_client(inline_service):
 def test_client_stop_while_threads_are_sending(inline_service):
     port, _ = inline_service
     q = mp.Queue()
-    proc = mp.Process(target=_proc_stop_while_sending, args=(active_runtime(), port, q), daemon=True)
+    proc = mp.Process(
+        target=_proc_stop_while_sending, args=(active_runtime(), port, q), daemon=True
+    )
     proc.start()
     try:
         result = q.get(timeout=120)
@@ -705,10 +751,16 @@ def test_client_stop_racing_server_shutdown(free_port):
     from daffi import Client, TCPTransport
 
     for round_ in range(3):
-        router = mp.Process(target=proc_router, args=(active_runtime(), free_port), daemon=True)
+        router = mp.Process(
+            target=proc_router, args=(active_runtime(), free_port), daemon=True
+        )
         router.start()
         wait_for_port(free_port)
-        client = Client(app_name=f"race-{round_}", transport=TCPTransport(HOST, free_port), runtime=active_runtime())
+        client = Client(
+            app_name=f"race-{round_}",
+            transport=TCPTransport(HOST, free_port),
+            runtime=active_runtime(),
+        )
         client.connect()
 
         joiner = threading.Thread(target=lambda: _swallow(client.join), daemon=True)
@@ -821,7 +873,9 @@ finally:
 
 def _service_script(port: int, setup: str = "") -> subprocess.Popen:
     """Start the script and return once ``start()`` has returned in it."""
-    proc = _run_script(_SERVICE_SCRIPT.format(runtime=active_runtime(), port=port, setup=setup))
+    proc = _run_script(
+        _SERVICE_SCRIPT.format(runtime=active_runtime(), port=port, setup=setup)
+    )
     line = proc.stdout.readline().strip()
     if line != "started":
         proc.kill()
@@ -866,7 +920,6 @@ print("survived", flush=True)
         code, output = _finish(_run_script(script))
         assert code == -signal.SIGTERM, output
         assert time.monotonic() - started < 3, output
-
 
     def test_user_handler_still_runs(self, free_port):
         setup = (
@@ -1075,19 +1128,27 @@ def test_evicted_client_does_not_take_its_name_back(free_port):
     from daffi import Client, TCPTransport
     from daffi.exceptions import Evicted
 
-    router = mp.Process(target=proc_router, args=(active_runtime(), free_port), daemon=True)
+    router = mp.Process(
+        target=proc_router, args=(active_runtime(), free_port), daemon=True
+    )
     router.start()
     worker = None
     try:
         wait_for_port(free_port)
         worker = mp.Process(
-            target=proc_worker, args=(active_runtime(), free_port, "evict-worker"), daemon=True
+            target=proc_worker,
+            args=(active_runtime(), free_port, "evict-worker"),
+            daemon=True,
         )
         worker.start()
         wait_for_members(free_port, {"evict-worker"})
 
         def _connect():
-            client = Client(app_name="contested", transport=TCPTransport(HOST, free_port), runtime=active_runtime())
+            client = Client(
+                app_name="contested",
+                transport=TCPTransport(HOST, free_port),
+                runtime=active_runtime(),
+            )
             conn = client.connect()
             conn.wait_for_members("evict-worker", timeout=10)
             return client, conn
@@ -1095,6 +1156,7 @@ def test_evicted_client_does_not_take_its_name_back(free_port):
         old, old_conn = _connect()
         new, new_conn = _connect()
         try:
+
             def _old_was_told() -> bool:
                 try:
                     old_conn.rpc(timeout=5).add(1, 1)

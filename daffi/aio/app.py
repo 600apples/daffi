@@ -1,12 +1,12 @@
 """
-Async application classes: Router, Service, and Client.
+Async application classes: AsyncRouter, AsyncService, and AsyncClient.
 
 Usage::
 
-    from daffi.aio import Client, Service, Router
+    from daffi.aio import AsyncClient, AsyncService, AsyncRouter
 
     async def main():
-        client = Client(app_name="caller", transport=TCPTransport("127.0.0.1", 6000))
+        client = AsyncClient(app_name="caller", transport=TCPTransport("127.0.0.1", 6000))
         conn = await client.connect()
 
         result = await conn.rpc(timeout=5).multiply(6, 7)
@@ -23,6 +23,7 @@ and the async lifecycle methods (``connect``, ``join``,
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 
 from .. import dfcore
 
@@ -34,6 +35,7 @@ from daffi.app import (
     SingleTransportMixin,
 )
 from daffi.exceptions import Evicted, InitializationError
+from daffi._bindings import invalidate_members
 from daffi._signals import SIGNAL_POLL_S
 from daffi._rpc_proxy import RpcProxy
 from daffi.transports import TCPTransport, UnixTransport
@@ -69,6 +71,27 @@ class AsyncApplication(Application):
         # The loop that started this application; signals schedule stop() on it.
         self._loop: asyncio.AbstractEventLoop | None = None
         self._stop_tasks: set[asyncio.Task] = set()
+        self._send_pool: concurrent.futures.ThreadPoolExecutor | None = None
+
+    # Native sends may block on a full socket buffer.  They get their own
+    # threads so that blocked sends never delay the handshake or stop(),
+    # which use the loop's default executor.
+    SEND_THREADS = 4
+
+    def _send_executor(self) -> concurrent.futures.ThreadPoolExecutor:
+        """The executor for outgoing messages; created on first use."""
+        pool = self._send_pool
+        if pool is None:
+            pool = self._send_pool = concurrent.futures.ThreadPoolExecutor(
+                max_workers=self.SEND_THREADS, thread_name_prefix="daffi-aio-send"
+            )
+        return pool
+
+    def _shutdown_send_executor(self) -> None:
+        """A send still blocked returns once the native connection closes."""
+        pool, self._send_pool = self._send_pool, None
+        if pool is not None:
+            pool.shutdown(wait=False)
 
     def _signal_stop(self) -> None:
         """Schedule ``stop()`` on the application's loop, from any thread."""
@@ -135,17 +158,23 @@ class AsyncServerMixin:
                 if not self._task_dispatcher:
                     self._task_dispatcher = AsyncTaskDispatcher(workers=self.workers)
             loop = asyncio.get_running_loop()
-            self._conn_num = await loop.run_in_executor(None, self._add_native_listeners)
+            self._conn_num = await loop.run_in_executor(
+                None, self._add_native_listeners
+            )
             self.logger.debug(
                 f"has been started successfully. connection info: {self.info}"
             )
             if self.server_mode == ServerMode.SERVICE:
                 self._task_dispatcher.start_for_connection(self)
-                RpcProxy._advertise_service_methods(self._conn_num, self._exposed_names())
+                RpcProxy._advertise_service_methods(
+                    self._conn_num, self._exposed_names()
+                )
             await loop.run_in_executor(None, dfcore.startServer, self._conn_num)
             self._register_executors()
             if self.server_mode == ServerMode.SERVICE:
-                RpcProxy._process_service_handshake(self._conn_num, self._exposed_names())
+                RpcProxy._process_service_handshake(
+                    self._conn_num, self._exposed_names()
+                )
         except BaseException:
             await self._abort_start()
             raise
@@ -158,8 +187,11 @@ class AsyncServerMixin:
                 await dispatcher.stop_for_connection(self)
         finally:
             if self._conn_num is not None:
-                dfcore.stopServer(self._conn_num)
-                self._conn_num = None
+                conn_num, self._conn_num = self._conn_num, None
+                await asyncio.get_running_loop().run_in_executor(
+                    None, dfcore.stopServer, conn_num
+                )
+            self._shutdown_send_executor()
             self._unregister_executor_subscriber()
 
     async def stop(self, *_, **__) -> None:
@@ -182,6 +214,7 @@ class AsyncServerMixin:
                         None, dfcore.stopServer, conn_num
                     )
             finally:
+                self._shutdown_send_executor()
                 self._stop_event.set()
 
 
@@ -196,7 +229,7 @@ class AsyncRouter(AsyncServerMixin, AsyncApplication[MultipleTransportMixin]):
     Example::
 
         async def main():
-            router = Router(transport=TCPTransport("127.0.0.1", 6000))
+            router = AsyncRouter(transport=TCPTransport("127.0.0.1", 6000))
             await router.start()
             await router.join()
     """
@@ -215,14 +248,14 @@ class AsyncService(AsyncServerMixin, AsyncApplication[MultipleTransportMixin]):
     Example::
 
         from daffi import callback, TCPTransport
-        from daffi.aio import Service
+        from daffi.aio import AsyncService
 
         @callback
         async def add(a: int, b: int) -> int:
             return a + b
 
         async def main():
-            svc = Service(transport=TCPTransport("127.0.0.1", 5000))
+            svc = AsyncService(transport=TCPTransport("127.0.0.1", 5000))
             await svc.start()
             await svc.join()
     """
@@ -241,7 +274,9 @@ class AsyncClient(AsyncApplication[SingleTransportMixin]):
     Example::
 
         async def main():
-            client = Client(app_name="caller", transport=TCPTransport("127.0.0.1", 6000))
+            client = AsyncClient(
+                app_name="caller", transport=TCPTransport("127.0.0.1", 6000)
+            )
             conn = await client.connect()
 
             result = await conn.rpc(timeout=5).multiply(6, 7)
@@ -308,18 +343,23 @@ class AsyncClient(AsyncApplication[SingleTransportMixin]):
         self._intentionally_stopped = True
         self._unregister_executor_subscriber()
         async with self._stop_lock:
-            await self._release_connection()
-            self._stop_event.set()
+            try:
+                await self._release_connection()
+            finally:
+                self._shutdown_send_executor()
+                self._stop_event.set()
 
     async def _release_connection(self) -> None:
         """Detach from the dispatcher and free the native connection.
 
-        Callers hold ``_stop_lock``.
+        Callers hold ``_stop_lock``.  Calls still waiting for a response
+        fail with :class:`~daffi.exceptions.Disconnected`.
         """
         if self._task_dispatcher:
             await self._task_dispatcher.stop_for_connection(self)
         if self._conn_num is not None:
             AsyncResponseNotifier.unregister(self._conn_num)
+            invalidate_members(self._conn_num)
             conn_num, self._conn_num = self._conn_num, None
             # Joins the native receiver thread; keep the loop running.
             await asyncio.get_running_loop().run_in_executor(
@@ -368,15 +408,18 @@ class AsyncClient(AsyncApplication[SingleTransportMixin]):
             # keeps that wait off the event loop.
             loop = asyncio.get_running_loop()
             handshake = await loop.run_in_executor(
-                None, AsyncRpcProxy._process_client_handshake, self._conn_num, self._exposed_names()
+                None,
+                AsyncRpcProxy._process_client_handshake,
+                self._conn_num,
+                self._exposed_names(),
             )
         except Exception as exc:
             AsyncResponseNotifier.unregister(self._conn_num)
+            conn_num, self._conn_num = self._conn_num, None
             try:
-                dfcore.stopClient(self._conn_num)
+                await loop.run_in_executor(None, dfcore.stopClient, conn_num)
             except Exception:
                 pass
-            self._conn_num = None
             raise InitializationError(
                 f"Failed to connect to the server: {exc}. connection info: {self.info}"
             ) from exc

@@ -180,7 +180,11 @@ def _websocket_origins(value: Iterable[str] | None) -> tuple[str, ...] | None:
         )
     origins = tuple(value)
     for origin in origins:
-        if not isinstance(origin, str) or not origin or any(c in origin for c in "\r\n\0"):
+        if (
+            not isinstance(origin, str)
+            or not origin
+            or any(c in origin for c in "\r\n\0")
+        ):
             raise InitializationError(
                 f"invalid origin in websocket_allowed_origins: {origin!r}"
             )

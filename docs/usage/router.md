@@ -1,6 +1,6 @@
-# Client → Router → Worker
+# Router and workers
 
-![Router topology](../images/router-topology.png)
+![Distributed communication](../images/distributed_worker_arch.png)
 
 The Router topology decouples callers from workers. The **Router** is a pure message forwarder; **Workers** register their callbacks with it; **Callers** invoke those callbacks through it.
 
@@ -24,28 +24,25 @@ if __name__ == "__main__":
 
 | Parameter | Type | Description |
 |---|---|---|
-| `transport` | transport or sequence | One `TCPTransport` or `UnixTransport`, or several. Every listener shares this router's membership. `start()` brings all of them up at once or none of them. TLS (`tls`, `cert`, `key`) is set on each `TCPTransport`. |
+| `transport` | transport or sequence | One `TCPTransport` or `UnixTransport`, or several. Every listener shares this router's membership. `start()` brings all of them up at once or none of them. TLS is set on each `TCPTransport`. |
 | `runtime` | `Runtime` | `THREADS` or `EVENTED` for this process. Omit for `threads`. One process, one choice. |
-| `auth_token` | `str` | Shared secret. Every peer must send the same token in its handshake (`auth_token=` on `Client`, `authToken` in the JS client); a peer without it is disconnected before it can call anything or take a name. Omit to accept any peer. |
+| `auth_token` | `str` | Shared secret. Every peer must send the same token in its handshake. A peer without it is disconnected before it can call anything. Omit to accept any peer. |
 
-Requests are only accepted from peers that have completed the handshake, under
-the name they registered; a request that names another peer as its sender is
-answered with `UnknownSender`. A reply is only accepted from the peer the
-request was routed to.
+Requests are only accepted from peers that have completed the handshake, under the name they registered. A request that names another peer as its sender is answered with `UnknownSender`. A reply is only accepted from the peer the request was routed to.
+
+To listen on TCP and Unix together (remote peers + co-located processes), pass a list of transports — see [Transports](transports.md).
 
 ---
 
 ## 2. Connect Workers
 
-Workers are **Clients** that expose `@callback` functions.  
-Start as many instances as you need — the Router load-balances across them.
+Workers are **Clients** that expose `@callback` functions. Start as many instances as you need — the Router load-balances across them.
 
 ```python
 from daffi import Client, callback, TCPTransport
 
 @callback
 def multiply(a: int, b: int) -> int:
-    print(f"[worker] multiply({a}, {b})")
     return a * b
 
 if __name__ == "__main__":
@@ -56,50 +53,23 @@ if __name__ == "__main__":
 ```
 
 !!! tip
-    Run two instances of this script in separate terminals.  
-    `rpc()` will round-robin between them; `cast()` will call both.
+    Run two instances of this script in separate terminals. `rpc()` will round-robin between them; `cast()` will call both.
 
-### Concurrent callbacks per worker node
-
-Each worker `Client` accepts the same `workers` parameter as `Service` — it
-controls how many callbacks a **single worker node** executes in parallel via
-a thread pool:
-
-| Parameter | Type | Default | Description |
-|---|---|---|---|
-| `workers` | `int` | `1` | Concurrency level for callback execution within this node. |
-
-**I/O-bound** callbacks (network, disk, database) — use a thread pool:
+Each worker `Client` accepts the same `workers` parameter as `Service` for in-process callback concurrency. For CPU-bound work, prefer multiple worker processes behind the Router rather than raising `workers` on one process — see [Callbacks and concurrency](callbacks.md).
 
 ```python
-# Each worker node handles up to 8 callbacks concurrently via threads.
-worker = Client(
-    app_name="io-worker",
-    workers=8,
-    transport=TCPTransport("127.0.0.1", 6001))
-worker.connect()
-worker.join()
-```
+import os
+from daffi import Client, TCPTransport
 
-**CPU-bound** callbacks (heavy computation, ML inference) — Python's GIL
-limits true CPU parallelism inside a single process.  Scale out by running
-**multiple worker nodes** behind the Router (one per CPU core) rather than
-increasing `workers` on a single node:
-
-```python
-from daffi import TCPTransport
-# Start N instances of this process — one per core.  The Router load-balances
-# RPCs across them so all cores run callbacks in parallel.
+# Start N instances — one per core. The Router load-balances across them.
 worker = Client(
     app_name=f"cpu-worker-{os.getpid()}",
     workers=1,
-    transport=TCPTransport("127.0.0.1", 6001))
+    transport=TCPTransport("127.0.0.1", 6001),
+)
 worker.connect()
 worker.join()
 ```
-
-See [Service → Concurrent callback execution](service.md#concurrent-callback-execution)
-for more on choosing a `workers` value.
 
 ---
 
@@ -116,11 +86,10 @@ if __name__ == "__main__":
 
     # Round-robin — any available worker handles this call.
     result = conn.rpc(timeout=5).multiply(6, 7)
-    print(f"multiply(6, 7) = {result}")   # → 42
+    print(f"multiply(6, 7) = {result}")  # → 42
 
     # Pin to a specific worker by name.
     result = conn.rpc(timeout=5, receiver="calc-worker").multiply(3, 3)
-    print(f"multiply(3, 3) [pinned] = {result}")   # → 9
 
     caller.stop()
 ```
@@ -129,9 +98,7 @@ if __name__ == "__main__":
 
 ## Bidirectional communication
 
-Because every Client can *both* expose callbacks and call remote ones,
-bidirectional communication is natural: two nodes connect to the same Router
-and call each other.
+Because every Client can both expose callbacks and call remote ones, bidirectional communication is natural: two nodes connect to the same Router and call each other.
 
 ```python
 # node_a.py
@@ -144,7 +111,6 @@ def hello_from_a(msg: str) -> str:
 node_a = Client(app_name="node-A", transport=TCPTransport("127.0.0.1", 6003))
 conn = node_a.connect()
 
-# Call node-B's callback
 reply = conn.rpc(timeout=5, receiver="node-B").hello_from_b("hi from A")
 print(reply)
 ```
@@ -166,69 +132,50 @@ node_b.join()
 
 ## cast() via Router
 
-`cast()` fans out to **every** worker that exposes the requested function and collects all results.
+`cast()` fans out to every worker that exposes the requested function and collects all results.
 
 ```python
 conn = caller.connect()
 
-# Call all workers — returns {"worker-1": result, "worker-2": result, ...}
 results = conn.cast(timeout=5).process("task-A")
-print(results)
+# → {"worker-1": result, "worker-2": result, ...}
 
-# Restrict broadcast to a subset of workers.
 results = conn.cast(timeout=5, receiver=["worker-1"]).process("task-B")
 
-# Fire-and-forget broadcast.
 conn.cast_nowait().process("task-C")
 ```
+
+See [Communication patterns](call-styles.md) for the full comparison of call styles.
 
 ---
 
 ## Waiting for members
 
-In a multi-worker environment the caller often starts before all workers are
-online.  Instead of adding `time.sleep()` calls or wrapping every RPC in a
-try/except retry loop, use `conn.wait_for_members()` to **block until the
-required peers appear** in the Router's member registry:
+In a multi-worker environment the caller often starts before all workers are online. Use `conn.wait_for_members()` to block until the required peers appear:
 
 ```python
 from daffi import Client, TCPTransport
 
-if __name__ == "__main__":
-    caller = Client(app_name="calc-caller", transport=TCPTransport("127.0.0.1", 6001))
-    conn = caller.connect()
+caller = Client(app_name="calc-caller", transport=TCPTransport("127.0.0.1", 6001))
+conn = caller.connect()
 
-    # Block until both workers have registered — start order doesn't matter.
-    conn.wait_for_members("worker-1", "worker-2")
+# Block until both workers have registered — start order doesn't matter.
+conn.wait_for_members("worker-1", "worker-2")
 
-    # Safe to call now — both peers are guaranteed to be online.
-    results = conn.cast(timeout=10).process("task")
-    print(results)
-
-    caller.stop()
+results = conn.cast(timeout=10).process("task")
+caller.stop()
 ```
 
-The method polls the native ChannelsMapper every `interval` seconds (default
-`1.0 s`) and returns as soon as all listed names appear.  An optional
-`timeout` parameter raises `TimeoutError` if the deadline is exceeded:
+An optional `timeout` raises `TimeoutError` if the deadline is exceeded:
 
 ```python
-from daffi import Client, TCPTransport
-
-conn = Client(app_name="caller", transport=TCPTransport("127.0.0.1", 6001)).connect()
-
-# Raise TimeoutError after 30 s if the worker hasn't joined yet.
 conn.wait_for_members("slow-worker", timeout=30)
-
-# Change the poll interval.
-conn.wait_for_members("worker-1", "worker-2", interval=0.5)
 ```
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `*members` | `str` | — | One or more peer names to wait for. |
-| `timeout` | `float \| None` | `None` | Max seconds to wait. `None` = wait forever. |
-| `interval` | `float` | `1.0` | Poll interval in seconds. |
+| `timeout` | `float \| None` | `None` | Max seconds to wait. `None` waits forever. |
 
 ---
 
@@ -239,10 +186,7 @@ conn.wait_for_members("worker-1", "worker-2", interval=0.5)
 | Basic rpc via router | `examples/router/01_rpc/` |
 | cast / cast_nowait via router | `examples/router/02_cast/` |
 | Bidirectional communication | `examples/router/03_bidirectional/` |
-| Pickle serde | `examples/router/04_serde_pickle/` |
-| JSON serde | `examples/router/05_serde_json/` |
-| OPAQUE serde | `examples/router/06_serde_opaque/` |
-| MSGPACK serde | `examples/router/07_serde_msgpack/` |
+| Serialization formats | `examples/router/04_serde_pickle/` … `07_serde_msgpack/` |
 | Events via router | `examples/router/08_events/` |
 | Waiting for members | `examples/router/09_wait_for_members/` |
 | TCP and Unix on one Router | `examples/router/10_multitransport/` |

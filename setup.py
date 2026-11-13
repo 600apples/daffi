@@ -148,9 +148,7 @@ def _zig_install_works(zig_exe: str) -> bool:
     if not os.path.isfile(std_zig):
         return False
     try:
-        proc = subprocess.run(
-            [zig_exe, "env"], capture_output=True, text=True
-        )
+        proc = subprocess.run([zig_exe, "env"], capture_output=True, text=True)
     except OSError:
         return False
     return proc.returncode == 0

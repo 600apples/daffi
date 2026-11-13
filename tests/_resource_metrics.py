@@ -130,8 +130,10 @@ def _silence(runtime: str) -> None:
     logging.disable(logging.CRITICAL)
 
     import tests.conftest as _runtime_state
+
     _runtime_state.SELECTED_RUNTIME = runtime
     from daffi import dfcore
+
     dfcore.setRuntime(runtime)
 
 
@@ -143,7 +145,9 @@ def proc_service(runtime: str, port: int) -> None:
     def echo(payload):
         return payload
 
-    svc = Service(app_name="res-service", transport=TCPTransport(HOST, port), runtime=runtime)
+    svc = Service(
+        app_name="res-service", transport=TCPTransport(HOST, port), runtime=runtime
+    )
     svc.start()
     svc.join()
 
@@ -152,7 +156,9 @@ def proc_router(runtime: str, port: int) -> None:
     _silence(runtime)
     from daffi import Router, TCPTransport
 
-    router = Router(app_name="res-router", transport=TCPTransport(HOST, port), runtime=runtime)
+    router = Router(
+        app_name="res-router", transport=TCPTransport(HOST, port), runtime=runtime
+    )
     router.start()
     router.join()
 
@@ -165,7 +171,9 @@ def proc_worker(runtime: str, port: int) -> None:
     def echo(payload):
         return payload
 
-    client = Client(app_name="res-worker", transport=TCPTransport(HOST, port), runtime=runtime)
+    client = Client(
+        app_name="res-worker", transport=TCPTransport(HOST, port), runtime=runtime
+    )
     client.connect()
     while True:
         time.sleep(1)
@@ -186,7 +194,11 @@ def _connect_clients(port: int, n: int, peer: str) -> tuple[list, list]:
 
     clients, conns = [], []
     for i in range(n):
-        client = Client(app_name=f"res-c{i}", transport=TCPTransport(HOST, port), runtime=active_runtime())
+        client = Client(
+            app_name=f"res-c{i}",
+            transport=TCPTransport(HOST, port),
+            runtime=active_runtime(),
+        )
         conn = client.connect()
         conn.wait_for_members(peer, timeout=15)
         clients.append(client)
@@ -253,7 +265,14 @@ def scenario_many_clients(
 ) -> ScenarioResult:
     """N clients → Service; measure the Service process."""
     port = free_port()
-    svc = mp.Process(target=proc_service, args=(active_runtime(), port,), daemon=True)
+    svc = mp.Process(
+        target=proc_service,
+        args=(
+            active_runtime(),
+            port,
+        ),
+        daemon=True,
+    )
     svc.start()
     try:
         wait_for_port(port)
@@ -289,8 +308,22 @@ def scenario_router(
 ) -> ScenarioResult:
     """N clients → Router → worker; measure the Router process."""
     port = free_port()
-    router = mp.Process(target=proc_router, args=(active_runtime(), port,), daemon=True)
-    worker = mp.Process(target=proc_worker, args=(active_runtime(), port,), daemon=True)
+    router = mp.Process(
+        target=proc_router,
+        args=(
+            active_runtime(),
+            port,
+        ),
+        daemon=True,
+    )
+    worker = mp.Process(
+        target=proc_worker,
+        args=(
+            active_runtime(),
+            port,
+        ),
+        daemon=True,
+    )
     router.start()
     try:
         wait_for_port(port)
@@ -328,7 +361,14 @@ def scenario_connection_churn(
     Used by the leak test: RSS must not climb every round.
     """
     port = free_port()
-    svc = mp.Process(target=proc_service, args=(active_runtime(), port,), daemon=True)
+    svc = mp.Process(
+        target=proc_service,
+        args=(
+            active_runtime(),
+            port,
+        ),
+        daemon=True,
+    )
     svc.start()
     samples: list[int] = []
     try:

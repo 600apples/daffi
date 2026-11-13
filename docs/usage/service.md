@@ -1,16 +1,13 @@
-# Client → Service
+# Direct topology (Service)
 
-![Service topology](../images/service-topology.png)
+![Direct communication](../images/direct_communication.png)
 
-The simplest daffi topology: a **Service** hosts `@callback` functions; **Clients** call them.
+The simplest Daffi topology: a **Service** hosts `@callback` functions; **Clients** call them.
 
 !!! note "Callbacks in the Service vs Router topology"
-    In this topology Clients are pure callers — they connect to the Service and issue RPC calls,
-    but do not expose their own callbacks.
+    In this topology Clients are typically pure callers — they connect to the Service and issue remote calls.
 
-    If you need Clients that *also* expose `@callback` functions (workers) or peers that call
-    each other, use the [Router topology](router.md) instead.  In that model every `Client`
-    can register callbacks and call other connected clients' callbacks through the Router.
+    If you need Clients that also expose `@callback` functions (workers) or peers that call each other, use the [Router topology](router.md) instead.
 
 ---
 
@@ -21,7 +18,6 @@ from daffi import Service, callback, TCPTransport
 
 @callback
 def add(a: int, b: int) -> int:
-    print(f"[service] add({a}, {b})")
     return a + b
 
 @callback
@@ -31,10 +27,11 @@ def greet(name: str) -> str:
 if __name__ == "__main__":
     svc = Service(
         app_name="calc-service",
-        transport=TCPTransport("127.0.0.1", 5001))
+        transport=TCPTransport("127.0.0.1", 5001),
+    )
     svc.start()
     print("Service running — press Ctrl+C to stop.")
-    svc.join()   # blocks until Ctrl+C
+    svc.join()
 ```
 
 ### `Service` parameters
@@ -42,64 +39,12 @@ if __name__ == "__main__":
 | Parameter | Type | Description |
 |---|---|---|
 | `app_name` | `str` | Unique name for this node. Auto-generated if omitted. |
-| `transport` | transport or sequence | One `TCPTransport` or `UnixTransport`, or several. Every listener shares this node's membership. `start()` brings all of them up at once or none of them. TLS (`tls`, `cert`, `key`) is set on each `TCPTransport`. |
-| `workers` | `int` | Concurrency level for callback execution. Default: `1` (inline). |
-| `runtime` | `Runtime` | `THREADS` or `EVENTED` for this process. Omit for `threads`. One process, one choice. |
+| `transport` | transport or sequence | One `TCPTransport` or `UnixTransport`, or several. Every listener shares this node's membership. `start()` brings all of them up at once or none of them. TLS is set on each `TCPTransport`. |
+| `workers` | `int` | Concurrency level for callback execution. Default: `1` (sequential). See [Callbacks and concurrency](callbacks.md). |
+| `runtime` | `Runtime` | `THREADS` or `EVENTED` for this process. Omit for `threads`. See [Native runtime](runtime.md). |
 | `auth_token` | `str` | Shared secret every client must send in its handshake. Omit to accept any client. |
-| `callbacks` | list | The `@callback` functions (or their names) this node offers. Default: every registered callback. A request for another one is answered with an error, as if it did not exist. |
-
-### Concurrent callback execution
-
-By default (`workers=1`) callbacks are executed **inline** — one at a time, in the
-poller thread.  A slow callback blocks every subsequent call until it finishes.
-
-#### Thread pool (`workers=N`)
-
-Set `workers=N` to process up to N callbacks in parallel using a **thread pool**.
-Good for I/O-bound callbacks — the threads release the GIL while waiting on
-network, disk, or database, so they genuinely run in parallel:
-
-```python
-import time
-from daffi import Service, callback, TCPTransport
-
-@callback
-def fetch_data(query: str) -> dict:
-    time.sleep(0.3)          # I/O-bound — sleeps while waiting for a DB / API
-    return {"result": query}
-
-# workers=1 (default): 10 concurrent callers finish in ~3 s total
-svc = Service( workers=1,transport=TCPTransport("127.0.0.1", 5000))
-
-# workers=10: 10 concurrent callers all finish in ~0.3 s
-svc = Service( workers=10,transport=TCPTransport("127.0.0.1", 5000))
-
-svc.start()
-svc.join()
-```
-
-The same `workers` parameter applies to a `Client` acting as a worker in the
-[Router topology](router.md):
-
-```python
-from daffi import Client, callback, TCPTransport
-
-@callback
-def process(task: str) -> str:
-    time.sleep(0.5)
-    return f"done: {task}"
-
-client = Client(app_name="worker-1", workers=8, transport=TCPTransport("127.0.0.1", 6000))
-client.connect()
-client.join()
-```
-
-!!! tip "Choosing the right value for `workers`"
-    | Callback type | Recommended setting |
-    |---|---|
-    | Fast / pure-Python | `workers=1` (default inline mode, zero overhead) |
-    | I/O-bound (network, disk, DB) | `workers=N` (thread pool) |
-    | CPU-bound (math, compression, ML inference) | Run multiple separate worker nodes behind a Router — Python's GIL limits true CPU parallelism within one process. |
+| `serdes` | `SerdeFormat` | Receiver-side deserialization policy. Default: `ALL`. Pass `SAFE` to refuse PICKLE. See [Serialization](serialization.md). |
+| `callbacks` | list | The `@callback` functions (or their names) this node offers. Default: every registered callback. |
 
 ---
 
@@ -112,11 +57,9 @@ if __name__ == "__main__":
     client = Client(app_name="calc-client", transport=TCPTransport("127.0.0.1", 5001))
     conn = client.connect()
 
-    # Blocking call — waits for the result.
     result = conn.rpc(timeout=5).add(3, 4)
-    print(f"add(3, 4) = {result}")          # → 7
+    print(f"add(3, 4) = {result}")  # → 7
 
-    # Fire-and-forget — returns immediately.
     conn.rpc_nowait().greet("world")
 
     client.stop()
@@ -128,70 +71,56 @@ if __name__ == "__main__":
 |---|---|---|
 | `app_name` | `str` | Unique name for this node. |
 | `transport` | `TCPTransport` or `UnixTransport` | The one address this client connects to. |
-| `runtime` | `Runtime` | `THREADS` or `EVENTED` for this process. A client uses the same runtime as the server. Omit for `threads`. |
+| `runtime` | `Runtime` | `THREADS` or `EVENTED` for this process. Omit for `threads`. |
 | `auth_token` | `str` | The token of a server started with `auth_token=`. |
+| `workers` | `int` | Concurrency for incoming callbacks when this Client acts as a worker. |
 | `callbacks` | list | For a client acting as a worker: the callbacks it offers. Default: every registered callback. |
-
-### `conn.rpc()`
-
-```python
-rpc = conn.rpc(timeout=5, receiver="calc-service")
-result = rpc.add(3, 4)
-```
-
-| Option | Type | Description |
-|---|---|---|
-| `timeout` | `float \| None` | Seconds to wait for a result before raising. `None` = wait forever. |
-| `receiver` | `str \| list[str] \| None` | Pin the call to a specific node by name, or to whichever of the listed nodes is connected (taking turns). In the Service topology there is only one Service so this is optional. |
-| `serde` | `SerdeFormat` | Serialisation format (default: `MSGPACK`). |
-
-### `conn.rpc_nowait()`
-
-```python
-conn.rpc_nowait().greet("world")
-```
-
-Same options as `rpc()` except `timeout` (ignored — no result is waited for).
+| `serdes` | `SerdeFormat` | Receiver-side deserialization policy. |
 
 ---
 
-## Callbacks in a class
+## Calling the Service
 
-Instead of decorating individual methods you can apply `@callback` to the **whole class**.  
-daffi will instantiate the class (calling `__init__` with no arguments) and register every public method as a remote callback.
+```python
+conn = client.connect()
 
-**Rules:**
+# Blocking call
+result = conn.rpc(timeout=5).add(3, 4)
 
-- Methods whose names start with `_` are **skipped automatically**.
-- Methods decorated with `@local` are **excluded** — they remain purely local.
-- All other public methods become callable by remote clients.
+# Fire-and-forget
+conn.rpc_nowait().greet("world")
+
+# Broadcast — one entry when only one Service is running
+results = conn.cast(timeout=5).add(1, 2)
+
+# Stream chunks (see Communication patterns)
+conn.stream(serde=SerdeFormat.OPAQUE).process_stream(chunk_source("large.bin"))
+```
+
+Full option tables for every call style: [Communication patterns](call-styles.md).
+
+---
+
+## Class callbacks
+
+Apply `@callback` to an entire class to export its public methods. Methods starting with `_` and methods marked `@local` are not exported.
 
 ```python
 from daffi import Service, callback, TCPTransport
 from daffi.registry import local
 
 
-@callback                          # ← decorate the class, not individual methods
+@callback
 class TextProcessor:
-    def __init__(self):
-        self._call_count = 0       # private — not exported
-
     def upper(self, text: str) -> str:
-        self._call_count += 1
         return text.upper()
 
     def reverse(self, text: str) -> str:
-        self._call_count += 1
         return text[::-1]
-
-    def word_count(self, text: str) -> int:
-        self._call_count += 1
-        return len(text.split())
 
     @local
     def reset(self):
-        """Not exported — only callable within this process."""
-        self._call_count = 0
+        pass
 
 
 if __name__ == "__main__":
@@ -200,82 +129,7 @@ if __name__ == "__main__":
     svc.join()
 ```
 
-The three public methods (`upper`, `reverse`, `word_count`) are registered as callbacks.  
-`_call_count` (private attribute) and `reset` (`@local`) are never exposed to callers.
-
-!!! tip
-    The class must be constructable with **no arguments** when decorated at class level.  
-    If you need to pass constructor arguments, initialise the object first and decorate its methods individually instead.
-
----
-
-## cast() with a Service
-
-`cast()` broadcasts to *all* nodes that expose the method and collects their results as a dict.  
-When only one Service is running the dict has exactly one entry.
-
-```python
-conn = client.connect()
-
-# Broadcast — returns {service_name: result}
-results = conn.cast(timeout=5).notify("hello")
-print(results)   # {"notify-service": "ack: hello"}
-
-# Fire-and-forget broadcast
-conn.cast_nowait().notify("ping")
-```
-
-See [Call Styles](call-styles.md) for a full comparison.
-
----
-
-## stream() / stream_nowait() — generator streaming
-
-Both methods iterate a generator and send each yielded value as a separate message to the remote callback (once per chunk, no results returned). They differ only in backpressure:
-
-- **`stream()`** — waits for an ack from the service before sending the next chunk. Safe default.
-- **`stream_nowait()`** — fire-and-forget per chunk. No ack, no backpressure. User controls rate.
-
-Both default to `SerdeFormat.OPAQUE` (raw bytes, zero serialisation overhead).
-
-**Service** — receives one chunk per invocation:
-
-```python
-from daffi import Service, callback, TCPTransport
-
-@callback
-def receive_chunk(data: bytes) -> None:
-    print(f"[service] received {len(data)} bytes: {data!r}")
-
-svc = Service(app_name="stream-service", transport=TCPTransport("127.0.0.1", 5010))
-svc.start(); svc.join()
-```
-
-**Client** — streams a generator:
-
-```python
-from daffi import Client, TCPTransport
-from daffi import SerdeFormat, TCPTransport
-
-def data_source():
-    for i in range(5):
-        yield f"chunk-{i}".encode()
-
-client = Client(app_name="stream-client", transport=TCPTransport("127.0.0.1", 5010))
-conn = client.connect()
-
-conn.stream(serde=SerdeFormat.OPAQUE).receive_chunk(data_source())        # blocking, safe
-conn.stream_nowait(serde=SerdeFormat.OPAQUE).receive_chunk(data_source())  # fire-and-forget
-client.stop()
-```
-
-### Options
-
-| Option | Type | Default | Description |
-|---|---|---|---|
-| `receiver` | `str \| None` | `None` | Pin to a specific worker by name. `None` picks one round-robin. |
-| `serde` | `SerdeFormat` | `OPAQUE` | Serialisation format for each chunk. |
-| `timeout` | `float \| None` | `None` | (`stream()` only) Seconds to wait per chunk ack. |
+See [Callbacks and concurrency](callbacks.md) for rules and `workers` guidance.
 
 ---
 
@@ -285,10 +139,7 @@ client.stop()
 |---|---|
 | Basic rpc | `examples/service/01_rpc/` |
 | Class-based callbacks | `examples/service/03_class_callbacks/` |
-| Pickle serde | `examples/service/04_serde_pickle/` |
-| JSON serde | `examples/service/05_serde_json/` |
-| OPAQUE serde | `examples/service/06_serde_opaque/` |
-| MSGPACK serde | `examples/service/07_serde_msgpack/` |
+| Serialization formats | `examples/service/04_serde_pickle/` … `07_serde_msgpack/` |
 | Unix socket | `examples/service/08_unix_socket/` |
 | Events | `examples/service/09_events/` |
 | Generator streaming | `examples/service/10_stream/` |
