@@ -21,7 +21,7 @@ jobs:
         os:
           - ubuntu-24.04        # Linux x86_64  (native)
           - ubuntu-24.04-arm    # Linux aarch64 (native — no QEMU)
-          - macos-14            # macOS arm64   (Apple Silicon)
+          - macos-15            # macOS arm64   (Apple Silicon)
 
     steps:
       - uses: actions/checkout@v4
