@@ -8,13 +8,14 @@ Linux / macOS only.
 
 Run 1_service.py first.
 """
-from daffi import Client
+
+from daffi import Client, UnixTransport
 
 SOCK = "/tmp/daffi_example.sock"
 
 
 if __name__ == "__main__":
-    client = Client(app_name="unix-client", unix_sock_path=SOCK)
+    client = Client(app_name="unix-client", transport=UnixTransport(SOCK))
     conn = client.connect()
 
     rpc = conn.rpc(timeout=5)

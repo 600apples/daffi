@@ -30,6 +30,24 @@ jobs:
         uses: pypa/cibuildwheel@v3.4.1
         env:
           CIBW_BUILD_VERBOSITY: 1
+          # Publish CPython 3.10–3.15 only. 3.9 and older are not built.
+          CIBW_BUILD: "cp310-* cp311-* cp312-* cp313-* cp314-* cp315-*"
+          CIBW_SKIP: "pp* *i686* cp36-* cp37-* cp38-* cp39-*"
+
+      # cibuildwheel silently skips build identifiers it does not know, so a
+      # too-old pin would drop the newest Python without any error.  Fail the
+      # job instead.
+      - name: Verify every supported CPython produced a wheel
+        shell: bash
+        run: |
+          set -e
+          for tag in cp310 cp311 cp312 cp313 cp314 cp315; do
+            if ! ls wheelhouse/*-${tag}-${tag}-*.whl >/dev/null 2>&1; then
+              echo "::error::no ${tag} wheel was built (is the cibuildwheel pin new enough for ${tag}?)"
+              exit 1
+            fi
+          done
+          ls -1 wheelhouse
 
       - name: Upload wheel artifacts
         uses: actions/upload-artifact@v4

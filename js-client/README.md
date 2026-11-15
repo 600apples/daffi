@@ -1,10 +1,12 @@
 # JavaScript Client
 
-![JS client](images/js-client.png)
+![JS client](js-client.png)
 
-daffi ships a browser JavaScript client (`daffi.js`) backed by a precompiled WebAssembly module (`app.wasm`) that speaks the native daffi wire protocol over WebSocket.
+Browser JavaScript client (`daffi.js`) backed by a precompiled WebAssembly module (`app.wasm`) that speaks the native daffi wire protocol over WebSocket.
 
-Both files live in `js-client/` of the repository and are also distributed via jsDelivr CDN.
+Both files live in this directory and are also distributed via jsDelivr CDN.
+
+This is an optional companion to the Python library. Python docs do not cover it — everything you need is here.
 
 ---
 
@@ -20,15 +22,12 @@ The Python side sees the browser as a regular daffi Client — no special config
 
 ## Loading from CDN
 
-`daffi.js` is hosted on [jsDelivr](https://www.jsdelivr.com/) automatically from the GitHub repository.  
+`daffi.js` is hosted on [jsDelivr](https://www.jsdelivr.com/) automatically from the GitHub repository.
 `app.wasm` is fetched automatically from the same CDN release — **you do not need to host or specify it yourself.**
 
 ```html
-<!-- daffi.js client library (pinned to release 2.0.0) -->
-<script src="https://cdn.jsdelivr.net/gh/600apples/daffi@2.0.0/js-client/daffi.js"></script>
-
-<!-- Optional: msgpack-lite (only needed for serde: "msgpack") -->
-<script src="https://unpkg.com/msgpack-lite/dist/msgpack.min.js"></script>
+<!-- daffi.js client library (pinned to release 4.0.0). MessagePack is built in. -->
+<script src="https://cdn.jsdelivr.net/gh/600apples/daffi@4.0.0/js-client/daffi.js"></script>
 ```
 
 ---
@@ -51,9 +50,9 @@ const client = new DaffiClient(options);
 | `options.wsUrl` | `string` | **required** | WebSocket URL of the Python backend. No default — must always be provided explicitly (e.g. `"ws://127.0.0.1:5000"`). |
 | `options.autoreconnect` | `boolean` | `false` | Reconnect automatically when the server drops the link. |
 | `options.reconnectDelay` | `number` (ms) | `2000` | Base delay before the first retry. Doubles after each failure, capped at 60 s. |
+| `options.authToken` | `string` | `""` | Token of a server started with `auth_token=`. Requires an explicit `name`. Anyone who can read the page can read it. |
 
-!!! note
-    `app.wasm` is loaded automatically from the CDN release that matches the `daffi.js` version — there is no `wasmPath` option.
+> **Note:** `app.wasm` is loaded automatically from the CDN release that matches the `daffi.js` version — there is no `wasmPath` option.
 
 ### `client.connect()` → `Promise<Connection>`
 
@@ -71,9 +70,14 @@ Close the connection permanently (no auto-reconnect, even if `autoreconnect` is 
 client.stop();
 ```
 
+Calls still waiting for a reply are rejected with `"Client stopped"`.
+Calling `connect()` again later turns `autoreconnect` back on.
+
 ### `client.addEventHandler(fn)`
 
 Subscribe to server-side events. The handler receives `{ type, member }`.
+An exception thrown by a handler is logged with `console.error`; the other
+handlers still run.
 
 ```javascript
 client.addEventHandler(event => {
@@ -82,6 +86,16 @@ client.addEventHandler(event => {
     // "disconnected" "worker-A"
 });
 ```
+
+### While disconnected
+
+Calls made while the connection is down fail at once with
+`Error("Connection is closed")`: the promise of `rpc()`, `cast()` and
+`stream()` rejects, while `stream_nowait()` and `cast_nowait()` throw.
+Calls already waiting when the connection drops are rejected with
+`"Connection closed unexpectedly"`.
+
+A reply that arrives after its call timed out is dropped.
 
 ---
 
@@ -100,7 +114,7 @@ const result = await conn.rpc({ timeout: 5000 }).add(3, 4);
 |---|---|---|--------------------------------------|
 | `receiver` | `string` | `""` | Pin to a specific worker name.       |
 | `timeout` | `number` (ms) | `null` | Reject if no reply within this time. |
-| `serde` | `"json"` \| `"msgpack"` \| `"raw"` | `"json"` | Serialisation format.                |
+| `serde` | `"json"` \| `"msgpack"` \| `"raw"` | `"msgpack"` | Serialisation format.                |
 
 ### `conn.rpc_nowait(options)` — one target, fire-and-forget
 
@@ -112,7 +126,7 @@ Same options as `rpc()` — `timeout` is ignored.
 
 ### `conn.cast(options)` — all workers, collect results
 
-Broadcasts to every connected worker that exposes the function.  
+Broadcasts to every connected worker that exposes the function.
 Returns a `Promise<{ workerName: result, … }>` dict — exactly like the Python `cast()`.
 
 ```javascript
@@ -122,9 +136,9 @@ const results = await conn.cast({ timeout: 5000 }).ping();
 
 | Option | Type | Default | Description                                   |
 |---|---|---|-----------------------------------------------|
-| `receiver` | `string \| string[]` | `null` | Restrict to these worker names. `null` = all. |
+| `receiver` | `string \| string[]` | `null` | Restrict to these worker names (exact match). `null` = all. |
 | `timeout` | `number` (ms) | `null` | Per-peer timeout.                             |
-| `serde` | `string` | `"json"` | Serialisation format.                         |
+| `serde` | `string` | `"msgpack"` | Serialisation format.                         |
 
 ### `conn.cast_nowait(options)` — all workers, fire-and-forget
 
@@ -191,12 +205,11 @@ await conn.waitForMembers(['worker-A', 'worker-B'], { timeout: 30000 });
 
 | `serde` value | Description |
 |---|---|
-| `"json"` \| `1` | JSON (default). Works with any JS-serialisable value. |
+| `"msgpack"` \| `3` | MessagePack (default). Built into `daffi.js`. |
+| `"json"` \| `1` | JSON. Works with any JS-serialisable value. |
 | `"raw"` \| `0` | OPAQUE. Pass a `Uint8Array` or string; receive raw bytes. |
-| `"msgpack"` \| `3` | Binary MessagePack. Requires `msgpack-lite` loaded before `daffi.js`. |
 
-!!! note
-    PICKLE (`2`) is Python-only and is not supported in the JS client.
+> **Note:** PICKLE (`2`) is Python-only and is not supported here.
 
 ---
 
@@ -232,10 +245,9 @@ auto-reconnect loop.
 
 ## Securing the connection
 
-Authentication and confidentiality are delegated to TLS — there is no
-application-level password. Run the Python backend with `tls=True`
-(plus `cert_file` / `key_file`) and connect from the browser using a
-`wss://` URL:
+Confidentiality is delegated to TLS. Run the Python backend with a TLS
+`TCPTransport` (`tls=True` plus `cert` / `key`) and connect from the
+browser using a `wss://` URL:
 
 ```javascript
 const client = new DaffiClient("my-app", { wsUrl: "wss://example.com:5000" });
@@ -245,19 +257,34 @@ const conn   = await client.connect();
 The browser will refuse the upgrade unless the server presents a
 certificate that chains to a CA the browser already trusts.
 
+Any web page the user opens can try to connect to a WebSocket on their
+machine. Limit which pages may connect by setting
+`websocket_allowed_origins` on the listening transport after construction;
+an upgrade from another `Origin`, or without one, is refused with 403.
+Native daffi clients don't use WebSocket and are not affected:
+
+```python
+transport = TCPTransport("0.0.0.0", 5000)
+transport.websocket_allowed_origins = ["https://app.example.com"]
+```
+
+A server started with `auth_token=` also needs the token from the page
+(`authToken` option). It only keeps out clients that don't have it: anyone
+who can load the page can read it.
+
 ---
 
 ## Examples
 
 | Example | Directory | Description |
 |---|---|---|
-| Service — JSON | `js-client/examples/01_service_json/` | Browser calls a Python Service with JSON. |
-| Service — MSGPACK | `js-client/examples/02_service_msgpack/` | Same, using binary MSGPACK. |
-| Router — JSON | `js-client/examples/03_router_json/` | Browser → Router → Python worker (JSON). |
-| Router — MSGPACK | `js-client/examples/04_router_msgpack/` | Same, using binary MSGPACK. |
-| cast() | `js-client/examples/05_cast/` | Broadcast to 3 workers, display result dict. |
-| cast_nowait() | `js-client/examples/06_cast_nowait/` | Fire-and-forget broadcast to 3 workers. |
-| waitForMembers() | `js-client/examples/07_wait_for_members/` | Block until a Python worker is online before calling it. |
+| Service — JSON | `examples/01_service_json/` | Browser calls a Python Service with JSON. |
+| Service — MSGPACK | `examples/02_service_msgpack/` | Same, using binary MSGPACK. |
+| Router — JSON | `examples/03_router_json/` | Browser → Router → Python worker (JSON). |
+| Router — MSGPACK | `examples/04_router_msgpack/` | Same, using binary MSGPACK. |
+| cast() | `examples/05_cast/` | Broadcast to 3 workers, display result dict. |
+| cast_nowait() | `examples/06_cast_nowait/` | Fire-and-forget broadcast to 3 workers. |
+| waitForMembers() | `examples/07_wait_for_members/` | Block until a Python worker is online before calling it. |
 
 ### Running an example
 
@@ -278,7 +305,7 @@ certificate that chains to a CA the browser already trusts.
   <meta charset="UTF-8">
   <title>daffi demo</title>
   <!-- app.wasm is fetched automatically from the same CDN release -->
-  <script src="https://cdn.jsdelivr.net/gh/600apples/daffi@2.0.0/js-client/daffi.js"></script>
+  <script src="https://cdn.jsdelivr.net/gh/600apples/daffi@4.0.0/js-client/daffi.js"></script>
 </head>
 <body>
 <script>

@@ -15,7 +15,7 @@ pub const std_options: std.Options = .{
     .logFn    = @import("log.zig").logFn,
 };
 
-const py = @import("python.zig").c;
+const py = @import("python_c");
 const PyObject = py.PyObject;
 const PyMethodDef = py.PyMethodDef;
 const PyModule_Create = py.PyModule_Create;
@@ -27,18 +27,36 @@ const cffi = @import("cffi.zig");
 
 const server_methods = [_]PyMethodDef{
     .{
+        .ml_name  = "addListeners",
+        .ml_meth  = cffi.addListeners,
+        .ml_flags = 1,
+        .ml_doc   =
+            \\addListeners(listeners, mode, app_name) -> int
+            \\
+            \\Bind every listener at once and return one conn_num for the
+            \\whole server.  Sockets accept only after startServer().
+            \\
+            \\  listeners - non-empty list of address tuples.  Each entry is
+            \\              (host, port) for plaintext,
+            \\              (host, port, tls, cert, key), or
+            \\              (host, port, tls, cert, key, ca) for per-bind TLS.
+            \\              A non-empty ca enables mutual TLS (require client
+            \\              cert).  cert/key/ca are a path or PEM material.
+            \\
+            \\All or nothing: if a listener cannot be bound, none stays bound and
+            \\ValueError.args is (reason, index of the failing listener).
+        ,
+    },
+    .{
         .ml_name  = "startServer",
         .ml_meth  = cffi.startServer,
         .ml_flags = 1,
         .ml_doc   =
-            \\startServer(host, port, mode, app_name, tls, cert_file, key_file) -> int | None
+            \\startServer(conn_num)
             \\
-            \\Bind to host:port and start the server dispatcher thread.
-            \\Returns a conn_num handle, or None on failure.
-            \\
-            \\  tls       - True to enable TLS (requires cert_file and key_file)
-            \\  cert_file - path to PEM server certificate (ignored when tls=False)
-            \\  key_file  - path to PEM server private key  (ignored when tls=False)
+            \\Start accepting on every listener.  Call once after addListeners,
+            \\and for a Service after its request fd and callback list are set,
+            \\so the first client handshake already carries those callbacks.
         ,
     },
     .{
@@ -48,27 +66,10 @@ const server_methods = [_]PyMethodDef{
         .ml_doc   =
             \\stopServer(conn_num)
             \\
-            \\Signal the server to stop and release all native resources.
-        ,
-    },
-    .{
-        .ml_name  = "joinServer",
-        .ml_meth  = cffi.joinServer,
-        .ml_flags = 1,
-        .ml_doc   =
-            \\joinServer(conn_num)
-            \\
-            \\Block until the server dispatcher thread exits.
-        ,
-    },
-    .{
-        .ml_name  = "detachServer",
-        .ml_meth  = cffi.detachServer,
-        .ml_flags = 1,
-        .ml_doc   =
-            \\detachServer(conn_num)
-            \\
-            \\Detach the server thread; resources are reclaimed when it exits.
+            \\Stop the server and release all native resources (every
+            \\listening socket, connections, threads).  All listeners stop
+            \\accepting at the same moment.  Blocks until shutdown completes,
+            \\so every port can be rebound as soon as this returns.
         ,
     },
     .{
@@ -111,7 +112,7 @@ const server_methods = [_]PyMethodDef{
             \\
             \\Register an eventfd or pipe write-end that the native layer will signal
             \\whenever a message is pushed onto the Service task queue.
-            \\Call once after startServer() returns and before the handshake.
+            \\Call once after addListeners() returns and before startServer().
         ,
     },
 };
@@ -127,13 +128,16 @@ const client_methods = [_]PyMethodDef{
         .ml_meth  = cffi.startClient,
         .ml_flags = 1,
         .ml_doc   =
-            \\startClient(host, port, app_name, tls, ca_file) -> int | None
+            \\startClient(host, port, app_name, tls, ca, cert, key) -> int
             \\
-            \\Open a TCP connection and return a conn_num handle, or None on failure.
+            \\Open a TCP connection and return a conn_num handle.
+            \\Raises OSError with the native error name and OS errno on failure.
             \\
-            \\  tls     - True to enable TLS
-            \\  ca_file - path to PEM CA bundle for server cert verification;
-            \\            empty string disables verification
+            \\  tls  - True to enable TLS
+            \\  ca   - path or PEM for the CA used to verify the server; empty
+            \\         disables verification
+            \\  cert - optional client certificate (path or PEM) for mTLS
+            \\  key  - optional client private key (path or PEM) for mTLS
         ,
     },
     .{
@@ -179,23 +183,53 @@ const client_methods = [_]PyMethodDef{
         ,
     },
     .{
+        .ml_name  = "missingMembers",
+        .ml_meth  = cffi.missingMembers,
+        .ml_flags = 1,
+        .ml_doc   =
+            \\missingMembers(conn_num, names) -> list[str]
+            \\
+            \\The names in *names* that are not connected peers.
+        ,
+    },
+    .{
         .ml_name  = "getMessageFromClientStore",
         .ml_meth  = cffi.getMessageFromClientStore,
         .ml_flags = 1,
         .ml_doc   =
-            \\getMessageFromClientStore(uuid, conn_num) -> (data, flag, serde) | None
+            \\getMessageFromClientStore(uuid, conn_num) -> (data, flag, serde) | None | "disconnected"
             \\
-            \\Poll the client message store for a response to uuid.
+            \\Take the response to uuid if it already arrived.
         ,
     },
     .{
-        .ml_name  = "setTimeoutError",
-        .ml_meth  = cffi.setTimeoutError,
+        .ml_name  = "drainParkedResponses",
+        .ml_meth  = cffi.drainParkedResponses,
         .ml_flags = 1,
         .ml_doc   =
-            \\setTimeoutError(uuid, conn_num)
+            \\drainParkedResponses(conn_num) -> list[int] | "disconnected"
             \\
-            \\Mark a pending message as timed-out so its slot can be reclaimed.
+            \\uuids of responses parked since the last drain.
+        ,
+    },
+    .{
+        .ml_name  = "waitMessageFromClientStore",
+        .ml_meth  = cffi.waitMessageFromClientStore,
+        .ml_flags = 1,
+        .ml_doc   =
+            \\waitMessageFromClientStore(uuid, timeout_ms, conn_num) -> (data, flag, serde) | None | "disconnected" | "evicted"
+            \\
+            \\Wait without the GIL for the response to uuid.  None means timeout.
+        ,
+    },
+    .{
+        .ml_name  = "expireMessage",
+        .ml_meth  = cffi.expireMessage,
+        .ml_flags = 1,
+        .ml_doc   =
+            \\expireMessage(uuid, conn_num)
+            \\
+            \\Stop waiting for uuid; a response that arrives later is dropped.
         ,
     },
     .{
@@ -253,6 +287,37 @@ const client_methods = [_]PyMethodDef{
 // ── Logging / utility methods ─────────────────────────────────────────────────
 const util_methods = [_]PyMethodDef{
     .{
+        .ml_name  = "acquireDescriptors",
+        .ml_meth  = cffi.acquireDescriptors,
+        .ml_flags = 1,
+        .ml_doc   =
+            \\acquireDescriptors(n: int) -> None
+            \\
+            \\Count n more open descriptors. When the stored count passes the
+            \\stored soft limit, that limit doubles.
+        ,
+    },
+    .{
+        .ml_name  = "releaseDescriptors",
+        .ml_meth  = cffi.releaseDescriptors,
+        .ml_flags = 1,
+        .ml_doc   =
+            \\releaseDescriptors(n: int) -> None
+            \\
+            \\Count n fewer open descriptors.
+        ,
+    },
+    .{
+        .ml_name  = "bumpFileLimit",
+        .ml_meth  = cffi.bumpFileLimit,
+        .ml_flags = 4,
+        .ml_doc   =
+            \\bumpFileLimit() -> int
+            \\
+            \\Double the stored soft open-file limit once. 1 if it moved.
+        ,
+    },
+    .{
         .ml_name  = "setLogLevel",
         .ml_meth  = cffi.setLogLevel,
         .ml_flags = 1,
@@ -271,7 +336,43 @@ const util_methods = [_]PyMethodDef{
             \\Python logger would also emit them.
         ,
     },
+    .{
+        .ml_name  = "getRuntime",
+        .ml_meth  = cffi.getRuntime,
+        .ml_flags = 4,
+        .ml_doc   =
+            \\getRuntime() -> str
+            \\
+            \\Runtime of the native core: "threads" (an OS thread per
+            \\connection) or "evented" (connections multiplexed over a few
+            \\event-loop threads).  Chosen once per process by setRuntime.
+            \\The default, when setRuntime was not called, is "threads".
+            \\DAFFI_EVENT_LOOPS sets the number of loop threads.
+        ,
+    },
+    .{
+        .ml_name  = "setRuntime",
+        .ml_meth  = cffi.setRuntime,
+        .ml_flags = 1,
+        .ml_doc   =
+            \\setRuntime(name: str) -> None
+            \\
+            \\Lock the process to "threads" or "evented".  Must match a
+            \\runtime already locked in this process.
+        ,
+    },
 };
+
+test {
+    _ = @import("serde.zig");
+    _ = @import("runtime.zig");
+    _ = @import("misc.zig");
+    _ = @import("network.zig");
+    _ = @import("store.zig");
+    _ = @import("handlers/handlers.zig");
+    _ = @import("Server.zig");
+    _ = @import("nofile.zig");
+}
 
 // ── Combined method table ─────────────────────────────────────────────────────
 var methods = server_methods ++ client_methods ++ util_methods ++ [_]PyMethodDef{
@@ -290,6 +391,9 @@ var module = py.PyModuleDef{
     .m_free     = null,
 };
 
-pub export fn PyInit_dfcore() [*]PyObject {
+// Nullable: on failure PyModule_Create returns NULL with a Python exception set,
+// which the interpreter turns into an ImportError.  A non-optional return type
+// would make that a safety-checked null-to-pointer cast (an abort in ReleaseSafe).
+pub export fn PyInit_dfcore() ?[*]PyObject {
     return PyModule_Create(&module);
 }

@@ -81,38 +81,70 @@ class ColoredFormatter(logging.Formatter):
         return f"{self.get_level_message(record)} {message}"
 
 
-def get_daffi_logger(name: str, color: Callable) -> DaffiLoggerAdapter:
-    """Create and return a configured :class:`DaffiLoggerAdapter` for *name*.
+#: The one logger every daffi application logs through.
+LOGGER_NAME = "daffi"
 
-    The adapter injects a ``%(app)s`` extra that wraps the logger name in
-    coloured pipe delimiters, e.g. ``| my-service |``.
+
+def _logging_unconfigured(record: logging.LogRecord) -> bool:
+    """True while the root logger has no handlers: the application has not
+    set up logging, so daffi prints its own console lines."""
+    return not logging.getLogger().handlers
+
+
+class _ConsoleHandler(logging.StreamHandler):
+    """Writes to ``sys.<name>`` as it is when the record is emitted, so a
+    replaced ``sys.stdout`` / ``sys.stderr`` is followed."""
+
+    def __init__(self, name: str) -> None:
+        self._stream_name = name
+        super().__init__()
+
+    @property
+    def stream(self):
+        return getattr(sys, self._stream_name)
+
+    @stream.setter
+    def stream(self, _value) -> None:
+        pass
+
+
+def _console_handlers() -> list:
+    formatter = ColoredFormatter("%(asctime)s %(app)s %(message)s", "%Y-%m-%d %H:%M:%S")
+    out = _ConsoleHandler("stdout")
+    out.addFilter(lambda record: record.levelno <= logging.INFO)
+    err = _ConsoleHandler("stderr")
+    err.setLevel(logging.WARNING)
+    for handler in (out, err):
+        handler.addFilter(_logging_unconfigured)
+        handler.setFormatter(formatter)
+    return [out, err]
+
+
+def _daffi_logger() -> logging.Logger:
+    logger = logging.getLogger(LOGGER_NAME)
+    if not any(isinstance(h, _ConsoleHandler) for h in logger.handlers):
+        for handler in _console_handlers():
+            logger.addHandler(handler)
+    return logger
+
+
+def get_daffi_logger(name: str, color: Callable) -> DaffiLoggerAdapter:
+    """Return a :class:`DaffiLoggerAdapter` that tags each record with *name*.
+
+    Every application shares the ``daffi`` logger, so no logger or handler
+    is created per name.  Records propagate as usual: once the application
+    configures logging (the root logger has handlers), they go to its
+    handlers only, carrying the name as ``record.daffi_app``.  Until then
+    daffi prints them itself, with the name between coloured pipes, e.g.
+    ``| my-service |``.  The level follows the ``daffi`` logger, or the root
+    logger when that is unset.
 
     Args:
-        name:  Identifier shown in every log line (e.g. ``"client[my-app]"``).
+        name:  Identifier for every log line (e.g. ``"client[my-app]"``).
         color: A callable from :mod:`daffi.utils.colors` used to colour the
                pipe delimiters.
     """
-    logger = logging.getLogger(name=name)
-    root_level = logging.getLogger().getEffectiveLevel()
-
-    cho = logging.StreamHandler(sys.stdout)
-    che = logging.StreamHandler(sys.stderr)
-
-    logger.propagate = False
-    if logger.hasHandlers():
-        logger.handlers.clear()
-
-    cho.addFilter(lambda record: record.levelno <= logging.INFO)
     delim = color("|")
-    logger = DaffiLoggerAdapter(logger, {"app": f"{delim} {logger.name:^10} {delim}"})
-
-    logger.setLevel(root_level)
-    cho.setLevel(root_level)
-    che.setLevel(logging.WARNING)
-    formatter = ColoredFormatter("%(asctime)s %(app)s %(message)s", "%Y-%m-%d %H:%M:%S")
-    cho.setFormatter(formatter)
-    che.setFormatter(formatter)
-
-    logger.logger.addHandler(cho)
-    logger.logger.addHandler(che)
-    return logger
+    return DaffiLoggerAdapter(
+        _daffi_logger(), {"app": f"{delim} {name:^10} {delim}", "daffi_app": name}
+    )

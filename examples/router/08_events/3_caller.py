@@ -7,17 +7,18 @@ and a "disconnected" event when it leaves.
 
 Run 1_router.py and 2_worker.py first.
 """
-import time
-from daffi import Client
 
+import time
+from daffi import Client, TCPTransport
 
 if __name__ == "__main__":
+
     def on_event(event: dict) -> None:
         name = event["member"]
         status = event["type"]
         print(f"[caller] event: {name!r} → {status}")
 
-    caller = Client(app_name="event-caller", host="0.0.0.0", port=6008)
+    caller = Client(app_name="event-caller", transport=TCPTransport("0.0.0.0", 6008))
     caller.add_event_handler(on_event)
     conn = caller.connect()
 

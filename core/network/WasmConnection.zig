@@ -6,9 +6,16 @@ const WasmConnection = @This();
 
 pub const op_table = OperationTable{
     .read = undefined, // wasm doesn't have net package functionality
+    .readSome = undefined, // wasm doesn't have net package functionality
     .readNoBuffer = undefined, // wasm doesn't have net package functionality
     .write = undefined, // wasm doesn't have net package functionality
+    .writeParts = undefined, // wasm doesn't have net package functionality
+    .writeNonBlocking = undefined, // wasm doesn't have net package functionality
+    .writeNonBlockingParts = undefined, // wasm doesn't have net package functionality
+    .writeVec = undefined, // wasm doesn't have net package functionality
     .accept = undefined, // wasm doesn't have net package functionality
+    .handle = undefined, // wasm doesn't have net package functionality
+    .hasPendingInput = undefined, // wasm doesn't have net package functionality
     .close = close,
     .destroy = destroy,
     .getAddr = undefined, // wasm doesn't have net package functionality
@@ -36,10 +43,9 @@ pub fn destroy(ctx: *anyopaque) void {
 /// Stub SynParser so that connection.zig can reference WebConnection.SynParser
 /// on wasm targets (where WebConnection is aliased to WasmConnection).
 pub const SynParser = struct {
-    pub fn init(_: std.mem.Allocator) !@This() {
+    pub fn init(_: i64, _: []const u8) @This() {
         return .{};
     }
-    pub fn deinit(_: *@This()) void {}
     pub fn tryWebSocket(_: *@This(), _: anytype) !bool {
         return false;
     }

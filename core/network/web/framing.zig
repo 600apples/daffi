@@ -10,11 +10,17 @@ pub const Fragmented = struct {
     max_size: usize,
     allocator: Allocator,
     buf: std.ArrayList(u8),
+    /// Share of the partial-message budget (see `reader.chargePartial`).
+    charged: usize,
 
     pub fn init(bp: *buffer.Provider, max_size: usize, message_type: MessageType, value: []const u8) !Fragmented {
         const gpa = bp.allocator;
+        if (value.len > max_size) return error.TooLarge;
+        const initial = @min(value.len * 2, max_size);
+        try reader.chargePartial(initial);
+        errdefer reader.releasePartial(initial);
         var buf: std.ArrayList(u8) = .empty;
-        try buf.ensureTotalCapacity(gpa, value.len * 2);
+        try buf.ensureTotalCapacityPrecise(gpa, initial);
         buf.appendSliceAssumeCapacity(value);
 
         return .{
@@ -22,26 +28,45 @@ pub const Fragmented = struct {
             .max_size = max_size,
             .type = message_type,
             .allocator = gpa,
+            .charged = initial,
         };
     }
 
     pub fn deinit(self: *Fragmented) void {
         self.buf.deinit(self.allocator);
+        reader.releasePartial(self.charged);
+        self.charged = 0;
+    }
+
+    /// Room for `extra` more bytes: doubling, but never past `max_size`.
+    fn reserve(self: *Fragmented, extra: usize) !void {
+        const need = self.buf.items.len + extra;
+        if (need > self.max_size) return error.TooLarge;
+        if (need <= self.buf.capacity) return;
+        const capacity = @min(@max(need, self.buf.capacity * 2), self.max_size);
+        const delta = capacity -| self.charged;
+        try reader.chargePartial(delta);
+        errdefer reader.releasePartial(delta);
+        try self.buf.ensureTotalCapacityPrecise(self.allocator, capacity);
+        self.charged += delta;
     }
 
     pub fn add(self: *Fragmented, value: []const u8) !void {
-        if (self.buf.items.len + value.len > self.max_size) {
-            return error.TooLarge;
-        }
-        try self.buf.appendSlice(self.allocator, value);
+        try self.reserve(value.len);
+        self.buf.appendSliceAssumeCapacity(value);
     }
 
     // Optimization so that we don't over-allocate on our last frame.
     pub fn last(self: *Fragmented, value: []const u8) ![]u8 {
-        if (self.buf.items.len + value.len > self.max_size) {
-            return error.TooLarge;
+        const need = self.buf.items.len + value.len;
+        if (need > self.max_size) return error.TooLarge;
+        if (need > self.buf.capacity) {
+            const delta = need -| self.charged;
+            try reader.chargePartial(delta);
+            errdefer reader.releasePartial(delta);
+            try self.buf.ensureTotalCapacityPrecise(self.allocator, need);
+            self.charged += delta;
         }
-        try self.buf.ensureUnusedCapacity(self.allocator, value.len);
         self.buf.appendSliceAssumeCapacity(value);
         return self.buf.items;
     }
@@ -100,7 +125,7 @@ fn simpleMask(m: []const u8, payload: []u8) void {
 
 pub fn frame(op_code: OpCode, comptime msg: []const u8) [frameLen(msg)]u8 {
     var framed: [frameLen(msg)]u8 = undefined;
-    framed[0] = @intFromEnum(op_code);
+    framed[0] = @backingInt(op_code);
 
     const len = msg.len;
     if (len <= 125) {

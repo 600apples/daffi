@@ -8,13 +8,18 @@ Broadcasts to ALL connected workers and collects every response.
 
 Start 1_router.py and 2_worker.py (×3) first.
 """
+
 import asyncio
 from daffi.aio import AsyncClient
+from daffi import TCPTransport
+
 from daffi._rpc_proxy import get_available_members
 
 
 async def main():
-    caller = AsyncClient(app_name="cast-caller", host="0.0.0.0", port=6002)
+    caller = AsyncClient(
+        app_name="cast-caller", transport=TCPTransport("0.0.0.0", 6002)
+    )
     conn = await caller.connect()
 
     workers = [

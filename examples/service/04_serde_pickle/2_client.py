@@ -6,10 +6,10 @@ serialisation (the default).  The service returns the updated object.
 
 Run 1_service.py first.
 """
-from daffi import Client
-from daffi import SerdeFormat
-from models import Order, LineItem, OrderStatus
 
+from daffi import Client, TCPTransport
+from daffi import SerdeFormat, TCPTransport
+from models import Order, LineItem, OrderStatus
 
 if __name__ == "__main__":
     order = Order(
@@ -22,17 +22,21 @@ if __name__ == "__main__":
         status=OrderStatus.PENDING,
     )
 
-    print(f"Sending order: {order.order_id}  total=${order.grand_total:.2f}  "
-          f"status={order.status.value}")
+    print(
+        f"Sending order: {order.order_id}  total=${order.grand_total:.2f}  "
+        f"status={order.status.value}"
+    )
 
-    client = Client(app_name="order-client", host="0.0.0.0", port=5004)
+    client = Client(app_name="order-client", transport=TCPTransport("0.0.0.0", 5004))
     conn = client.connect()
 
     rpc = conn.rpc(timeout=5, serde=SerdeFormat.PICKLE)
     updated = rpc.process_order(order)
 
-    print(f"Received back: status={updated.status.value}  "
-          f"total=${updated.grand_total:.2f}")
+    print(
+        f"Received back: status={updated.status.value}  "
+        f"total=${updated.grand_total:.2f}"
+    )
 
     client.stop()
     print("Done.")

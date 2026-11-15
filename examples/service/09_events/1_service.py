@@ -12,8 +12,9 @@ Multiple handlers can be registered; they run in registration order.
 
 Run first, then run 2_client.py.
 """
+
 import time
-from daffi import Service, callback
+from daffi import Service, callback, TCPTransport
 
 
 @callback
@@ -31,9 +32,11 @@ if __name__ == "__main__":
             print(f"[service] ✦ {name!r} connected   (total: {len(connected_clients)})")
         elif event["type"] == "disconnected":
             connected_clients.discard(name)
-            print(f"[service] ✦ {name!r} disconnected (total: {len(connected_clients)})")
+            print(
+                f"[service] ✦ {name!r} disconnected (total: {len(connected_clients)})"
+            )
 
-    svc = Service(app_name="event-service", host="0.0.0.0", port=5009)
+    svc = Service(app_name="event-service", transport=TCPTransport("0.0.0.0", 5009))
     svc.add_event_handler(on_event)
     svc.start()
     print("Service running on 0.0.0.0:5009 — press Ctrl+C to stop.")

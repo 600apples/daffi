@@ -1,72 +1,61 @@
-# daffi
+# Daffi
 
-**daffi** is a high-performance Python RPC framework with a native compiled core.  
-It lets processes call each other's functions over TCP or Unix sockets — with minimal boilerplate and near-zero overhead.
+High-performance RPC for Python.
 
----
+[![Performance](https://img.shields.io/badge/Performance-Native%20Core-blue)](#)
+[![Transports](https://img.shields.io/badge/Transports-TCP%20%7C%20Unix-green)](#)
+[![Python](https://img.shields.io/badge/Python-3.10%2B-blue)](https://www.python.org/)
+[![License](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-## Key features
-
-| Feature | Details                                                                                                                                       |
-|---|-----------------------------------------------------------------------------------------------------------------------------------------------|
-| **Native core** | The message framing, connection management and routing logic is implemented in a native compiled extension (`dfcore`) for maximum throughput. |
-| **Multiple transports** | TCP, Unix domain sockets, TLS — same API.                                                                                                     |
-| **Four call styles** | `rpc`, `rpc_nowait`, `cast`, `cast_nowait` — blocking/non-blocking, single target/broadcast.                                                  |
-| **Four serialisation formats** | PICKLE (Python-only, default), JSON, MSGPACK, OPAQUE (raw bytes or string).                                                                   |
-| **Event subscriptions** | React to nodes joining and leaving the network.                                                                                               |
+Daffi is a lightweight inter-process communication framework powered by a compiled native core. 
+Connect Python applications, distribute workloads, and exchange data with minimal overhead.
 
 ---
 
-## Install
+## Why Daffi?
+
+- **No external broker required** — Establish direct connections without additional infrastructure.
+- **Simple remote calls** — Invoke remote functions through familiar Python interfaces.
+- **Multiple communication patterns** — Support RPC, broadcast, and streaming.
+- **Native runtime** — Choose between threaded and event-driven connection handling.
+- **Efficient data transfer** — Exchange large binary payloads with minimal overhead.
+
+---
+
+## Installation
 
 ```bash
 pip install daffi
-
-# optional: MessagePack support
-pip install "daffi[msgpack]"
 ```
 
----
-
-## 30-second example
-
-**Service** — expose a function:
-
-```python
-from daffi import Service, callback
-
-@callback
-def add(a: int, b: int) -> int:
-    return a + b
-
-svc = Service(app_name="calc", host="127.0.0.1", port=5000)
-svc.start()
-svc.join()
-```
-
-**Client** — call it:
-
-```python
-from daffi import Client
-
-client = Client(app_name="my-client", host="127.0.0.1", port=5000)
-conn = client.connect()
-
-result = conn.rpc(timeout=5).add(3, 4)   # → 7
-client.stop()
-```
+Requires Python 3.10 or newer.
 
 ---
 
 ## Two topologies
 
-daffi supports two network topologies:
+Daffi supports two primary communication topologies:
 
-- **Client → Service** — the Service hosts callbacks; Clients call them directly.  
-  Best for simple request/response scenarios.
+| Topology                     | Description                                                                                |
+|------------------------------|--------------------------------------------------------------------------------------------|
+| **Client → Service**         | A Service exposes callbacks; Clients call them directly.                                   |
+| **Client → Router → Worker** | A Router forwards calls between Callers and Workers. Workers can join or leave at runtime. |
 
-- **Client → Router → Worker** — a Router forwards calls between Callers and Workers.  
-  Workers can be added or removed at runtime without restarting anything.  
-  Best for scalable, distributed workloads.
+See [Architecture](architecture.md) for diagrams and component roles, or jump to [Getting Started](getting-started.md) for runnable examples.
 
-See [Architecture](architecture.md) for diagrams and a deeper explanation.
+---
+
+## Documentation
+
+| Topic                      | Page                                            |
+|----------------------------|-------------------------------------------------|
+| Direct Client → Service    | [Direct topology](usage/service.md)             |
+| Router and workers         | [Router and workers](usage/router.md)           |
+| `rpc` / `cast` / `stream`  | [Communication patterns](usage/call-styles.md)  |
+| Wire formats               | [Serialization](usage/serialization.md)         |
+| `@callback` and `workers`  | [Callbacks and concurrency](usage/callbacks.md) |
+| `threads` vs `evented`     | [Native runtime](usage/runtime.md)              |
+| TCP, Unix, multi-transport | [Transports](usage/transports.md)               |
+| Membership notifications   | [Event handlers](usage/events.md)               |
+| TLS                        | [Security](usage/tls.md)                        |
+| Asyncio API                | [Async interface](usage/aio.md)                 |

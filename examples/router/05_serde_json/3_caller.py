@@ -9,15 +9,15 @@ Shows all four call styles with JSON serialisation:
 
 Run 1_router.py and 2_worker.py first.
 """
-import time
-from daffi import Client
-from daffi import SerdeFormat
 
+import time
+from daffi import Client, TCPTransport
+from daffi import SerdeFormat, TCPTransport
 
 BATCH = {"values": [10, 20, 30, 40, 50]}
 
 if __name__ == "__main__":
-    caller = Client(app_name="json-caller", host="0.0.0.0", port=6005)
+    caller = Client(app_name="json-caller", transport=TCPTransport("0.0.0.0", 6005))
     conn = caller.connect()
 
     # rpc — blocking call to one worker.

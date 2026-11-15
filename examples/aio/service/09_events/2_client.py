@@ -6,17 +6,21 @@ The async handler fires when the service connects or disconnects.
 
 Run 1_service.py first.
 """
+
 import asyncio
 from daffi.aio import AsyncClient
+from daffi import TCPTransport
 
 
 async def main():
     async def on_event(event: dict) -> None:
         name = event["member"]
-        status = event["type"]   # "connected" or "disconnected"
+        status = event["type"]  # "connected" or "disconnected"
         print(f"[client] event: {name!r} → {status}")
 
-    client = AsyncClient(app_name="event-client", host="0.0.0.0", port=5009)
+    client = AsyncClient(
+        app_name="event-client", transport=TCPTransport("0.0.0.0", 5009)
+    )
     client.add_event_handler(on_event)
 
     conn = await client.connect()

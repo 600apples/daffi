@@ -10,10 +10,11 @@ code.
 Start 1_router.py first.  Then start this script and 2_worker.py in any
 order — the caller will wait automatically.
 """
-from daffi import Client
+
+from daffi import Client, TCPTransport
 
 if __name__ == "__main__":
-    caller = Client(app_name="calc-caller", host="0.0.0.0", port=6009)
+    caller = Client(app_name="calc-caller", transport=TCPTransport("0.0.0.0", 6009))
     conn = caller.connect()
 
     print("Connected to router.  Waiting for 'calc-worker' to come online…")

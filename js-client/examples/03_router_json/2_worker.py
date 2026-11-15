@@ -6,7 +6,8 @@ browser via JSON serde.
 
 Start 1_router.py first, then this, then open index.html.
 """
-from daffi import Client, callback
+
+from daffi import Client, callback, TCPTransport
 
 
 @callback
@@ -24,7 +25,7 @@ def word_count(text: str) -> int:
 
 
 if __name__ == "__main__":
-    worker = Client(app_name="json-worker", host="127.0.0.1", port=6010)
+    worker = Client(app_name="json-worker", transport=TCPTransport("127.0.0.1", 6010))
     worker.connect()
     print("Worker connected to router — press Ctrl+C to stop.")
     worker.join()

@@ -1,10 +1,9 @@
 //! Re-exports all CFFI functions from client.zig and server.zig.
 
 // --- server functions ---
+pub const addListeners              = @import("cffi/server.zig").addListeners;
 pub const startServer               = @import("cffi/server.zig").startServer;
 pub const stopServer                = @import("cffi/server.zig").stopServer;
-pub const joinServer                = @import("cffi/server.zig").joinServer;
-pub const detachServer              = @import("cffi/server.zig").detachServer;
 pub const sendMessageFromServer     = @import("cffi/server.zig").sendMessageFromServer;
 pub const getMessageForServerWorker = @import("cffi/server.zig").getMessageForServerWorker;
 pub const setServiceMethods         = @import("cffi/server.zig").setServiceMethods;
@@ -12,13 +11,21 @@ pub const setServiceRequestFd       = @import("cffi/server.zig").setServiceReque
 
 // --- client functions ---
 pub const setLogLevel               = @import("cffi/client.zig").setLogLevel;
+pub const acquireDescriptors        = @import("cffi/client.zig").acquireDescriptors;
+pub const releaseDescriptors        = @import("cffi/client.zig").releaseDescriptors;
+pub const bumpFileLimit             = @import("cffi/client.zig").bumpFileLimit;
+pub const getRuntime         = @import("cffi/client.zig").getRuntime;
+pub const setRuntime         = @import("cffi/client.zig").setRuntime;
 pub const startClient               = @import("cffi/client.zig").startClient;
 pub const stopClient                = @import("cffi/client.zig").stopClient;
 pub const sendMessageFromClient     = @import("cffi/client.zig").sendMessageFromClient;
 pub const sendHandshakeFromClient   = @import("cffi/client.zig").sendHandshakeFromClient;
 pub const getAvailableMembers       = @import("cffi/client.zig").getAvailableMembers;
+pub const missingMembers            = @import("cffi/client.zig").missingMembers;
 pub const getMessageFromClientStore = @import("cffi/client.zig").getMessageFromClientStore;
-pub const setTimeoutError           = @import("cffi/client.zig").setTimeoutError;
+pub const drainParkedResponses      = @import("cffi/client.zig").drainParkedResponses;
+pub const waitMessageFromClientStore = @import("cffi/client.zig").waitMessageFromClientStore;
+pub const expireMessage             = @import("cffi/client.zig").expireMessage;
 pub const getMessageForClientWorker = @import("cffi/client.zig").getMessageForClientWorker;
 pub const setClientRequestFd        = @import("cffi/client.zig").setClientRequestFd;
 pub const setLifecycleFd            = @import("cffi/client.zig").setLifecycleFd;

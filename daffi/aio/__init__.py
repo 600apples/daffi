@@ -3,14 +3,16 @@
 
 Import async node classes from here::
 
-    from daffi.aio import Client, Service, Router
+    from daffi.aio import AsyncClient, AsyncService, AsyncRouter
+    from daffi import TCPTransport, UnixTransport
+
 
 All classes share the same constructor signature as their sync counterparts
 in :mod:`daffi`.  The difference is that lifecycle methods (``connect``,
 ``join``, ``stop``) and all RPC call styles are coroutines::
 
     async def main():
-        client = Client(app_name="caller", host="127.0.0.1", port=6000)
+        client = AsyncClient(app_name="caller", transport=TCPTransport("127.0.0.1", 6000))
         conn = await client.connect()
 
         result = await conn.rpc(timeout=5).multiply(6, 7)

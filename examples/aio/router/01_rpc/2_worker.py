@@ -6,8 +6,9 @@ the AsyncTaskDispatcher — no thread-pool needed.
 
 Start 1_router.py first, then this, then 3_caller.py.
 """
+
 import asyncio
-from daffi import callback
+from daffi import callback, TCPTransport
 from daffi.aio import AsyncClient
 
 
@@ -19,7 +20,9 @@ async def multiply(a: int, b: int) -> int:
 
 
 async def main():
-    worker = AsyncClient(app_name="calc-worker", host="0.0.0.0", port=6001)
+    worker = AsyncClient(
+        app_name="calc-worker", transport=TCPTransport("0.0.0.0", 6001)
+    )
     await worker.connect()
     print("Worker connected to router — press Ctrl+C to stop.")
     await worker.join()

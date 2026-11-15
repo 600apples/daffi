@@ -6,9 +6,10 @@ serialisation and receives the updated Order back.
 
 Run 1_service.py first.
 """
+
 import asyncio
 from daffi.aio import AsyncClient
-from daffi import SerdeFormat
+from daffi import SerdeFormat, TCPTransport
 from models import Order, LineItem, OrderStatus
 
 
@@ -23,17 +24,23 @@ async def main():
         status=OrderStatus.PENDING,
     )
 
-    print(f"Sending order: {order.order_id}  total=${order.grand_total:.2f}  "
-          f"status={order.status.value}")
+    print(
+        f"Sending order: {order.order_id}  total=${order.grand_total:.2f}  "
+        f"status={order.status.value}"
+    )
 
-    client = AsyncClient(app_name="order-client", host="0.0.0.0", port=5004)
+    client = AsyncClient(
+        app_name="order-client", transport=TCPTransport("0.0.0.0", 5004)
+    )
     conn = await client.connect()
 
     rpc = conn.rpc(timeout=5, serde=SerdeFormat.PICKLE)
     updated = await rpc.process_order(order)
 
-    print(f"Received back: status={updated.status.value}  "
-          f"total=${updated.grand_total:.2f}")
+    print(
+        f"Received back: status={updated.status.value}  "
+        f"total=${updated.grand_total:.2f}"
+    )
 
     await client.stop()
     print("Done.")

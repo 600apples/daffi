@@ -7,22 +7,21 @@ MSGPACK is more compact than JSON for binary-heavy payloads.
 The browser client encodes arguments as msgpack bytes and the service
 returns msgpack-encoded responses — end-to-end binary serialisation.
 
-Requires: pip install 'daffi[msgpack]'
-
 Run this first, then open index.html in a browser (via an HTTP server).
 """
-from daffi import Service, callback
-from daffi import SerdeFormat
+
+from daffi import Service, callback, TCPTransport
+from daffi import SerdeFormat, TCPTransport
 
 
 @callback
 def compute(data: dict) -> dict:
     values = data.get("values", [])
-    total  = sum(values)
+    total = sum(values)
     result = {
         "count": len(values),
-        "sum":   total,
-        "avg":   round(total / len(values), 4) if values else 0,
+        "sum": total,
+        "avg": round(total / len(values), 4) if values else 0,
     }
     print(f"[service] compute(values={values}) → {result}")
     return result
@@ -35,7 +34,12 @@ def echo(payload) -> object:
 
 
 if __name__ == "__main__":
-    svc = Service(app_name="msgpack-service", host="127.0.0.1", port=5011)
+    transport = TCPTransport("127.0.0.1", 5011)
+    transport.websocket_allowed_origins = ["*"]
+    svc = Service(
+        app_name="msgpack-service",
+        transport=transport,
+    )
     svc.start()
     print("Service on ws://127.0.0.1:5011 — open index.html in a browser.")
     svc.join()

@@ -7,12 +7,16 @@ asyncio.gather() — something the sync version cannot do easily.
 
 Start 1_router.py first.  Then start this and 2_worker.py in any order.
 """
+
 import asyncio
 from daffi.aio import AsyncClient
+from daffi import TCPTransport
 
 
 async def main():
-    caller = AsyncClient(app_name="calc-caller", host="0.0.0.0", port=6009)
+    caller = AsyncClient(
+        app_name="calc-caller", transport=TCPTransport("0.0.0.0", 6009)
+    )
     conn = await caller.connect()
 
     print("Connected to router.  Waiting for 'calc-worker' to come online…")

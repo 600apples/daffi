@@ -8,13 +8,33 @@ the rest of the Python code does not call ``dfcore.*`` directly.
 
 from __future__ import annotations
 
-import ctypes
+import itertools
 import json
+import threading
 from . import dfcore
 from enum import IntEnum
 from typing import Union, Tuple
 
 from daffi._serialization import SerdeFormat
+
+_members_cache: dict[int, list] = {}
+# conn_num -> stamp of the native read in flight on a cache miss.  An
+# invalidation removes it, so a read that raced one is not stored.  Stamps
+# never repeat, and handles are never reused, so nothing outlives a release.
+_members_reads: dict[int, int] = {}
+_members_stamps = itertools.count(1)
+_members_lock = threading.Lock()
+
+
+def invalidate_members(conn_num: int | None = None) -> None:
+    """Drop cached membership for *conn_num*, or for every connection."""
+    with _members_lock:
+        if conn_num is None:
+            _members_cache.clear()
+            _members_reads.clear()
+        else:
+            _members_cache.pop(conn_num, None)
+            _members_reads.pop(conn_num, None)
 
 
 class MessageFlag(IntEnum):
@@ -45,9 +65,10 @@ def send_message_from_client(
     """Send a message from a client connection.
 
     Args:
-        data:          Serialised payload (bytes or str depending on *serde*).
+        data:          Serialised payload.  ``bytes`` and ``str`` are passed
+                       to the native layer without a copy.
         flag:          Message type — one of :class:`MessageFlag`.
-        serde:         Serialisation format — one of :class:`~daffi.serialization.SerdeFormat`.
+        serde:         Serialisation format — one of :class:`~daffi._serialization.SerdeFormat`.
         receiver:      Target node name, or an empty string for any node.
         func_name:     Name of the remote callback to invoke.
         return_result: ``True`` if the caller expects a response message.
@@ -59,13 +80,6 @@ def send_message_from_client(
     Returns:
         A ``(uuid, timestamp, found_receiver)`` tuple.
     """
-    if is_bytes:
-        data = bytes(data)
-        data = ctypes.create_string_buffer(data, len(data))
-    else:
-        data = str(data)
-        encoded = data.encode()
-        data = ctypes.create_string_buffer(encoded, len(encoded))
     return dfcore.sendMessageFromClient(
         data, uuid, flag, serde, is_bytes, receiver, func_name, return_result, conn_num
     )
@@ -93,8 +107,21 @@ def get_available_members(conn_num: int) -> list:
     Returns:
         A list of member-info dicts, or an empty list when none are available.
     """
-    members = dfcore.getAvailableMembers(conn_num)
-    return json.loads(members)["members"] if members else []
+    with _members_lock:
+        cached = _members_cache.get(conn_num)
+        if cached is not None:
+            return cached
+        stamp = _members_reads.setdefault(conn_num, next(_members_stamps))
+    members_json = dfcore.getAvailableMembers(conn_num)
+    members = json.loads(members_json)["members"] if members_json else []
+    with _members_lock:
+        if _members_reads.get(conn_num) == stamp:
+            if members_json:
+                _members_cache[conn_num] = members
+            else:
+                # No answer: the handle is gone (or failed); keep nothing.
+                del _members_reads[conn_num]
+    return members
 
 
 def send_message_from_service(
@@ -113,40 +140,61 @@ def send_message_from_service(
     Identical signature to :func:`send_message_from_client` but routes through
     the server-side native send path.
     """
-    if is_bytes:
-        data = bytes(data)
-        data = ctypes.create_string_buffer(data, len(data))
-    else:
-        data = str(data)
-        encoded = data.encode()
-        data = ctypes.create_string_buffer(encoded, len(encoded))
     return dfcore.sendMessageFromServer(
         data, uuid, flag, serde, is_bytes, receiver, func_name, return_result, conn_num
     )
 
 
-def get_message_from_client_store(uuid: int, conn_num: int) -> Tuple:
-    """Poll the native client message store for a response to *uuid*.
-
-    Args:
-        uuid:     Message UUID previously returned by :func:`send_message_from_client`.
-        conn_num: Native connection handle.
+def get_message_from_client_store(
+    uuid: int, conn_num: int
+) -> Union[Tuple[Union[bytes, str], int, int], str, None]:
+    """Take the response to *uuid* if it already arrived.
 
     Returns:
-        A ``(data, flag, serde)`` tuple when the response is ready, or ``None``
-        if it has not arrived yet.
+        ``(data, flag, serde)``; ``None`` when it has not arrived yet; or
+        ``"disconnected"`` when the connection is gone.
     """
     return dfcore.getMessageFromClientStore(uuid, conn_num)
 
 
-def mark_message_as_expired(uuid: int, conn_num: int) -> None:
-    """Mark a pending message as timed-out so the native layer can clean it up.
+def drain_parked_responses(conn_num: int) -> Union[list, str]:
+    """uuids of responses parked since the last drain.
+
+    Returns a list of request ids, or ``"disconnected"`` when the handle
+    is gone.  The payloads stay in the store until
+    :func:`get_message_from_client_store`.
+    """
+    return dfcore.drainParkedResponses(conn_num)
+
+
+def wait_message_from_client_store(
+    uuid: int, timeout_ms: int, conn_num: int
+) -> Union[Tuple[Union[bytes, str], int, int], str, None]:
+    """Wait up to *timeout_ms* for the response to *uuid*, without the GIL.
+
+    Returns:
+        ``(data, flag, serde)``; ``None`` on timeout; or ``"disconnected"`` /
+        ``"evicted"`` once no response can arrive.
+    """
+    return dfcore.waitMessageFromClientStore(uuid, timeout_ms, conn_num)
+
+
+def expire_message(uuid: int, conn_num: int) -> None:
+    """Stop waiting for *uuid*: a response that arrives later is dropped."""
+    dfcore.expireMessage(uuid, conn_num)
+
+
+def missing_members(conn_num: int, names) -> list:
+    """Names in *names* that are not currently connected for *conn_num*.
 
     Args:
-        uuid:     Message UUID to expire.
         conn_num: Native connection handle.
+        names:    Iterable of peer ``app_name`` strings to check.
+
+    Returns:
+        A list of names that are missing (empty when every name is present).
     """
-    dfcore.setTimeoutError(uuid, conn_num)
+    return dfcore.missingMembers(conn_num, names)
 
 
 def set_request_fd(conn_num: int, fd: int, *, server_mode: bool) -> None:
@@ -168,8 +216,7 @@ def set_request_fd(conn_num: int, fd: int, *, server_mode: bool) -> None:
                      ``os.pipe()`` (macOS / fallback).
         server_mode: ``True`` for Service connections, ``False`` for Client.
 
-    See also:
-        :func:`set_response_fd` — signals that a *response* to an outgoing call arrived.
+    Pass ``-1`` to withdraw the fd before closing it.
     """
     if server_mode:
         dfcore.setServiceRequestFd(conn_num, fd)
@@ -185,27 +232,22 @@ def set_lifecycle_fd(conn_num: int, fd: int) -> None:
     * ``b'd'`` — normal disconnect  → Python raises :class:`~daffi.exceptions.Disconnected`
     * ``b'e'`` — client evicted     → Python raises :class:`~daffi.exceptions.Evicted`
 
-    Closing the write-end (on user-initiated :meth:`~daffi.app.Client.stop`)
-    produces an EOF read, which the watcher treats as a clean shutdown.
+    Pass ``-1`` to withdraw the fd before closing it.
     """
     dfcore.setLifecycleFd(conn_num, fd)
 
 
 def set_response_fd(conn_num: int, fd: int) -> None:
-    """Register the fd the native layer signals whenever a **response** to an
-    outgoing RPC call is inserted into the client message store.
+    """Register the fd the native layer signals whenever a **response** is
+    parked in the client message store for an asyncio waiter.
 
-    :class:`~daffi._rpc_proxy.RpcResult` waiters block on this fd so they
-    wake as soon as their result is ready — no busy-wait or fixed-interval
-    polling.
+    Blocking waiters use :func:`wait_message_from_client_store` instead.
+    Pass ``-1`` to withdraw the fd before closing it.
 
     Args:
-        conn_num: Native connection handle returned by :func:`~daffi.bindings.startClient`.
+        conn_num: Native connection handle returned by ``dfcore.startClient``.
         fd:       An ``os.eventfd`` (Linux) or the **write end** of an
                   ``os.pipe()`` (macOS / fallback).
-
-    See also:
-        :func:`set_request_fd` — signals that an *incoming* request arrived.
     """
     dfcore.setResponseFd(conn_num, fd)
 

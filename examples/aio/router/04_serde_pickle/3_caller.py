@@ -7,14 +7,17 @@ broadcast to all workers concurrently.
 
 Run 1_router.py and 2_worker.py first.
 """
+
 import asyncio
 from daffi.aio import AsyncClient
-from daffi import SerdeFormat
+from daffi import SerdeFormat, TCPTransport
 from models import Task, TaskResult, Priority
 
 
 async def main():
-    caller = AsyncClient(app_name="task-caller", host="0.0.0.0", port=6004)
+    caller = AsyncClient(
+        app_name="task-caller", transport=TCPTransport("0.0.0.0", 6004)
+    )
     conn = await caller.connect()
 
     rpc = conn.rpc(timeout=5, serde=SerdeFormat.PICKLE)
@@ -25,8 +28,10 @@ async def main():
     ]
     for task in tasks:
         result: TaskResult = await rpc.execute_task(task)
-        print(f"task {result.task_id}: worker={result.worker!r}  "
-              f"output={result.output!r}  ok={result.success}")
+        print(
+            f"task {result.task_id}: worker={result.worker!r}  "
+            f"output={result.output!r}  ok={result.success}"
+        )
 
     # cast() — broadcast to ALL workers.
     cast = conn.cast(timeout=5, serde=SerdeFormat.PICKLE)

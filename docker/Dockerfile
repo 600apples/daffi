@@ -1,13 +1,11 @@
-FROM python:3.9-alpine
+FROM python:3.12-slim-bookworm
 
 WORKDIR /opt
 
-RUN apk add --no-cache linux-headers build-base
-
-RUN python3 -m pip install --upgrade pip
-
 COPY main.py .
 
-RUN python3 -m pip install daffi
+RUN python3 -m pip install --upgrade pip \
+    && python3 -m pip install daffi
 
-CMD [ "python3", "-u", "main.py" ]
+# Listen port comes from DAFFI_PORT at runtime.
+CMD ["python3", "-u", "main.py"]
