@@ -1113,8 +1113,14 @@ def test_peer_that_stops_reading_does_not_freeze_the_service(fragile_service):
         time.sleep(1.0)  # its replies are being written by now
         with _client(port, "behind-stalled", FRAGILE) as conn:
             started = time.monotonic()
-            assert conn.rpc(timeout=30).add(1, 1) == 2
-            assert time.monotonic() - started < 20
+            assert conn.rpc(timeout=45).add(1, 1) == 2
+            # Darwin SO_SNDTIMEO resets whenever any data is delivered, so a
+            # threads+pool service can drip several large replies into a
+            # SIGSTOP'd peer across multiple 5s stall windows before the peer
+            # is dropped. Evented fails after one poll wait (~5s). Allow enough
+            # headroom for the threads path without treating a hung service
+            # (rpc timeout) as a pass.
+            assert time.monotonic() - started < 35
     finally:
         _resume_and_kill(stalled)
 
