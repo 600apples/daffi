@@ -27,7 +27,8 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Build wheels
-        uses: pypa/cibuildwheel@v3.4.1
+        # v4.2+ accepts cp315 by default; v3.4.1 rejects the selector entirely.
+        uses: pypa/cibuildwheel@v4.3.5
         env:
           CIBW_BUILD_VERBOSITY: 1
           # Publish CPython 3.10–3.15 only. 3.9 and older are not built.
